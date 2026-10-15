@@ -198,5 +198,8 @@ jobs:
           rust\target\release\compara.exe compare data\demo_a.csv data\demo_b.csv `
               -k account_id,txn_id -i updated_at -o report.html
           if ($LASTEXITCODE -ne 1) { throw "expected exit 1 (differences found), got $LASTEXITCODE" }
-          if (-not (Select-String -Path report.html -Pattern 'compara' -Quiet)) { throw "report.html was not written" }
+          # The report's title names the two files it compares.
+          if (-not (Select-String -Path report.html -Pattern 'demo_a.csv vs demo_b.csv' -SimpleMatch -Quiet)) {
+            throw "report.html does not name the two files"
+          }
           exit 0
