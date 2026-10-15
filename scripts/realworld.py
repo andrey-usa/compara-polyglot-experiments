@@ -388,8 +388,9 @@ def measure(variants, shape, args, tmp: Path):
                     results.append(row)
                     continue
                 got = counts_of(json.loads(doc.read_text()))
-                # Which reader ran matters only for Parquet: text has one path.
-                parquet = variant.startswith("parquet-") and label in dict(PORTS)
+                # Which reader ran matters only for Parquet, and only the Rust
+                # and Zig ports have two; C and C++ name every engine `turbo`.
+                parquet = variant.startswith("parquet-") and label in ("compara", "Zig")
                 row.update(state="ok" if got == reference else "differs", counts=got,
                            reader=reader_of(done.stdout) if parquet else "")
                 results.append(row)

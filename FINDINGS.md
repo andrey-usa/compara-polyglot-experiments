@@ -36,6 +36,10 @@ history and acted on without repeating it.
   the three counting, and 1.9-2.7x writing the rows as CSV, with the same
   answer; on CSV and TSV it writes the rows 2.1-3.0x faster than the fastest
   of them, though its text-path export is the slower half of its own work (E-002).
+- **On a GitHub runner** (R-008), every port built for it: the four ports tie on
+  CSV and TSV (0.11-0.12 s at 1M rows), and on the real writers' Parquet compara
+  counts in 0.26-0.29 s against Polars' 0.78-0.87 s, DuckDB's 1.76-2.83 s and
+  Zig's row reader at 1.23-2.13 s.
 - **TSV** (R-005): the same answer and the same speed as CSV in every port.
 - **Generated data** (the README's 2026-09-30 table and the "Where another port
   leads compara" table below): within 1.18x of the fastest port on CSV, a tie on
@@ -179,6 +183,31 @@ DuckDB 0.86s, compara row reader with CSV rows 0.90s / 195 MB, pandas 2.47s,
 DataComPy 5.70s. The verdict was that on Parquet with CSV row output compara was
 level with DuckDB and Polars, not ahead. A-131 (row files from the columnar
 path) and A-132 (zstd on the columnar path) are the answer; R-004 measures it.
+
+### R-008 — The same table on a GitHub runner
+
+`realworld.yml`'s first run, [run 38823328417](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/38823328417):
+`AMD EPYC 7763`, 4 cores, 1M rows a side, best of 3, every tool at its default
+thread count, and every port built for the runner by `scripts/build_ports.sh`
+(compara with `-C target-cpu=x86-64-v3`). Wide shape; wall · peak RSS.
+
+| File | C | C++ | compara | Zig | DuckDB | Polars | pandas |
+|---|---|---|---|---|---|---|---|
+| csv | **0.11s** · 415 MB | **0.11s** · 418 MB | 0.12s · 416 MB | 0.12s · 420 MB | 4.00s · 1,321 MB | 1.26s · 2,147 MB | 10.85s · 2,094 MB |
+| tsv | **0.11s** · 415 MB | **0.11s** · 418 MB | 0.12s · 416 MB | 0.12s · 421 MB | 4.02s · 1,352 MB | 1.31s · 2,128 MB | 11.49s · 2,094 MB |
+| parquet-gen | 0.15s · 320 MB | **0.13s** · 317 MB | 0.17s · 325 MB | 0.16s · 296 MB | 3.05s · 1,503 MB | 0.88s · 1,847 MB | 4.31s · 2,191 MB |
+| parquet-pyarrow | — | — | **0.26s** · 404 MB | 1.26s · 569 MB | 2.48s · 1,098 MB | 0.86s · 1,654 MB | 3.86s · 1,714 MB |
+| parquet-polars | — | — | **0.29s** · 355 MB | 2.13s · 530 MB | 2.82s · 1,262 MB | 0.86s · 1,905 MB | 3.74s · 2,003 MB |
+| parquet-duckdb | — | — | **0.29s** · 392 MB | 1.23s · 580 MB | 1.76s · 1,077 MB | 0.78s · 1,781 MB | 3.83s · 1,745 MB |
+| parquet-pandas | — | — | **0.26s** · 406 MB | 1.37s · 573 MB | 2.83s · 1,170 MB | 0.87s · 1,704 MB | 3.68s · 1,923 MB |
+
+With the rows written as CSV: compara 0.76s on the CSV pair against Polars
+1.38s, DuckDB 4.63s and pandas 12.81s, and 0.53-0.57s on the four real writers'
+Parquet files against Polars 0.84-0.92s, DuckDB 2.28-3.59s and pandas
+5.49-5.75s. On the narrow shape compara counted the real writers' Parquet in
+0.16-0.17s against Polars 0.61-0.63s, and wrote its rows in 0.31-0.35s against
+0.61-0.63s. Built for the runner, compara is level with C, C++ and Zig on text
+(0.12s against 0.11s), which is E-001 measured the other way round.
 
 ## Advances
 
