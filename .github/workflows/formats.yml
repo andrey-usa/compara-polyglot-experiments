@@ -1,0 +1,164 @@
+name: Formats (Rust, Zig, C++)
+
+permissions:
+  contents: read
+
+# The three native ports read CSV, TSV, newline-delimited JSON and Parquet, and
+# the only claim worth CI time is that they cannot disagree: every port, on every
+# format, has to return the same counts and the same per-column stats for the
+# same rows. The payloads come from this project's own generator, so a
+# disagreement is a reader bug rather than a converter's.
+
+on:
+  push:
+    # `main` only. Every branch here gets a pull request, and a branch listed
+    # beside it means each push runs this workflow twice on the same SHA -- once
+    # for the push, once for the pull_request -- which the per-ref concurrency
+    # group cannot collapse, because a push is `refs/heads/...` and a pull
+    # request is `refs/pull/N/merge`. Two different groups, two full runs. The
+    # `pull_request` trigger below covers the branch; this one covers what
+    # landed.
+    branches: [main]
+    paths:
+      - "rust/**"
+      - "zig/**"
+      - "cpp/**"
+      - "tests/fixtures/formats/**"
+      - ".github/workflows/formats.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "zig/**"
+      - "cpp/**"
+      - "tests/fixtures/formats/**"
+      - ".github/workflows/formats.yml"
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "How many rows the benchmark uses"
+        default: "1m"
+
+concurrency:
+  group: formats-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agree:
+    name: every port reads every format the same way
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # Zig comes from PyPI rather than ziglang.org: it is the same release,
+      # and it needs no network beyond the one the runner already trusts.
+      - name: Install Zig
+        uses: ./.github/actions/setup-zig
+
+      # gen-data as well as the engine: the Zig suite's columnar Parquet checks
+      # write their fixtures with `cpp/build/gen-data --format parquet`, and
+      # they skip themselves by name rather than failing when it is absent --
+      # which is how eleven of them silently did not run here.
+      # The four at once; see scripts/build_ports.sh. `rust` there is the
+      # --no-default-features build, which is the one this job wants: every run
+      # here goes through `turbo` or the columnar Parquet path, and since both
+      # Rust rows exist it is now both rather than only the first.
+      - name: Build the four ports
+        env:
+          CXX: clang++
+        run: scripts/build_ports.sh c rust zig cpp cpp-gen
+
+      # The dev profile, deliberately: the release profile links with thin LTO
+      # in one codegen unit, which costs minutes per test binary and buys
+      # nothing a correctness test can use. Same feature set as the build above,
+      # so the two share a target directory instead of each filling their own.
+      - name: Rust format tests
+        run: cd rust && cargo test --no-default-features --test formats --test parquet
+
+      # A skip is not a pass. The suite reports one per line, so the run fails
+      # if any check declined to run for want of a tool this job just built.
+      - name: Zig test suite, against the Rust port
+        run: |
+          cd zig
+          ZIG=zig ./test.sh | tee /tmp/zig-test.txt
+          status=${PIPESTATUS[0]}
+          if grep -q "  skip" /tmp/zig-test.txt; then
+            echo "::error::a check skipped itself:"
+            grep "  skip" /tmp/zig-test.txt
+            exit 1
+          fi
+          exit "$status"
+
+      - name: Every port, every format, one answer
+        run: |
+          ROWS="${{ github.event.inputs.rows || '1m' }}"
+          mkdir -p data
+          for f in csv tsv ndjson parquet; do
+            ./rust/target/release/compara-gen-data --rows "$ROWS" --out-dir data --prefix fmt --format $f
+          done
+          run() {  # port, binary, extra flags, format, and optionally an A to use
+            ext=$4
+            a=${5:-data/fmt_a.$ext}
+            $2 compare "$a" data/fmt_b.$ext -k account_id,txn_id -i updated_at \
+              $3 --json "/tmp/$1-$ext.json" >/dev/null || true
+          }
+          for ext in csv tsv ndjson parquet; do
+            run cpp ./cpp/build/csvdiff "" $ext
+            # Both Rust readers on Parquet. `--engine turbo` is the one flag that
+            # retires the columnar one, so the row that named it was checking the
+            # reader `auto` does not pick -- and nothing was checking the one it
+            # does.
+            run rust "./rust/target/release/compara" "-o /dev/null" $ext
+            run rust-turbo "./rust/target/release/compara" "--engine turbo -o /dev/null" $ext
+            run zig ./zig/zig-out/bin/csvdiff "" $ext
+          done
+          # One Parquet side against one text side: not the columnar path, which
+          # has no column to compare a byte stream against, but the same answer
+          # -- so it belongs in the set that has to agree.
+          run rust-mixed "./rust/target/release/compara" "--engine turbo -o /dev/null" csv \
+            data/fmt_a.parquet
+          run zig-mixed ./zig/zig-out/bin/csvdiff "" csv data/fmt_a.parquet
+          # A TSV side against a CSV side: each file's separator is read from
+          # its own header line, so the two need not share one.
+          run rust-tsv-csv "./rust/target/release/compara" "-o /dev/null" csv data/fmt_a.tsv
+          run cpp-tsv-csv ./cpp/build/csvdiff "" csv data/fmt_a.tsv
+          run zig-tsv-csv ./zig/zig-out/bin/csvdiff "" csv data/fmt_a.tsv
+          python3 - <<'PY'
+          import glob, json, sys
+          answers = {}
+          for path in sorted(glob.glob("/tmp/*-*.json")):
+              name = path.split("/")[-1][:-5]
+              summary = json.load(open(path))
+              answers[name] = (summary["counts"],
+                               [(c["name"], c["changed"], c["blanked"], c["filled"])
+                                for c in summary["columns"]])
+          if not answers:
+              sys.exit("no run produced a summary")
+          reference = next(iter(answers))
+          for name, value in answers.items():
+              if value != answers[reference]:
+                  sys.exit(f"{name} disagrees with {reference}:\n  {value}\n  {answers[reference]}")
+          print(f"{len(answers)} runs agree:", json.dumps(answers[reference][0]))
+          print("| run | rows | matched | changed | added | removed |")
+          print("|---|---:|---:|---:|---:|---:|")
+          c = answers[reference][0]
+          for name in answers:
+              print(f"| {name} | {c['a_rows']} | {c['matched']} | {c['changed']} "
+                    f"| {c['added']} | {c['removed']} |")
+          PY
+
+      # This job used to end with a 1M benchmark through
+      # `scripts/bench_formats_ports.py`. `bench-2m.yml` runs the same harness on
+      # every pull request at twice the rows, three repeats instead of two, and
+      # with the scanner builds beside the four ports, so the table here was a
+      # smaller copy of one taken minutes earlier -- and it made this workflow a
+      # timing job, which raised the question of whether it belonged in the
+      # `benchmark-host` group and had to queue behind other benchmarks. It does
+      # not, now: this is a correctness workflow and nothing in it is timed.

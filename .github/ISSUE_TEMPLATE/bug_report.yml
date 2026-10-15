@@ -1,0 +1,52 @@
+name: Bug report
+description: Something is wrong with a comparison
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: input
+    id: port
+    attributes:
+      label: Port
+      description: Which implementation? (c, cpp, rust, zig)
+      placeholder: rust
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit hash or the output of `csvdiff --version`
+      placeholder: 4f80fa2
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command you ran
+      placeholder: |
+        c/gen-data --rows 10k --out-dir data --prefix p
+        rust/target/release/compara compare data/p_a.csv data/p_b.csv -k account_id,txn_id
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What you expected, and what you got instead
+    validations:
+      required: true
+  - type: textarea
+    id: input
+    attributes:
+      label: Input
+      description: Rows × columns, format, and the smallest input that reproduces it (attach it if you can)
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: OS, CPU, anything else that might matter
+    validations:
+      required: false

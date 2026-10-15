@@ -1,0 +1,46 @@
+__pycache__/
+*.pyc
+/build/
+/dist/
+# Generated data and benchmark output, anchored per implementation. Unanchored,
+# "bench/" would also match a source directory named bench and silently drop it
+# from every commit.
+/data/
+/bench/
+/out/
+/rust/data/
+/rust/bench/
+/rust/out/
+/rust/target/
+# The scanner variants build into their own target directories, because a
+# different -C target-feature invalidates everything cargo has cached.
+/rust/target-*/
+/zig/zig-out-*/
+csvdiff.toml
+compara.toml
+*.html
+!examples/report.html
+!rust/src/report.html
+
+# JVM crash dumps, left behind when an engine is run out of memory on purpose.
+hs_err_pid*.log
+replay_pid*.log
+
+# C++ build output.
+/cpp/build/
+
+# Zig build output.
+/zig/zig-out/
+/zig/.zig-cache/
+
+# C build output.
+/c/csvdiff
+/c/gen-data
+/c/csvdiff-asan
+
+# The C port builds objects beside its sources now, not just one binary.
+c/*.o
+
+# scripts/win_smoke.sh works here; it cleans up after itself, but a killed run
+# would leave it behind.
+.win-smoke-tmp/

@@ -1,0 +1,26 @@
+name: Feature request
+description: An idea for the tool or the project
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today, or what's awkward?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should happen instead? Which ports should it apply to?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Examples, prior art, anything that sharpens the idea
+    validations:
+      required: false

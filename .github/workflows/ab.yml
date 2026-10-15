@@ -1,0 +1,120 @@
+name: A/B (two refs of one port, one runner)
+
+# Did a change pay, measured the way that cannot miss a pair: the base ref and
+# the head ref of one port, built and run interleaved on a single runner by
+# `scripts/variants_ab.py`, with the base run a second time beside them as the
+# floor. Two phases runs dispatched separately land on two runners, and on this
+# fleet two runners are as often two CPUs as one -- which is why that way took
+# a second batch of runs to get a single pair when clang 23 was measured.
+#
+# The base binary is copied rather than built twice: "base-again" is the same
+# bytes, so its distance from "base" is the noise and nothing else.
+
+on:
+  workflow_dispatch:
+    inputs:
+      port:
+        description: "c, cpp, rust or zig"
+        default: "cpp"
+      head:
+        description: "Head ref: a branch, tag or SHA"
+        required: true
+      base:
+        description: "Base ref"
+        default: "main"
+      format:
+        description: "csv, ndjson or parquet"
+        default: "csv"
+      rows:
+        description: "Row count: 2m, 10m ..."
+        default: "10m"
+      threads:
+        description: "Comma-separated thread counts"
+        default: "1,4"
+      rounds:
+        description: "Rounds; the median is printed"
+        default: "7"
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    name: "a/b — ${{ inputs.port }} ${{ inputs.format }} ${{ inputs.rows }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # The workflow's own ref, for the tooling -- this file, the scripts and
+      # the setup actions. Head and base are built in worktrees of their own,
+      # since either may predate the tooling.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ab
+
+      - name: Install Zig
+        uses: ./.github/actions/setup-zig
+
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
+
+      - name: Build head, base and the generator
+        env:
+          PORT: ${{ inputs.port }}
+          HEAD_REF: ${{ inputs.head }}
+          BASE: ${{ inputs.base }}
+        run: |
+          set -eu
+          case "$PORT" in
+            c)    bin=c/csvdiff ;;
+            cpp)  bin=cpp/build/csvdiff ;;
+            rust) bin=rust/target/release/compara ;;
+            zig)  bin=zig/zig-out/bin/csvdiff ;;
+            *)    echo "unknown port $PORT" >&2; exit 2 ;;
+          esac
+          resolve() { git rev-parse --verify -q "origin/$1^{commit}" || git rev-parse --verify "$1^{commit}"; }
+          head=$(resolve "$HEAD_REF")
+          base=$(resolve "$BASE")
+          echo "head $HEAD_REF = $head"
+          echo "base $BASE = $base"
+          git worktree add --detach /tmp/head "$head"
+          git worktree add --detach /tmp/base "$base"
+          # The generator is the Rust port's, built from the workflow's ref.
+          scripts/build_ports.sh rust
+          (cd /tmp/head && scripts/build_ports.sh "$PORT")
+          (cd /tmp/base && scripts/build_ports.sh "$PORT")
+          cp "/tmp/base/$bin" /tmp/base-again
+          echo "BIN=$bin" >> "$GITHUB_ENV"
+
+      - name: A/B
+        env:
+          PORT: ${{ inputs.port }}
+          ROWS: ${{ inputs.rows }}
+          FORMAT: ${{ inputs.format }}
+          THREADS: ${{ inputs.threads }}
+          ROUNDS: ${{ inputs.rounds }}
+        run: |
+          set -o pipefail
+          extra=()
+          # Rust writes a report unless told not to; the others write nothing.
+          [ "$PORT" = rust ] && extra=(--extra=--summary)
+          python3 scripts/variants_ab.py --rows "$ROWS" --format "$FORMAT" \
+            --threads "$THREADS" --rounds "$ROUNDS" "${extra[@]}" \
+            "$PORT base=/tmp/base/$BIN" "$PORT head=/tmp/head/$BIN" "$PORT base-again=/tmp/base-again" \
+            | tee /tmp/ab.txt
+          {
+            echo "## A/B — $PORT, $ROWS rows, $FORMAT"
+            echo
+            echo '```'
+            cat /tmp/ab.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

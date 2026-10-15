@@ -1,0 +1,88 @@
+name: Set up Zig
+description: >-
+  Installs the pinned Zig release and leaves a plain `zig` on PATH.
+
+# Zig comes from PyPI rather than ziglang.org: it is the same release, and it
+# needs no network beyond the one the runner already trusts.
+#
+# This exists because the install was copied into nine places across seven
+# workflows, each pinning the version separately, and two of the copies carried
+# a comment telling a human to keep the rest in step by hand. The version below
+# is now the only place it is written down.
+#
+# The shim matters as much as the install. `zig/test.sh` and `build_ports.sh`
+# both invoke a plain `zig`, not `python -m ziglang`, so a workflow that
+# installed the package and stopped there failed on the first build step. The
+# two runner families need different homes for it: `sudo` and /usr/local/bin are
+# not a given everywhere, so this writes to ~/.local/bin and puts that on PATH,
+# which works on all four families platforms.yml covers. That is the form
+# platforms.yml had already arrived at independently; the other seven copies had
+# the sudo one.
+
+inputs:
+  version:
+    description: Zig release to install from PyPI.
+    required: false
+    default: "0.16.0"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Zig ${{ inputs.version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # One interpreter for both halves, resolved once and written into the
+        # shim by absolute path.
+        #
+        # `pip3 install` + `exec python3 -m ziglang` is the obvious spelling and
+        # it is wrong: those two names can resolve to different interpreters, so
+        # the module lands in one and the shim looks for it in the other. Where
+        # a workflow also runs `actions/setup-python` there are certainly two,
+        # and benchmark-native.yml failed exactly this way --
+        # `/usr/bin/python3: No module named ziglang` -- while the ladder, which
+        # has no setup-python step, passed because its two names happened to
+        # agree. Resolving `python3` once and using `$py -m pip` to install
+        # makes the two identical by construction, and baking the absolute path
+        # into the shim keeps it true however PATH changes afterwards.
+        py=$(command -v python3)
+        # ...but not an interpreter that is about to be deleted.
+        #
+        # Several jobs here free disk before generating tens of gigabytes of
+        # rows, and what they delete includes `$AGENT_TOOLSDIRECTORY` --
+        # /opt/hostedtoolcache, which is exactly where actions/setup-python
+        # puts its interpreter. Install into that one and the shim dies later
+        # with `exec: /opt/hostedtoolcache/Python/3.14.7/x64/bin/python3: not
+        # found`, which is how benchmark-native.yml failed on the second
+        # attempt at this. The tarball install it replaced was immune because a
+        # zig binary needs no interpreter at all.
+        #
+        # So: if the resolved python3 lives under the tool cache and a system
+        # python3 exists, take the system one. It is the interpreter that is
+        # still there after the cleanup.
+        if [ -n "${AGENT_TOOLSDIRECTORY:-}" ] \
+           && [ -x /usr/bin/python3 ] \
+           && case "$py" in "$AGENT_TOOLSDIRECTORY"/*) true ;; *) false ;; esac
+        then
+          echo "$py is under the deletable tool cache; using /usr/bin/python3"
+          py=/usr/bin/python3
+        fi
+        echo "using $py"
+        # --break-system-packages for the runners whose python is marked
+        # externally managed (PEP 668); the fallback covers the ones where the
+        # flag itself is not recognised.
+        "$py" -m pip install --break-system-packages "ziglang==${{ inputs.version }}" \
+          || "$py" -m pip install "ziglang==${{ inputs.version }}"
+        mkdir -p "$HOME/.local/bin"
+        printf '#!/bin/sh\nexec "%s" -m ziglang "$@"\n' "$py" > "$HOME/.local/bin/zig"
+        chmod +x "$HOME/.local/bin/zig"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Check it runs
+      shell: bash
+      run: |
+        # PATH from GITHUB_PATH only applies to later *steps*, so this cannot be
+        # folded into the step above -- which is the exact ordering bug
+        # platforms.yml records having hit.
+        export PATH="$HOME/.local/bin:$PATH"
+        zig version

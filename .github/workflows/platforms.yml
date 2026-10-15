@@ -1,0 +1,304 @@
+name: Platforms
+
+# Where each port actually builds and passes its own suite, on every runner
+# family GitHub offers. A status board rather than a gate.
+#
+# The README has a "What runs where" table, and the story it tells against
+# itself is why this file exists: the Rust row once said "native" on Windows on
+# the strength of a grep for `std::os::unix` that could not see inside a
+# dependency, and a reader hit the failure within the hour. A claim about a
+# platform is worth what the runner that proves it is worth, so every cell in
+# that table should have a job behind it.
+#
+# Windows is a second job because it is a different build entirely: gcc comes
+# from MSYS2 rather than the image, and the three POSIX suites do not run there
+# yet -- they are written for a POSIX shell and reach for binaries by their
+# extensionless names. `scripts/win_smoke.sh` is what stands in, and it asks the
+# question those suites ask: does this build give the same answers as the Rust
+# port, which has built and been tested on Windows for some time.
+#
+# The Rust port has no lane there because `ci-rust.yml` already builds it,
+# tests it, and re-runs the README's own PowerShell lines.
+#
+# macOS is capped at five concurrent jobs on a free plan, so only one macOS
+# family runs here. Adding the Intel one would double the count and queue.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  schedule:
+    # Weekly, because the thing this catches is a runner image changing under
+    # a claim that used to be true.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: platforms-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Whether this pull request has anything for the jobs below to check. The
+  # pull_request trigger has no path filter, so `platforms` reports on every pull
+  # request and can be a required check: a PR that touches none of these paths
+  # is settled here in seconds and every other job is skipped. The pattern is
+  # the path filter the pull_request trigger here used to carry.
+  scope:
+    name: scope
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: scope
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != pull_request ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed=$(git diff --name-only "$BASE...$HEAD")
+          if echo "$changed" | grep -qE '^(c/|cpp/|zig/|rust/src/|rust/Cargo\.toml$|\.github/workflows/platforms\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing here is built or run by this workflow." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    name: "${{ matrix.port }} on ${{ matrix.os }}"
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        port: [c, cpp, rust, zig]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # Every lane needs the Rust port, C++ included: all three suites hold
+      # their answers against it rather than against a golden file, which is the
+      # whole reason four ports are worth having. This job first exempted the
+      # C++ lane and all three of its runners failed on `build the Rust port
+      # first` -- cpp/test.sh checks for it in its opening lines, same as the
+      # others.
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # Zig comes from PyPI rather than ziglang.org: it is the same release, and
+      # it needs no network beyond the one the runner already trusts. The shim
+      # goes on PATH rather than into /usr/local/bin the way the Linux-only
+      # workflows do it -- `sudo` is not a given on every runner family, and
+      # `zig/test.sh` looks for a plain `zig`.
+      - name: Install Zig
+        if: matrix.port == 'zig'
+        uses: ./.github/actions/setup-zig
+
+      - name: What this runner is
+        run: |
+          echo "os=${{ matrix.os }}  arch=$(uname -m)  cores=$(getconf _NPROCESSORS_ONLN)"
+          case "${{ matrix.port }}" in
+            c)    ${CC:-cc} --version | head -1 ;;
+            cpp)  ${CXX:-c++} --version | head -1 ;;
+            rust) rustc --version ;;
+            zig)  zig version ;;
+          esac
+
+      # The Rust port at default features -- it has no optional ones, and the
+      # binaries the other suites reach for (`csvdiff`, `gen-data`) both come
+      # out of this one build.
+      - name: Build the Rust port
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      - name: Build
+        run: |
+          case "${{ matrix.port }}" in
+            c)    make -C c && make -C c gen-data ;;
+            cpp)  make -C cpp && make -C cpp gen-data ;;
+            zig)  (cd zig && zig build --release=fast) ;;
+            rust) : ;;   # built above
+          esac
+
+      # Building is not the claim -- running is. A port that compiles and then
+      # answers wrongly on a new platform is worse than one that does not
+      # compile, because only the second kind announces itself.
+      #
+      # The Zig suite's Parquet checks write their fixtures with
+      # `cpp/build/gen-data`, and skip themselves by name when it is absent.
+      # It is two files and a few seconds, so build it and let them run.
+      - name: Build cpp gen-data for the Zig suite
+        if: matrix.port == 'zig'
+        run: make -C cpp gen-data
+
+      # cpp/test.sh writes the Parquet for two of its sections with duckdb, and
+      # skips them by name when there is none -- which is what it did on every
+      # run here, on every platform: eleven checks, among them the one that
+      # holds C++'s columnar Parquet path to the CSV of the same rows. A pinned
+      # CLI from duckdb's own releases, so they run.
+      - name: Install duckdb for the C++ suite
+        if: matrix.port == 'cpp'
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)  asset=linux-amd64 ;;
+            Linux-aarch64) asset=linux-arm64 ;;
+            Darwin-*)      asset=osx-universal ;;
+            *) echo "::error::no duckdb build for $(uname -s)-$(uname -m)"; exit 1 ;;
+          esac
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/duckdb.zip" \
+            "https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-$asset.zip"
+          mkdir -p "$RUNNER_TEMP/duckdb"
+          unzip -q -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
+          echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/duckdb/duckdb" --version
+
+      # A skip is not a pass. The suites print one per check that declined to
+      # run for want of a tool; this job builds or installs every one of them,
+      # so any skip here means a step went missing and a check went with it.
+      - name: Test
+        run: |
+          case "${{ matrix.port }}" in
+            c)    (cd c   && ./test.sh) | tee "$RUNNER_TEMP/suite.txt" ;;
+            cpp)  (cd cpp && ./test.sh) | tee "$RUNNER_TEMP/suite.txt" ;;
+            zig)  (cd zig && ./test.sh) | tee "$RUNNER_TEMP/suite.txt" ;;
+            rust) cargo test --release --manifest-path rust/Cargo.toml ;;
+          esac
+          if [ -f "$RUNNER_TEMP/suite.txt" ] && grep -qE '^ *skip' "$RUNNER_TEMP/suite.txt"; then
+            echo "::error::a check skipped itself rather than ran:"
+            grep -E '^ *skip' "$RUNNER_TEMP/suite.txt"
+            exit 1
+          fi
+
+      - name: Say so
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = success ]; then mark='builds and passes'; else mark='**FAILED**'; fi
+          {
+            echo "| port | runner | arch | result |"
+            echo "| --- | --- | --- | --- |"
+            echo "| ${{ matrix.port }} | ${{ matrix.os }} | $(uname -m) | $mark |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: "${{ matrix.port }} on windows"
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        port: [c, cpp, zig]
+        include:
+          # MSYS2's bash for the two Makefile ports, so `make`, `uname` and the
+          # shell script all come from one place. The Zig port needs none of it.
+          - { port: c,   shell: "msys2 {0}" }
+          - { port: cpp, shell: "msys2 {0}" }
+          - { port: zig, shell: "bash" }
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: msys2/setup-msys2@v2
+        if: matrix.port != 'zig'
+        with:
+          msystem: MINGW64
+          # `inherit` keeps the Windows PATH, which is where cargo and python
+          # are: this job needs both alongside gcc.
+          path-type: inherit
+          update: false
+          install: mingw-w64-x86_64-gcc make
+
+      # The oracle. Every check below is this port's answer against the Rust
+      # port's on the same file, so it is built first and on every lane.
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # Before the step that reports it, which is the order the Linux job uses
+      # and the order this one did not: `python -m ziglang version` ran first
+      # and the lane died on `No module named ziglang`.
+      - name: Install Zig
+        if: matrix.port == 'zig'
+        run: pip install ziglang==0.16.0
+
+      - name: What this runner is
+        run: |
+          echo "arch=$(uname -m 2>/dev/null || echo x86_64)"
+          case "${{ matrix.port }}" in
+            c)    gcc --version | head -1 ;;
+            cpp)  g++ --version | head -1 ;;
+            zig)  python -m ziglang version ;;
+          esac
+          rustc --version
+
+      - name: Build the Rust port
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      # CC and CXX by name: MSYS2 ships `gcc` and `g++`, and the Makefiles'
+      # defaults (`cc`, `c++`) are not there.
+      - name: Build
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          case "${{ matrix.port }}" in
+            c)    make -C c && make -C c gen-data ;;
+            cpp)  make -C cpp && make -C cpp gen-data ;;
+            zig)  (cd zig && python -m ziglang build --release=fast) ;;
+          esac
+
+      - name: Same answers as the Rust port
+        run: bash scripts/win_smoke.sh ${{ matrix.port }}
+
+      - name: Say so
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = success ]; then mark='builds and agrees with rust'; else mark='**FAILED**'; fi
+          {
+            echo "| port | runner | arch | result |"
+            echo "| --- | --- | --- | --- |"
+            echo "| ${{ matrix.port }} | windows-latest | x86_64 | $mark |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The one check to require. Matrix lanes that are skipped never expand into
+  # their names, so a required "cpp on macos-latest" would wait forever on a
+  # pull request that skipped it; this job always runs and reports for all of
+  # them: it fails if any lane failed or was cancelled, and passes otherwise.
+  result:
+    name: platforms
+    needs: [scope, build, windows]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "jobs: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a job ended '$r'"; exit 1 ;;
+            esac
+          done

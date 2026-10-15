@@ -1,0 +1,416 @@
+name: Benchmark ladder (10M and up)
+
+permissions:
+  contents: read
+
+# A rung per size, all rungs at once, on request only.
+#
+# This is what `bench-10m.yml` became. Ten million rows on every pull request
+# cost 4m48s and held the repository-wide benchmark lock for all of it, and a
+# reviewer asking "did this get slower" is answered by `bench-2m.yml` in a
+# fraction of that. The large sizes are still the interesting ones -- the index
+# stops fitting in cache, the generator stops fitting on the disk -- but they
+# are a question somebody asks deliberately, not a tax on every push.
+#
+# One job per *size and format*, and never one per port: a table's ports have to
+# have run on one host in one sitting or it compares machines instead of
+# engines. Sizes were never comparable with each other, and neither were
+# formats, so splitting on those two costs nothing that was not already gone.
+#
+# Formats were split off after a 40m run lost everything it had measured. The
+# CSV half had finished -- nine builds, real numbers -- and then the runner was
+# taken away partway through parquet, with `exit 143` and a shutdown signal. A
+# step that publishes at the end cannot help there: when the runner goes, no
+# further step runs at all, `if: always()` included, so the upload never
+# happened and the numbers survived only in the log. Separate jobs are the only
+# arrangement where finishing CSV means keeping CSV.
+#
+# It costs one generation per cell rather than one per size, and buys back more
+# than it costs: each job now generates only its own format, so the 40m CSV job
+# writes 14 GB instead of that plus 6 GB of parquet beside it.
+#
+# `fail-fast: false` is load-bearing: a rung that cannot finish should not take
+# the rungs below it with it, which is why this reads as a ladder rather than one
+# number.
+#
+# **What kills a rung is memory, not disk.** That was written the other way round
+# here for a while, and five dispatched runs say otherwise -- every single
+# failure was `exit 143` with a shutdown signal, during the comparison, after the
+# data had generated cleanly:
+#
+#   200m csv      wrote 70,176 MB with 107 GB still free, then died 24m in
+#    50m parquet  wrote  7,673 MB, then died 3m in
+#
+# Disk was never short. The runner was being reclaimed for memory, and a
+# reclaimed runner runs no further step -- `if: always()` included -- so the rung
+# reported nothing at all, not even that it had run out of memory.
+#
+# `--memory-cap` is the fix, and it is why a rung can now say so. It caps each
+# port's heap and anonymous memory through `RLIMIT_DATA`, which since Linux 4.7
+# excludes file-backed mappings -- so the mapped input is untouched and only what
+# scales with the row count is bounded. The port then fails on its own: C and Zig
+# say "out of memory", C++ "std::bad_alloc", Rust aborts naming the allocation it
+# could not make. All four leave the runner alive and the table written.
+#
+# **A failed rung does not cancel the larger ones, deliberately.** The obvious
+# rule -- 30m failed, so 40m is pointless, stop it -- saves less than it costs.
+# The rungs start together, so by the time 30m fails, 40m is already most of the
+# way through its own generation and is minutes from its own answer. And a
+# cancelled rung reports *nothing*, which throws away the one thing the ladder
+# exists to tell you: whether 40m failed for the same reason 30m did, or for a
+# different one, or -- when the failure is a runner that happened to have less
+# disk -- did not fail at all. Two rungs failing separately is data. One rung
+# failing and one cancelled is a guess.
+#
+# The `collect` job at the bottom is what makes that readable: it prints one
+# table of every rung asked for and whether it produced numbers, so where the
+# wall is stays obvious without any rung having to be killed to show it.
+#
+# If you want the ladder to *stop* at the first failure, that is
+# `scale-ceiling.yml` -- it climbs deliberately and reports what stopped it. This
+# workflow answers "how fast at each of these sizes", which wants every rung it
+# was given.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: "Comma-separated row counts, one job each (10m,20m,40m)"
+        default: "10m,20m,40m"
+      formats:
+        description: "Comma-separated: csv, tsv, ndjson, parquet"
+        default: "csv,parquet"
+      repeats:
+        description: "Runs per build; the best is kept"
+        default: "2"
+      matrix:
+        description: "Include the scanner builds (SWAR vs AVX2 vs AVX-512) — triples each job"
+        type: boolean
+        # Off by default now. Nine builds instead of four is three times the
+        # measurements and three times the wall clock for a question about
+        # instruction sets, which is not the question a ladder asks. It also
+        # produced the highest memory this workflow has recorded -- 15.1 GB on a
+        # 16 GB runner, at 40m rows of CSV. Turn it on deliberately.
+        default: false
+      first:
+        description: "Port whose rows run first (label prefix), so a truncated rung keeps its number"
+        default: "Rust"
+
+# The same group every benchmark in this repository names, so a ladder and a 2M
+# run queue for each other instead of measuring each other's contention. The
+# rungs inside one ladder do run together -- that is the point of it -- and each
+# one prints its host so a reader can see whether two landed on the same
+# machine.
+concurrency:
+  group: benchmark-host
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: read the ladder
+    runs-on: ubuntu-latest
+    outputs:
+      sizes: ${{ steps.read.outputs.sizes }}
+      formats: ${{ steps.read.outputs.formats }}
+    steps:
+      - id: read
+        # Refused rather than silently dropped: a size this cannot parse would
+        # otherwise become a rung that runs the generator's default and reports
+        # a number for the wrong row count, which is this repository's
+        # longest-running class of bug.
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, sys
+          rungs = [s.strip() for s in os.environ["SIZES"].split(",") if s.strip()]
+          if not rungs:
+              sys.exit("no sizes given")
+          for s in rungs:
+              if not re.fullmatch(r"\d+[kmKM]?", s):
+                  sys.exit(f"not a row count: {s!r}")
+          print("sizes=" + json.dumps(rungs))
+          # Same refusal for formats, and for the same reason: a name this does
+          # not know would otherwise become a job that generates nothing and
+          # reports an empty table.
+          fmts = [f.strip().lower() for f in os.environ["FORMATS"].split(",") if f.strip()]
+          if not fmts:
+              sys.exit("no formats given")
+          for f in fmts:
+              if f not in ("csv", "tsv", "ndjson", "parquet"):
+                  sys.exit(f"not a format: {f!r}")
+          print("formats=" + json.dumps(fmts))
+          PY
+        env:
+          SIZES: ${{ github.event.inputs.sizes }}
+          FORMATS: ${{ github.event.inputs.formats || 'csv,parquet' }}
+
+  rung:
+    name: "${{ matrix.size }} rows — ${{ matrix.format }}"
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        size: ${{ fromJSON(needs.plan.outputs.sizes) }}
+        format: ${{ fromJSON(needs.plan.outputs.formats) }}
+    env:
+      FORMAT: ${{ matrix.format }}
+      REPEATS: ${{ github.event.inputs.repeats || '2' }}
+      MATRIX: ${{ github.event.inputs.matrix || 'false' }}
+      FIRST: ${{ github.event.inputs.first || 'Rust' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: What this runner is
+        run: |
+          {
+            echo "## ${{ matrix.size }} ${{ matrix.format }} — host"
+            echo
+            echo '```'
+            grep -m1 "model name" /proc/cpuinfo
+            echo "cores: $(nproc)"
+            echo "runner: $RUNNER_NAME"
+            free -g | head -2
+            df -h --output=avail / | tail -1 | sed 's/^/disk available: /'
+            echo -n "vector units: "
+            grep -o -m1 -E "avx2|avx512f|avx512bw" /proc/cpuinfo | sort -u | tr '\n' ' '
+            echo
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        # The 150m rungs fill the disk with benchmark data. A cache save that
+        # then hits "no space left" does not fail fast -- it hangs, and
+        # continue-on-error cannot rescue a hanging post-step, so the rung
+        # has to be skipped instead of tolerated. The cache buys a minute or
+        # two of build time on a rung that runs for hours; not worth the disk.
+        if: matrix.size != '150m'
+        with:
+          workspaces: rust
+          key: ladder-${{ matrix.size }}-${{ matrix.format }}
+
+      - name: Install Zig
+        uses: ./.github/actions/setup-zig
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
+
+      # The cleanup is I/O and the builds are CPU, so they run at the same time;
+      # nothing needs the disk until the data is generated a step later. See
+      # scripts/build_ports.sh.
+      - name: Free the disk, and build every port at the same time
+        run: |
+          before=$(df --output=avail -m / | tail -1)
+          (
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                        /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          ) >/tmp/freedisk.log 2>&1 &
+          freeing=$!
+
+          targets="c rust zig cpp cpp-gen"
+          if [ "$MATRIX" = "true" ]; then
+            targets="$targets cpp-scanners zig-v32 rust-avx2"
+            if grep -q avx512bw /proc/cpuinfo; then
+              targets="$targets cpp-avx512 zig-v64"
+            else
+              echo "no AVX-512 on this runner: the 64-byte builds are skipped"
+              rm -f cpp/build/csvdiff-avx512
+            fi
+          fi
+
+          if scripts/build_ports.sh $targets; then built=0; else built=1; fi
+
+          wait "$freeing" || true
+          after=$(df --output=avail -m / | tail -1)
+          echo "freed $(( (after - before) / 1024 )) GB, $(( after / 1024 )) GB now available"
+          exit "$built"
+
+      - name: Run this rung
+        run: |
+          scanners=""
+          if [ "$MATRIX" = "true" ]; then
+            scanners="--matrix"
+          fi
+          # Leave the OS and the page cache room to work: the cap bounds one
+          # port at a time, since the harness runs them in sequence, so the
+          # margin only has to cover everything that is not the port.
+          total_mb=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo)
+          cap=$(( total_mb - 2048 ))
+          echo "host has ${total_mb} MB; capping each port at ${cap} MB"
+
+          python3 scripts/bench_formats_ports.py \
+            --rows "${{ matrix.size }}" --formats "$FORMAT" --repeats "$REPEATS" $scanners \
+            --first "$FIRST" \
+            --memory-cap "$cap" \
+            --md-out /tmp/bench.md \
+            --json-out /tmp/bench.json \
+            | tee /tmp/bench.txt
+
+      # The table outside the code fence and the log inside it. They used to go
+      # in together, which meant the markdown table this script prints was
+      # sealed in a ``` block and shown as its own source -- a row of pipes,
+      # never a table. Everything else the script prints is narrative and does
+      # belong in a fence, so the two are published separately rather than the
+      # fence being dropped.
+      - name: Publish this rung
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.size }} rows — $FORMAT"
+            echo
+            if [ -s /tmp/bench.md ]; then
+              cat /tmp/bench.md
+            else
+              echo "_This rung produced no table. Its log is below._"
+            fi
+            echo
+            echo "<details><summary>${{ matrix.size }} ${{ matrix.format }} — full log</summary>"
+            echo
+            echo '```'
+            cat /tmp/bench.txt 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ladder-${{ matrix.size }}-${{ matrix.format }}-${{ github.run_id }}
+          # Both: the log for what happened, the table on its own for reading
+          # and for pasting into BENCHMARKS.md.
+          path: |
+            /tmp/bench.txt
+            /tmp/bench.md
+            /tmp/bench.json
+          retention-days: 30
+
+  collect:
+    name: the ladder
+    needs: [plan, rung]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # Before the download, not after: checkout cleans the workspace, so the
+      # other order would delete the rungs it is here to read. This job needs
+      # the tree at all because the table it prints comes from
+      # scripts/mdtable.py, the same renderer every rung used.
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ladder-*-${{ github.run_id }}
+          path: rungs
+          merge-multiple: false
+
+      - name: One table for the whole ladder
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, os, pathlib, sys
+          sizes = json.loads(os.environ["SIZES"])
+          formats = json.loads(os.environ["FORMATS"])
+          root = pathlib.Path("rungs")
+          sys.path.insert(0, "scripts")
+          from mdtable import render
+          print("## The ladder\n")
+          grid, missing = [], []
+          for size in sizes:
+              row = [size]
+              for fmt in formats:
+                  # `merge-multiple: false` keeps one directory per cell, named
+                  # for the artifact, so a cell that uploaded nothing is visibly
+                  # absent rather than merged into a neighbour's file.
+                  hit = list(root.glob(f"ladder-{size}-{fmt}-*/bench.txt"))
+                  text = hit[0].read_text().strip() if hit else ""
+                  row.append("reported" if text else "**none**")
+                  if not text:
+                      missing.append(f"{size} {fmt}")
+              grid.append(row)
+          print(render(["Rows"] + formats, ["l"] + ["l"] * len(formats), grid))
+          total = len(sizes) * len(formats)
+          if missing:
+              print(f"{len(missing)} of {total} cells produced no table: "
+                    + ", ".join(missing) + ".")
+              print("Running out of disk while generating, or the runner itself "
+                    "being taken away, are the two usual reasons. Every other "
+                    "cell is unaffected -- that is why they are separate jobs.")
+          else:
+              print(f"All {total} cells reported.")
+          PY
+        env:
+          SIZES: ${{ needs.plan.outputs.sizes }}
+          FORMATS: ${{ needs.plan.outputs.formats }}
+
+      # Every rung is a separate job and therefore a separate machine, and
+      # GitHub's hosted fleet mixes processor generations behind one
+      # `ubuntu-latest` label. Two rungs of one ladder can land on a Xeon
+      # Platinum 8370C and an EPYC 7763. Read as a single curve those rungs
+      # measure the fleet as much as the code, so this groups them by the CPU
+      # that produced them and says out loud when the ladder is split.
+      #
+      # Not `|| echo "_no rung JSON to group_"`. That is what this was, and it
+      # turned a TypeError inside bench_group.py into one calm line in the
+      # summary and a green job: six rungs, fifty-one measurements on three
+      # different processors, and the grouped table -- the whole reason this
+      # job exists -- reported as simply absent. A benchmark that silently
+      # publishes nothing is worse than one that fails.
+      #
+      # Exit 3 is the script saying it found nothing to group, which a ladder
+      # whose rungs all died legitimately is. It has its own code because a
+      # traceback also exits 1, and telling those two apart is the entire
+      # point. Any other non-zero exit is a bug in the script, and it fails
+      # here with its traceback in the summary.
+      #
+      # `tee`, not `>>`, so the table is in the job log as well as the summary.
+      # The step summary is not readable through the API, so a table that goes
+      # only there cannot be checked afterwards from the run alone -- confirming
+      # that this step had published anything at all meant re-downloading the
+      # rung artifacts and running the script again by hand. The log costs
+      # nothing and answers it directly. The other summary steps in this
+      # workflow already tee for the same reason.
+      - name: The ladder, grouped by the CPU that measured it
+        run: |
+          set +e
+          grouped=$(python3 scripts/bench_group.py rungs/ 2>/tmp/group.err)
+          code=$?
+          set -e
+          {
+            echo "## By CPU"
+            echo
+            if [ "$code" -eq 0 ]; then
+              printf '%s\n' "$grouped"
+            else
+              echo "_grouping produced no table (exit $code)_"
+              echo
+              echo '```'
+              cat /tmp/group.err
+              echo '```'
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$code" -eq 0 ] || [ "$code" -eq 3 ]
+
+      - name: Every rung's table, in full
+        run: |
+          for f in rungs/ladder-*/bench.txt; do
+            [ -s "$f" ] || continue
+            dir=$(dirname "$f")
+            # ladder-<size>-<format>-<run id>
+            cell=$(basename "$dir" | sed 's/^ladder-//; s/-[0-9]*$//')
+            {
+              echo "### ${cell%-*} rows — ${cell##*-}"
+              echo
+              # The table renders; the log it came from goes in the fold.
+              [ -s "$dir/bench.md" ] && { cat "$dir/bench.md"; echo; }
+              echo "<details><summary>$cell — full log</summary>"
+              echo
+              echo '```'
+              cat "$f"
+              echo '```'
+              echo
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          done

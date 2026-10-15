@@ -1,0 +1,168 @@
+name: CI (C)
+
+permissions:
+  contents: read
+
+# Two jobs, because they cost very different amounts.
+#
+# `test` builds nothing but this port. It generates its own fixtures now, so
+# there is no Rust or C++ toolchain between a change and knowing whether it
+# broke anything, and it finishes in under a minute on both compilers.
+#
+# `ports` adds the cross-port checks -- the Rust port as the oracle on CSV, the
+# C++ port on ndjson, and the two generators' bytes against each other. That
+# last group is what keeps the fast job honest: a generator that drifted would
+# fail nothing in it, because both sides of every comparison would drift
+# together.
+
+on:
+  push:
+    # `main` only. Every branch here gets a pull request, and a branch listed
+    # beside it means each push runs this workflow twice on the same SHA -- once
+    # for the push, once for the pull_request -- which the per-ref concurrency
+    # group cannot collapse, because a push is `refs/heads/...` and a pull
+    # request is `refs/pull/N/merge`. Two different groups, two full runs. The
+    # `pull_request` trigger below covers the branch; this one covers what
+    # landed.
+    branches: [main]
+    # `scripts/**`, not just the one harness: the shell-syntax step below covers
+    # every script here, and a gate that does not fire on the file it guards is
+    # not a gate.
+    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/**"]
+  pull_request:
+    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-c-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test c, ${{ matrix.cc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both compilers, because the gap between them on this source is a
+        # finding the port exists to show rather than an implementation detail.
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned so every workflow here runs the same interpreter; the runner's
+      # own python3 drifts with the image. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      # Two compiled binaries have been committed to this port inside three
+      # commits -- c/gen-data, then c/csvdiff-asan -- both built with
+      # `-march=native`, both invisible until a runner tried to execute one.
+      # Neither failed the suite that was running at the time. This is the check
+      # that would have caught either one the moment it was staged.
+      - name: No compiled binaries in the index
+        run: |
+          set -o pipefail
+          bad=$(git ls-files -z | xargs -0 -r file --mime-type -- \
+              | grep -E ':[[:space:]]*application/x-(executable|pie-executable|sharedlib|object|archive)$') || true
+          if [ -n "$bad" ]; then
+            echo "::error::a build artifact is tracked in git"
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: Shell scripts parse
+        run: |
+          # The measurement harness and the suites are shell; a syntax error in
+          # one of them is only found when somebody reaches for it, which is
+          # exactly when they least want to debug it.
+          for f in scripts/*.sh c/test.sh cpp/test.sh rust/test.sh zig/test.sh; do
+            [ -f "$f" ] || continue
+            bash -n "$f" || { echo "::error::$f does not parse"; exit 1; }
+          done
+
+      - name: What this runner is
+        run: |
+          ${{ matrix.cc }} --version | head -1
+          echo "transparent_hugepage: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+
+      # test.sh holds the C port to the Rust port's answers on the awkward
+      # fixture, and its Parquet fixtures come from the C++ generator, so both
+      # have to exist before it runs.
+      - name: Build
+        run: CC=${{ matrix.cc }} make -C c
+
+      # A check that declines to run is not a check that passed: test.sh prints
+      # "skip" and keeps going when a fixture generator is missing, which would
+      # let the whole Parquet half of the suite disappear behind a green tick.
+      - name: test.sh
+        run: |
+          set -o pipefail
+          (cd c && bash test.sh) 2>&1 | tee /tmp/c-test.txt
+          if grep -q '^skip' /tmp/c-test.txt; then
+            echo "::error::a check skipped rather than ran"
+            exit 1
+          fi
+
+      # A compare exits 1 when it finds differences, which is the expected
+      # outcome of every case here -- so the exit code has to be caught rather
+      # than allowed to reach `bash -e`, which would end the step at the first
+      # comparison and call a working run a failure. Only 0 and 1 are results;
+      # anything else is a crash or a sanitizer report.
+      - name: Sanitizers
+        run: |
+          CC=${{ matrix.cc }} make -C c asan
+          tmp=$(mktemp -d)
+          for flags in "" "--dict-limit 1" "--dict-limit 175 --row-group-size 300"; do
+            c/gen-data --rows 5k --out-dir "$tmp" --prefix s \
+                --format parquet $flags >/dev/null
+            code=0
+            c/csvdiff-asan compare "$tmp/s_a.unc.parquet" "$tmp/s_b.unc.parquet" \
+                -k account_id,txn_id -i updated_at --json /dev/null || code=$?
+            [ "$code" -le 1 ] || { echo "::error::sanitizer run exited $code"; exit 1; }
+          done
+          # And the two text shapes, including the threaded sweep: 5k rows is
+          # under the four-megabyte split threshold, so `--threads` is what makes
+          # the boundary logic run under the sanitizers at all.
+          c/gen-data --rows 60k --out-dir "$tmp" --prefix t >/dev/null
+          c/gen-data --rows 60k --out-dir "$tmp" --prefix t --format json >/dev/null
+          for pair in "t_a.csv t_b.csv" "t_a.ndjson t_b.ndjson"; do
+            set -- $pair
+            for t in 1 4; do
+              code=0
+              c/csvdiff-asan compare "$tmp/$1" "$tmp/$2" -k account_id,txn_id \
+                  -i updated_at --threads $t --json /dev/null || code=$?
+              [ "$code" -le 1 ] || { echo "::error::sanitizer run exited $code"; exit 1; }
+            done
+          done
+
+  ports:
+    name: against the other ports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build what the cross-checks compare against
+        run: |
+          make -C c
+          make -C cpp
+          make -C cpp gen-data
+          cargo build --release --manifest-path rust/Cargo.toml
+      - name: test.sh --with-ports
+        run: |
+          set -o pipefail
+          (cd c && bash test.sh --with-ports) 2>&1 | tee /tmp/c-ports.txt
+          if grep -qE '^\s*(skip|FAIL)' /tmp/c-ports.txt; then
+            echo "::error::a check skipped or failed"
+            exit 1
+          fi

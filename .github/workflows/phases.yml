@@ -1,0 +1,85 @@
+name: Phases (every port, one runner)
+
+# Where the time goes, on a CI runner, for every port at once.
+#
+# The ladder says how long each port takes on a given runner; it cannot say
+# where. A gap that shows up on one CPU and not on the container this project is
+# developed on -- 10M rows of Parquet on the EPYC 7763, where Zig measured 1.92x
+# C in run 36241447420 and the container measures them 1.03x apart -- can only
+# be explained with the phases from that CPU. This builds all four ports the way
+# the ladder does and runs `scripts/phases_ports.py` on one runner, so every
+# number in its output shares one machine.
+#
+# Dispatched, or run by a pull request that changes it. One job, sequential, and not in the `benchmark-host` group: it
+# measures phases within a port, not ports against each other, and it should not
+# queue behind a ladder.
+
+on:
+  # A change to the tool runs the tool, with the defaults below, so a pull
+  # request that edits it shows what it prints on a real runner.
+  pull_request:
+    paths:
+      - .github/workflows/phases.yml
+      - scripts/phases_ports.py
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Row count: 2m, 10m ..."
+        default: "10m"
+      format:
+        description: "csv, ndjson or parquet"
+        default: "parquet"
+      threads:
+        description: "Comma-separated thread counts"
+        default: "1,4"
+      rounds:
+        description: "Rounds per port and thread count; the median is printed"
+        default: "3"
+
+permissions:
+  contents: read
+
+jobs:
+  phases:
+    name: "phases — ${{ github.event.inputs.rows || '10m' }} ${{ github.event.inputs.format || 'parquet' }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: phases
+
+      - name: Install Zig
+        uses: ./.github/actions/setup-zig
+
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
+
+      - name: Build every port as the ladder does
+        run: scripts/build_ports.sh c rust zig cpp
+
+      - name: Phases
+        env:
+          ROWS: ${{ github.event.inputs.rows || '10m' }}
+          FORMAT: ${{ github.event.inputs.format || 'parquet' }}
+          THREADS: ${{ github.event.inputs.threads || '1,4' }}
+          ROUNDS: ${{ github.event.inputs.rounds || '3' }}
+        run: |
+          python3 scripts/phases_ports.py \
+            --rows "$ROWS" --format "$FORMAT" --threads "$THREADS" --rounds "$ROUNDS" \
+            | tee /tmp/phases.txt
+          {
+            echo "## Phases — $ROWS rows, $FORMAT"
+            echo
+            echo '```'
+            cat /tmp/phases.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

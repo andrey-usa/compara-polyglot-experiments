@@ -1,0 +1,226 @@
+name: Benchmark 2M
+
+permissions:
+  contents: read
+
+# Two million rows, every native port, every scanner, every format -- one job
+# per format, all three at once.
+#
+# This is the benchmark a pull request gets. The ten-million-row table moved to
+# `bench-ladder.yml`, which runs on request: 10M took 4m48s and held the
+# repository-wide benchmark lock for all of it, which is a long time to make a
+# reviewer wait for a number that 2M answers just as well for "did this change
+# make the port slower".
+#
+# **One job per format, and never one job per port.** The whole value of these
+# tables is that the ports in them ran on one host in one sitting, so splitting
+# the ports across runners would compare machines rather than engines. Splitting
+# by format keeps every port-against-port comparison inside a single job, and
+# the formats were never comparable with each other anyway -- the
+# "never compare across tables" rule in CONTRIBUTING.md already said so.
+#
+# What that buys and what it costs: three jobs finish in the time of the slowest
+# one instead of the sum, and in exchange the three run at the same time, which
+# the "one benchmark at a time" rule was written to prevent. The rule's concern
+# is two tables spoiling each other, and that concern is unchanged *within* a
+# table -- but absolute numbers across runs get noisier if the runners are
+# co-tenanted. Each job prints its runner's model and id for exactly this
+# reason: if two rungs report the same host, treat their absolute numbers with
+# suspicion. Relative order inside one job is what a review should read.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "c/**"
+      - "cpp/src/**"
+      - "cpp/Makefile"
+      - "rust/src/**"
+      - "zig/src/**"
+      - "zig/build.zig"
+      - "scripts/bench_formats_ports.py"
+      - "scripts/build_ports.sh"
+      - ".github/workflows/bench-2m.yml"
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Row count (2m, 5m ...). Ten million and up belongs in the ladder."
+        default: "2m"
+      repeats:
+        description: "Runs per build; the best is kept"
+        default: "3"
+      matrix:
+        description: "Include the scanner builds (SWAR against AVX2 and AVX-512)"
+        type: boolean
+        default: true
+
+# This one is deliberately *not* in the `benchmark-host` group the two
+# dispatch-only benchmarks share. It used to be, and a pull request's 2M run
+# then queued behind whatever ladder somebody had dispatched. The run that
+# settled it waited 10m 46s to start and then took 3m 27s -- three times the
+# measurement, spent waiting for it -- while the change it measures sat
+# unreviewed.
+#
+# The lock rested on two timing jobs sharing a host and measuring each other's
+# contention. `bench-contention.yml` was written to check that and, when it was
+# finally dispatched, found six identical 10M jobs started together
+# indistinguishable from one alone -- median 0.98x, not one build slower than
+# 1.00x. BENCHMARKS.md has both that table and the 2M one that said otherwise
+# and was wrong. Separate hosted runners are separate machines.
+#
+# So a pull request's benchmark no longer waits on anything. It keeps a group of
+# its own, per ref, so that two runs of *this* workflow on one branch still
+# queue rather than race -- and `cancel-in-progress: false` because the run
+# already going is a measurement somebody is waiting for.
+#
+# What this gives up: a dispatched `bench-contention.yml` can now overlap a pull
+# request's 2M run. That workflow is the one measurement here whose validity
+# needs a quiet repository, and it is dispatched by hand -- so the remedy is to
+# dispatch it when nothing is in flight, not to make every pull request wait for
+# a case that arises a few times a year.
+concurrency:
+  group: benchmark-pr-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ROWS: ${{ github.event.inputs.rows || '2m' }}
+  # Three rather than the ten-million table's two: a 2M run is short enough that
+  # the noise is a larger share of it, and repeats are cheap here.
+  REPEATS: ${{ github.event.inputs.repeats || '3' }}
+  MATRIX: ${{ github.event.inputs.matrix || 'true' }}
+
+jobs:
+  bench:
+    name: "${{ matrix.format }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      # A format that cannot be measured should not take the other two down
+      # with it -- an ndjson failure is still worth the csv and parquet tables.
+      fail-fast: false
+      matrix:
+        format: [csv, ndjson, parquet]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: What this runner is
+        run: |
+          {
+            echo "## ${{ matrix.format }} — host"
+            echo
+            echo '```'
+            grep -m1 "model name" /proc/cpuinfo
+            echo "cores: $(nproc)"
+            echo "runner: $RUNNER_NAME"
+            free -g | head -2
+            echo -n "vector units: "
+            grep -o -m1 -E "avx2|avx512f|avx512bw" /proc/cpuinfo | sort -u | tr '\n' ' '
+            echo
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          # Three jobs share one cache and would otherwise each write a copy
+          # under the same key at the end of the run.
+          key: bench2m-${{ matrix.format }}
+
+      - name: Install Zig
+        uses: ./.github/actions/setup-zig
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
+
+      # No disk cleanup here, unlike the ladder: two million rows of ndjson is
+      # about 1.7 GB for the pair and the runner has room for it as it ships.
+      # Deleting 25 GB of toolchains took 1m22s and would be most of this job.
+      - name: Build every port and every scanner
+        run: |
+          # --no-default-features leaves out nothing any more -- the crate has no
+          # optional features left -- but it is what `rust` means in the script,
+          # and it is the spelling the other workflows use.
+          targets="c rust zig cpp cpp-gen"
+          if [ "$MATRIX" = "true" ]; then
+            targets="$targets cpp-scanners zig-v32"
+            targets="$targets rust-avx2"
+            if grep -q avx512bw /proc/cpuinfo; then
+              targets="$targets cpp-avx512 zig-v64"
+            else
+              echo "no AVX-512 on this runner: the 64-byte builds are skipped"
+              rm -f cpp/build/csvdiff-avx512
+            fi
+          fi
+          scripts/build_ports.sh $targets
+
+      - name: Run the table
+        run: |
+          # An `if`, not `[ ... ] && var=...`: the runner's shell is `bash -eo
+          # pipefail`, so that idiom exits 1 -- and fails the step -- on the run
+          # where the test is false. It never fired because the input defaults to
+          # true, which is exactly how a latent one survives.
+          scanners=""
+          if [ "$MATRIX" = "true" ]; then
+            scanners="--matrix"
+          fi
+          # Two million rows costs the ports about a gigabyte, so this cap is
+          # not near anything -- it is here so that a change which balloons a
+          # port's memory is reported as a refusal in the table rather than as a
+          # lost runner with no table at all. See bench-ladder.yml, where the
+          # same cap is load-bearing.
+          total_mb=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo)
+          cap=$(( total_mb - 2048 ))
+          echo "host has ${total_mb} MB; capping each port at ${cap} MB"
+
+          # The csv job measures TSV too, in the same sitting: the claim to check
+          # is that a tab costs what a comma costs, and two jobs are two machines.
+          python3 scripts/bench_formats_ports.py \
+            --rows "$ROWS" --formats "${{ matrix.format == 'csv' && 'csv,tsv' || matrix.format }}" \
+            --repeats "$REPEATS" $scanners \
+            --memory-cap "$cap" \
+            --md-out /tmp/bench.md \
+            --json-out /tmp/bench.json \
+            | tee /tmp/bench.txt
+
+      # The table outside the fence so it renders, the log inside it. Both
+      # together in a ``` block meant the markdown table was shown as its own
+      # source: a row of pipes rather than a table.
+      - name: Publish the table
+        if: always()
+        run: |
+          {
+            echo "## $ROWS rows — ${{ matrix.format }}"
+            echo
+            # Each format is its own job and so its own machine. The three
+            # summaries are read as one table by anybody scrolling this page,
+            # and they are not one table unless this line matches.
+            echo "Measured on: \`$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)\`, $(nproc) cores."
+            echo
+            if [ -s /tmp/bench.md ]; then
+              cat /tmp/bench.md
+            else
+              echo "_No table: the run did not get that far. Its log is below._"
+            fi
+            echo
+            echo "<details><summary>full log</summary>"
+            echo
+            echo '```'
+            cat /tmp/bench.txt 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-2m-${{ matrix.format }}-${{ github.run_id }}
+          path: |
+            /tmp/bench.txt
+            /tmp/bench.md
+            /tmp/bench.json
+          retention-days: 30

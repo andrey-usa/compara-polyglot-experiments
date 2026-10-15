@@ -1,0 +1,19 @@
+# Copy to compara.toml in the directory you run compara from (or to
+# ~/.config/compara/compara.toml), or pass --config <path>, to give a recurring
+# comparison a name:
+#
+#   compara compare data/p_a.csv data/p_b.csv --profile demo
+#
+# Every field is optional, and only the fields present override the defaults; the
+# command line in turn overrides the profile.
+
+[profiles.demo]
+key    = ["account_id", "txn_id"]   # the key the generators write; required for any real pair
+ignore = ["updated_at"]             # subtractive: only skip columns present in both files
+trim   = true
+tolerance = 0.005
+
+[profiles.report]
+key      = ["account_id", "txn_id"]
+max_rows = 20000
+engine   = "turbo"
