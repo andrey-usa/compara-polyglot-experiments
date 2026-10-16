@@ -44,8 +44,10 @@ history and acted on without repeating it.
 - **Generated data** (the README's 2026-09-30 table and the "Where another port
   leads compara" table below): within 1.18x of the fastest port on CSV, a tie on
   ndjson, 1.10x behind C on Parquet, and Zig spends the least CPU on text.
-- **The biggest gap a user feels** is that the published Rust numbers come from
-  an AVX2 build and the released binaries are baseline x86-64 (M-153, E-001).
+- **The release binary is the measured binary** (A-135): compara chooses AVX2 at
+  run time, so a baseline x86-64 build scans as fast as one built for the runner
+  (10M rows: 0.86 s either way on CSV, 2.32 s against 2.31 s on ndjson), and the
+  benchmarks now build it the way it is installed.
 
 ## Real-world files
 
@@ -63,11 +65,12 @@ The tables below are one sitting: `Intel(R) Xeon(R) Processor @ 2.10GHz`, 4 core
 a side, 4 threads for every tool, best of 3, 2026-10-15. C and
 C++ were built by their Makefiles with `-march=native` and Zig for the host CPU;
 compara is the baseline x86-64 build that `cargo build --release` gives and its
-releases ship, without the AVX2 scanner. Built for this CPU
-(`-C target-cpu=x86-64-v3`), compara counts the wide CSV pair in 0.119 s against
+releases ship, which then had no AVX2 scanner. Built for this CPU
+(`-C target-cpu=x86-64-v3`), compara counted the wide CSV pair in 0.119 s against
 0.137 s for the baseline build — paired median 1.17x, middle half 1.10-1.19x,
 nine rounds after the table; TSV 1.13x; with `--export-dir` 1.06x — which is
-level with C (E-001). Two shapes: **wide**
+level with C. The baseline build has chosen AVX2 at run time since (A-135), which
+closes that gap. Two shapes: **wide**
 is the standard twenty columns keyed on `(account_id, txn_id)` with `updated_at`
 ignored; **narrow** is five columns keyed on two integers (`id, k2`, comparing
 `amount, name, status`) with B shuffled against A. Each cell is wall · peak RSS
@@ -207,7 +210,7 @@ Parquet files against Polars 0.84-0.92s, DuckDB 2.28-3.59s and pandas
 5.49-5.75s. On the narrow shape compara counted the real writers' Parquet in
 0.16-0.17s against Polars 0.61-0.63s, and wrote its rows in 0.31-0.35s against
 0.61-0.63s. Built for the runner, compara is level with C, C++ and Zig on text
-(0.12s against 0.11s), which is E-001 measured the other way round.
+(0.12s against 0.11s), which is the gap A-135 closed, measured the other way round.
 
 ## Advances
 
@@ -354,6 +357,7 @@ Each row is a change that measurably moved speed, memory, correctness or coverag
 | A-132 | 2026-10-15 | compara | Parquet | gzip, zstd and LZ4 pages on the columnar path, through the row reader's size-bounded decoders | 2M pair written by Polars (zstd), two threads: 1.14 s → 0.39 s, what the same pair written with snappy takes; with `-o` 1.31 s → 0.55 s | compara CHANGELOG, Unreleased |
 | A-133 | 2026-10-15 | compara | correctness | TSV held to the CSV answer on every engine; `compara-gen-data --format tsv` | 1M pair, four threads: turbo 0.15 s against 0.14 s, native 1.33 s against 1.28 s, sortmerge 2.07 s against 1.98 s; identical counts and row files | compara CHANGELOG, Unreleased |
 | A-134 | 2026-10-15 | all four | harness | Real-world files: Parquet as pyarrow, Polars, DuckDB and pandas write it by default, and TSV, measured against DuckDB, Polars and pandas on the same files and held to one answer (`realworld.py`, `realworld.yml`); TSV in `parity.yml`, `formats.yml` and the benchmarks | R-001 to R-006 | this repository |
+| A-135 | 2026-10-16 | compara | CSV, TSV, ndjson | AVX2 chosen at run time: the scan width is a type (`Swar`, or `Wide`, which only `Wide::detect` makes), and each row parse runs a copy compiled with `#[target_feature(enable = "avx2")]` or the SWAR one, checked once a row; the benchmarks build the Rust port as it is installed (E-001, M-153) | Local, 2M pair, four threads, `bench_ab.sh`, 11 rounds, baseline build → this build: CSV 0.28 s → 0.24 s, wall 1.16x (1.12-1.19), CPU 1.19x; TSV 1.19x (1.16-1.22); ndjson 1.02x (1.01-1.03); against an x86-64-v3 build not told apart on any of the three; counts and export files identical. CI 10M (`bench-ladder.yml`, 4 cores, best of 2), the installed build against the `+avx2` build: CSV 0.86 s and 0.86 s, TSV 0.86 s and 0.91 s (EPYC 9V45), ndjson 2.32 s and 2.31 s (EPYC 9V74), CPU equal. Against an x86-64-v3 build of the same code (CI, EPYC 7763, 10M CSV, `ab.yml`): 1.02x at one thread and 1.04x at four, the E-001 code itself 0.99-1.00x; the cost is outside the scan, about 40% of it the index's per-key popcount | compara CHANGELOG, Unreleased |
 
 ## Mistakes not to repeat
 
@@ -513,7 +517,7 @@ Every wrong turn the history records, in date order: measurement errors, claims 
 | M-150 | 2026-10-15 | Head-to-heads compared different outputs: compara's Parquet fast path kept its rows inside the HTML report while DuckDB, Polars and pandas wrote row files, and the only way to get CSV rows from compara's Parquet path was its row reader, level with DuckDB and Polars | External testing (R-007) | Time the same output — counts against counts, row files against row files — and gate on identical counts | R-007, A-131 |
 | M-151 | 2026-10-15 | The columnar reader carried only uncompressed and snappy, so the default output of the most common writer (Polars, zstd) went through the row reader at 2.9x the time; the codec study that said "write zstd" held the reader still and never asked which reader a default file reaches | External testing on a Polars-written pair | Test each writer's default output, not each codec in isolation | A-132 |
 | M-152 | 2026-10-15 | A harness that imported pyarrow, Polars and DuckDB before forking its timed children charged each about 400 MB of peak RSS that was the harness's own: a forked child counts its parent's resident pages until it execs | Every tool in a first table at 407-428 MB on a 100k pair | Keep the measuring process small; prepare inputs in a child process | `realworld.py` |
-| M-153 | 2026-10-15 | compara's published speed comes from builds made for the runner (`-C target-cpu=x86-64-v3`, the AVX2 scanner compiled in), while its release binaries and `cargo install` are baseline x86-64 and run the SWAR scanner — the same kind of mismatch M-059 found in the other direction | The technique matrix (T-093) | Publish numbers from the binary users install, or name the build beside the number | T-093, E-001 |
+| M-153 | 2026-10-15 | compara's published speed comes from builds made for the runner (`-C target-cpu=x86-64-v3`, the AVX2 scanner compiled in), while its release binaries and `cargo install` are baseline x86-64 and run the SWAR scanner — the same kind of mismatch M-059 found in the other direction | The technique matrix (T-093) | Publish numbers from the binary users install, or name the build beside the number | T-093, A-135 |
 | M-154 | 2026-10-15 | The ports' harness polls each child every 50 ms to sample `VmData`, which put a 50 ms grain on every wall time; reused for sub-second runs it read compara, C and Zig as 0.15, 0.20 and 0.21 s on one CSV pair and TSV as up to 30% slower than CSV in one port | Every time in a first real-world table landing on a multiple of 0.05 s | Time short runs with a blocking `wait4`; keep the poll for runs of seconds and longer, where it samples memory | `realworld.py` |
 
 ## Techniques across the four ports
@@ -529,11 +533,11 @@ with the entry's date and title.
 
 | ID | Technique (plain description) | C | C++ | Zig | compara (Rust) | Evidence | Measured effect (verbatim, where) | Gap / action for Rust |
 |---|---|---|---|---|---|---|---|---|
-| T-001 | SWAR byte search: find a byte in eight with `(diff - 0x0101…) & ~diff & 0x8080…` | yes | yes | yes | yes | c/csvdiff.c:131; cpp/src/csvdiff.cpp:66; zig/src/scan.zig:27,44; rust/src/engine/turbo/field.rs:103-118 | "ties the Vector API at 10M and beats it by 19% at 20M" (Archive below, Techniques) | none |
-| T-002 | 16-byte SSE2 step between the wide step and SWAR, always available on x86-64 | yes | yes | no (single width; `-Dscan=16` replaces SWAR) | no | c/csvdiff.c:170,276; cpp/src/csvdiff.cpp:183; zig/build.zig:35-36; rust/src/engine/turbo/field.rs:65-101 (AVX2/AVX-512 or SWAR only) | C wider step "About 6.6% on CSV" (W37, 2026-09-10 C field scan); C++ rung ndjson "0.958 [0.949-0.975]", CSV no result (W38, 2026-09-16 scanners); Rust rung on x86-64-v3 builds "1.000 [0.963-1.009]" ndjson, "1.005 [0.981-1.013]" CSV, reverted (W38, rust scan); "The SSE2 window was not measured, on CI or anywhere" on a baseline build (W39, zig scan32 default, correction) | Shipped compara x86_64 binaries are baseline builds (T-093), so they have SWAR and nothing above it. Either ship an AVX2 build (preferred) or add the SSE2 rung and measure it on a baseline build, which has never been done |
-| T-003 | 32-byte AVX2 scan step chosen at compile time | yes (`__AVX2__` from `-march=native`) | yes (`__AVX2__` for cursor, row end and `next_of1`; `next_of2` AVX2 only in `make scanners`) | yes (default `scan=32` when the target has AVX2) | partial (compiled in only with `-C target-feature=+avx2` or a v3 target; shipped release binaries do not set it) | c/csvdiff.c:159,234,266; cpp/src/csvdiff.cpp:161,228,302,959,1395; zig/build.zig:33-36; rust/src/engine/turbo/field.rs:65-101; compara's `release.yml`; scripts/build_ports.sh:107-110 (benchmarks use x86-64-v3) | Zig scan32 default: CSV "13–17% faster at one thread and 8–12% at four, ndjson 6–7% and 10–11%" (W39, 2026-09-27 zig scan32 default); "the vector scanner is about 7% ahead of SWAR" at 10M (cpp/README); C++ AVX2 `next_of2` on ndjson "1.059x slower" (W38, 2026-09-16 scanners) | Make the AVX2 path reach users: ship x86-64-v3 artifacts beside baseline, or dispatch once at the top of the sweep/join with `is_x86_feature_detected!` and `#[target_feature(enable = "avx2")]` (see T-093) |
-| T-004 | 64-byte AVX-512 scan step | no (AVX2 and SSE2 rungs only) | yes (opt-in binary `build/csvdiff-avx512`) | yes (`-Dscan=64`) | partial (compiled in with `+avx512bw` only; no shipped or benchmark build sets it) | cpp/Makefile:52-60; cpp/src/csvdiff.cpp:151; zig/build.zig:35; rust/src/engine/turbo/field.rs:65-66,81-89; rust/src/engine/pqdiff.rs:962-973 | "wins on a CPU that has it, which hosted runners mostly do not" (Archive below, a parallel branch's table); Zig `-Dscan=64` sweep "0.31s", "not pursued", against "0.30s" at 32 (W39, 2026-09-24 zig scan width) | Low priority; only via runtime dispatch, never as the default |
-| T-005 | Delimiter cursor: keep one vector load's unreturned matches across a row's fields (vector builds only) | yes (AVX2 only) | yes (AVX2 only, state in locals) | yes (gated on `wide_scan`) | partial (gated on `WIDE_SCAN`, so absent from shipped baseline binaries; `refill` inlined) | c/csvdiff.c:199-233; cpp/src/csvdiff.cpp:960-999; zig/src/scan.zig:103-119, zig/src/text.zig:726; rust/src/engine/turbo/field.rs:140-288, rust/src/engine/turbo/text.rs:690-694 | Rust "15.0% faster" and Zig "12.9%" at a 32-byte step; SWAR "3.8% slower" (rust/src/engine/turbo/field.rs:154-160); C "14–16% at one thread and 6–8% at four" (W39, c delim cursor); C++ "10–14% faster at one thread" (W39, cpp delimiter cursor, fourth try); Rust inline cursor "4.5–6% faster at one thread and about 6% at four" (W39, rust and zig cursor inline) | Follows T-003: the cursor only exists where the AVX2 step does |
+| T-001 | SWAR byte search: find a byte in eight with `(diff - 0x0101…) & ~diff & 0x8080…` | yes | yes | yes | yes | c/csvdiff.c:131; cpp/src/csvdiff.cpp:66; zig/src/scan.zig:27,44; rust/src/engine/turbo/field.rs:183-218 | "ties the Vector API at 10M and beats it by 19% at 20M" (Archive below, Techniques) | none |
+| T-002 | 16-byte SSE2 step between the wide step and SWAR, always available on x86-64 | yes | yes | no (single width; `-Dscan=16` replaces SWAR) | no | c/csvdiff.c:170,276; cpp/src/csvdiff.cpp:183; zig/build.zig:35-36; rust/src/engine/turbo/field.rs:76-181 (AVX2/AVX-512 or SWAR only) | C wider step "About 6.6% on CSV" (W37, 2026-09-10 C field scan); C++ rung ndjson "0.958 [0.949-0.975]", CSV no result (W38, 2026-09-16 scanners); Rust rung on x86-64-v3 builds "1.000 [0.963-1.009]" ndjson, "1.005 [0.981-1.013]" CSV, reverted (W38, rust scan); "The SSE2 window was not measured, on CI or anywhere" on a baseline build (W39, zig scan32 default, correction) | Shipped compara x86_64 binaries choose AVX2 at run time (A-135), so only a CPU without AVX2 falls through to SWAR, where this rung would sit. Low value now, and never measured on a baseline build |
+| T-003 | 32-byte AVX2 scan step chosen at compile time | yes (`__AVX2__` from `-march=native`) | yes (`__AVX2__` for cursor, row end and `next_of1`; `next_of2` AVX2 only in `make scanners`) | yes (default `scan=32` when the target has AVX2) | yes (chosen at run time on a baseline x86-64 build, A-135; compiled in with `+avx2` or a v3 target) | c/csvdiff.c:159,234,266; cpp/src/csvdiff.cpp:161,228,302,959,1395; zig/build.zig:33-36; rust/src/engine/turbo/field.rs:76-181; rust/src/engine/turbo/text.rs (the `*_wide` entry points); scripts/build_ports.sh (benchmarks build Rust as installed) | Zig scan32 default: CSV "13–17% faster at one thread and 8–12% at four, ndjson 6–7% and 10–11%" (W39, 2026-09-27 zig scan32 default); "the vector scanner is about 7% ahead of SWAR" at 10M (cpp/README); C++ AVX2 `next_of2` on ndjson "1.059x slower" (W38, 2026-09-16 scanners); compara choosing it at run time against the `+avx2` build at 10M: CSV 0.86 s and 0.86 s, ndjson 2.32 s and 2.31 s (A-135) | Done (A-135) |
+| T-004 | 64-byte AVX-512 scan step | no (AVX2 and SSE2 rungs only) | yes (opt-in binary `build/csvdiff-avx512`) | yes (`-Dscan=64`) | partial (compiled in with `+avx512bw` only; no shipped or benchmark build sets it) | cpp/Makefile:52-60; cpp/src/csvdiff.cpp:151; zig/build.zig:35; rust/src/engine/turbo/field.rs:121-140; rust/src/engine/pqdiff.rs:962-973 | "wins on a CPU that has it, which hosted runners mostly do not" (Archive below, a parallel branch's table); Zig `-Dscan=64` sweep "0.31s", "not pursued", against "0.30s" at 32 (W39, 2026-09-24 zig scan width) | Low priority; only via runtime dispatch, never as the default |
+| T-005 | Delimiter cursor: keep one vector load's unreturned matches across a row's fields (vector builds only) | yes (AVX2 only) | yes (AVX2 only, state in locals) | yes (gated on `wide_scan`) | partial (gated on `WIDE_SCAN`, so absent from shipped baseline binaries; `refill` inlined) | c/csvdiff.c:199-233; cpp/src/csvdiff.cpp:960-999; zig/src/scan.zig:103-119, zig/src/text.zig:726; rust/src/engine/turbo/field.rs:220-365, rust/src/engine/turbo/text.rs:864-878 | Rust "15.0% faster" and Zig "12.9%" at a 32-byte step; SWAR "3.8% slower" (rust/src/engine/turbo/field.rs:154-160); C "14–16% at one thread and 6–8% at four" (W39, c delim cursor); C++ "10–14% faster at one thread" (W39, cpp delimiter cursor, fourth try); Rust inline cursor "4.5–6% faster at one thread and about 6% at four" (W39, rust and zig cursor inline) | Follows T-003: the cursor only exists where the AVX2 step does |
 | T-006 | Widest-step skip of the row tail once the last needed field is read (CSV `end_of_row`, ndjson row end) | yes | yes (`next_row_break`, wide `next_of1`) | yes | partial (uses `next_of2`/`next_of1`: 32-byte in vector builds, SWAR in shipped builds) | c/csvdiff.c:266-281; cpp/src/csvdiff.cpp:228-241,1395; zig/src/text.zig:71,294; rust/src/engine/turbo/text.rs:234,1093 | C++ wide row skip "2.3% at one thread and 3.0–3.4% at four" (W39); C `next_of1` "ndjson: 10% faster at one thread and 12% at four", sweep "26% faster" (W39, c ndjson scans); C++ wide `next_of1` "The sweep 21% faster; the run 4% at one thread and 9% at four" (W39) | As T-003 |
 | T-007 | Key-only parse in the sweep: stop at the last key column, scan once to the newline | yes | yes | yes | yes | c/README "Parsing what is read"; cpp/src/csvdiff.cpp:1388; zig/src/text.zig:764; rust/src/engine/turbo.rs:96-108,159-170 | "2.66x on wall, 3.03x on CPU" at 2M; "At ten million rows on a four-core runner it is 3.65x" (c/README) | none |
 | T-008 | Column-to-slot map inverted once; one-slot fast path per column | yes (`col_first`) | yes | yes | yes (`single`) | c/README "Parsing what is read"; cpp/src/csvdiff.cpp (W39 cpp single slot); zig/src/text.zig:650; rust/src/engine/turbo/text.rs:262-271 | C++ "8.468 B → 7.565 B (−10.7%)" instructions, wall 1 thread "2.93–2.99 s" → "2.785 / 2.802 / 2.804 s" (W39, cpp single slot) | none |
@@ -661,7 +665,7 @@ with the entry's date and title.
 
 | ID | Technique (plain description) | C | C++ | Zig | compara (Rust) | Evidence | Measured effect (verbatim, where) | Gap / action for Rust |
 |---|---|---|---|---|---|---|---|---|
-| T-093 | Binary compiled for the CPU it runs on, so the wide scan paths exist | yes (`-march=native`, probed) | yes (`-march=native`, probed) | yes (host target by default) | partial (benchmarks build `-C target-cpu=x86-64-v3`; `Cargo.toml` and `release.yml` set nothing, so shipped and `cargo install` x86_64 binaries are baseline SSE2 and compile out T-002 to T-006) | c/Makefile:41-42; cpp/Makefile:30-31; zig/build.zig:33-36; scripts/build_ports.sh:107-113; rust/Cargo.toml:58-61; compara's `release.yml` | With Rust and Zig compiled for the runner, C's lead went "CSV 2.12x → **1.42x**", "Parquet 1.91x → **1.30x**": "Two thirds of the CSV margin and two thirds of the Parquet margin were build flags" (W37, joint run third); Rust baseline vs native at 1M CSV "0.53s" vs "0.46s" and "0.51s", "not established" (W37, build flags). The compara README Speed table repeats this repository's README's Rust column, which was built x86-64-v3 | Highest-value build gap. Ship an x86-64-v3 artifact beside the baseline one (installers pick by CPU), or add runtime dispatch on the sweep, parse and join entry points. Never `target-cpu=native` in CI: it reaches build-script binaries and died with SIGILL on `znver4` lanes (W37) |
+| T-093 | Binary compiled for the CPU it runs on, so the wide scan paths exist | yes (`-march=native`, probed) | yes (`-march=native`, probed) | yes (host target by default) | partial (shipped and `cargo install` x86_64 binaries are baseline builds, and the benchmarks build it that way since A-135; the AVX2 scan and the cursor on it, T-003 and T-005, are chosen at run time, T-002 and T-004 are not) | c/Makefile:41-42; cpp/Makefile:30-31; zig/build.zig:33-36; scripts/build_ports.sh; rust/Cargo.toml:58-61; compara's `release.yml` | With Rust and Zig compiled for the runner, C's lead went "CSV 2.12x → **1.42x**", "Parquet 1.91x → **1.30x**": "Two thirds of the CSV margin and two thirds of the Parquet margin were build flags" (W37, joint run third); Rust baseline vs native at 1M CSV "0.53s" vs "0.46s" and "0.51s", "not established" (W37, build flags). The compara README Speed table repeats this repository's README's Rust column, which was built x86-64-v3 | The scan's share of the gap is closed by run-time dispatch on the parse entry points (A-135); against an x86-64-v3 build the rest was not told apart at 2M. Never `target-cpu=native` in CI: it reaches build-script binaries and died with SIGILL on `znver4` lanes (W37) |
 | T-094 | Optimisation level, LTO, codegen units | no (`-O2`; `-O3` and LTO measured, not adopted) | no (`-O2`; ThinLTO measured, not adopted) | n/a (ReleaseFast, one compilation unit) | yes (`opt-level = 3`, thin LTO, `codegen-units = 1`) | c/Makefile:42; cpp/Makefile:31; rust/Cargo.toml:58-61 | C "`-O3` … costs C up to 17% on ndjson at four threads"; C++ "ThinLTO gains C++ 2–3% on ndjson at one thread and loses up to 7% on CSV at four" (W39, -O3, LTO and hardening) | none |
 | T-095 | Profile-guided optimisation | no | no | no | no | no PGO in either tree | not recorded | Optional experiment on the 10M CSV, ndjson and Parquet trio; nothing recorded either way |
 | T-096 | Allocator choice | glibc malloc | glibc malloc | partial (`smp_allocator`, no libc) | partial (system allocator; glibc on Linux; no mimalloc or jemalloc trial recorded) | zig/src/csvdiff.zig:2063-2072; compara's `release.yml`:87-89 | Zig with libc: "1.72x wall and 2.15x CPU" on the split sweep (W39, zig split); musl rejected: "musl's allocator makes the report path 1.7x slower" (compara's `release.yml`:87-88) | Low priority for turbo (few large allocations); worth one trial for `native`, `sortmerge` and the report path |
@@ -674,7 +678,7 @@ with the entry's date and title.
 |---|---|---|---|---|---|---|---|---|
 | T-099 | Windows: native file mapping and threads (madvise a no-op) | yes (`CreateFileMapping`, `CreateThread`) | yes | yes (`CreateFileMappingW` / `MapViewOfFile`) | yes (`memmap2`; advice Unix-only) | c/win32.h, c/parallel.c:34-52; cpp/src/win32.hpp; zig/src/slab.zig:120-127; rust/src/engine/turbo/slab.rs:61-90 | n/a | none |
 | T-100 | macOS build | yes (`-march=native` probed; Apple clang rejects it on arm64) | yes | yes | yes (arm64 and x86_64 releases; memory probe for macOS) | c/Makefile:18-23; rust/src/memory.rs:163; compara's `release.yml`:93-94 | n/a | none |
-| T-101 | aarch64: vector scan step | no (SWAR) | no (SWAR) | no (SWAR default) | no (SWAR) | W37 (C field scan: "aarch64 falls through to the SWAR loop"); zig/build.zig:30-36; rust/src/engine/turbo/field.rs:65-101 | not recorded | Shared gap. A NEON 16-byte rung (`vceqq_u8` with a narrowing-shift mask) would be the first in the project; measure on the arm64 runner |
+| T-101 | aarch64: vector scan step | no (SWAR) | no (SWAR) | no (SWAR default) | no (SWAR) | W37 (C field scan: "aarch64 falls through to the SWAR loop"); zig/build.zig:30-36; rust/src/engine/turbo/field.rs:76-181 | not recorded | Shared gap. A NEON 16-byte rung (`vceqq_u8` with a narrowing-shift mask) would be the first in the project; measure on the arm64 runner |
 | T-102 | aarch64: software prefetch | yes (`__builtin_prefetch`) | yes (`__builtin_prefetch`) | yes (`@prefetch`) | no (prefetch compiled only for x86_64) | c/csvdiff.c:1641; cpp/src/csvdiff.cpp:1706; zig/src/csvdiff.zig:1080; rust/src/engine/turbo.rs:490-498,1228-1236, rust/src/engine/pqdiff.rs:539-549 | Prefetch on x86: C++ insert "0.769s" → "0.615s" (W38) | compara ships aarch64 Linux and macOS binaries without any prefetch. Add `prfm pldl1keep` through `core::arch::asm!` under `cfg(target_arch = "aarch64")` and measure on the arm64 runner |
 
 ### compara against the Rust port it came from
@@ -701,7 +705,7 @@ compara's text engine is the old port's, file for file (`turbo/field.rs` unchang
   LTO, one codegen unit in both `Cargo.toml` files). What differs is who builds it:
   the old port was only ever measured through `scripts/build_ports.sh`, which sets
   `-C target-cpu=x86-64-v3`; compara is distributed as prebuilt baseline binaries
-  (T-093).
+  (T-093), which choose AVX2 at run time since A-135.
 - **Removed**: nothing measurable; environment switches were renamed from `CSVDIFF_*`
   to `COMPARA_*`.
 
@@ -710,8 +714,9 @@ compara's text engine is the old port's, file for file (`turbo/field.rs` unchang
 The Rust column in these tables is the old `rust/` port built with
 `-C target-cpu=x86-64-v3`. compara's turbo engine is that code plus the parallel
 insertion and read-ahead (both later than every table here), and its shipped x86_64
-binaries are baseline builds (T-093), so these numbers are an upper bound on what a
-user of the release binary sees. "Rust / leader" is Rust's number divided by the
+binaries were baseline SWAR builds when these were measured (T-093), so the numbers
+were an upper bound on what a user of the release binary saw; since A-135 the release
+binary scans with AVX2 and is level with the `+avx2` build at 10M. "Rust / leader" is Rust's number divided by the
 leader's; by RESULTS' own rule, differences under about 10% are ties.
 
 ### Current tables
@@ -766,10 +771,10 @@ is "Not a benchmark" (every port paged) and 150M has no results.
 3. **Wide ndjson (100 columns) is where compara trails most on text: 1.14–1.19x.**
    The name-compare inlining (T-019) every other port has was judged neutral for Rust
    at 20 columns only.
-4. **The shipped binary is not the measured binary.** Every Rust number above was built
-   for x86-64-v3; compara's releases are baseline x86-64 (T-093). The only fair-build
-   measurement on record says build flags were two thirds of C's CSV and Parquet lead
-   (W37, joint run third).
+4. **The shipped binary was not the measured binary; since A-135 it is.** Every Rust
+   number above was built for x86-64-v3, and compara's releases are baseline x86-64
+   (T-093). They now choose AVX2 at run time, and at 10M rows the release-style build
+   and the `+avx2` build are level on CSV, TSV and ndjson.
 
 ## Open experiments
 
@@ -779,7 +784,6 @@ advances (or the mistakes) with its number.
 
 | ID | Experiment | Rests on | What is known | How to measure | Where |
 |---|---|---|---|---|---|
-| E-001 | Get the AVX2 scanner to users: dispatch at run time (`is_x86_feature_detected!` with `#[target_feature(enable = "avx2")]` at the top of the sweep and join) or ship x86-64-v3 builds beside the baseline ones | T-003, T-005, T-093, M-153 | The vector step was 12.3% over SWAR for Rust at 10M (A-030); on 2026-10-15, 1M × 20 CSV, four threads, the x86-64-v3 build counted in 0.119 s against the release-style build's 0.137 s (paired median 1.17x, middle half 1.10-1.19x), TSV 1.13x, `--export-dir` 1.06x — the whole of compara's text gap to C in R-003 | `bench_ab.sh` baseline build against the dispatching build, 2M CSV, TSV and ndjson, then `realworld.py` | compara |
 | E-002 | Text-path `--export-dir` in parallel blocks, as the columnar path writes it | T-083, A-131 | 1M × 20 CSV, four threads: 0.87 s with `--export-dir` against 0.14 s counts only (2026-10-15) | `realworld.py` rows task, CSV and TSV | compara |
 | E-003 | Version-2 data pages and the delta encodings on the columnar path | T-069, T-070 | the fall-through to the row reader costs 3.7x | `realworld.py` with pyarrow `data_page_version="2.0"` and a delta-encoded writer | compara |
 | E-004 | One sweep thread per file on text, as Zig does | T-013 | Zig spends the least CPU on text in every current table: 3.0 s against compara's 4.0 s on 10M CSV | `bench_ab.sh`, CPU and wall, on a 4-vCPU runner | compara |

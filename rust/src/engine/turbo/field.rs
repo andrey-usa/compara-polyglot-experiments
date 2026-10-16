@@ -54,50 +54,130 @@ pub(super) fn is_real(f: Field) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Scanning: SWAR, or a vector register where the build targets one
+// Scanning: SWAR, or a vector register where the CPU has one
 // ---------------------------------------------------------------------------
 //
-// The vector paths are compiled in only when the build says the target has the
-// instructions -- `RUSTFLAGS=-C target-feature=+avx2`, or `+avx512bw` -- so one
-// source produces both binaries and neither pays for a runtime check. SWAR is
-// what a stock `cargo build` gets, because it needs no CPU feature at all.
+// Every scan comes in two widths: eight bytes at a time with SWAR, which needs no
+// CPU feature at all, and thirty-two (AVX2) or sixty-four (AVX-512BW) with a
+// vector compare. Which one runs is a type, `Swar` or `Wide`, carried by the
+// functions that scan, so each width is compiled as its own copy and the choice
+// is not re-made inside a loop.
+//
+// A build for a vector unit -- `-C target-cpu=x86-64-v3`, `+avx2` or `+avx512bw`
+// -- compiles the vector compare inline and always takes `Wide`. A baseline
+// x86-64 build, which is what a release ships and a plain `cargo build` makes,
+// asks the CPU once whether it has AVX2 (`Wide::detect`); each parsing entry
+// point in `text` then runs a copy of itself compiled for AVX2 (`*_wide`, marked
+// `#[target_feature]`), into which every scan below inlines, or its SWAR copy.
+// The check is a cached load and a branch per row, where a check and a call per
+// scan would land between every field and the next.
 
+/// The width a scan steps in. Implemented by `Swar` and `Wide` only.
+pub(super) trait Scan: Copy {
+    const WIDE: bool;
+    /// One bit per byte of the register at `at` that is `a` or `b`. Only asked
+    /// of `Wide`, and only where `at + STEP <= data.len()`.
+    fn hits(self, data: &[u8], at: usize, a: u8, b: u8) -> u64;
+}
+
+/// Eight bytes at a time, on any CPU.
+#[derive(Clone, Copy)]
+pub(super) struct Swar;
+
+impl Scan for Swar {
+    const WIDE: bool = false;
+    #[inline(always)]
+    fn hits(self, _: &[u8], _: usize, _: u8, _: u8) -> u64 {
+        0
+    }
+}
+
+/// A vector register at a time. Holding one is the proof that the CPU has the
+/// instructions: the field is private, and [`Wide::detect`] is the only way to
+/// make one.
+#[derive(Clone, Copy)]
+pub(super) struct Wide(());
+
+impl Wide {
+    /// `Some` where this CPU can scan wide. Asked of the CPU once per process
+    /// (`std` caches it); every later call is a load and a test.
+    #[inline(always)]
+    pub(super) fn detect() -> Option<Wide> {
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_feature = "avx2", target_feature = "avx512bw")
+        ))]
+        return Some(Wide(()));
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(any(target_feature = "avx2", target_feature = "avx512bw"))
+        ))]
+        return std::arch::is_x86_feature_detected!("avx2").then_some(Wide(()));
+        #[cfg(not(target_arch = "x86_64"))]
+        return None;
+    }
+}
+
+/// The bytes a `Wide` scan takes in one step.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-const VECTOR_WIDTH: usize = 64;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    not(target_feature = "avx512bw")
-))]
-const VECTOR_WIDTH: usize = 32;
-/// The bytes of the sixteen-to-sixty-four at `at` that equal `a` or `b`, one bit
-/// each, or `None` where this build has no vector unit to ask.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_feature = "avx2", target_feature = "avx512bw")
-))]
-#[inline(always)]
-fn vector_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
-    #[cfg(target_feature = "avx512bw")]
-    // Safety: the caller has checked `at + 64 <= data.len()`, and the build
-    // targets a CPU with AVX-512BW or this function is not compiled at all.
-    unsafe {
-        use std::arch::x86_64::*;
-        let chunk = _mm512_loadu_si512(data.as_ptr().add(at) as *const _);
-        _mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8(a as i8))
-            | _mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8(b as i8))
+pub(super) const STEP: usize = 64;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
+pub(super) const STEP: usize = 32;
+
+impl Scan for Wide {
+    const WIDE: bool = true;
+    #[inline(always)]
+    fn hits(self, data: &[u8], at: usize, a: u8, b: u8) -> u64 {
+        debug_assert!(at + STEP <= data.len());
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+        // Safety: the caller has checked `at + 64 <= data.len()`, and this build
+        // targets a CPU with AVX-512BW.
+        return unsafe {
+            use std::arch::x86_64::*;
+            let chunk = _mm512_loadu_si512(data.as_ptr().add(at) as *const _);
+            _mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8(a as i8))
+                | _mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8(b as i8))
+        };
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512bw")
+        ))]
+        // Safety: as above, with AVX2 and thirty-two bytes.
+        return unsafe { avx2_hits(data, at, a, b) };
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(any(target_feature = "avx2", target_feature = "avx512bw"))
+        ))]
+        // Safety: `self` exists, so the CPU has AVX2 (`Wide::detect`), and the
+        // caller has checked the bounds. Inside a function compiled for AVX2
+        // this inlines to the few instructions it is.
+        return unsafe { avx2_hits(data, at, a, b) };
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (data, at, a, b);
+            unreachable!("no Wide scan off x86-64")
+        }
     }
-    #[cfg(not(target_feature = "avx512bw"))]
-    // Safety: as above, with AVX2 and thirty-two bytes.
-    unsafe {
-        use std::arch::x86_64::*;
-        let chunk = _mm256_loadu_si256(data.as_ptr().add(at) as *const _);
-        let equal = _mm256_or_si256(
-            _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(a as i8)),
-            _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b as i8)),
-        );
-        _mm256_movemask_epi8(equal) as u32 as u64
-    }
+}
+
+/// The AVX2 compare.
+///
+/// # Safety
+/// The CPU has AVX2, and `at + 32 <= data.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(dead_code)] // unused in an AVX-512 build
+unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
+    use std::arch::x86_64::*;
+    // Safety: the bounds are the caller's promise.
+    let chunk = unsafe { _mm256_loadu_si256(data.as_ptr().add(at) as *const _) };
+    let equal = _mm256_or_si256(
+        _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(a as i8)),
+        _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b as i8)),
+    );
+    _mm256_movemask_epi8(equal) as u32 as u64
 }
 
 const ONES: u64 = 0x0101_0101_0101_0101;
@@ -112,6 +192,7 @@ fn broadcast(b: u8) -> u64 {
 /// `diff - ONES` borrows across a byte only where that byte was zero, and
 /// `!diff` cancels the false positives the borrow creates, so what survives
 /// marks exactly the matching bytes.
+#[inline(always)]
 fn match_bits(word: u64, target: u64) -> u64 {
     let diff = word ^ target;
     (diff.wrapping_sub(ONES)) & !diff & HIGH
@@ -130,17 +211,11 @@ fn match_bits(word: u64, target: u64) -> u64 {
 /// Forcing each byte's high bit before the subtraction stops the borrow: no
 /// byte is then below 0x80, so subtracting one never carries into its
 /// neighbour. The result marks *non*-matching bytes, so it is complemented.
+#[inline(always)]
 fn match_bits_all(word: u64, target: u64) -> u64 {
     let diff = word ^ target;
     !(diff | ((diff | HIGH).wrapping_sub(ONES))) & HIGH
 }
-
-/// Whether this build scans with a vector register rather than SWAR. The
-/// delimiter cursor is worth having only here -- see [`Delims`].
-pub(super) const WIDE_SCAN: bool = cfg!(all(
-    target_arch = "x86_64",
-    any(target_feature = "avx2", target_feature = "avx512bw")
-));
 
 /// A left-to-right cursor over the delimiters of one row.
 ///
@@ -151,13 +226,14 @@ pub(super) const WIDE_SCAN: bool = cfg!(all(
 /// order, so the scan can keep what it has -- the chunk it loaded and the
 /// matches in it that no field has claimed yet -- and read every byte once.
 ///
-/// **Only worth it for a vector step, which is why [`WIDE_SCAN`] gates its
-/// use.** Fields here average 9.2 bytes, so an eight-byte step rarely spans a
-/// boundary and there is almost nothing to reuse: measured interleaved against
-/// the plain scan, SWAR came out 3.8% slower in this port and 0.7% slower in
-/// Zig, the bookkeeping costing more than it saves. A thirty-two-byte step
-/// covers three and a half fields, so the plain scan loads the same bytes three
-/// or four times over, and the cursor is 15.0% faster here and 12.9% in Zig.
+/// **Only worth it for a vector step, which is why the row parse uses it only
+/// with `Wide`.** Fields here average 9.2 bytes, so an eight-byte step rarely
+/// spans a boundary and there is almost nothing to reuse: measured interleaved
+/// against the plain scan, SWAR came out 3.8% slower in this port and 0.7%
+/// slower in Zig, the bookkeeping costing more than it saves. A thirty-two-byte
+/// step covers three and a half fields, so the plain scan loads the same bytes
+/// three or four times over, and the cursor is 15.0% faster here and 12.9% in
+/// Zig.
 ///
 /// Instruction count says the opposite of all that -- the exact mask above is
 /// two more ALU operations per word, and callgrind reports the cursor as a
@@ -167,7 +243,8 @@ pub(super) const WIDE_SCAN: bool = cfg!(all(
 /// `next` takes the position to resume from rather than assuming the previous
 /// result, because a quoted field is walked by `skip_quoted` and the cursor has
 /// to be told to seek past its body.
-pub(super) struct Delims<'a> {
+pub(super) struct Delims<'a, S: Scan> {
+    scan: S,
     data: &'a [u8],
     a: u8,
     b: u8,
@@ -183,9 +260,11 @@ pub(super) struct Delims<'a> {
     scanned: usize,
 }
 
-impl<'a> Delims<'a> {
-    pub(super) fn new(data: &'a [u8], from: usize, end: usize, a: u8, b: u8) -> Self {
+impl<'a, S: Scan> Delims<'a, S> {
+    #[inline(always)]
+    pub(super) fn new(scan: S, data: &'a [u8], from: usize, end: usize, a: u8, b: u8) -> Self {
         Delims {
+            scan,
             data: &data[..end.min(data.len())],
             a,
             b,
@@ -198,7 +277,7 @@ impl<'a> Delims<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn lowest(&self, bits: u64) -> usize {
         self.held
             + if self.wide {
@@ -239,24 +318,22 @@ impl<'a> Delims<'a> {
     #[inline(always)]
     fn refill(&mut self, from: usize) -> usize {
         let mut at = from.max(self.scanned);
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(target_feature = "avx2", target_feature = "avx512bw")
-        ))]
-        while at + VECTOR_WIDTH <= self.data.len() {
-            let mut hits = vector_hits(self.data, at, self.a, self.b);
-            self.held = at;
-            self.wide = true;
-            self.scanned = at + VECTOR_WIDTH;
-            while hits != 0 {
-                let idx = at + hits.trailing_zeros() as usize;
-                hits &= hits - 1;
-                if idx >= from {
-                    self.bits = hits;
-                    return idx;
+        if S::WIDE {
+            while at + STEP <= self.data.len() {
+                let mut hits = self.scan.hits(self.data, at, self.a, self.b);
+                self.held = at;
+                self.wide = true;
+                self.scanned = at + STEP;
+                while hits != 0 {
+                    let idx = at + hits.trailing_zeros() as usize;
+                    hits &= hits - 1;
+                    if idx >= from {
+                        self.bits = hits;
+                        return idx;
+                    }
                 }
+                at += STEP;
             }
-            at += VECTOR_WIDTH;
         }
         while at + 8 <= self.data.len() {
             let word = word_at(self.data, at);
@@ -287,8 +364,44 @@ impl<'a> Delims<'a> {
     }
 }
 
+#[inline(always)]
 fn word_at(data: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(data[at..at + 8].try_into().expect("eight bytes"))
+}
+
+/// The scan a caller outside the dispatched parse gets: `Wide` in a build for a
+/// vector unit, `Swar` otherwise. Only the setup paths use it -- the header,
+/// opening a file -- where a row's worth of bytes is all that is scanned.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_feature = "avx2", target_feature = "avx512bw")
+))]
+#[inline(always)]
+fn fixed() -> Wide {
+    Wide(())
+}
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_feature = "avx2", target_feature = "avx512bw")
+)))]
+#[inline(always)]
+fn fixed() -> Swar {
+    Swar
+}
+
+/// [`next_of2_with`] at the build's fixed width.
+pub(super) fn next_of2(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> usize {
+    next_of2_with(fixed(), data, from, end, a, b)
+}
+
+/// [`next_of1_with`] at the build's fixed width.
+pub(super) fn next_of1(data: &[u8], from: usize, end: usize, target: u8) -> usize {
+    next_of1_with(fixed(), data, from, end, target)
+}
+
+/// [`skip_quoted_with`] at the build's fixed width.
+pub(super) fn skip_quoted(data: &[u8], from: usize, end: usize) -> usize {
+    skip_quoted_with(fixed(), data, from, end)
 }
 
 /// The offset of the first byte at or after `from` that is `a` or `b`, or `end`.
@@ -297,19 +410,25 @@ fn word_at(data: &[u8], at: usize) -> u64 {
 /// data.len()` the loop condition, so the compiler can see that the eight-byte
 /// read inside cannot be out of range and drops the bounds check it would
 /// otherwise emit on every step of a scan over gigabytes.
-pub(super) fn next_of2(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> usize {
+#[inline(always)]
+pub(super) fn next_of2_with<S: Scan>(
+    scan: S,
+    data: &[u8],
+    from: usize,
+    end: usize,
+    a: u8,
+    b: u8,
+) -> usize {
     let data = &data[..end.min(data.len())];
     let mut at = from;
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(target_feature = "avx2", target_feature = "avx512bw")
-    ))]
-    while at + VECTOR_WIDTH <= data.len() {
-        let hits = vector_hits(data, at, a, b);
-        if hits != 0 {
-            return at + hits.trailing_zeros() as usize;
+    if S::WIDE {
+        while at + STEP <= data.len() {
+            let hits = scan.hits(data, at, a, b);
+            if hits != 0 {
+                return at + hits.trailing_zeros() as usize;
+            }
+            at += STEP;
         }
-        at += VECTOR_WIDTH;
     }
     let (ba, bb) = (broadcast(a), broadcast(b));
     while at + 8 <= data.len() {
@@ -330,19 +449,24 @@ pub(super) fn next_of2(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> us
 }
 
 /// The offset of the first `target` at or after `from`, or `end`.
-pub(super) fn next_of1(data: &[u8], from: usize, end: usize, target: u8) -> usize {
+#[inline(always)]
+pub(super) fn next_of1_with<S: Scan>(
+    scan: S,
+    data: &[u8],
+    from: usize,
+    end: usize,
+    target: u8,
+) -> usize {
     let data = &data[..end.min(data.len())];
     let mut at = from;
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(target_feature = "avx2", target_feature = "avx512bw")
-    ))]
-    while at + VECTOR_WIDTH <= data.len() {
-        let hits = vector_hits(data, at, target, target);
-        if hits != 0 {
-            return at + hits.trailing_zeros() as usize;
+    if S::WIDE {
+        while at + STEP <= data.len() {
+            let hits = scan.hits(data, at, target, target);
+            if hits != 0 {
+                return at + hits.trailing_zeros() as usize;
+            }
+            at += STEP;
         }
-        at += VECTOR_WIDTH;
     }
     let bt = broadcast(target);
     while at + 8 <= data.len() {
@@ -387,10 +511,11 @@ pub(super) fn count_byte(data: &[u8], from: usize, end: usize, target: u8) -> us
 
 /// Walks past a quoted field's body, returning the offset after its closing quote.
 /// A doubled quote inside is content, not the end.
-pub(super) fn skip_quoted(data: &[u8], from: usize, end: usize) -> usize {
+#[inline(always)]
+pub(super) fn skip_quoted_with<S: Scan>(scan: S, data: &[u8], from: usize, end: usize) -> usize {
     let mut at = from;
     loop {
-        let q = next_of1(data, at, end, b'"');
+        let q = next_of1_with(scan, data, at, end, b'"');
         if q >= end {
             return end;
         }
@@ -428,6 +553,54 @@ mod tests {
     fn a_doubled_quote_is_content() {
         let d = b"\"a\"\"b\",rest";
         assert_eq!(skip_quoted(d, 1, d.len()), 6);
+    }
+
+    /// The widths have to agree wherever a vector step could start, end or
+    /// straddle a match. Only runs where the CPU has the vector width: elsewhere
+    /// there is one width and nothing to compare.
+    #[test]
+    fn both_widths_find_the_same_bytes() {
+        let Some(w) = Wide::detect() else { return };
+        // Plain bytes with the searched-for ones mixed in, over several vector
+        // steps so every alignment is crossed.
+        let mut d = Vec::new();
+        let mut x = 0x2545_f491_u32;
+        for _ in 0..300 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            d.push(match x % 11 {
+                0 => b',',
+                1 => b'\n',
+                2 => b'"',
+                _ => b'a' + (x % 26) as u8,
+            });
+        }
+        for end in [d.len(), d.len() - 1, 100, 64, 33, 7] {
+            let mut wide = Delims::new(w, &d, 0, end, b',', b'\n');
+            let mut swar = Delims::new(Swar, &d, 0, end, b',', b'\n');
+            let mut at = 0;
+            loop {
+                let want = next_of2_with(Swar, &d, at, end, b',', b'\n');
+                assert_eq!(next_of2_with(w, &d, at, end, b',', b'\n'), want);
+                assert_eq!(wide.next(at), want, "wide cursor from {at} to {end}");
+                assert_eq!(swar.next(at), want, "SWAR cursor from {at} to {end}");
+                if want >= end {
+                    break;
+                }
+                at = want + 1;
+            }
+            for from in 0..end {
+                assert_eq!(
+                    next_of1_with(w, &d, from, end, b'"'),
+                    next_of1_with(Swar, &d, from, end, b'"'),
+                );
+                assert_eq!(
+                    skip_quoted_with(w, &d, from, end),
+                    skip_quoted_with(Swar, &d, from, end),
+                );
+            }
+        }
     }
 
     #[test]

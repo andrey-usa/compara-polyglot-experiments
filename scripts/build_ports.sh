@@ -85,35 +85,29 @@ done
 # `benchmark-native.yml` sets the flag by hand. The six workflows that build
 # through this script never did, and those are the ones a pull request sees.
 #
-# The automatic default is `x86-64-v3` rather than the host's resolved CPU, and
-# it is a fixed string rather than a per-host name. Both choices are about where
-# the flag lands. `-C target-cpu` reaches *every* crate cargo compiles, not just
-# the csvdiff binary the tables measure -- including the proc-macro build tools
-# (`proc-macro2`, behind serde's derive) whose compiled binaries then *run* on
-# the runner half-way through the build. Resolving the host CPU on GitHub's VM
-# fleet picked `znver4`, and one of those build tools died with SIGILL -- illegal
-# instruction -- because the guest advertises AVX-512 that it cannot execute.
-# Lanes that resolved `znver3` were fine, and CI (Rust), which builds without the
-# flag, passed on the same SHA. C and C++ never hit this because `-march=native`
-# only touches binaries that run later, on the host they were built on. Capping
-# at `x86-64-v3` keeps the gain over SSE2 -- every current ubuntu-latest VM
-# executes AVX2 without difficulty, the `csvdiff-avx2` build is already
-# unconditional -- and stays inside what the whole fleet runs. A fixed string
-# also makes cargo's fingerprint uniform across hosts, which is safe now rather
-# than the trap it was with a resolved name: a `rust/target` restored from
-# another machine's cache still runs here, and vice versa.
+# On x86-64 that is no longer the gap it was. compara asks the CPU at run time
+# for AVX2 and scans with it where it is there (E-001), so a baseline build --
+# the one its releases ship and `cargo install` makes -- scans as fast as one
+# built for the runner, and that baseline build is the one the tables measure:
+# a number from a build nobody installs is the mismatch M-153 recorded. The
+# static `+avx2` build stays beside it as `rust-avx2`, so the matrix still shows
+# what compiling the compare in is worth. On x86-64 the script sets nothing.
+#
+# Elsewhere it still compiles for the host. The CPU is named rather than
+# `native`, because `-C target-cpu` reaches *every* crate cargo compiles, not
+# just the csvdiff binary the tables measure -- including the proc-macro build
+# tools (`proc-macro2`, behind serde's derive) whose compiled binaries then
+# *run* on the runner half-way through the build. Resolving the host CPU on
+# GitHub's x86 VM fleet once picked `znver4`, and one of those build tools died
+# with SIGILL because the guest advertises AVX-512 that it cannot execute.
 #
 # An explicit RUSTFLAGS from the caller still wins, as it always did.
-if [ -z "${RUSTFLAGS:-}" ]; then
-    if [ "$(uname -m 2>/dev/null)" = "x86_64" ]; then
-        export RUSTFLAGS="-C target-cpu=x86-64-v3"
-    else
-        native_cpu=$(rustc --print target-cpus 2>/dev/null |
-                     sed -n 's/.*currently \([A-Za-z0-9_-]*\).*/\1/p' | head -1)
-        export RUSTFLAGS="-C target-cpu=${native_cpu:-native}"
-    fi
-    echo "build_ports: RUSTFLAGS=$RUSTFLAGS"
+if [ -z "${RUSTFLAGS:-}" ] && [ "$(uname -m 2>/dev/null)" != "x86_64" ]; then
+    native_cpu=$(rustc --print target-cpus 2>/dev/null |
+                 sed -n 's/.*currently \([A-Za-z0-9_-]*\).*/\1/p' | head -1)
+    export RUSTFLAGS="-C target-cpu=${native_cpu:-native}"
 fi
+echo "build_ports: RUSTFLAGS=${RUSTFLAGS:-(none: baseline, as installed)}"
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 logs=$(mktemp -d)

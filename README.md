@@ -30,8 +30,8 @@ wrote, and its Parquet is all strings. Files arrive written by pyarrow, Polars,
 DuckDB or pandas — typed columns, each writer's codec — and on those the picture
 changes: the C and C++ ports refuse every one, Zig falls back to its row reader,
 and compara stays on its columnar path. C and C++ are built for this CPU
-(`-march=native`), compara as its releases ship (baseline x86-64; built for the
-CPU it counts the CSV pair 1.17x faster, level with C — E-001). One sitting, `Intel(R) Xeon(R) Processor @ 2.10GHz`,
+(`-march=native`), compara as its releases ship (baseline x86-64, which then lacked the AVX2 scan; built for the
+CPU it counted the CSV pair 1.17x faster, level with C, and the baseline build has chosen AVX2 at run time since — A-135). One sitting, `Intel(R) Xeon(R) Processor @ 2.10GHz`,
 4 cores, 1M rows a side of the standard twenty columns,
 4 threads for every tool, best of 3,
 2026-10-15; wall · peak RSS with the mapped input; every tool that read a file

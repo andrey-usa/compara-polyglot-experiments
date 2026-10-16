@@ -10,7 +10,10 @@
 //! the JSON the same pipeline emits, and the key order on each side is free to
 //! differ, because the JSON reader joins by name.
 
-use super::field::{ABSENT, Delims, Field, WIDE_SCAN, next_of1, next_of2, pack, skip_quoted};
+use super::field::{
+    ABSENT, Delims, Field, Scan, Swar, Wide, next_of1_with, next_of2, next_of2_with, pack,
+    skip_quoted, skip_quoted_with,
+};
 use super::slab::{Dialect, Slab, text_of};
 use crate::error::{Error, Result};
 use std::path::Path;
@@ -69,7 +72,7 @@ pub(super) fn csv_header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec
             let close = skip_quoted(data, pos + 1, end);
             let body_end = close.saturating_sub(1).max(pos + 1);
             (
-                quoted_field(data, pos + 1, body_end),
+                quoted_field(Swar, data, pos + 1, body_end),
                 next_of2(data, close, end, delimiter, b'\n'),
             )
         } else {
@@ -119,7 +122,7 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
             break;
         }
         let from = pos + 1;
-        let (close, escaped) = skip_json_string(data, pos, end);
+        let (close, escaped) = skip_json_string(Swar, data, pos, end);
         if close <= from {
             break;
         }
@@ -142,8 +145,8 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
             break;
         }
         pos = match data[pos] {
-            b'"' => skip_json_string(data, pos, end).0,
-            b'{' | b'[' => skip_json_nested(data, pos, end),
+            b'"' => skip_json_string(Swar, data, pos, end).0,
+            b'{' | b'[' => skip_json_nested(Swar, data, pos, end),
             _ => {
                 let mut at = pos;
                 while at < end && data[at] != b',' && data[at] != b'}' && !json_space(data[at]) {
@@ -168,11 +171,11 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
 // a hundred million calls on the 2M ndjson pair, each a few dozen
 // instructions of which the call was a fair share.
 #[inline(always)]
-fn skip_json_string(data: &[u8], mut at: usize, end: usize) -> (usize, bool) {
+fn skip_json_string<S: Scan>(scan: S, data: &[u8], mut at: usize, end: usize) -> (usize, bool) {
     at += 1; // the opening quote
     let mut escaped = false;
     loop {
-        let stop = next_of2(data, at, end, b'"', b'\\');
+        let stop = next_of2_with(scan, data, at, end, b'"', b'\\');
         if stop >= end {
             return (end, escaped);
         }
@@ -188,12 +191,12 @@ fn skip_json_string(data: &[u8], mut at: usize, end: usize) -> (usize, bool) {
 }
 
 /// Skips a nested object or array, which is not a cell value.
-fn skip_json_nested(data: &[u8], mut pos: usize, end: usize) -> usize {
+fn skip_json_nested<S: Scan>(scan: S, data: &[u8], mut pos: usize, end: usize) -> usize {
     let mut depth = 0i32;
     while pos < end {
         match data[pos] {
             b'"' => {
-                pos = skip_json_string(data, pos, end).0;
+                pos = skip_json_string(scan, data, pos, end).0;
                 continue;
             }
             b'{' | b'[' => depth += 1,
@@ -215,8 +218,9 @@ fn skip_json_nested(data: &[u8], mut pos: usize, end: usize) -> usize {
 /// A quoted CSV field, flagged when it holds a doubled quote. A quote inside the
 /// body can only be half of such a pair, which is what makes the test a single
 /// scan and lets the unescaping wait until the bytes are actually read.
-fn quoted_field(data: &[u8], from: usize, to: usize) -> Field {
-    let escaped = next_of1(data, from, to, b'"') < to;
+#[inline(always)]
+fn quoted_field<S: Scan>(scan: S, data: &[u8], from: usize, to: usize) -> Field {
+    let escaped = next_of1_with(scan, data, from, to, b'"') < to;
     pack(from as u64, (to - from) as u64, escaped)
 }
 
@@ -231,15 +235,16 @@ fn plain_field(data: &[u8], from: usize, to: usize) -> Field {
 }
 
 /// The offset of the newline ending the row that starts at `pos`.
-fn end_of_row(data: &[u8], pos: usize, end: usize) -> usize {
+#[inline(always)]
+fn end_of_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize) -> usize {
     let mut at = pos;
     while at < end {
-        let next = next_of2(data, at, end, b'\n', b'"');
+        let next = next_of2_with(scan, data, at, end, b'\n', b'"');
         if next >= end {
             return end;
         }
         if data[next] == b'"' {
-            at = skip_quoted(data, next + 1, end);
+            at = skip_quoted_with(scan, data, next + 1, end);
             continue;
         }
         return next;
@@ -383,12 +388,49 @@ pub(super) fn guard_span(
     delimiter: u8,
     commas: usize,
 ) -> Option<usize> {
-    use super::field::{Delims, skip_quoted};
+    match Wide::detect() {
+        // Safety: `w` proves the CPU has AVX2.
+        Some(w) => unsafe { guard_span_wide(w, data, lo, hi, delimiter, commas) },
+        None => guard_span_with(Swar, data, lo, hi, delimiter, commas),
+    }
+}
+
+/// [`guard_span_with`], compiled for AVX2 in a baseline build.
+///
+/// # Safety
+/// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        not(any(target_feature = "avx2", target_feature = "avx512bw"))
+    ),
+    target_feature(enable = "avx2")
+)]
+unsafe fn guard_span_wide(
+    w: Wide,
+    data: &[u8],
+    lo: usize,
+    hi: usize,
+    delimiter: u8,
+    commas: usize,
+) -> Option<usize> {
+    guard_span_with(w, data, lo, hi, delimiter, commas)
+}
+
+#[inline(always)]
+fn guard_span_with<S: Scan>(
+    scan: S,
+    data: &[u8],
+    lo: usize,
+    hi: usize,
+    delimiter: u8,
+    commas: usize,
+) -> Option<usize> {
     let mut at = lo;
-    let mut delims = Delims::new(data, lo, hi, delimiter, b'\n');
+    let mut delims = Delims::new(scan, data, lo, hi, delimiter, b'\n');
     for i in 0..commas {
         let cur = if at < hi && data[at] == b'"' {
-            let close = skip_quoted(data, at + 1, hi);
+            let close = skip_quoted_with(scan, data, at + 1, hi);
             delims.next(close)
         } else {
             delims.next(at)
@@ -471,19 +513,69 @@ impl Runs {
         delimiter: u8,
         out: &mut [(usize, usize)],
     ) -> bool {
-        let mut delims = Delims::new(data, lo, hi, delimiter, b'\n');
+        match Wide::detect() {
+            // Safety: `w` proves the CPU has AVX2.
+            Some(w) => unsafe { self.of_row_wide(w, data, lo, hi, delimiter, out) },
+            None => self.of_row_with(Swar, data, lo, hi, delimiter, out),
+        }
+    }
+
+    /// [`Runs::of_row_with`], compiled for AVX2 in a baseline build.
+    ///
+    /// # Safety
+    /// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
+    #[cfg_attr(
+        all(
+            target_arch = "x86_64",
+            not(any(target_feature = "avx2", target_feature = "avx512bw"))
+        ),
+        target_feature(enable = "avx2")
+    )]
+    unsafe fn of_row_wide(
+        &self,
+        w: Wide,
+        data: &[u8],
+        lo: usize,
+        hi: usize,
+        delimiter: u8,
+        out: &mut [(usize, usize)],
+    ) -> bool {
+        self.of_row_with(w, data, lo, hi, delimiter, out)
+    }
+
+    #[inline(always)]
+    fn of_row_with<S: Scan>(
+        &self,
+        scan: S,
+        data: &[u8],
+        lo: usize,
+        hi: usize,
+        delimiter: u8,
+        out: &mut [(usize, usize)],
+    ) -> bool {
+        let mut delims = Delims::new(scan, data, lo, hi, delimiter, b'\n');
         let mut at = lo;
         let n = self.seg.len();
         for (j, (slot, &fields)) in out.iter_mut().zip(&self.seg).enumerate() {
             let last = j + 1 == n;
-            let Some(end) = past_fields(&mut delims, data, at, hi, delimiter, fields, last) else {
+            let Some(end) = past_fields(scan, &mut delims, data, at, hi, delimiter, fields, last)
+            else {
                 return false;
             };
             *slot = (at, end - at);
             if last {
                 break;
             }
-            match past_fields(&mut delims, data, end, hi, delimiter, self.gap[j], false) {
+            match past_fields(
+                scan,
+                &mut delims,
+                data,
+                end,
+                hi,
+                delimiter,
+                self.gap[j],
+                false,
+            ) {
                 Some(next) => at = next,
                 None => return false,
             }
@@ -503,7 +595,51 @@ impl Runs {
         hi: usize,
         delimiter: u8,
     ) -> bool {
-        let mut delims = Delims::new(b, lo, hi, delimiter, b'\n');
+        match Wide::detect() {
+            // Safety: `w` proves the CPU has AVX2.
+            Some(w) => unsafe { self.matches_wide(w, a, spans, b, lo, hi, delimiter) },
+            None => self.matches_with(Swar, a, spans, b, lo, hi, delimiter),
+        }
+    }
+
+    /// [`Runs::matches_with`], compiled for AVX2 in a baseline build.
+    ///
+    /// # Safety
+    /// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        all(
+            target_arch = "x86_64",
+            not(any(target_feature = "avx2", target_feature = "avx512bw"))
+        ),
+        target_feature(enable = "avx2")
+    )]
+    unsafe fn matches_wide(
+        &self,
+        w: Wide,
+        a: &[u8],
+        spans: &[(usize, usize)],
+        b: &[u8],
+        lo: usize,
+        hi: usize,
+        delimiter: u8,
+    ) -> bool {
+        self.matches_with(w, a, spans, b, lo, hi, delimiter)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn matches_with<S: Scan>(
+        &self,
+        scan: S,
+        a: &[u8],
+        spans: &[(usize, usize)],
+        b: &[u8],
+        lo: usize,
+        hi: usize,
+        delimiter: u8,
+    ) -> bool {
+        let mut delims = Delims::new(scan, b, lo, hi, delimiter, b'\n');
         let mut at = lo;
         let n = self.seg.len();
         for (j, &(from, len)) in spans.iter().enumerate().take(n) {
@@ -514,7 +650,7 @@ impl Runs {
             if j + 1 == n {
                 break;
             }
-            match past_fields(&mut delims, b, at, hi, delimiter, self.gap[j], false) {
+            match past_fields(scan, &mut delims, b, at, hi, delimiter, self.gap[j], false) {
                 Some(next) => at = next,
                 None => return false,
             }
@@ -526,8 +662,11 @@ impl Runs {
 /// Past the byte that closes the `n`th field from `at`, or `None` where the row
 /// ends first. With `may_end` the last of them may close on the line ending: a
 /// run that ends in the row's last column has nothing else to close it.
-fn past_fields(
-    delims: &mut Delims<'_>,
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn past_fields<S: Scan>(
+    scan: S,
+    delims: &mut Delims<'_, S>,
     data: &[u8],
     mut at: usize,
     hi: usize,
@@ -537,7 +676,7 @@ fn past_fields(
 ) -> Option<usize> {
     for i in 0..n {
         let cur = if at < hi && data[at] == b'"' {
-            delims.next(skip_quoted(data, at + 1, hi))
+            delims.next(skip_quoted_with(scan, data, at + 1, hi))
         } else {
             delims.next(at)
         };
@@ -628,6 +767,45 @@ impl RowParser {
     /// A row shorter than the header leaves the missing fields [`ABSENT`], which
     /// compares as absent — a difference to report, not a file to refuse.
     pub(super) fn parse(&self, data: &[u8], start: usize, end: usize, out: &mut [Field]) -> usize {
+        match Wide::detect() {
+            // Safety: `w` proves the CPU has AVX2.
+            Some(w) => unsafe { self.parse_wide(w, data, start, end, out) },
+            None => self.parse_with(Swar, data, start, end, out),
+        }
+    }
+
+    /// [`RowParser::parse_with`], compiled for AVX2 in a baseline build, so
+    /// every scan of the row inlines into it as a vector compare.
+    ///
+    /// # Safety
+    /// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
+    #[cfg_attr(
+        all(
+            target_arch = "x86_64",
+            not(any(target_feature = "avx2", target_feature = "avx512bw"))
+        ),
+        target_feature(enable = "avx2")
+    )]
+    unsafe fn parse_wide(
+        &self,
+        w: Wide,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        out: &mut [Field],
+    ) -> usize {
+        self.parse_with(w, data, start, end, out)
+    }
+
+    #[inline(always)]
+    fn parse_with<S: Scan>(
+        &self,
+        scan: S,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        out: &mut [Field],
+    ) -> usize {
         match self {
             RowParser::Csv {
                 delimiter,
@@ -635,6 +813,7 @@ impl RowParser {
                 slots_for,
                 single,
             } => self.parse_csv(
+                scan,
                 *delimiter,
                 slots_for,
                 single,
@@ -644,14 +823,15 @@ impl RowParser {
                 end,
                 out,
             ),
-            RowParser::Json { .. } => self.parse_json(data, start, end, out),
+            RowParser::Json { .. } => self.parse_json(scan, data, start, end, out),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    fn parse_csv(
+    #[inline(always)]
+    fn parse_csv<S: Scan>(
         &self,
+        scan: S,
         delimiter: u8,
         slots_for: &[Vec<u16>],
         single: &[i32],
@@ -681,18 +861,21 @@ impl RowParser {
         // broadcast once -- but only where a scan step spans several fields. On
         // an eight-byte step it does not, and the plain scan is quicker; see
         // `Delims`.
-        let mut delims = Delims::new(data, start, end, delimiter, b'\n');
+        let mut delims = Delims::new(scan, data, start, end, delimiter, b'\n');
 
         while pos <= end {
             let (field, next) = if pos < end && data[pos] == b'"' {
-                let close = skip_quoted(data, pos + 1, end);
+                let close = skip_quoted_with(scan, data, pos + 1, end);
                 let body_end = close.saturating_sub(1).max(pos + 1);
-                (quoted_field(data, pos + 1, body_end), delims.next(close))
+                (
+                    quoted_field(scan, data, pos + 1, body_end),
+                    delims.next(close),
+                )
             } else {
-                let next = if WIDE_SCAN {
+                let next = if S::WIDE {
                     delims.next(pos)
                 } else {
-                    next_of2(data, pos, end, delimiter, b'\n')
+                    next_of2_with(scan, data, pos, end, delimiter, b'\n')
                 };
                 (plain_field(data, pos, next), next)
             };
@@ -720,7 +903,7 @@ impl RowParser {
             // Every needed column is filled, so there is nothing to blank: the
             // rest of the row is skipped without being parsed.
             if column > last_needed {
-                let eol = end_of_row(data, pos, end);
+                let eol = end_of_row(scan, data, pos, end);
                 return if eol >= end { end } else { eol + 1 };
             }
         }
@@ -729,7 +912,15 @@ impl RowParser {
     }
 
     /// Walks one JSON object, storing the values of the keys we want.
-    fn parse_json(&self, data: &[u8], start: usize, end: usize, out: &mut [Field]) -> usize {
+    #[inline(always)]
+    fn parse_json<S: Scan>(
+        &self,
+        scan: S,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        out: &mut [Field],
+    ) -> usize {
         let RowParser::Json {
             wanted,
             key_size,
@@ -750,7 +941,7 @@ impl RowParser {
             return end;
         }
         if data[pos] != b'{' {
-            return end_of_json_row(data, pos, end); // not an object: skip the line
+            return end_of_json_row(scan, data, pos, end); // not an object: skip the line
         }
         pos += 1;
 
@@ -781,7 +972,7 @@ impl RowParser {
                 }
             }
             let key_from = pos + 1;
-            let key_end = skip_json_string(data, pos, end).0;
+            let key_end = skip_json_string(scan, data, pos, end).0;
             // A row cut off right after a key's opening quote has no key.
             if key_end > end || key_end <= key_from {
                 break;
@@ -809,13 +1000,13 @@ impl RowParser {
 
             let field = if data[pos] == b'"' {
                 let from = pos + 1;
-                let (close, escaped) = skip_json_string(data, pos, end);
+                let (close, escaped) = skip_json_string(scan, data, pos, end);
                 let to = close.saturating_sub(1).max(from);
                 pos = close;
                 Some(pack(from as u64, (to - from) as u64, escaped))
             } else if data[pos] == b'{' || data[pos] == b'[' {
                 // Not a cell value. Left absent rather than guessed at.
-                pos = skip_json_nested(data, pos, end);
+                pos = skip_json_nested(scan, data, pos, end);
                 None
             } else {
                 // A number, true, false or null: it runs to the next comma,
@@ -860,7 +1051,7 @@ impl RowParser {
                 }
             }
         }
-        end_of_json_row(data, pos, end)
+        end_of_json_row(scan, data, pos, end)
     }
 
     pub(super) fn slot_for(&self, key: &[u8]) -> Option<usize> {
@@ -902,13 +1093,20 @@ impl RowParser {
 /// Mistaking a closing quote for an opening one costs a lookup that fails, which
 /// is a fallback and not a wrong answer — and an escaped name counts as a hit for
 /// the same reason, since the wanted names are held unescaped.
-pub(super) fn json_tail_is_clean(p: &RowParser, d: &[u8], mut at: usize, end: usize) -> bool {
+#[inline(always)]
+fn json_tail_is_clean_with<S: Scan>(
+    scan: S,
+    p: &RowParser,
+    d: &[u8],
+    mut at: usize,
+    end: usize,
+) -> bool {
     while at < end {
-        let q = next_of1(d, at, end, b'"');
+        let q = next_of1_with(scan, d, at, end, b'"');
         if q >= end {
             return true;
         }
-        let (close, escaped) = skip_json_string(d, q, end);
+        let (close, escaped) = skip_json_string(scan, d, q, end);
         if escaped {
             return false;
         }
@@ -942,6 +1140,44 @@ pub(super) fn json_tail_is_clean(p: &RowParser, d: &[u8], mut at: usize, end: us
 /// same bytes; the tail check covers what follows. The C and C++ ports have the
 /// same proof (#234, #235).
 pub(super) fn json_rows_match(p: &RowParser, a: &[u8], b: &[u8], b_lo: usize, b_hi: usize) -> bool {
+    match Wide::detect() {
+        // Safety: `w` proves the CPU has AVX2.
+        Some(w) => unsafe { json_rows_match_wide(w, p, a, b, b_lo, b_hi) },
+        None => json_rows_match_with(Swar, p, a, b, b_lo, b_hi),
+    }
+}
+
+/// [`json_rows_match_with`], compiled for AVX2 in a baseline build.
+///
+/// # Safety
+/// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        not(any(target_feature = "avx2", target_feature = "avx512bw"))
+    ),
+    target_feature(enable = "avx2")
+)]
+unsafe fn json_rows_match_wide(
+    w: Wide,
+    p: &RowParser,
+    a: &[u8],
+    b: &[u8],
+    b_lo: usize,
+    b_hi: usize,
+) -> bool {
+    json_rows_match_with(w, p, a, b, b_lo, b_hi)
+}
+
+#[inline(always)]
+fn json_rows_match_with<S: Scan>(
+    scan: S,
+    p: &RowParser,
+    a: &[u8],
+    b: &[u8],
+    b_lo: usize,
+    b_hi: usize,
+) -> bool {
     let (mut ai, mut bi) = (0usize, b_lo);
     let mut after_value = false;
     for _ in 0..64 {
@@ -950,20 +1186,20 @@ pub(super) fn json_rows_match(p: &RowParser, a: &[u8], b: &[u8], b_lo: usize, b_
         // The whole run first: equal slices are one memcmp, and they are the
         // common case -- every row whose ignored values do not differ.
         if m == left && a[ai..] == b[bi..bi + left] {
-            return json_tail_is_clean(p, b, bi + left, b_hi);
+            return json_tail_is_clean_with(scan, p, b, bi + left, b_hi);
         }
         let same = common_prefix(&a[ai..ai + m], &b[bi..bi + m]);
         if same == left {
-            return json_tail_is_clean(p, b, bi + left, b_hi);
+            return json_tail_is_clean_with(scan, p, b, bi + left, b_hi);
         }
         if same == m {
             return false; // B ends first
         }
-        let Some((vs, ve)) = json_member_at(p, a, ai, ai + same, after_value) else {
+        let Some((vs, ve)) = json_member_at(scan, p, a, ai, ai + same, after_value) else {
             return false;
         };
         let b_vs = bi + (vs - ai);
-        let b_ve = json_value_end(b, b_vs, b_hi);
+        let b_ve = json_value_end(scan, b, b_vs, b_hi);
         if b_ve >= b_hi || b_ve <= b_vs {
             return false;
         }
@@ -998,13 +1234,14 @@ fn json_gap(c: u8) -> bool {
 
 /// Past one JSON value from `at`: a string, a scalar, or a nested object or
 /// array. `end` where it does not close before `end`.
-fn json_value_end(d: &[u8], mut at: usize, end: usize) -> usize {
+#[inline(always)]
+fn json_value_end<S: Scan>(scan: S, d: &[u8], mut at: usize, end: usize) -> usize {
     if at >= end {
         return end;
     }
     match d[at] {
-        b'"' => skip_json_string(d, at, end).0,
-        b'{' | b'[' => skip_json_nested(d, at, end),
+        b'"' => skip_json_string(scan, d, at, end).0,
+        b'{' | b'[' => skip_json_nested(scan, d, at, end),
         _ => {
             while at < end && !matches!(d[at], b',' | b'}' | b']' | b'\n') && !json_gap(d[at]) {
                 at += 1;
@@ -1020,7 +1257,9 @@ fn json_value_end(d: &[u8], mut at: usize, end: usize) -> usize {
 /// tracked member, or anywhere the walk cannot follow -- an escaped name
 /// included, as the tail check treats one. `d` ends at the last wanted value, so
 /// a value that runs to its end is not a gap.
-fn json_member_at(
+#[inline(always)]
+fn json_member_at<S: Scan>(
+    scan: S,
     p: &RowParser,
     d: &[u8],
     mut at: usize,
@@ -1043,7 +1282,7 @@ fn json_member_at(
             return None;
         }
         let kq = at;
-        let (kend, escaped) = skip_json_string(d, at, end);
+        let (kend, escaped) = skip_json_string(scan, d, at, end);
         if escaped || kend >= end || kend >= diff {
             return None;
         }
@@ -1061,7 +1300,7 @@ fn json_member_at(
         if at > diff {
             return None;
         }
-        let v_end = json_value_end(d, at, end);
+        let v_end = json_value_end(scan, d, at, end);
         if v_end >= end || v_end <= at {
             return None;
         }
@@ -1090,8 +1329,9 @@ fn json_member_at(
 /// that does put a raw newline inside a string is not JSON, and this reader will
 /// split the row there -- which is what every ndjson reader does, because the
 /// format has no other way to say where a row ends.
-fn end_of_json_row(data: &[u8], pos: usize, end: usize) -> usize {
-    let stop = next_of1(data, pos, end, b'\n');
+#[inline(always)]
+fn end_of_json_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize) -> usize {
+    let stop = next_of1_with(scan, data, pos, end, b'\n');
     if stop >= end { end } else { stop + 1 }
 }
 
@@ -1184,6 +1424,69 @@ mod tests {
         assert_eq!(slab.raw(key[0]), b"1");
         keys.parse(slab.data(), next, text.len(), &mut key);
         assert_eq!(slab.raw(key[0]), b"3");
+    }
+
+    /// A row parses to the same fields at either scan width. Only runs where
+    /// the CPU has the vector width.
+    #[test]
+    fn both_widths_parse_alike() {
+        let Some(w) = Wide::detect() else { return };
+        let long = "x".repeat(70);
+        let mut csv = format!(
+            "id,name,note,amount\n1,alpha,\"a, \"\"quoted\"\" note\",10.5\n\
+             2,{long},plain,7\n3,,\"\",\n4,\"{long},\n{long}\",z,1\n5,a,b\n"
+        );
+        // Field lengths that walk a delimiter through every byte of a vector
+        // step, with a quoted field now and then.
+        for i in 0..200usize {
+            let field = |n: usize| "y".repeat(n % 41);
+            let note = if i % 5 == 0 {
+                format!("\"{},\"\"{}\"", field(i * 3), field(i))
+            } else {
+                field(i * 3)
+            };
+            csv += &format!("{i},{},{note},{}\n", field(i * 7), field(i * 13));
+        }
+        let json = format!(
+            "{{\"id\":\"1\",\"name\":\"a\\\"b\",\"skip\":{{\"n\":[1,{{\"m\":\"}}\"}}]}},\"amount\":2}}\n\
+             {{\"amount\":null,\"name\":\"{long}\",\"id\":\"2\",\"id\":\"3\"}}\n\
+             {{\"id\":\"4\",\"note\":\"{long}\\n{long}\"}}\n"
+        );
+        let parsers = [
+            (
+                RowParser::csv(b',', vec![Some(0), Some(1), Some(2), Some(3)]),
+                csv.as_bytes(),
+            ),
+            (
+                RowParser::csv(b',', vec![Some(0), None, Some(2), Some(0)]),
+                csv.as_bytes(),
+            ),
+            (
+                RowParser::json(
+                    vec![
+                        Some("id".into()),
+                        Some("name".into()),
+                        Some("amount".into()),
+                        Some("note".into()),
+                    ],
+                    1,
+                ),
+                json.as_bytes(),
+            ),
+        ];
+        for (parser, data) in &parsers {
+            let n = 4;
+            let mut at = 0;
+            while at < data.len() {
+                let mut a = vec![ABSENT; n];
+                let mut b = vec![ABSENT; n];
+                let next = parser.parse_with(Swar, data, at, data.len(), &mut a);
+                assert_eq!(parser.parse_with(w, data, at, data.len(), &mut b), next);
+                assert_eq!(a, b, "the row at {at}");
+                assert!(next > at);
+                at = next;
+            }
+        }
     }
 
     #[test]

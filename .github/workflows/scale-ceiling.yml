@@ -151,10 +151,8 @@ jobs:
           case "${{ matrix.port }}" in
             c)    make -C c ;;
             cpp)  make -C cpp ;;
-            # Through the shared script, which compiles Rust for the runner
-            # (x86-64-v3) as the Makefiles compile C and C++ (-march=native)
-            # and Zig is by default. Plain `cargo build --release` is baseline
-            # SSE2, and the ceiling timed it against the others' AVX2.
+            # Through the shared script, which builds Rust as it is installed:
+            # baseline x86-64, with the AVX2 scan chosen at run time (E-001).
             rust) scripts/build_ports.sh rust ;;
             zig)  (cd zig && zig build --release=fast) ;;
           esac
@@ -277,10 +275,8 @@ jobs:
           case "${{ matrix.port }}" in
             c)    make -C c ;;
             cpp)  make -C cpp ;;
-            # Through the shared script, which compiles Rust for the runner
-            # (x86-64-v3) as the Makefiles compile C and C++ (-march=native)
-            # and Zig is by default. Plain `cargo build --release` is baseline
-            # SSE2, and the ceiling timed it against the others' AVX2.
+            # Through the shared script, which builds Rust as it is installed:
+            # baseline x86-64, with the AVX2 scan chosen at run time (E-001).
             rust) scripts/build_ports.sh rust ;;
             zig)  (cd zig && zig build --release=fast) ;;
           esac

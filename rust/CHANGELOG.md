@@ -17,6 +17,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- On x86-64 the CSV, TSV and NDJSON readers scan with AVX2 when the CPU has
+  it, asked at run time, so the release binaries and `cargo install` get the
+  vector scan that before needed a build made with `-C target-cpu=x86-64-v3`.
+  On a 2M-row pair, four threads, CSV counts in 0.24 s against 0.28 s (paired
+  1.16x), TSV 1.19x, NDJSON 1.02x, level with the x86-64-v3 build on all three;
+  answers and export files are the same, byte for byte. A CPU without AVX2,
+  and aarch64, scan eight bytes at a time as before.
 - `--export-dir` on two Parquet files runs on the columnar path. Before, it
   stopped with "--export-dir is not supported on the parquet path" unless
   `--engine turbo` was given, which reads the files row by row: on a 1M-row

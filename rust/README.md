@@ -107,8 +107,9 @@ five. Each cell is wall time · CPU time · memory above the mapped input.
 
 These come from a build made for the runner (`-C target-cpu=x86-64-v3`, the
 2026-09-30 table in the [repository README](../README.md#the-example)), which
-compiles in the AVX2 scanner; a default `cargo build` or a release binary is a
-baseline x86-64 build without it ([E-001](../FINDINGS.md#open-experiments)). The
+compiles in the AVX2 scanner. A default `cargo build` or a release binary is a
+baseline x86-64 build that chooses the same scanner at run time, and at 10M rows
+scans as fast ([A-135](../FINDINGS.md#advances)). The
 Parquet row is the generator's all-string files; real writers' files are in
 [FINDINGS.md](../FINDINGS.md#real-world-files).
 
