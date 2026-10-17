@@ -1052,8 +1052,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let b_map = map(b_path)?;
     let a_name = a_path.display().to_string();
     let b_name = b_path.display().to_string();
-    let a_meta = parquet::read_meta(&a_map, &a_name)?;
-    let b_meta = parquet::read_meta(&b_map, &b_name)?;
+    // The footer is parsed once per file; every column read below reuses it.
+    let a_fm = parquet::read_file_meta(&a_map, &a_name)?;
+    let b_fm = parquet::read_file_meta(&b_map, &b_name)?;
+    let a_meta = parquet::read_meta(&a_fm);
+    let b_meta = parquet::read_meta(&b_fm);
 
     let resolved = resolve(&a_meta.names, &b_meta.names, opt)?;
     let key_size = opt.key.len();
@@ -1161,14 +1164,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 return mine;
             }
             let (from_b, j) = jobs[at];
-            let (data, meta, name) = if from_b {
-                (&b_map, &b_meta, &b_name)
+            let (data, fm, meta, name) = if from_b {
+                (&b_map, &b_fm, &b_meta, &b_name)
             } else {
-                (&a_map, &a_meta, &a_name)
+                (&a_map, &a_fm, &a_meta, &a_name)
             };
             mine.push((
                 at,
-                parquet::read_column(data, slot_of(&meta.names, &opt.key[j]), name),
+                parquet::read_column(data, fm, slot_of(&meta.names, &opt.key[j]), name),
             ));
         }
     };
@@ -1482,12 +1485,12 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         (0..nc).map(|_| Mutex::new(None)).collect();
     let read_pair = |c: usize| -> Result<(Col<'_>, Col<'_>)> {
         let a_col = Col::new(
-            parquet::read_column(&a_map, slot_of(&a_meta.names, &compared[c]), &a_name)?,
+            parquet::read_column(&a_map, &a_fm, slot_of(&a_meta.names, &compared[c]), &a_name)?,
             &a_map,
             a_kind(&compared[c]),
         );
         let b_col = Col::new(
-            parquet::read_column(&b_map, slot_of(&b_meta.names, &compared[c]), &b_name)?,
+            parquet::read_column(&b_map, &b_fm, slot_of(&b_meta.names, &compared[c]), &b_name)?,
             &b_map,
             b_kind(&compared[c]),
         );
