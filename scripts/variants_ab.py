@@ -28,6 +28,7 @@ import re
 import statistics
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -39,19 +40,45 @@ TIMING = re.compile(rb"\b\d+(?:\.\d+)?m?s\b")
 
 
 def run(exe: str, extra: list[str], a: pathlib.Path, b: pathlib.Path,
-        threads: int) -> tuple[float, float, str]:
+        threads: int) -> tuple[float, float, float, str]:
+    """Run one comparison. Returns (wall_s, cpu_s, peak_rss_mib, stdout_digest).
+
+    Peak RSS comes from wait4(2)'s rusage, so it is the max resident set of
+    exactly this child -- not a process-wide high-water mark shared with the
+    other builds' children.
+    """
     before = os.times()
     t0 = time.perf_counter()
-    r = subprocess.run([exe, "compare", str(a), str(b), *KEY, *extra,
-                        "--threads", str(threads)], capture_output=True)
+    p = subprocess.Popen(
+        [exe, "compare", str(a), str(b), *KEY, *extra,
+         "--threads", str(threads)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    chunks: dict[str, bytes] = {}
+
+    def drain(stream, tag: str) -> None:
+        chunks[tag] = stream.read()
+
+    workers = [threading.Thread(target=drain, args=(p.stdout, "out")),
+               threading.Thread(target=drain, args=(p.stderr, "err"))]
+    for w in workers:
+        w.start()
+    _, status, rusage = os.wait4(p.pid, 0)
+    for w in workers:
+        w.join()
+    p.returncode = os.waitstatus_to_exitcode(status)
     wall = time.perf_counter() - t0
     after = os.times()
     cpu = (after.children_user - before.children_user) + \
           (after.children_system - before.children_system)
     # 0 is no differences and 1 is differences found; anything else is a failure.
-    if r.returncode not in (0, 1):
-        sys.exit(f"{exe} exited {r.returncode}:\n{r.stderr[-2000:].decode(errors='replace')}")
-    return wall, cpu, hashlib.sha256(TIMING.sub(b"", r.stdout)).hexdigest()[:12]
+    if p.returncode not in (0, 1):
+        sys.exit(f"{exe} exited {p.returncode}:\n"
+                 f"{chunks['err'][-2000:].decode(errors='replace')}")
+    # ru_maxrss is KiB on Linux, bytes on macOS.
+    peak_mib = rusage.ru_maxrss / 1024 if sys.platform.startswith("linux") \
+        else rusage.ru_maxrss / (1024 * 1024)
+    digest = hashlib.sha256(TIMING.sub(b"", chunks["out"])).hexdigest()[:12]
+    return wall, cpu, peak_mib, digest
 
 
 def main() -> None:
@@ -82,16 +109,16 @@ def main() -> None:
 
     print(f"host: {host()}")
     print(f"{args.rows} rows, {args.format}, median of {args.rounds} rounds, interleaved\n")
-    samples: dict[tuple[str, int], list[tuple[float, float]]] = {}
+    samples: dict[tuple[str, int], list[tuple[float, float, float]]] = {}
     digests: dict[str, set[str]] = {}
     for _ in range(args.rounds):
         for t in threads:
             for label, exe in builds:
-                w, c, d = run(exe, args.extra, a, b, t)
-                samples.setdefault((label, t), []).append((w, c))
+                w, c, m, d = run(exe, args.extra, a, b, t)
+                samples.setdefault((label, t), []).append((w, c, m))
                 digests.setdefault(label.split(" ")[0], set()).add(d)
 
-    print(f"{'build':<30}" + "".join(f"{f'{t} thr wall':>13}{'vs base':>9}{'cpu':>9}"
+    print(f"{'build':<30}" + "".join(f"{f'{t} thr wall':>13}{'vs base':>9}{'cpu':>9}{'peak rss':>10}"
                                      for t in threads))
     base: dict[str, str] = {}
     for label, _ in builds:
@@ -102,7 +129,8 @@ def main() -> None:
             w = statistics.median(s[0] for s in samples[(label, t)])
             w0 = statistics.median(s[0] for s in samples[(base[g], t)])
             c = statistics.median(s[1] for s in samples[(label, t)])
-            row += f"{w:>12.3f}s{w / w0:>8.3f}x{c:>8.2f}s"
+            m = max(s[2] for s in samples[(label, t)])
+            row += f"{w:>12.3f}s{w / w0:>8.3f}x{c:>8.2f}s{m:>9.0f}M"
         print(row)
     print()
     for g, ds in digests.items():
