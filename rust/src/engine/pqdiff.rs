@@ -34,7 +34,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -1481,172 +1481,6 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         Ok((a_col, b_col))
     };
 
-    let export_temp_dir = if exporting {
-        static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = TEMP_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("compara-pqexport-{}-{seq}", std::process::id()));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| Error::new(format!("cannot create temp dir {}: {e}", dir.display())))?;
-        Some(dir)
-    } else {
-        None
-    };
-
-    let write_temp_column = |col: &parquet::Column, path: &Path| -> Result<()> {
-        let mut w =
-            std::io::BufWriter::new(File::create(path).map_err(|e| {
-                Error::new(format!("cannot create temp file {}: {e}", path.display()))
-            })?);
-        let dict_len = col.dict.len() as u64;
-        w.write_all(&dict_len.to_le_bytes())
-            .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-        for s in &col.dict {
-            w.write_all(&s.raw().to_le_bytes())
-                .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-        }
-        let index_len = col.index.len() as u64;
-        w.write_all(&index_len.to_le_bytes())
-            .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-        for &idx in &col.index {
-            w.write_all(&idx.to_le_bytes())
-                .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-        }
-        let vals_len = col.values.len() as u64;
-        w.write_all(&vals_len.to_le_bytes())
-            .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-        for s in &col.values {
-            w.write_all(&s.raw().to_le_bytes())
-                .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-        }
-        let owned_len = col.owned.len() as u64;
-        w.write_all(&owned_len.to_le_bytes())
-            .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-        w.write_all(&col.owned)
-            .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-        let has_words = col.words.is_some() as u8;
-        w.write_all(&[has_words])
-            .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-        if let Some(words) = &col.words {
-            let words_vals_len = words.values.len() as u64;
-            w.write_all(&words_vals_len.to_le_bytes())
-                .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-            for v in &words.values {
-                w.write_all(v)
-                    .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-            }
-            let nulls_len = words.nulls.len() as u64;
-            w.write_all(&nulls_len.to_le_bytes())
-                .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-            for &n in &words.nulls {
-                w.write_all(&n.to_le_bytes())
-                    .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-            }
-        }
-        let dict_flag = col.dictionary as u8;
-        w.write_all(&[dict_flag])
-            .map_err(|e| Error::new(format!("cannot write temp file: {e}")))?;
-        w.flush()
-            .map_err(|e| Error::new(format!("cannot flush temp file: {e}")))?;
-        Ok(())
-    };
-
-    let read_temp_column = |path: &Path| -> Result<parquet::Column> {
-        let f = File::open(path)
-            .map_err(|e| Error::new(format!("cannot open temp file {}: {e}", path.display())))?;
-        let mut r = std::io::BufReader::new(f);
-        let mut buf8 = [0u8; 8];
-        let mut buf4 = [0u8; 4];
-
-        r.read_exact(&mut buf8)
-            .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-        let dict_len = u64::from_le_bytes(buf8) as usize;
-        let mut dict = Vec::with_capacity(dict_len);
-        for _ in 0..dict_len {
-            r.read_exact(&mut buf8)
-                .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-            dict.push(parquet::Slice(u64::from_le_bytes(buf8)));
-        }
-
-        r.read_exact(&mut buf8)
-            .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-        let index_len = u64::from_le_bytes(buf8) as usize;
-        let mut index = Vec::with_capacity(index_len);
-        for _ in 0..index_len {
-            r.read_exact(&mut buf4)
-                .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-            index.push(i32::from_le_bytes(buf4));
-        }
-
-        r.read_exact(&mut buf8)
-            .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-        let vals_len = u64::from_le_bytes(buf8) as usize;
-        let mut values = Vec::with_capacity(vals_len);
-        for _ in 0..vals_len {
-            r.read_exact(&mut buf8)
-                .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-            values.push(parquet::Slice(u64::from_le_bytes(buf8)));
-        }
-
-        r.read_exact(&mut buf8)
-            .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-        let owned_len = u64::from_le_bytes(buf8) as usize;
-        let mut owned = vec![0u8; owned_len];
-        r.read_exact(&mut owned)
-            .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-
-        let mut buf1 = [0u8; 1];
-        r.read_exact(&mut buf1)
-            .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-        let words = if buf1[0] != 0 {
-            r.read_exact(&mut buf8)
-                .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-            let words_vals_len = u64::from_le_bytes(buf8) as usize;
-            let mut words_values = Vec::with_capacity(words_vals_len);
-            for _ in 0..words_vals_len {
-                r.read_exact(&mut buf8)
-                    .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-                words_values.push(buf8);
-            }
-            r.read_exact(&mut buf8)
-                .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-            let nulls_len = u64::from_le_bytes(buf8) as usize;
-            let mut nulls = Vec::with_capacity(nulls_len);
-            for _ in 0..nulls_len {
-                r.read_exact(&mut buf8)
-                    .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-                nulls.push(u64::from_le_bytes(buf8));
-            }
-            Some(parquet::Words {
-                values: words_values,
-                nulls,
-            })
-        } else {
-            None
-        };
-
-        r.read_exact(&mut buf1)
-            .map_err(|e| Error::new(format!("cannot read temp file: {e}")))?;
-        let dictionary = buf1[0] != 0;
-
-        Ok(parquet::Column {
-            dictionary,
-            dict,
-            index,
-            values,
-            owned,
-            words,
-        })
-    };
-
-    let temp_pair_paths = |c: usize| -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        let dir = export_temp_dir.as_ref()?;
-        Some((
-            dir.join(format!("{c}_a.bin")),
-            dir.join(format!("{c}_b.bin")),
-        ))
-    };
-
     let work = || -> Result<Vec<(usize, ColOut)>> {
         let mut mine = Vec::new();
         loop {
@@ -1659,11 +1493,6 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 ..ColOut::default()
             };
             let (a_col, b_col) = read_pair(c)?;
-
-            if let Some((path_a, path_b)) = temp_pair_paths(c) {
-                write_temp_column(&a_col.c, &path_a)?;
-                write_temp_column(&b_col.c, &path_b)?;
-            }
 
             let mut hits: Vec<usize> = Vec::new();
             // The fast path: both sides dictionary encoded, so the two
@@ -1874,16 +1703,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                     if c >= nc {
                         return Ok(mine);
                     }
-                    let (a_col, b_col) = if let Some((path_a, path_b)) = temp_pair_paths(c) {
-                        let ca = read_temp_column(&path_a)?;
-                        let cb = read_temp_column(&path_b)?;
-                        (
-                            Col::new(ca, &a_map, a_kind(&compared[c])),
-                            Col::new(cb, &b_map, b_kind(&compared[c])),
-                        )
-                    } else {
-                        read_pair(c)?
-                    };
+                    let (a_col, b_col) = read_pair(c)?;
                     let a = changed_list.cells(&a_col, |p| pa[p] as usize, opt)?;
                     let b = changed_list.cells(&b_col, |p| pb[p] as usize, opt)?;
                     mine.push((c, (a, b)));
@@ -1916,9 +1736,6 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         phases.mark("export write");
     }
     drop(export_lists);
-    if let Some(dir) = &export_temp_dir {
-        let _ = std::fs::remove_dir_all(dir);
-    }
     for c in &mut cols {
         c.export_added = Cells::default();
         c.export_removed = Cells::default();
