@@ -39,8 +39,8 @@ from phases_ports import GEN, KEY, host  # noqa: E402
 TIMING = re.compile(rb"\b\d+(?:\.\d+)?m?s\b")
 
 
-def run(exe: str, extra: list[str], a: pathlib.Path, b: pathlib.Path,
-        threads: int) -> tuple[float, float, float, str]:
+def run(exe: str, extra: list[str], env: dict[str, str], a: pathlib.Path,
+        b: pathlib.Path, threads: int) -> tuple[float, float, float, str]:
     """Run one comparison. Returns (wall_s, cpu_s, peak_rss_mib, stdout_digest).
 
     Peak RSS comes from wait4(2)'s rusage, so it is the max resident set of
@@ -52,7 +52,8 @@ def run(exe: str, extra: list[str], a: pathlib.Path, b: pathlib.Path,
     p = subprocess.Popen(
         [exe, "compare", str(a), str(b), *KEY, *extra,
          "--threads", str(threads)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env={**os.environ, **env})
     chunks: dict[str, bytes] = {}
 
     def drain(stream, tag: str) -> None:
@@ -90,10 +91,17 @@ def main() -> None:
     ap.add_argument("--data-dir", default="/tmp/variants-data")
     ap.add_argument("--extra", action="append", default=[],
                     help="an argument passed to every build, e.g. --extra=--summary")
+    ap.add_argument("--env", action="append", default=[],
+                    help="KEY=VALUE applied to every build's environment, "
+                         "e.g. --env=COMPARA_PARALLEL_INSERT=0")
     ap.add_argument("builds", nargs="+", help="label=path")
     args = ap.parse_args()
     builds = [tuple(s.split("=", 1)) for s in args.builds]
     threads = [int(t) for t in args.threads.split(",") if t.strip()]
+    extra_env: dict[str, str] = {}
+    for kv in args.env:
+        k, v = kv.split("=", 1)
+        extra_env[k] = v
 
     data = pathlib.Path(args.data_dir)
     data.mkdir(parents=True, exist_ok=True)
@@ -108,13 +116,15 @@ def main() -> None:
                 pass
 
     print(f"host: {host()}")
+    if extra_env:
+        print(f"env: {' '.join(f'{k}={v}' for k, v in extra_env.items())}")
     print(f"{args.rows} rows, {args.format}, median of {args.rounds} rounds, interleaved\n")
     samples: dict[tuple[str, int], list[tuple[float, float, float]]] = {}
     digests: dict[str, set[str]] = {}
     for _ in range(args.rounds):
         for t in threads:
             for label, exe in builds:
-                w, c, m, d = run(exe, args.extra, a, b, t)
+                w, c, m, d = run(exe, args.extra, extra_env, a, b, t)
                 samples.setdefault((label, t), []).append((w, c, m))
                 digests.setdefault(label.split(" ")[0], set()).add(d)
 

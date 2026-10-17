@@ -34,6 +34,9 @@ on:
       rounds:
         description: "Rounds; the median is printed"
         default: "7"
+      env_vars:
+        description: "Comma-separated KEY=VALUE pairs applied to every build's environment"
+        default: ""
 
 permissions:
   contents: read
@@ -107,8 +110,13 @@ jobs:
           extra=()
           # Rust writes a report unless told not to; the others write nothing.
           [ "$PORT" = rust ] && extra=(--extra=--summary)
+          env_flags=()
+          if [ -n "${{ inputs.env_vars }}" ]; then
+            IFS=',' read -ra pairs <<< "${{ inputs.env_vars }}"
+            for kv in "${pairs[@]}"; do env_flags+=(--env="$kv"); done
+          fi
           python3 scripts/variants_ab.py --rows "$ROWS" --format "$FORMAT" \
-            --threads "$THREADS" --rounds "$ROUNDS" "${extra[@]}" \
+            --threads "$THREADS" --rounds "$ROUNDS" "${extra[@]}" "${env_flags[@]}" \
             "$PORT base=/tmp/base/$BIN" "$PORT head=/tmp/head/$BIN" "$PORT base-again=/tmp/base-again" \
             | tee /tmp/ab.txt
           {
