@@ -37,6 +37,9 @@ on:
       env_vars:
         description: "Comma-separated KEY=VALUE pairs applied to every build's environment"
         default: ""
+      extra_args:
+        description: "Comma-separated extra CLI args for every build, e.g. --export-dir=/tmp/x"
+        default: ""
 
 permissions:
   contents: read
@@ -114,6 +117,10 @@ jobs:
           if [ -n "${{ inputs.env_vars }}" ]; then
             IFS=',' read -ra pairs <<< "${{ inputs.env_vars }}"
             for kv in "${pairs[@]}"; do env_flags+=(--env="$kv"); done
+          fi
+          if [ -n "${{ inputs.extra_args }}" ]; then
+            IFS=',' read -ra xargs <<< "${{ inputs.extra_args }}"
+            for xa in "${xargs[@]}"; do extra+=(--extra="$xa"); done
           fi
           python3 scripts/variants_ab.py --rows "$ROWS" --format "$FORMAT" \
             --threads "$THREADS" --rounds "$ROUNDS" "${extra[@]}" "${env_flags[@]}" \
