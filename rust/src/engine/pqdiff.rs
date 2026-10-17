@@ -1310,6 +1310,18 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     } else {
         0
     };
+    // The two sweeps run concurrently in one scope, so a_ways + b_ways is the
+    // live thread count; uncapped that is twice the budget whenever both
+    // passes are active. Share the budget between the passes in proportion
+    // to their key counts, keeping one way per active pass.
+    let budget = threads.max(1);
+    let (a_ways, b_ways) = if budget < 2 || a_ways + b_ways <= budget {
+        (a_ways, b_ways)
+    } else {
+        let total = (ai.firsts.len() + bi.firsts.len()).max(1);
+        let a = ((ai.firsts.len() * budget / total).max(1)).min(budget - 1);
+        (a, budget - a)
+    };
 
     let a_range = |p: usize| -> Result<Part> {
         let mut out = Part::default();
