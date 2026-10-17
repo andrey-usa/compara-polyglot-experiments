@@ -451,7 +451,8 @@ fn row_end(ix: &RowIndex, row: i32, size: usize) -> usize {
 /// From this many rows the key index is built on every thread
 /// (`RowIndex::insert_parallel`); below it the serial insertion takes well
 /// under a second and is left alone. `COMPARA_PARALLEL_INSERT=1` (set and not
-/// "0") takes the parallel insertion at any size, for the tests.
+/// "0") forces parallel insertion at any size; `COMPARA_PARALLEL_INSERT=0`
+/// forces serial insertion at any size.
 const PARALLEL_INSERT_ROWS: usize = 1 << 20;
 
 /// The fewest slots a region of a parallel insertion is given.
@@ -461,10 +462,15 @@ fn parallel_insert(rows: usize, threads: usize) -> bool {
     if threads < 2 {
         return false;
     }
-    let forced = std::env::var("COMPARA_PARALLEL_INSERT")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
-    forced || rows >= PARALLEL_INSERT_ROWS
+    if let Ok(v) = std::env::var("COMPARA_PARALLEL_INSERT") {
+        if v == "0" {
+            return false;
+        }
+        if !v.is_empty() {
+            return true;
+        }
+    }
+    rows >= PARALLEL_INSERT_ROWS
 }
 
 /// One region's outcome in a parallel insertion: repeated keys' counts and
@@ -2122,7 +2128,7 @@ fn mark_seen(seen: &[AtomicU64], row: i32) {
 /// `row` is the row's id for the pick lists, `from`/`end` its byte range in
 /// A's slab, `hash` its sweep-computed key hash, and `k` its index in the part,
 /// for the proof backoff. `seen` records the mate in B's seen bitmap.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::nonminimal_bool)]
 fn join_row(
     ctx: &JoinCtx,
     out: &mut Part,
