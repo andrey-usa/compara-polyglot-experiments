@@ -112,7 +112,11 @@ jobs:
           set -o pipefail
           extra=()
           # Rust writes a report unless told not to; the others write nothing.
-          [ "$PORT" = rust ] && extra=(--extra=--summary)
+          # --summary conflicts with --export-dir (the binary refuses both),
+          # so skip it when the user asked for an export.
+          if [ "$PORT" = rust ] && [[ "${{ inputs.extra_args }}" != *export-dir* ]]; then
+            extra=(--extra=--summary)
+          fi
           env_flags=()
           if [ -n "${{ inputs.env_vars }}" ]; then
             IFS=',' read -ra pairs <<< "${{ inputs.env_vars }}"
