@@ -37,6 +37,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Mutex;
 
 use memmap2::Mmap;
 
@@ -1462,6 +1463,23 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let compared = &resolved.compared;
     let (pa, pb) = (&pair_a, &pair_b);
     let (added_held, removed_held) = (&added.held, &removed.held);
+    // The export's changed rows need every compared column's cell at the pairs
+    // that changed, which are known only after every column is compared. Two
+    // ways to have them then: read each column a second time, or keep the
+    // decoded columns from the first pass. The second costs roughly rows × 8
+    // bytes × 2 sides per word column while it is held, so it is taken only
+    // when the memory budget leaves room for it with margin; otherwise the
+    // export falls back to the second read.
+    let stash_bytes: u64 = resolved
+        .compared
+        .iter()
+        .map(|n| held(&a_meta, n) + held(&b_meta, n))
+        .sum();
+    let stash = exporting
+        && memory::available(opt.memory).saturating_sub(floor)
+            >= stash_bytes + stash_bytes / 4;
+    let stashed: Vec<Mutex<Option<(Col<'_>, Col<'_>)>>> =
+        (0..nc).map(|_| Mutex::new(None)).collect();
     let read_pair = |c: usize| -> Result<(Col<'_>, Col<'_>)> {
         let a_col = Col::new(
             parquet::read_column(&a_map, slot_of(&a_meta.names, &compared[c]), &a_name)?,
@@ -1623,6 +1641,13 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 out.export_added = added_list.cells(&b_col, |r| r, opt)?;
                 out.export_removed = removed_list.cells(&a_col, |r| r, opt)?;
             }
+            // Kept for the export's gather below instead of dropped: with the
+            // changed pairs known, their cells come out of these columns with
+            // no second read of the file.
+            if stash {
+                *stashed[c].lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((a_col, b_col));
+            }
             mine.push((c, out));
         }
     };
@@ -1677,12 +1702,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
 
     // --- the export -------------------------------------------------------
     if let Some((added_list, removed_list)) = &export_lists {
-        // Which pairs changed is known only now, after every column, so their
-        // cells take a second pass: each column is read again, on as many
-        // lanes as the first pass had, and written out at those pairs alone.
-        // Holding every column from the first pass instead would cost eight
-        // bytes a row per column per file for the whole run, the memory this
-        // path exists not to spend.
+        // Which pairs changed is known only now, after every column.
         let mut changed_found: Vec<usize> =
             alloc::sized(changed_total as usize, "the changed pairs")?;
         for (w, &word) in any.iter().enumerate() {
@@ -1695,34 +1715,64 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         let changed_list = Listed::new(changed_found, &a_keys, |p| pair_a[p] as usize, opt)?;
         let mut sides: Vec<Sides> = (0..nc).map(|_| Default::default()).collect();
         if !changed_list.found.is_empty() {
-            let next = AtomicUsize::new(0);
-            let again = || -> Result<Vec<(usize, Sides)>> {
-                let mut mine = Vec::new();
-                loop {
-                    let c = next.fetch_add(1, AtomicOrdering::Relaxed);
-                    if c >= nc {
-                        return Ok(mine);
+            if stash {
+                // The columns stayed in memory: each changed pair's cells come
+                // out of them directly, and each column is released as it is
+                // gathered.
+                for (sides_c, slot) in sides.iter_mut().zip(stashed.iter()) {
+                    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some((a_col, b_col)) = guard.take() else {
+                        return Err(Error::new("a stashed column went missing"));
+                    };
+                    drop(guard);
+                    let mut a = Cells::with_room(changed_list.found.len())?;
+                    let mut b = Cells::with_room(changed_list.found.len())?;
+                    for &p in &changed_list.found {
+                        a.push(a_col.at(pa[p] as usize), opt)?;
+                        b.push(b_col.at(pb[p] as usize), opt)?;
                     }
-                    let (a_col, b_col) = read_pair(c)?;
-                    let a = changed_list.cells(&a_col, |p| pa[p] as usize, opt)?;
-                    let b = changed_list.cells(&b_col, |p| pb[p] as usize, opt)?;
-                    mine.push((c, (a, b)));
+                    // As `Listed::cells` does: the file lists rows in key
+                    // order, not pair order.
+                    let a = a.permuted(&changed_list.order)?;
+                    let b = b.permuted(&changed_list.order)?;
+                    *sides_c = (a, b);
                 }
-            };
-            let gathered: Vec<Result<Vec<(usize, Sides)>>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..lanes).map(|_| parallel::spawn(scope, &again)).collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
-                    .collect()
-            });
-            for got in gathered {
-                for (c, pair) in got? {
-                    sides[c] = pair;
+                phases.mark("export cells (stash)");
+            } else {
+                // No room to keep the columns: each is read again, on as many
+                // lanes as the first pass had, and written out at the changed
+                // pairs alone.
+                let next = AtomicUsize::new(0);
+                let again = || -> Result<Vec<(usize, Sides)>> {
+                    let mut mine = Vec::new();
+                    loop {
+                        let c = next.fetch_add(1, AtomicOrdering::Relaxed);
+                        if c >= nc {
+                            return Ok(mine);
+                        }
+                        let (a_col, b_col) = read_pair(c)?;
+                        let a = changed_list.cells(&a_col, |p| pa[p] as usize, opt)?;
+                        let b = changed_list.cells(&b_col, |p| pb[p] as usize, opt)?;
+                        mine.push((c, (a, b)));
+                    }
+                };
+                let gathered: Vec<Result<Vec<(usize, Sides)>>> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> =
+                            (0..lanes).map(|_| parallel::spawn(scope, &again)).collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
+                            .collect()
+                    });
+                for got in gathered {
+                    for (c, pair) in got? {
+                        sides[c] = pair;
+                    }
                 }
+                phases.mark("export cells (par)");
             }
         }
-        phases.mark("export cells (par)");
 
         let dir = Path::new(opt.export_dir.as_deref().unwrap_or_default());
         create_export_dir(dir)?;
