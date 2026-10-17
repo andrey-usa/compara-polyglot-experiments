@@ -84,10 +84,14 @@ const T_STRUCT: u8 = 12;
 /// The offset is into the mapped file where the page was stored uncompressed,
 /// and into the reader's own buffer where it had to be decompressed --
 /// [`Column::owned`] says which.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Slice(u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slice(pub u64);
 
 impl Slice {
+    #[inline]
+    pub fn raw(self) -> u64 {
+        self.0
+    }
     pub const MAX_LENGTH: u32 = (1 << 23) - 1;
     const OFFSET_MASK: u64 = (1 << 40) - 1;
     const LENGTH_SHIFT: u32 = 40;
