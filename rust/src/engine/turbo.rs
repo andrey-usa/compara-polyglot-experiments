@@ -815,92 +815,132 @@ impl RowIndex {
         idx.occurrences = alloc::sized(total, "one count per distinct key")?;
         let mut probe = vec![ABSENT; side.width];
         let mut mine = vec![ABSENT; side.width];
-        for row in 0..total {
-            if let Some(&soon) = idx.row_hash.get(row + PREFETCH_AHEAD) {
-                idx.prefetch(soon);
-            }
-            idx.insert(side, row as i32, key_size, opt, &mut probe, &mut mine)?;
-        }
+        idx.insert_all(side, key_size, opt, &mut probe, &mut mine)?;
         phases.mark("index insert (serial)");
         Ok((idx, fparts))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    /// Indexes row `row`, which is already in `row_at` and `row_hash`.
-    fn insert(
+    /// Inserts every row in file order, the whole index build when the
+    /// parallel pass does not run. A per-row `insert` here paid for what a
+    /// loop knows once: every table and list access was bounds-checked, the
+    /// lists grew a push at a time through the vector's capacity test, and the
+    /// slot helpers were re-borrowed out of `self` each row. That was 45% of
+    /// the serial insertion's instructions under callgrind at 3M rows.
+    ///
+    /// `build` sized the table so `total * 3 + 16 <= table.len() * 2` and both
+    /// lists to `total`, and keys are rows at most, so on this path nothing
+    /// grows, rehashes, or leaves its allocation: a slot is masked into the
+    /// table, a key is under the lists' capacity, and a slot's position points
+    /// at a key already written. The borrow checker cannot see any of that,
+    /// so the loop runs on pointers and lengths in locals, and the lists are
+    /// committed with `set_len` at the end. Their element types have no drop,
+    /// so the early `?` returns leak nothing.
+    fn insert_all(
         &mut self,
         side: &Side,
-        row: i32,
         key_size: usize,
         opt: &Options,
         probe: &mut [Field],
         mine: &mut [Field],
     ) -> Result<()> {
-        self.rows += 1;
-        let at = self.row_at[row as usize];
-        let hash = self.row_hash[row as usize];
-
-        let mut slot = self.slot(hash);
-        let mut mine_parsed = false;
-        loop {
-            let word = self.table[slot];
-            if word == EMPTY_SLOT {
-                self.table[slot] = self.slot_for(hash, self.first_row.len());
-                self.first_row.push(row);
-                self.occurrences.push(1);
-                // Two thirds, which is what `build` sizes the table for. Half was
-                // the wrong number in the wrong place: a file whose keys are
-                // nearly all distinct crossed it and doubled a table that had
-                // been sized precisely so it would not have to.
-                if self.first_row.len() * 3 > self.table.len() * 2 {
-                    self.rehash()?;
-                }
-                return Ok(());
+        let total = self.row_hash.len();
+        let mask = self.mask;
+        let region_mask = self.region_mask;
+        let pos_mask = self.pos_mask;
+        let pos_bits = self.pos_bits;
+        let tag_bits = 32 - pos_bits;
+        let mut keys = 0usize;
+        let first_row = self.first_row.as_mut_ptr();
+        let occurrences = self.occurrences.as_mut_ptr();
+        let table = self.table.as_mut_ptr();
+        debug_assert!(self.first_row.capacity() >= total && self.occurrences.capacity() >= total);
+        debug_assert!(total * 3 + 16 <= self.table.len() * 2);
+        for row in 0..total {
+            if let Some(&soon) = self.row_hash.get(row + PREFETCH_AHEAD) {
+                self.prefetch(soon);
             }
-            // The tag rejects almost every collision without leaving this word.
-            if self.tag_is(word, hash) {
-                let key = self.pos_of(word);
-                let candidate = self.first_row[key];
-                if self.row_hash[candidate as usize] == hash {
-                    // This row's fields are re-parsed rather than carried over from
-                    // the sweep because the sweep produced ten million of them and
-                    // this branch wants one.
-                    if !mine_parsed {
-                        side.keys_at(at, key_size, mine);
-                        mine_parsed = true;
+            let hash = self.row_hash[row];
+            let mut slot = ((hash ^ (hash >> 32)) as usize) & mask;
+            let mut mine_parsed = false;
+            loop {
+                // Safety: `slot` is masked into the table.
+                let word = unsafe { *table.add(slot) };
+                if word == EMPTY_SLOT {
+                    let pos = keys as u32 + 1;
+                    let packed = if tag_bits == 0 {
+                        pos
+                    } else {
+                        (((hash >> (64 - tag_bits)) as u32) << pos_bits) | pos
+                    };
+                    // Safety: `slot` is in the table, and `keys` is under the
+                    // lists' `total` capacity.
+                    unsafe {
+                        *table.add(slot) = packed;
+                        *first_row.add(keys) = row as i32;
+                        *occurrences.add(keys) = 1;
                     }
-                    self.keys_of(side, candidate, key_size, probe);
-                    if (0..key_size).all(|i| same(&side.slab, probe[i], &side.slab, mine[i], opt)) {
-                        self.occurrences[key] += 1;
-                        if self.occurrences[key] == 2 {
-                            self.dup_keys += 1;
-                            self.dup_rows += 1; // the first occurrence counts once the key repeats
-                            if self.keep_dup_keys {
-                                // A key that does not decode is left to the
-                                // section, which reports it.
-                                let values: Option<Vec<Val>> = probe[..key_size]
-                                    .iter()
-                                    .map(|f| {
-                                        value_checked(&side.slab, *f, opt, "a duplicated key").ok()
-                                    })
-                                    .collect();
-                                if let Some(values) = values {
-                                    self.dup_key_values.insert(key as u32, values);
+                    keys += 1;
+                    break;
+                }
+                // The tag rejects almost every collision without leaving this word.
+                if tag_bits == 0 || (word >> pos_bits) == (hash >> (64 - tag_bits)) as u32 {
+                    let key = ((word & pos_mask) - 1) as usize;
+                    // Safety: the slot was written with a `keys` value already
+                    // committed above.
+                    let candidate = unsafe { *first_row.add(key) };
+                    if self.row_hash[candidate as usize] == hash {
+                        // This row's fields are re-parsed rather than carried over
+                        // from the sweep because the sweep produced ten million of
+                        // them and this branch wants one.
+                        if !mine_parsed {
+                            side.keys_at(self.row_at[row], key_size, mine);
+                            mine_parsed = true;
+                        }
+                        self.keys_of(side, candidate, key_size, probe);
+                        if (0..key_size)
+                            .all(|i| same(&side.slab, probe[i], &side.slab, mine[i], opt))
+                        {
+                            // Safety: `key` is under `keys`.
+                            let count = unsafe { &mut *occurrences.add(key) };
+                            *count += 1;
+                            if *count == 2 {
+                                self.dup_keys += 1;
+                                self.dup_rows += 1; // the first occurrence counts once the key repeats
+                                if self.keep_dup_keys {
+                                    // A key that does not decode is left to the
+                                    // section, which reports it.
+                                    let values: Option<Vec<Val>> = probe[..key_size]
+                                        .iter()
+                                        .map(|f| {
+                                            value_checked(&side.slab, *f, opt, "a duplicated key")
+                                                .ok()
+                                        })
+                                        .collect();
+                                    if let Some(values) = values {
+                                        self.dup_key_values.insert(key as u32, values);
+                                    }
                                 }
                             }
+                            self.dup_rows += 1;
+                            // The fused join joined this row as though it were
+                            // first; it is joined again afterwards and subtracted.
+                            if self.track_later {
+                                alloc::push(&mut self.later, row as i32, "a repeated key's row")?;
+                            }
+                            break;
                         }
-                        self.dup_rows += 1;
-                        // The fused join joined this row as though it were
-                        // first; it is joined again afterwards and subtracted.
-                        if self.track_later {
-                            alloc::push(&mut self.later, row, "a repeated key's row")?;
-                        }
-                        return Ok(());
                     }
                 }
+                slot = (slot & !region_mask) | ((slot + 1) & region_mask);
             }
-            slot = self.next(slot);
         }
+        // Safety: the first `keys` entries of both lists were written above.
+        unsafe {
+            self.first_row.set_len(keys);
+            self.occurrences.set_len(keys);
+        }
+        self.rows += total as i64;
+        Ok(())
     }
 
     /// Indexes every row on `threads` threads, each owning one region of the
@@ -1234,25 +1274,6 @@ impl RowIndex {
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = hash;
-    }
-
-    /// Only reached if the row count was underestimated: `build` sizes the table
-    /// for the rows it is about to insert, so the common path never grows it.
-    fn rehash(&mut self) -> Result<()> {
-        let size = self.table.len() * 2;
-        self.table = empty_table(size)?;
-        self.mask = size - 1;
-        self.region_mask = self.mask;
-        for key in 0..self.first_row.len() {
-            let row = self.first_row[key];
-            let hash = self.row_hash[row as usize];
-            let mut slot = self.slot(hash);
-            while self.table[slot] != EMPTY_SLOT {
-                slot = self.next(slot);
-            }
-            self.table[slot] = self.slot_for(hash, key);
-        }
-        Ok(())
     }
 
     /// The row carrying `fields`' key in this index, or `None`. `other` is the
