@@ -1794,6 +1794,49 @@ fn chunk_bounds(
             .collect()
     };
 
+    if dialect == Dialect::Json {
+        let mut bounds = vec![from];
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        let mut target_idx = 0;
+        let mut at = from;
+
+        while at < end && target_idx < nominal.len() {
+            let target = nominal[target_idx];
+            let b = data[at];
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if b == b'\\' {
+                    escape = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'{' => {
+                        if (depth == 0 || depth == 1) && at >= target {
+                            if at > *bounds.last().unwrap() {
+                                bounds.push(at);
+                            }
+                            target_idx += 1;
+                        }
+                        depth += 1;
+                    }
+                    b'[' => depth += 1,
+                    b'}' | b']' => depth = (depth - 1).max(0),
+                    _ => {}
+                }
+            }
+            at += 1;
+        }
+        bounds.push(end);
+        bounds.dedup();
+        return bounds;
+    }
+
     let mut bounds = vec![from];
     for (i, &start) in nominal.iter().enumerate() {
         let mut in_quotes = quotes[i] % 2 == 1;

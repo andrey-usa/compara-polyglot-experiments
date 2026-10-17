@@ -28,7 +28,7 @@ pub(super) fn sniff_dialect(data: &[u8]) -> Dialect {
         if json_space(b) {
             continue;
         }
-        return if b == b'{' {
+        return if b == b'{' || b == b'[' {
             Dialect::Json
         } else {
             Dialect::Csv
@@ -97,7 +97,7 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
     let end = data.len();
     let mut names: Vec<String> = Vec::new();
     let mut pos = 0usize;
-    while pos < end && json_space(data[pos]) {
+    while pos < end && (json_space(data[pos]) || data[pos] == b'[') {
         pos += 1;
     }
     if pos >= end || data[pos] != b'{' {
@@ -934,16 +934,22 @@ impl RowParser {
         let mut found = 0; // key slots filled, for the early exit below
         let mut guess = 0; // the slot the next member most likely fills
         let mut pos = start;
-        while pos < end && json_space(data[pos]) {
+        while pos < end
+            && (json_space(data[pos])
+                || data[pos] == b','
+                || data[pos] == b'['
+                || data[pos] == b']')
+        {
             pos += 1;
         }
         if pos >= end {
             return end;
         }
         if data[pos] != b'{' {
-            return end_of_json_row(scan, data, pos, end); // not an object: skip the line
+            return end_of_json_row(scan, data, pos, end, 1);
         }
         pos += 1;
+        let mut depth = 1i32;
 
         loop {
             // Compact ndjson separates members with a bare `,"`, which goes
@@ -961,6 +967,7 @@ impl RowParser {
                 match data[pos] {
                     b'}' => {
                         pos += 1;
+                        depth -= 1;
                         break;
                     }
                     b',' => {
@@ -1051,7 +1058,7 @@ impl RowParser {
                 }
             }
         }
-        end_of_json_row(scan, data, pos, end)
+        end_of_json_row(scan, data, pos, end, depth)
     }
 
     pub(super) fn slot_for(&self, key: &[u8]) -> Option<usize> {
@@ -1330,9 +1337,36 @@ fn json_member_at<S: Scan>(
 /// split the row there -- which is what every ndjson reader does, because the
 /// format has no other way to say where a row ends.
 #[inline(always)]
-fn end_of_json_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize) -> usize {
-    let stop = next_of1_with(scan, data, pos, end, b'\n');
-    if stop >= end { end } else { stop + 1 }
+fn end_of_json_row<S: Scan>(
+    scan: S,
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    mut depth: i32,
+) -> usize {
+    while depth > 0 && pos < end {
+        match data[pos] {
+            b'"' => {
+                pos = skip_json_string(scan, data, pos, end).0;
+                continue;
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                pos += 1;
+                if depth <= 0 {
+                    break;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    while pos < end && (json_space(data[pos]) || data[pos] == b',' || data[pos] == b']') {
+        pos += 1;
+    }
+    pos
 }
 
 #[cfg(test)]
@@ -1487,6 +1521,15 @@ mod tests {
                 at = next;
             }
         }
+    }
+
+    #[test]
+    fn json_array_sniff_and_header() {
+        let text = "[\n  {\"id\":\"1\",\"val\":\"a\"},\n  {\"id\":\"2\",\"val\":\"b\"}\n]";
+        assert_eq!(sniff_dialect(text.as_bytes()), Dialect::Json);
+        let slab = json_slab(text);
+        let names = json_header(&slab, Path::new("x")).expect("header");
+        assert_eq!(names, ["id", "val"]);
     }
 
     #[test]

@@ -844,3 +844,83 @@ fn an_ndjson_row_cut_off_inside_a_key_is_not_read_past() {
         assert_eq!(r.counts.changed, 0, "tail {tail:?}");
     }
 }
+
+#[test]
+fn top_level_json_array_matches_ndjson() {
+    let ndjson_a = "{\"id\":\"k1\",\"val\":\"a\"}\n{\"id\":\"k2\",\"val\":\"b\"}\n{\"id\":\"k3\",\"val\":\"c\"}\n";
+    let ndjson_b = "{\"id\":\"k1\",\"val\":\"a\"}\n{\"id\":\"k2\",\"val\":\"X\"}\n{\"id\":\"k4\",\"val\":\"d\"}\n";
+
+    // Shape A: one object per line
+    let shape_a_1 = "[\n{\"id\":\"k1\",\"val\":\"a\"},\n{\"id\":\"k2\",\"val\":\"b\"},\n{\"id\":\"k3\",\"val\":\"c\"}\n]\n";
+    let shape_a_2 = "[\n{\"id\":\"k1\",\"val\":\"a\"},\n{\"id\":\"k2\",\"val\":\"X\"},\n{\"id\":\"k4\",\"val\":\"d\"}\n]\n";
+
+    // Shape B: compact single line
+    let shape_b_1 = "[{\"id\":\"k1\",\"val\":\"a\"},{\"id\":\"k2\",\"val\":\"b\"},{\"id\":\"k3\",\"val\":\"c\"}]";
+    let shape_b_2 = "[{\"id\":\"k1\",\"val\":\"a\"},{\"id\":\"k2\",\"val\":\"X\"},{\"id\":\"k4\",\"val\":\"d\"}]";
+
+    // Shape C: pretty-printed multi-line
+    let shape_c_1 = "[\n  {\n    \"id\": \"k1\",\n    \"val\": \"a\"\n  },\n  {\n    \"id\": \"k2\",\n    \"val\": \"b\"\n  },\n  {\n    \"id\": \"k3\",\n    \"val\": \"c\"\n  }\n]";
+    let shape_c_2 = "[\n  {\n    \"id\": \"k1\",\n    \"val\": \"a\"\n  },\n  {\n    \"id\": \"k2\",\n    \"val\": \"X\"\n  },\n  {\n    \"id\": \"k4\",\n    \"val\": \"d\"\n  }\n]";
+
+    let fix_nd = json_fixture(ndjson_a, ndjson_b);
+    let fix_a = json_fixture(shape_a_1, shape_a_2);
+    let fix_b = json_fixture(shape_b_1, shape_b_2);
+    let fix_c = json_fixture(shape_c_1, shape_c_2);
+
+    let dir_nd = fix_nd.dir.join("export_nd");
+    let dir_b = fix_b.dir.join("export_b");
+
+    let mut opt_nd = Options::with_key(["id"]);
+    opt_nd.export_dir = Some(dir_nd.display().to_string());
+    opt_nd.engine = Engine::Turbo.label().to_string();
+
+    let mut opt_b = Options::with_key(["id"]);
+    opt_b.export_dir = Some(dir_b.display().to_string());
+    opt_b.engine = Engine::Turbo.label().to_string();
+
+    let res_nd = compare(&fix_nd.a, &fix_nd.b, &mut opt_nd).unwrap();
+    let res_b = compare(&fix_b.a, &fix_b.b, &mut opt_b).unwrap();
+
+    assert_eq!(res_nd.counts, res_b.counts);
+
+    let read_file = |d: &std::path::Path, f: &str| std::fs::read_to_string(d.join(f)).unwrap();
+    assert_eq!(
+        read_file(&dir_nd, "changed.csv"),
+        read_file(&dir_b, "changed.csv")
+    );
+    assert_eq!(
+        read_file(&dir_nd, "added.csv"),
+        read_file(&dir_b, "added.csv")
+    );
+    assert_eq!(
+        read_file(&dir_nd, "removed.csv"),
+        read_file(&dir_b, "removed.csv")
+    );
+
+    let mut opt_a = Options::with_key(["id"]);
+    opt_a.engine = Engine::Turbo.label().to_string();
+    let res_a = compare(&fix_a.a, &fix_a.b, &mut opt_a).unwrap();
+    assert_eq!(res_nd.counts, res_a.counts);
+
+    let mut opt_c = Options::with_key(["id"]);
+    opt_c.engine = Engine::Turbo.label().to_string();
+    let res_c = compare(&fix_c.a, &fix_c.b, &mut opt_c).unwrap();
+    assert_eq!(res_nd.counts, res_c.counts);
+}
+
+#[test]
+fn json_array_nested_escaped_and_empty() {
+    let empty_a = "[]";
+    let empty_b = "[]";
+    let fix_empty = json_fixture(empty_a, empty_b);
+    let mut opt = Options::with_key(["id"]);
+    opt.engine = Engine::Turbo.label().to_string();
+    assert!(compare(&fix_empty.a, &fix_empty.b, &mut opt).is_err());
+
+    let nested_a = "[{\"id\":\"1\",\"str\":\"{\\\"fake\\\":1}\",\"obj\":{\"x\":[1,2,{\"y\":3}]}},{\"id\":\"2\",\"str\":\"regular\"}]";
+    let nested_b = "[{\"id\":\"1\",\"str\":\"{\\\"fake\\\":1}\",\"obj\":{\"x\":[1,2,{\"y\":3}]}},{\"id\":\"2\",\"str\":\"changed\"}]";
+    let fix_nested = json_fixture(nested_a, nested_b);
+    let res_nested = compare(&fix_nested.a, &fix_nested.b, &mut opt).unwrap();
+    assert_eq!(res_nested.counts.matched, 2);
+    assert_eq!(res_nested.counts.changed, 1);
+}
