@@ -130,7 +130,7 @@ fn absent(c: Look<'_>, opt: &Options) -> bool {
         return true;
     }
     // A written-out value is never empty, trimmed or not, so only a null is.
-    needs_normalising(opt) && c.kind.is_none() && absent_normalised(c, opt)
+    c.kind.is_none() && needs_normalising(opt) && absent_normalised(c, opt)
 }
 
 #[cold]
@@ -1504,22 +1504,36 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 let amap = code(&a_col, &mut ids, opt)?;
                 let bmap = code(&b_col, &mut ids, opt)?;
                 let (aix, bix) = (&a_col.c.index, &b_col.c.index);
-                let mut xa = vec![0i32; BLOCK];
-                let mut xb = vec![0i32; BLOCK];
+                // Both gathers in one pass, without the scratch columns the
+                // block used to be walked three times for. The indexing goes
+                // unchecked: every pair row is a row of its side's column,
+                // every non-negative index was validated against its
+                // dictionary at decode, and a map holds one id per entry.
                 let mut neq = vec![0u8; BLOCK];
                 let mut base = 0usize;
                 while base < npairs {
                     let m = BLOCK.min(npairs - base);
-                    for i in 0..m {
-                        let k = aix[pa[base + i] as usize];
-                        xa[i] = if k < 0 { -1 } else { amap[k as usize] };
-                    }
-                    for i in 0..m {
-                        let k = bix[pb[base + i] as usize];
-                        xb[i] = if k < 0 { -1 } else { bmap[k as usize] };
-                    }
-                    for i in 0..m {
-                        neq[i] = (xa[i] != xb[i]) as u8;
+                    for (i, ne) in neq[..m].iter_mut().enumerate() {
+                        // Safety: see above.
+                        let (ka, kb) = unsafe {
+                            (
+                                *aix.get_unchecked(*pa.get_unchecked(base + i) as usize),
+                                *bix.get_unchecked(*pb.get_unchecked(base + i) as usize),
+                            )
+                        };
+                        // Safety: see above.
+                        let xa = if ka < 0 {
+                            -1
+                        } else {
+                            unsafe { *amap.get_unchecked(ka as usize) }
+                        };
+                        // Safety: see above.
+                        let xb = if kb < 0 {
+                            -1
+                        } else {
+                            unsafe { *bmap.get_unchecked(kb as usize) }
+                        };
+                        *ne = (xa != xb) as u8;
                     }
                     alloc::room(&mut hits, m, "the changed cells in one column")?;
                     scan_mask(&neq[..m], base, |p| hits.push(p));
@@ -1577,18 +1591,45 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 let (ab, bb) = (a_col.base(), b_col.base());
                 let mut neq = vec![0u8; BLOCK];
                 let mut base = 0usize;
-                while base < npairs {
-                    let m = BLOCK.min(npairs - base);
-                    for i in 0..m {
-                        neq[i] = cell_differs(
-                            look(ab, a_col.slice_at(pa[base + i] as usize)),
-                            look(bb, b_col.slice_at(pb[base + i] as usize)),
-                            opt,
-                        ) as u8;
+                if !needs_normalising(opt) {
+                    // No normalising asked: a cell is absent when it is null
+                    // or empty, and two present cells differ when their bytes
+                    // do -- `cell_differs` with the flags off, without the
+                    // per-pair flag reads and `Look`s it pays to say so.
+                    while base < npairs {
+                        let m = BLOCK.min(npairs - base);
+                        for i in 0..m {
+                            let x = a_col.slice_at(pa[base + i] as usize);
+                            let y = b_col.slice_at(pb[base + i] as usize);
+                            let (xa, ya) = (
+                                x.is_null() || x.length() == 0,
+                                y.is_null() || y.length() == 0,
+                            );
+                            neq[i] = ((xa != ya)
+                                || (!xa
+                                    && !ya
+                                    && ab[x.offset()..x.offset() + x.length()]
+                                        != bb[y.offset()..y.offset() + y.length()]))
+                                as u8;
+                        }
+                        alloc::room(&mut hits, m, "the changed cells in one column")?;
+                        scan_mask(&neq[..m], base, |p| hits.push(p));
+                        base += BLOCK;
                     }
-                    alloc::room(&mut hits, m, "the changed cells in one column")?;
-                    scan_mask(&neq[..m], base, |p| hits.push(p));
-                    base += BLOCK;
+                } else {
+                    while base < npairs {
+                        let m = BLOCK.min(npairs - base);
+                        for i in 0..m {
+                            neq[i] = cell_differs(
+                                look(ab, a_col.slice_at(pa[base + i] as usize)),
+                                look(bb, b_col.slice_at(pb[base + i] as usize)),
+                                opt,
+                            ) as u8;
+                        }
+                        alloc::room(&mut hits, m, "the changed cells in one column")?;
+                        scan_mask(&neq[..m], base, |p| hits.push(p));
+                        base += BLOCK;
+                    }
                 }
             }
 
