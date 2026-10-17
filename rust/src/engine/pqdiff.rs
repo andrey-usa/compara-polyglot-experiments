@@ -1081,7 +1081,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     for name in opt.key.iter().chain(&resolved.compared) {
         let (ka, kb) = (a_kind(name), b_kind(name));
         let same_text = ka.is_text() && kb.is_text();
-        if !same_text && !(ka == kb && ka.is_word()) {
+        if !(same_text || (ka == kb && ka.is_word())) {
             return Err(Error::unsupported(format!(
                 "{name} is not stored as text or as one word-sized type in both files"
             )));
