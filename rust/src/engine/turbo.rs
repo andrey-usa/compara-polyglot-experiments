@@ -48,8 +48,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
-    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_header, json_rows_match,
-    shared_tail, sniff_dialect,
+    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_header, json_is_array,
+    json_rows_match, shared_tail, sniff_dialect,
 };
 
 use crate::alloc;
@@ -3584,11 +3584,13 @@ impl Input {
             } => {
                 let has = |n: &String| header.iter().any(|c| c == n);
                 let json = slab.dialect() == Dialect::Json;
+                let array = json && json_is_array(slab.data());
                 let build = |names: &[&String]| -> RowParser {
                     if json {
                         RowParser::json(
                             names.iter().map(|n| has(n).then(|| (*n).clone())).collect(),
                             key_size,
+                            array,
                         )
                     } else {
                         RowParser::csv(
@@ -3822,7 +3824,11 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
         } => {
             let json = slab.dialect() == Dialect::Json;
             let parser = if json {
-                RowParser::json(header.iter().cloned().map(Some).collect(), 0)
+                RowParser::json(
+                    header.iter().cloned().map(Some).collect(),
+                    0,
+                    json_is_array(slab.data()),
+                )
             } else {
                 RowParser::csv(delimiter, (0..width).map(Some).collect())
             };
