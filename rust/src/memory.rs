@@ -38,13 +38,11 @@ pub fn streaming_threshold(budget: Option<u64>) -> u64 {
 
 /// What a comparison may count on: the budget it was given, `COMPARA_MEMORY`,
 /// or what the machine has free without swapping, in that order; 16 GB where
-/// nothing can be read. Reserves 15% headroom so allocations near the ceiling
-/// do not exceed memory limits.
+/// nothing can be read.
 pub fn available(budget: Option<u64>) -> u64 {
-    let raw = stated(budget)
+    stated(budget)
         .or_else(|| probe().map(|m| m.available.min(m.limit)))
-        .unwrap_or(16 << 30);
-    raw * 85 / 100
+        .unwrap_or(16 << 30)
 }
 
 /// The budget someone set, by `--memory` or `COMPARA_MEMORY`, as distinct from
@@ -274,8 +272,8 @@ mod tests {
 
     #[test]
     fn a_budget_halves() {
-        assert_eq!(streaming_threshold(Some(16 << 30)), (16 << 30) * 85 / 200);
-        assert_eq!(streaming_threshold(Some(4 << 30)), (4 << 30) * 85 / 200);
+        assert_eq!(streaming_threshold(Some(16 << 30)), 8 << 30);
+        assert_eq!(streaming_threshold(Some(4 << 30)), 2 << 30);
     }
 
     #[test]
