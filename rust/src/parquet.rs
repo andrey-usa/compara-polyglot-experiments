@@ -866,7 +866,13 @@ impl<'a> RleReader<'a> {
                 let (fast, slow) = dst.split_at_mut(safe);
                 for o in fast {
                     let byte = bit >> 3;
-                    let w = u64::from_le_bytes(d[byte..byte + 8].try_into().unwrap());
+                    // Safety: `safe` counted only values whose eight-byte
+                    // window starts at or before the last one inside `d`.
+                    let w = u64::from_le_bytes(
+                        unsafe { d.get_unchecked(byte..byte + 8) }
+                            .try_into()
+                            .unwrap(),
+                    );
                     *o = ((w >> (bit & 7)) & mask) as i32;
                     bit += width;
                 }
@@ -1140,12 +1146,18 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                     if !RleReader::new(&body[vat + 1..], width).fill(idx) {
                         return fail("a parquet page ran out of dictionary indices", path);
                     }
+                    // The OR of the folded indices stays under the
+                    // dictionary's length exactly when no index could reach
+                    // it, which is every page of a valid file; only a page
+                    // that fails the guard is walked again to find the value.
+                    let mut or = 0usize;
                     for v in idx.iter_mut() {
                         let k = dict_base + *v as usize;
-                        if k >= dict.len() {
-                            return fail("a parquet dictionary index is out of range", path);
-                        }
+                        or |= k;
                         *v = k as i32;
+                    }
+                    if or >= dict.len() && idx.iter().any(|&v| v as usize >= dict.len()) {
+                        return fail("a parquet dictionary index is out of range", path);
                     }
                     // A page with no nulls, still in dictionary form, is its
                     // indices as they are: one copy rather than a push, a
