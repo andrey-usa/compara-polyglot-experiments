@@ -1387,6 +1387,13 @@ fn end_of_json_row<S: Scan>(
         let stop = next_of1_with(scan, data, pos, end, b'\n');
         return if stop >= end { end } else { stop + 1 };
     }
+    end_of_array_row(scan, data, pos, end, open)
+}
+
+/// The array half of [`end_of_json_row`], kept out of its body: the ndjson
+/// half is two instructions and inlines into every row's parse, and carrying
+/// the container walk there cost the sweep real time.
+fn end_of_array_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize, open: bool) -> usize {
     let mut at = pos;
     if open {
         let mut depth = 1i32;
