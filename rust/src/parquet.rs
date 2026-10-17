@@ -944,7 +944,7 @@ fn plain_slices(
 // ---------------------------------------------------------------------------
 
 /// Builds the column table from an already-parsed footer.
-pub fn read_meta(fm: &FileMeta) -> Meta {
+pub(crate) fn read_meta(fm: &FileMeta) -> Meta {
     let rows = fm.rows.max(0) as u64;
     let held = (0..fm.names.len())
         .map(|c| {
@@ -968,7 +968,7 @@ pub fn read_meta(fm: &FileMeta) -> Meta {
 
 /// Reads one column across every row group. `which` indexes into [`Meta::names`];
 /// `fm` is the file's footer, parsed once by the caller.
-pub fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str) -> Result<Column> {
+pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str) -> Result<Column> {
     if which >= fm.names.len() {
         return fail("no such column in the parquet file", path);
     }
