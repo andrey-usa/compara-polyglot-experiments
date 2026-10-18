@@ -498,6 +498,25 @@ fn prefetch_slot(part: &[u32], slot: usize) {
     let _ = (part, slot);
 }
 
+/// Starts the fetch of the `first_row` entry behind a probe's home slot.
+///
+/// The slot itself was prefetched 32 probes ago, so reading it here is cheap;
+/// the first_row entry is a random access into tens of megabytes and is not.
+/// Issuing it here overlaps that miss with the A-row parse `join_row` does
+/// next -- independent work the probe was serially waiting on.
+#[inline]
+fn prefetch_first_row(first_row: &[i32], pos: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // Safety: `pos` comes from a non-empty slot word, which always holds a
+    // position in range, and a prefetch has no architectural effect in any case.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(first_row.as_ptr().add(pos) as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (first_row, pos);
+}
+
 /// Appends `parts` to `out`, in order, copying each on a thread of its own
 /// into the room `out` already has for all of them, and releasing each as soon
 /// as it is copied. Errs, `out` untouched, if that room is short or a copy
@@ -2569,6 +2588,14 @@ fn join(
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             let hash = ai.row_hash[row as usize];
+            // The home slot was prefetched 32 probes ago, so this read is
+            // cheap; the first_row entry behind it is the probe's first
+            // unprefetched random access. Fetch it now, while join_row parses
+            // A's row, rather than serially inside the probe.
+            let word = bi.table[bi.slot(hash)];
+            if word != EMPTY_SLOT {
+                prefetch_first_row(&bi.first_row, bi.pos_of(word));
+            }
             join_row(
                 &ctx,
                 &mut out,
