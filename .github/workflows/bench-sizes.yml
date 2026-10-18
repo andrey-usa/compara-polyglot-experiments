@@ -21,6 +21,11 @@ permissions:
 # artifact; the median table goes to the step summary.
 
 on:
+  # Push runs it: a workflow_dispatch on a branch-only file needs GitHub to
+  # have indexed the new workflow first, which can lag the push by many
+  # minutes; the push trigger fires regardless.
+  push:
+    branches: [bench-sizes]
   workflow_dispatch:
     inputs:
       sizes:
