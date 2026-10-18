@@ -380,7 +380,7 @@ struct RowGroupMeta {
 }
 
 #[derive(Default)]
-struct FileMeta {
+pub(crate) struct FileMeta {
     names: Vec<String>,
     /// 1 where the column may be null.
     optional: Vec<bool>,
@@ -444,7 +444,7 @@ fn read_row_group(t: &mut Thrift, out: &mut RowGroupMeta) -> Result<()> {
     }
 }
 
-fn read_file_meta(data: &[u8], path: &str) -> Result<FileMeta> {
+pub(crate) fn read_file_meta(data: &[u8], path: &str) -> Result<FileMeta> {
     if data.len() < 12 || &data[..4] != b"PAR1" || &data[data.len() - 4..] != b"PAR1" {
         return fail("not a parquet file", path);
     }
@@ -866,7 +866,13 @@ impl<'a> RleReader<'a> {
                 let (fast, slow) = dst.split_at_mut(safe);
                 for o in fast {
                     let byte = bit >> 3;
-                    let w = u64::from_le_bytes(d[byte..byte + 8].try_into().unwrap());
+                    // Safety: `safe` counted only values whose eight-byte
+                    // window starts at or before the last one inside `d`.
+                    let w = u64::from_le_bytes(
+                        unsafe { d.get_unchecked(byte..byte + 8) }
+                            .try_into()
+                            .unwrap(),
+                    );
                     *o = ((w >> (bit & 7)) & mask) as i32;
                     bit += width;
                 }
@@ -943,10 +949,8 @@ fn plain_slices(
 // The two entry points
 // ---------------------------------------------------------------------------
 
-/// Reads the footer. Errors name the problem if the file is not Parquet or uses
-/// something this reader does not implement.
-pub fn read_meta(data: &[u8], path: &str) -> Result<Meta> {
-    let fm = read_file_meta(data, path)?;
+/// Builds the column table from an already-parsed footer.
+pub(crate) fn read_meta(fm: &FileMeta) -> Meta {
     let rows = fm.rows.max(0) as u64;
     let held = (0..fm.names.len())
         .map(|c| {
@@ -960,17 +964,17 @@ pub fn read_meta(data: &[u8], path: &str) -> Result<Meta> {
             rows.saturating_mul(8).saturating_add(expanded)
         })
         .collect();
-    Ok(Meta {
-        names: fm.names,
+    Meta {
+        names: fm.names.clone(),
         rows: fm.rows,
         row_groups: fm.groups.len(),
         held,
-    })
+    }
 }
 
-/// Reads one column across every row group. `which` indexes into [`Meta::names`].
-pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
-    let fm = read_file_meta(data, path)?;
+/// Reads one column across every row group. `which` indexes into [`Meta::names`];
+/// `fm` is the file's footer, parsed once by the caller.
+pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str) -> Result<Column> {
     if which >= fm.names.len() {
         return fail("no such column in the parquet file", path);
     }
@@ -1140,12 +1144,18 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                     if !RleReader::new(&body[vat + 1..], width).fill(idx) {
                         return fail("a parquet page ran out of dictionary indices", path);
                     }
+                    // The OR of the folded indices stays under the
+                    // dictionary's length exactly when no index could reach
+                    // it, which is every page of a valid file; only a page
+                    // that fails the guard is walked again to find the value.
+                    let mut or = 0usize;
                     for v in idx.iter_mut() {
                         let k = dict_base + *v as usize;
-                        if k >= dict.len() {
-                            return fail("a parquet dictionary index is out of range", path);
-                        }
+                        or |= k;
                         *v = k as i32;
+                    }
+                    if or >= dict.len() && idx.iter().any(|&v| v as usize >= dict.len()) {
+                        return fail("a parquet dictionary index is out of range", path);
                     }
                     // A page with no nulls, still in dictionary form, is its
                     // indices as they are: one copy rather than a push, a

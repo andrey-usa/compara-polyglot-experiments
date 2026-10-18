@@ -37,6 +37,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Mutex;
 
 use memmap2::Mmap;
 
@@ -130,7 +131,7 @@ fn absent(c: Look<'_>, opt: &Options) -> bool {
         return true;
     }
     // A written-out value is never empty, trimmed or not, so only a null is.
-    needs_normalising(opt) && c.kind.is_none() && absent_normalised(c, opt)
+    c.kind.is_none() && needs_normalising(opt) && absent_normalised(c, opt)
 }
 
 #[cold]
@@ -1051,8 +1052,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let b_map = map(b_path)?;
     let a_name = a_path.display().to_string();
     let b_name = b_path.display().to_string();
-    let a_meta = parquet::read_meta(&a_map, &a_name)?;
-    let b_meta = parquet::read_meta(&b_map, &b_name)?;
+    // The footer is parsed once per file; every column read below reuses it.
+    let a_fm = parquet::read_file_meta(&a_map, &a_name)?;
+    let b_fm = parquet::read_file_meta(&b_map, &b_name)?;
+    let a_meta = parquet::read_meta(&a_fm);
+    let b_meta = parquet::read_meta(&b_fm);
 
     let resolved = resolve(&a_meta.names, &b_meta.names, opt)?;
     let key_size = opt.key.len();
@@ -1160,14 +1164,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 return mine;
             }
             let (from_b, j) = jobs[at];
-            let (data, meta, name) = if from_b {
-                (&b_map, &b_meta, &b_name)
+            let (data, fm, meta, name) = if from_b {
+                (&b_map, &b_fm, &b_meta, &b_name)
             } else {
-                (&a_map, &a_meta, &a_name)
+                (&a_map, &a_fm, &a_meta, &a_name)
             };
             mine.push((
                 at,
-                parquet::read_column(data, slot_of(&meta.names, &opt.key[j]), name),
+                parquet::read_column(data, fm, slot_of(&meta.names, &opt.key[j]), name),
             ));
         }
     };
@@ -1305,6 +1309,18 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         split(bi.firsts.len())
     } else {
         0
+    };
+    // The two sweeps run concurrently in one scope, so a_ways + b_ways is the
+    // live thread count; uncapped that is twice the budget whenever both
+    // passes are active. Share the budget between the passes in proportion
+    // to their key counts, keeping one way per active pass.
+    let budget = threads.max(1);
+    let (a_ways, b_ways) = if budget < 2 || a_ways + b_ways <= budget {
+        (a_ways, b_ways)
+    } else {
+        let total = (ai.firsts.len() + bi.firsts.len()).max(1);
+        let a = ((ai.firsts.len() * budget / total).max(1)).min(budget - 1);
+        (a, budget - a)
     };
 
     let a_range = |p: usize| -> Result<Part> {
@@ -1462,14 +1478,31 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let compared = &resolved.compared;
     let (pa, pb) = (&pair_a, &pair_b);
     let (added_held, removed_held) = (&added.held, &removed.held);
+    // The export's changed rows need every compared column's cell at the pairs
+    // that changed, which are known only after every column is compared. Two
+    // ways to have them then: read each column a second time, or keep the
+    // decoded columns from the first pass. The second costs roughly rows × 8
+    // bytes × 2 sides per word column while it is held, so it is taken only
+    // when the memory budget leaves room for it with margin; otherwise the
+    // export falls back to the second read.
+    let stash_bytes: u64 = resolved
+        .compared
+        .iter()
+        .map(|n| held(&a_meta, n) + held(&b_meta, n))
+        .sum();
+    let stash = exporting
+        && memory::available(opt.memory).saturating_sub(floor)
+            >= stash_bytes + stash_bytes / 4;
+    let stashed: Vec<Mutex<Option<(Col<'_>, Col<'_>)>>> =
+        (0..nc).map(|_| Mutex::new(None)).collect();
     let read_pair = |c: usize| -> Result<(Col<'_>, Col<'_>)> {
         let a_col = Col::new(
-            parquet::read_column(&a_map, slot_of(&a_meta.names, &compared[c]), &a_name)?,
+            parquet::read_column(&a_map, &a_fm, slot_of(&a_meta.names, &compared[c]), &a_name)?,
             &a_map,
             a_kind(&compared[c]),
         );
         let b_col = Col::new(
-            parquet::read_column(&b_map, slot_of(&b_meta.names, &compared[c]), &b_name)?,
+            parquet::read_column(&b_map, &b_fm, slot_of(&b_meta.names, &compared[c]), &b_name)?,
             &b_map,
             b_kind(&compared[c]),
         );
@@ -1504,22 +1537,36 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 let amap = code(&a_col, &mut ids, opt)?;
                 let bmap = code(&b_col, &mut ids, opt)?;
                 let (aix, bix) = (&a_col.c.index, &b_col.c.index);
-                let mut xa = vec![0i32; BLOCK];
-                let mut xb = vec![0i32; BLOCK];
+                // Both gathers in one pass, without the scratch columns the
+                // block used to be walked three times for. The indexing goes
+                // unchecked: every pair row is a row of its side's column,
+                // every non-negative index was validated against its
+                // dictionary at decode, and a map holds one id per entry.
                 let mut neq = vec![0u8; BLOCK];
                 let mut base = 0usize;
                 while base < npairs {
                     let m = BLOCK.min(npairs - base);
-                    for i in 0..m {
-                        let k = aix[pa[base + i] as usize];
-                        xa[i] = if k < 0 { -1 } else { amap[k as usize] };
-                    }
-                    for i in 0..m {
-                        let k = bix[pb[base + i] as usize];
-                        xb[i] = if k < 0 { -1 } else { bmap[k as usize] };
-                    }
-                    for i in 0..m {
-                        neq[i] = (xa[i] != xb[i]) as u8;
+                    for (i, ne) in neq[..m].iter_mut().enumerate() {
+                        // Safety: see above.
+                        let (ka, kb) = unsafe {
+                            (
+                                *aix.get_unchecked(*pa.get_unchecked(base + i) as usize),
+                                *bix.get_unchecked(*pb.get_unchecked(base + i) as usize),
+                            )
+                        };
+                        // Safety: see above.
+                        let xa = if ka < 0 {
+                            -1
+                        } else {
+                            unsafe { *amap.get_unchecked(ka as usize) }
+                        };
+                        // Safety: see above.
+                        let xb = if kb < 0 {
+                            -1
+                        } else {
+                            unsafe { *bmap.get_unchecked(kb as usize) }
+                        };
+                        *ne = (xa != xb) as u8;
                     }
                     alloc::room(&mut hits, m, "the changed cells in one column")?;
                     scan_mask(&neq[..m], base, |p| hits.push(p));
@@ -1577,18 +1624,45 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 let (ab, bb) = (a_col.base(), b_col.base());
                 let mut neq = vec![0u8; BLOCK];
                 let mut base = 0usize;
-                while base < npairs {
-                    let m = BLOCK.min(npairs - base);
-                    for i in 0..m {
-                        neq[i] = cell_differs(
-                            look(ab, a_col.slice_at(pa[base + i] as usize)),
-                            look(bb, b_col.slice_at(pb[base + i] as usize)),
-                            opt,
-                        ) as u8;
+                if !needs_normalising(opt) {
+                    // No normalising asked: a cell is absent when it is null
+                    // or empty, and two present cells differ when their bytes
+                    // do -- `cell_differs` with the flags off, without the
+                    // per-pair flag reads and `Look`s it pays to say so.
+                    while base < npairs {
+                        let m = BLOCK.min(npairs - base);
+                        for i in 0..m {
+                            let x = a_col.slice_at(pa[base + i] as usize);
+                            let y = b_col.slice_at(pb[base + i] as usize);
+                            let (xa, ya) = (
+                                x.is_null() || x.length() == 0,
+                                y.is_null() || y.length() == 0,
+                            );
+                            neq[i] = ((xa != ya)
+                                || (!xa
+                                    && !ya
+                                    && ab[x.offset()..x.offset() + x.length()]
+                                        != bb[y.offset()..y.offset() + y.length()]))
+                                as u8;
+                        }
+                        alloc::room(&mut hits, m, "the changed cells in one column")?;
+                        scan_mask(&neq[..m], base, |p| hits.push(p));
+                        base += BLOCK;
                     }
-                    alloc::room(&mut hits, m, "the changed cells in one column")?;
-                    scan_mask(&neq[..m], base, |p| hits.push(p));
-                    base += BLOCK;
+                } else {
+                    while base < npairs {
+                        let m = BLOCK.min(npairs - base);
+                        for i in 0..m {
+                            neq[i] = cell_differs(
+                                look(ab, a_col.slice_at(pa[base + i] as usize)),
+                                look(bb, b_col.slice_at(pb[base + i] as usize)),
+                                opt,
+                            ) as u8;
+                        }
+                        alloc::room(&mut hits, m, "the changed cells in one column")?;
+                        scan_mask(&neq[..m], base, |p| hits.push(p));
+                        base += BLOCK;
+                    }
                 }
             }
 
@@ -1622,6 +1696,13 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             if let Some((added_list, removed_list)) = &export_lists {
                 out.export_added = added_list.cells(&b_col, |r| r, opt)?;
                 out.export_removed = removed_list.cells(&a_col, |r| r, opt)?;
+            }
+            // Kept for the export's gather below instead of dropped: with the
+            // changed pairs known, their cells come out of these columns with
+            // no second read of the file.
+            if stash {
+                *stashed[c].lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((a_col, b_col));
             }
             mine.push((c, out));
         }
@@ -1677,12 +1758,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
 
     // --- the export -------------------------------------------------------
     if let Some((added_list, removed_list)) = &export_lists {
-        // Which pairs changed is known only now, after every column, so their
-        // cells take a second pass: each column is read again, on as many
-        // lanes as the first pass had, and written out at those pairs alone.
-        // Holding every column from the first pass instead would cost eight
-        // bytes a row per column per file for the whole run, the memory this
-        // path exists not to spend.
+        // Which pairs changed is known only now, after every column.
         let mut changed_found: Vec<usize> =
             alloc::sized(changed_total as usize, "the changed pairs")?;
         for (w, &word) in any.iter().enumerate() {
@@ -1695,34 +1771,64 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         let changed_list = Listed::new(changed_found, &a_keys, |p| pair_a[p] as usize, opt)?;
         let mut sides: Vec<Sides> = (0..nc).map(|_| Default::default()).collect();
         if !changed_list.found.is_empty() {
-            let next = AtomicUsize::new(0);
-            let again = || -> Result<Vec<(usize, Sides)>> {
-                let mut mine = Vec::new();
-                loop {
-                    let c = next.fetch_add(1, AtomicOrdering::Relaxed);
-                    if c >= nc {
-                        return Ok(mine);
+            if stash {
+                // The columns stayed in memory: each changed pair's cells come
+                // out of them directly, and each column is released as it is
+                // gathered.
+                for (sides_c, slot) in sides.iter_mut().zip(stashed.iter()) {
+                    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some((a_col, b_col)) = guard.take() else {
+                        return Err(Error::new("a stashed column went missing"));
+                    };
+                    drop(guard);
+                    let mut a = Cells::with_room(changed_list.found.len())?;
+                    let mut b = Cells::with_room(changed_list.found.len())?;
+                    for &p in &changed_list.found {
+                        a.push(a_col.at(pa[p] as usize), opt)?;
+                        b.push(b_col.at(pb[p] as usize), opt)?;
                     }
-                    let (a_col, b_col) = read_pair(c)?;
-                    let a = changed_list.cells(&a_col, |p| pa[p] as usize, opt)?;
-                    let b = changed_list.cells(&b_col, |p| pb[p] as usize, opt)?;
-                    mine.push((c, (a, b)));
+                    // As `Listed::cells` does: the file lists rows in key
+                    // order, not pair order.
+                    let a = a.permuted(&changed_list.order)?;
+                    let b = b.permuted(&changed_list.order)?;
+                    *sides_c = (a, b);
                 }
-            };
-            let gathered: Vec<Result<Vec<(usize, Sides)>>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..lanes).map(|_| parallel::spawn(scope, &again)).collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
-                    .collect()
-            });
-            for got in gathered {
-                for (c, pair) in got? {
-                    sides[c] = pair;
+                phases.mark("export cells (stash)");
+            } else {
+                // No room to keep the columns: each is read again, on as many
+                // lanes as the first pass had, and written out at the changed
+                // pairs alone.
+                let next = AtomicUsize::new(0);
+                let again = || -> Result<Vec<(usize, Sides)>> {
+                    let mut mine = Vec::new();
+                    loop {
+                        let c = next.fetch_add(1, AtomicOrdering::Relaxed);
+                        if c >= nc {
+                            return Ok(mine);
+                        }
+                        let (a_col, b_col) = read_pair(c)?;
+                        let a = changed_list.cells(&a_col, |p| pa[p] as usize, opt)?;
+                        let b = changed_list.cells(&b_col, |p| pb[p] as usize, opt)?;
+                        mine.push((c, (a, b)));
+                    }
+                };
+                let gathered: Vec<Result<Vec<(usize, Sides)>>> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> =
+                            (0..lanes).map(|_| parallel::spawn(scope, &again)).collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
+                            .collect()
+                    });
+                for got in gathered {
+                    for (c, pair) in got? {
+                        sides[c] = pair;
+                    }
                 }
+                phases.mark("export cells (par)");
             }
         }
-        phases.mark("export cells (par)");
 
         let dir = Path::new(opt.export_dir.as_deref().unwrap_or_default());
         create_export_dir(dir)?;

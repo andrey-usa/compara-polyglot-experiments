@@ -609,3 +609,44 @@ fn a_memory_flag_that_is_not_a_size_is_refused() {
         assert!(err.contains("--memory"), "--memory {bad}: {err}");
     }
 }
+
+#[test]
+fn parallel_insert_off_switch_forces_serial_index_insert() {
+    let fx = Fixture::new();
+    let args = [
+        "compare",
+        "a.csv",
+        "b.csv",
+        "-k",
+        "account_id,txn_id",
+        "--summary",
+        "--threads",
+        "4",
+    ];
+
+    let (code_on, out_on, err_on) = run_with(
+        &fx.0,
+        &args,
+        &[("COMPARA_PHASES", "1"), ("COMPARA_PARALLEL_INSERT", "1")],
+    );
+    assert!(
+        code_on == 0 || code_on == 1,
+        "parallel insert run failed: {err_on}"
+    );
+    assert!(
+        err_on.contains("index insert (parallel)"),
+        "COMPARA_PARALLEL_INSERT=1 did not take parallel index insert:\n{err_on}"
+    );
+
+    let (code_off, out_off, err_off) = run_with(
+        &fx.0,
+        &args,
+        &[("COMPARA_PHASES", "1"), ("COMPARA_PARALLEL_INSERT", "0")],
+    );
+    assert_eq!(code_off, code_on, "serial insert run failed: {err_off}");
+    assert!(
+        err_off.contains("index insert (serial)"),
+        "COMPARA_PARALLEL_INSERT=0 did not take serial index insert:\n{err_off}"
+    );
+    assert_eq!(counts(&out_on), counts(&out_off));
+}
