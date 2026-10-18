@@ -498,25 +498,6 @@ fn prefetch_slot(part: &[u32], slot: usize) {
     let _ = (part, slot);
 }
 
-/// Starts the fetch of the `first_row` entry behind a probe's home slot.
-///
-/// The slot itself was prefetched 32 probes ago, so reading it here is cheap;
-/// the first_row entry is a random access into tens of megabytes and is not.
-/// Issuing it here overlaps that miss with the A-row parse `join_row` does
-/// next -- independent work the probe was serially waiting on.
-#[inline]
-fn prefetch_first_row(first_row: &[i32], pos: usize) {
-    #[cfg(target_arch = "x86_64")]
-    // Safety: `pos` comes from a non-empty slot word, which always holds a
-    // position in range, and a prefetch has no architectural effect in any case.
-    unsafe {
-        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-        _mm_prefetch::<_MM_HINT_T0>(first_row.as_ptr().add(pos) as *const i8);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = (first_row, pos);
-}
-
 /// Appends `parts` to `out`, in order, copying each on a thread of its own
 /// into the room `out` already has for all of them, and releasing each as soon
 /// as it is copied. Errs, `out` untouched, if that room is short or a copy
@@ -623,10 +604,26 @@ impl Chunk {
 /// Everything is a primitive array: where each row is, its key hash, and a table
 /// of key numbers masked into a power-of-two slot count. Collisions are resolved
 /// by comparing the key bytes, so the hash only has to be fast and spread.
+/// Everything a probe needs from an occupied slot, in one cache line: the key
+/// hash (the full 64 bits, so the slot tag is redundant on the probe path),
+/// the row's file offset, and the row number itself.
+#[derive(Clone, Copy)]
+struct SlotMeta {
+    hash: u64,
+    at: u64,
+    row: u32,
+}
+
 struct RowIndex {
     row_at: Vec<u64>,
     row_hash: Vec<u64>,
     table: Vec<u32>,
+    /// The probe's working set in slot order: each occupied slot's key hash,
+    /// row file offset and row number, copied here once the table is final.
+    /// A probe that has the slot reaches all three with one cache line, where
+    /// it used to hop `first_row` -> `row_hash` -> `row_at`, a dependent miss
+    /// at each step once the index outgrows the last-level cache.
+    meta: Vec<SlotMeta>,
     /// Low bits of a slot holding `first_row` positions plus one; the high
     /// bits hold the top of the key's hash as a tag. Chosen from the row count
     /// in `build`, so the slot stays four bytes at any scale this port runs.
@@ -682,6 +679,38 @@ impl RowIndex {
     /// The `first_row` position a non-empty slot holds.
     fn pos_of(&self, word: u32) -> usize {
         ((word & self.pos_mask) - 1) as usize
+    }
+
+    /// Copies the probe's working set into slot order.
+    ///
+    /// Called once the table is final, from either insertion path. Every
+    /// occupied slot's hash, file offset and row number land in `meta`,
+    /// indexed by slot; empty slots are never read (the probe checks the
+    /// table word first) and keep their zeroed entry. The row arrays stay
+    /// for the build and the walks -- the probe simply stops touching them.
+    fn materialize_probe_view(&mut self) -> Result<()> {
+        let cap = self.table.len();
+        let mut meta: Vec<SlotMeta> = alloc::sized(cap, "one probe entry per index slot")?;
+        meta.resize(
+            cap,
+            SlotMeta {
+                hash: 0,
+                at: 0,
+                row: 0,
+            },
+        );
+        for (slot, &word) in self.table.iter().enumerate() {
+            if word != EMPTY_SLOT {
+                let row = self.first_row[self.pos_of(word)];
+                meta[slot] = SlotMeta {
+                    hash: self.row_hash[row as usize],
+                    at: self.row_at[row as usize],
+                    row: row as u32,
+                };
+            }
+        }
+        self.meta = meta;
+        Ok(())
     }
 
     /// Finds and hashes every row in parallel, then inserts them in file order.
@@ -791,6 +820,7 @@ impl RowIndex {
             row_at,
             row_hash,
             table: empty_table(cap)?,
+            meta: Vec::new(),
             pos_bits,
             pos_mask,
             mask: cap - 1,
@@ -828,6 +858,7 @@ impl RowIndex {
             && idx.insert_parallel(side, key_size, opt, threads, arrays)?
         {
             phases.mark("index insert (parallel)");
+            idx.materialize_probe_view()?;
             return Ok((idx, fparts));
         }
         idx.first_row = alloc::sized(total, "one row per distinct key")?;
@@ -841,6 +872,7 @@ impl RowIndex {
             idx.insert(side, row as i32, key_size, opt, &mut probe, &mut mine)?;
         }
         phases.mark("index insert (serial)");
+        idx.materialize_probe_view()?;
         Ok((idx, fparts))
     }
 
@@ -1255,6 +1287,23 @@ impl RowIndex {
         let _ = hash;
     }
 
+    /// Starts the fetch of the probe's whole working set: the `SlotMeta` for
+    /// `slot(hash)` rides in the cache line next to nothing the probe needs,
+    /// so it is asked for together with the table slot and arrives with it.
+    #[inline]
+    fn prefetch_meta(&self, hash: u64) {
+        #[cfg(target_arch = "x86_64")]
+        // Safety: `slot` masks into `meta`'s length -- it matches the table's --
+        // so the pointer is in bounds, and a prefetch has no architectural
+        // effect in any case.
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch::<_MM_HINT_T0>(self.meta.as_ptr().add(self.slot(hash)) as *const i8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = hash;
+    }
+
     /// Only reached if the row count was underestimated: `build` sizes the table
     /// for the rows it is about to insert, so the common path never grows it.
     fn rehash(&mut self) -> Result<()> {
@@ -1302,44 +1351,55 @@ impl RowIndex {
             if word == EMPTY_SLOT {
                 return None;
             }
-            if self.tag_is(word, hash) {
-                let candidate = self.first_row[self.pos_of(word)];
-                if self.row_hash[candidate as usize] == hash {
-                    // The bytes first, where the caller offered them. A candidate
-                    // whose row opens with the same bytes as far as either file
-                    // reads has the same keys and the same columns, and neither
-                    // row needs parsing to say so. A candidate the tag let
-                    // through with a different key fails this on its first few
-                    // bytes, so the cost of being wrong is a handful of them.
-                    let proved = match span {
-                        Some(Proof::Csv { bytes, delimiter }) => {
-                            self.row_matches(side, candidate, bytes, delimiter)
-                        }
-                        Some(Proof::Json { bytes }) => self.json_matches(side, candidate, bytes),
-                        None => false,
-                    };
-                    if proved {
-                        return Some((candidate, true));
+            // The meta line was prefetched with the slot: hash, file offset
+            // and row number arrive together, so the probe needs no hop
+            // through `first_row`, `row_hash` or `row_at`, and the tag is
+            // redundant -- the full hash is right here.
+            let m = self.meta[slot];
+            if m.hash == hash {
+                let candidate = m.row as i32;
+                // The bytes first, where the caller offered them. A candidate
+                // whose row opens with the same bytes as far as either file
+                // reads has the same keys and the same columns, and neither
+                // row needs parsing to say so. A candidate the hash let
+                // through with a different key fails this on its first few
+                // bytes, so the cost of being wrong is a handful of them.
+                let proved = match span {
+                    Some(Proof::Csv { bytes, delimiter }) => {
+                        Self::row_matches(side, m.at as usize, bytes, delimiter)
                     }
-                    // No fields: the caller has the span but has not parsed the
-                    // row. A candidate the bytes do not settle is returned
-                    // unproven; the caller parses and re-looks-up with the key
-                    // check, which also covers the hash collision this skips.
-                    let fields = match fields {
-                        Some(f) => f,
-                        None => return Some((candidate, false)),
-                    };
-                    self.fields_of(side, candidate, probe);
-                    if (0..key_size).all(|i| same(&side.slab, probe[i], other, fields[i], opt)) {
-                        return Some((candidate, false));
+                    Some(Proof::Json { bytes }) => {
+                        let data = side.slab.data();
+                        Self::json_matches(
+                            side,
+                            m.at as usize,
+                            row_end(self, candidate, data.len()),
+                            bytes,
+                        )
                     }
+                    None => false,
+                };
+                if proved {
+                    return Some((candidate, true));
+                }
+                // No fields: the caller has the span but has not parsed the
+                // row. A candidate the bytes do not settle is returned
+                // unproven; the caller parses and re-looks-up with the key
+                // check, which also covers the hash collision this skips.
+                let fields = match fields {
+                    Some(f) => f,
+                    None => return Some((candidate, false)),
+                };
+                self.fields_of(side, candidate, probe);
+                if (0..key_size).all(|i| same(&side.slab, probe[i], other, fields[i], opt)) {
+                    return Some((candidate, false));
                 }
             }
             slot = self.next(slot);
         }
     }
 
-    /// Whether `candidate`'s row opens with exactly `bytes` and names nothing this
+    /// Whether the row at `from` opens with exactly `bytes` and names nothing this
     /// run tracks in what follows.
     ///
     /// The second half is the whole difference from CSV. A byte-equal prefix says
@@ -1347,24 +1407,21 @@ impl RowIndex {
     /// the mate does not name one of them again further on, and in JSON a repeated
     /// name takes its last value. What is left to scan is the trailing ignored
     /// columns, which is the only reason this is cheaper than parsing the row.
-    fn json_matches(&self, side: &Side, candidate: i32, bytes: &[u8]) -> bool {
+    fn json_matches(side: &Side, lo: usize, end: usize, bytes: &[u8]) -> bool {
         let Some(parser) = side.parser() else {
             return false;
         };
         let data = side.slab.data();
-        let lo = self.row_at[candidate as usize] as usize;
-        let end = row_end(self, candidate, data.len());
         json_rows_match(parser, bytes, data, lo, end)
     }
 
-    /// Whether `candidate`'s row opens with exactly `bytes` and ends that run on
+    /// Whether the row at `from` opens with exactly `bytes` and ends that run on
     /// a field boundary.
     ///
     /// The boundary is what makes the run a whole number of columns rather than
     /// a truncation of one: without it `12,3` would match a row opening `12,34`.
-    fn row_matches(&self, side: &Side, candidate: i32, bytes: &[u8], delimiter: u8) -> bool {
+    fn row_matches(side: &Side, from: usize, bytes: &[u8], delimiter: u8) -> bool {
         let data = side.slab.data();
-        let from = self.row_at[candidate as usize] as usize;
         let Some(to) = from.checked_add(bytes.len()) else {
             return false;
         };
@@ -2582,20 +2639,14 @@ fn join(
         let keys = &ai.first_row[lo..hi];
         for (i, &row) in keys.iter().enumerate() {
             if let Some(&soon) = keys.get(i + PREFETCH_AHEAD) {
-                bi.prefetch(ai.row_hash[soon as usize]);
+                let soon_hash = ai.row_hash[soon as usize];
+                bi.prefetch(soon_hash);
+                bi.prefetch_meta(soon_hash);
             }
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             let hash = ai.row_hash[row as usize];
-            // The home slot was prefetched 32 probes ago, so this read is
-            // cheap; the first_row entry behind it is the probe's first
-            // unprefetched random access. Fetch it now, while join_row parses
-            // A's row, rather than serially inside the probe.
-            let word = bi.table[bi.slot(hash)];
-            if word != EMPTY_SLOT {
-                prefetch_first_row(&bi.first_row, bi.pos_of(word));
-            }
             join_row(
                 &ctx,
                 &mut out,
