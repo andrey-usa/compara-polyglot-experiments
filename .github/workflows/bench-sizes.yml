@@ -1,0 +1,102 @@
+name: Size ladder (compara vs Polars vs DuckDB)
+
+permissions:
+  contents: read
+
+# The local size ladder (500 to 5M rows, CSV and Parquet, summary and full
+# diffs), run on a GitHub-hosted runner instead of a small dev box. One job,
+# one host, one sitting: every cell runs compara, Polars and DuckDB back to
+# back, so a cell compares engines, never machines -- the same rule the
+# bench-ladder workflow states for its ports.
+#
+# compara is built from this branch's rust/ (the 0.5.3-alpha.1 tree on the
+# branch this was written for). Polars and DuckDB are installed at their
+# latest releases on every run, the way realworld.yml does it, so the table
+# measures what a user would install today. The contenders run through the
+# repository's own scripts/contenders.py, the same harness the weekly
+# real-world benchmark holds them to.
+#
+# Counts are gated per cell: added/removed/changed must agree across the
+# three tools, or the run fails. Raw per-round numbers are uploaded as an
+# artifact; the median table goes to the step summary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: "Comma-separated row counts, one ladder rung each"
+        default: "500,5000,50000,500000,5000000"
+      formats:
+        description: "Comma-separated: csv, parquet"
+        default: "csv,parquet"
+      threads:
+        description: "Threads for every tool"
+        default: "4"
+
+# The same group every benchmark in this repository names, so a ladder and a
+# 2M run queue for each other instead of measuring each other's contention.
+concurrency:
+  group: benchmark-host
+  cancel-in-progress: false
+
+jobs:
+  ladder:
+    name: size ladder
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SIZES: ${{ github.event.inputs.sizes || '500,5000,50000,500000,5000000' }}
+      FORMATS: ${{ github.event.inputs.formats || 'csv,parquet' }}
+      THREADS: ${{ github.event.inputs.threads || '4' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: What this runner is
+        run: |
+          {
+            echo "## Host"
+            echo
+            echo '```'
+            grep -m1 "model name" /proc/cpuinfo
+            echo "cores: $(nproc)"
+            echo "runner: $RUNNER_NAME"
+            free -g | head -2
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build compara from this branch
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      # 3.13 rather than the newest interpreter: the other workflows pin it
+      # because a fresh release of a contender wheel is most likely to lack
+      # the newest one.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install the contenders at their latest releases
+        run: pip install polars duckdb pyarrow numpy
+
+      - name: Generate the fixtures
+        run: python3 scripts/bench_sizes_gen.py --sizes "$SIZES" --out data
+
+      - name: Run the ladder
+        run: |
+          python3 scripts/bench_sizes.py \
+            --sizes "$SIZES" --formats "$FORMATS" --threads "$THREADS" \
+            --compara "$PWD/rust/target/release/compara" \
+            --data data --out results
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-sizes-${{ github.run_id }}
+          path: results/
+          retention-days: 30
