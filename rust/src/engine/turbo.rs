@@ -604,10 +604,24 @@ impl Chunk {
 /// Everything is a primitive array: where each row is, its key hash, and a table
 /// of key numbers masked into a power-of-two slot count. Collisions are resolved
 /// by comparing the key bytes, so the hash only has to be fast and spread.
+/// One distinct key's join target, packed to a quarter of a cache line: where
+/// its first row starts, that row, and the low half of its hash. A probe reads
+/// this one entry where it used to read `first_row`, then `row_hash`, then
+/// `row_at` -- three dependent misses for one answer once the index is past
+/// the cache.
+#[derive(Clone, Copy)]
+struct KeyEntry {
+    at: u64,
+    row: u32,
+    hash_lo: u32,
+}
+
 struct RowIndex {
     row_at: Vec<u64>,
     row_hash: Vec<u64>,
     table: Vec<u32>,
+    /// One entry per distinct key, in `first_row` (slot position) order.
+    keys: Vec<KeyEntry>,
     /// Low bits of a slot holding `first_row` positions plus one; the high
     /// bits hold the top of the key's hash as a tag. Chosen from the row count
     /// in `build`, so the slot stays four bytes at any scale this port runs.
@@ -772,6 +786,7 @@ impl RowIndex {
             row_at,
             row_hash,
             table: empty_table(cap)?,
+            keys: Vec::new(),
             pos_bits,
             pos_mask,
             mask: cap - 1,
@@ -809,6 +824,7 @@ impl RowIndex {
             && idx.insert_parallel(side, key_size, opt, threads, arrays)?
         {
             phases.mark("index insert (parallel)");
+            idx.pack_keys()?;
             return Ok((idx, fparts));
         }
         idx.first_row = alloc::sized(total, "one row per distinct key")?;
@@ -822,6 +838,7 @@ impl RowIndex {
             idx.insert(side, row as i32, key_size, opt, &mut probe, &mut mine)?;
         }
         phases.mark("index insert (serial)");
+        idx.pack_keys()?;
         Ok((idx, fparts))
     }
 
@@ -1204,6 +1221,29 @@ impl RowIndex {
         side.keys_at(self.row_at[row as usize], key_size, out);
     }
 
+    /// Fills `keys` from the finished index: one sequential pass over
+    /// `first_row`, reading each key's hash and offset where the probe will
+    /// want them together. Insert leaves this to the end so neither the
+    /// serial nor the region-parallel path has a third array to grow.
+    fn pack_keys(&mut self) -> Result<()> {
+        let n = self.first_row.len();
+        let mut keys = alloc::filled(
+            KeyEntry { at: 0, row: 0, hash_lo: 0 },
+            n,
+            "one entry per distinct key",
+        )?;
+        for (i, &row) in self.first_row.iter().enumerate() {
+            let r = row as usize;
+            keys[i] = KeyEntry {
+                at: self.row_at[r],
+                row: row as u32,
+                hash_lo: self.row_hash[r] as u32,
+            };
+        }
+        self.keys = keys;
+        Ok(())
+    }
+
     fn slot(&self, hash: u64) -> usize {
         // The high bits of an FNV hash are the well-mixed ones; fold them down.
         ((hash ^ (hash >> 32)) as usize) & self.mask
@@ -1284,8 +1324,12 @@ impl RowIndex {
                 return None;
             }
             if self.tag_is(word, hash) {
-                let candidate = self.first_row[self.pos_of(word)];
-                if self.row_hash[candidate as usize] == hash {
+                let entry = self.keys[self.pos_of(word)];
+                let candidate = entry.row as i32;
+                // The slot's tag holds the hash's top bits and the entry its
+                // low half; the byte proof below remains the arbiter, exactly
+                // as it was for a full-hash match.
+                if entry.hash_lo == hash as u32 {
                     // The bytes first, where the caller offered them. A candidate
                     // whose row opens with the same bytes as far as either file
                     // reads has the same keys and the same columns, and neither
@@ -1294,7 +1338,7 @@ impl RowIndex {
                     // bytes, so the cost of being wrong is a handful of them.
                     let proved = match span {
                         Some(Proof::Csv { bytes, delimiter }) => {
-                            self.row_matches(side, candidate, bytes, delimiter)
+                            self.span_matches_at(side, entry.at, bytes, delimiter)
                         }
                         Some(Proof::Json { bytes }) => self.json_matches(side, candidate, bytes),
                         None => false,
@@ -1338,14 +1382,10 @@ impl RowIndex {
         json_rows_match(parser, bytes, data, lo, end)
     }
 
-    /// Whether `candidate`'s row opens with exactly `bytes` and ends that run on
-    /// a field boundary.
-    ///
-    /// The boundary is what makes the run a whole number of columns rather than
-    /// a truncation of one: without it `12,3` would match a row opening `12,34`.
-    fn row_matches(&self, side: &Side, candidate: i32, bytes: &[u8], delimiter: u8) -> bool {
+    /// `row_matches` for a row whose offset the caller already holds.
+    fn span_matches_at(&self, side: &Side, at: u64, bytes: &[u8], delimiter: u8) -> bool {
         let data = side.slab.data();
-        let from = self.row_at[candidate as usize] as usize;
+        let from = at as usize;
         let Some(to) = from.checked_add(bytes.len()) else {
             return false;
         };
