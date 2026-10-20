@@ -1,0 +1,53 @@
+name: vendor
+
+# Publishes `cargo vendor` output for compara (its `next` branch) and this
+# repository's rust/ port to the git ref `refs/cache/vendor` (not a branch,
+# so it never shows up in the branch list). Machines that reach github.com
+# over git but not crates.io build offline from it:
+#
+#   git fetch origin refs/cache/vendor:refs/cache/vendor
+#   mkdir -p ../vendor && git archive refs/cache/vendor | tar -x -C ../vendor
+#   printf '[source.crates-io]\nreplace-with = "v"\n[source.v]\ndirectory = "%s"\n' \
+#       "$(cd ../vendor && pwd)/vendor" >> ~/.cargo/config.toml
+#   cargo build --offline
+
+on:
+  push:
+    branches: [experiment-13]
+    paths: [rust/Cargo.lock, .github/workflows/vendor.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vendor
+  cancel-in-progress: false
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: andrey-usa/compara
+          ref: next
+          path: compara-next
+      - name: cargo vendor (compara next + rust/)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cache
+          cargo vendor --locked --manifest-path compara-next/Cargo.toml --sync rust/Cargo.toml /tmp/cache/vendor > /tmp/cache/cargo-config.toml
+          sed -i 's#directory = ".*"#directory = "vendor"#' /tmp/cache/cargo-config.toml
+          du -sh /tmp/cache/vendor
+      - name: Push to refs/cache/vendor
+        run: |
+          set -euo pipefail
+          cd /tmp/cache
+          git init -q
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com add -A
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -q -m "cargo vendor for ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/cache/vendor
+          echo "::notice title=vendor::refs/cache/vendor updated for ${GITHUB_SHA}"
