@@ -1,5 +1,5 @@
 diff --git a/src/engine/pqdiff.rs b/src/engine/pqdiff.rs
-index 23934a3..e7ddbab 100644
+index 23934a3..867f0d9 100644
 --- a/src/engine/pqdiff.rs
 +++ b/src/engine/pqdiff.rs
 @@ -36,8 +36,8 @@ use std::fs::File;
@@ -164,10 +164,27 @@ index 23934a3..e7ddbab 100644
          ((word & self.pos_mask) - 1) as usize
      }
  
-@@ -550,14 +601,60 @@ fn prefetch_slot(slots: &[u32], mask: u64, h: u64) {
+@@ -550,14 +601,77 @@ fn prefetch_slot(slots: &[u32], mask: u64, h: u64) {
      }
  }
  
++/// Starts the fetch of the cache line at `p`, which need not be valid: a
++/// prefetch has no effect but on the cache.
++#[inline]
++fn prefetch_at(p: *const u8) {
++    #[cfg(target_arch = "x86_64")]
++    // Safety: a prefetch has no architectural effect, and the address is not
++    // dereferenced.
++    unsafe {
++        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
++        _mm_prefetch::<_MM_HINT_T0>(p.cast());
++    }
++    #[cfg(not(target_arch = "x86_64"))]
++    {
++        let _ = p;
++    }
++}
++
 +/// Starts the fetch of what [`row_eq`] reads of `row` in `s`: each key column's
 +/// id, word or slice handle there.
 +///
@@ -228,7 +245,7 @@ index 23934a3..e7ddbab 100644
      } else {
          let per = n.div_ceil(ways);
          // How many chunks got a thread. The OS can refuse one -- a thread wants
-@@ -567,12 +664,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
+@@ -567,12 +681,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
          let mut spawned = 0usize;
          std::thread::scope(|scope| {
              for (p, chunk) in hs.chunks_mut(per).enumerate() {
@@ -242,7 +259,7 @@ index 23934a3..e7ddbab 100644
                  if std::thread::Builder::new().spawn_scoped(scope, go).is_err() {
                      break;
                  }
-@@ -580,9 +672,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
+@@ -580,9 +689,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
              }
          });
          let left = (spawned * per).min(n);
@@ -253,7 +270,7 @@ index 23934a3..e7ddbab 100644
      }
  
      let mut ix = Index {
-@@ -605,7 +695,6 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
+@@ -605,7 +712,6 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
      ix.mask = cap as u64 - 1;
      ix.set_pos_bits(n);
      alloc::grow(&mut ix.firsts, n, "one row per distinct key")?;
@@ -261,7 +278,7 @@ index 23934a3..e7ddbab 100644
      alloc::grow(&mut ix.hashes, n, "one hash per distinct key")?;
  
      for (r, &h) in hs.iter().enumerate() {
-@@ -616,17 +705,19 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
+@@ -616,17 +722,19 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
          loop {
              let slot = ix.slots[at];
              if slot == 0 {
@@ -287,7 +304,7 @@ index 23934a3..e7ddbab 100644
                          ix.dup_keys += 1;
                          ix.dup_rows += 1; // the first occurrence counts once the key repeats
                      }
-@@ -657,9 +748,9 @@ fn lookup(
+@@ -657,9 +765,9 @@ fn lookup(
              return -1;
          }
          if into.tag_is(slot, h) {
@@ -300,7 +317,7 @@ index 23934a3..e7ddbab 100644
              }
          }
          at = (at + 1) & into.mask as usize;
-@@ -951,6 +1042,11 @@ struct ColOut {
+@@ -951,6 +1059,11 @@ struct ColOut {
      /// the files list them.
      export_added: Cells,
      export_removed: Cells,
@@ -312,7 +329,7 @@ index 23934a3..e7ddbab 100644
  }
  
  const BLOCK: usize = 4096;
-@@ -1156,6 +1252,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1156,6 +1269,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
          .flat_map(|j| [(false, j), (true, j)])
          .collect();
      let next = AtomicUsize::new(0);
@@ -322,7 +339,7 @@ index 23934a3..e7ddbab 100644
      let read_keys = || -> Vec<(usize, Result<parquet::Column>)> {
          let mut mine = Vec::new();
          loop {
-@@ -1171,7 +1270,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1171,7 +1287,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
              };
              mine.push((
                  at,
@@ -331,7 +348,7 @@ index 23934a3..e7ddbab 100644
              ));
          }
      };
-@@ -1333,6 +1432,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1333,6 +1449,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
              if let Some(&soon) = ai.hashes.get(at + PREFETCH_AHEAD) {
                  prefetch_slot(&bi.slots, bi.mask, soon);
              }
@@ -341,7 +358,7 @@ index 23934a3..e7ddbab 100644
              let row = ai.firsts[at];
              let mate = lookup(
                  &as_id,
-@@ -1366,6 +1468,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1366,6 +1485,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
              if let Some(&soon) = bi.hashes.get(at + PREFETCH_AHEAD) {
                  prefetch_slot(&ai.slots, ai.mask, soon);
              }
@@ -351,7 +368,7 @@ index 23934a3..e7ddbab 100644
              let row = bi.firsts[at];
              if lookup(
                  &as_id,
-@@ -1473,7 +1578,26 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1473,7 +1595,26 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
      // values costs a couple of hundred megabytes on each side while it is being
      // read, and it is released before the next is asked for. `lanes` is that
      // choice, made above.
@@ -379,7 +396,7 @@ index 23934a3..e7ddbab 100644
      let next = AtomicUsize::new(0);
      let compared = &resolved.compared;
      let (pa, pb) = (&pair_a, &pair_b);
-@@ -1491,21 +1615,40 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1491,21 +1632,40 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
          .map(|n| held(&a_meta, n) + held(&b_meta, n))
          .sum();
      let stash = exporting
@@ -431,7 +448,7 @@ index 23934a3..e7ddbab 100644
          if a_col.rows() != a_keys.rows || b_col.rows() != b_keys.rows {
              return Err(Error::new(
                  "parquet columns disagree about how many rows the file has",
-@@ -1514,18 +1657,22 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1514,126 +1674,160 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
          Ok((a_col, b_col))
      };
  
@@ -452,11 +469,320 @@ index 23934a3..e7ddbab 100644
              };
 +            let began = std::time::Instant::now();
              let (a_col, b_col) = read_pair(c)?;
+-
+-            let mut hits: Vec<usize> = Vec::new();
+-            // The fast path: both sides dictionary encoded, so the two
+-            // dictionaries go into one id space and the per-row work is two
+-            // gathers and an integer compare.
+-            let coded = a_col.c.dictionary && b_col.c.dictionary && opt.tolerance == 0.0;
+-            if coded {
 +            let read_done = std::time::Instant::now();
++
++            // How a pair's two cells are told apart, decided once per column.
++            enum Way<'c> {
++                // Both sides dictionary encoded: the two dictionaries go into
++                // one id space, and the per-row work is two gathers and an
++                // integer compare.
++                Coded {
++                    amap: Vec<i32>,
++                    bmap: Vec<i32>,
++                },
++                // Words of one kind on both sides: two cells read the same
++                // exactly when their words are equal, so no cell is written
++                // out to find that it did not change.
++                Words {
++                    aw: &'c parquet::Words,
++                    bw: &'c parquet::Words,
++                },
++                // Words under --trim, --ignore-case, --empty-is-null or
++                // --tolerance: each cell is compared as the text it reads as,
++                // the way the CSV path compares it.
++                WordsAsText,
++                // Byte arrays, with the two buffers found once rather than per
++                // cell: which one a slice belongs to is a property of the
++                // column, and asking per access costs a branch and a bounds
++                // check on every one of ten million rows.
++                Bytes {
++                    ab: &'c [u8],
++                    bb: &'c [u8],
++                },
++                BytesNormalised {
++                    ab: &'c [u8],
++                    bb: &'c [u8],
++                },
++            }
++            let way = if a_col.c.dictionary && b_col.c.dictionary && opt.tolerance == 0.0 {
+                 let mut ids = Ids::default();
+                 let amap = code(&a_col, &mut ids, opt)?;
+                 let bmap = code(&b_col, &mut ids, opt)?;
+-                let (aix, bix) = (&a_col.c.index, &b_col.c.index);
+-                // Both gathers in one pass, without the scratch columns the
+-                // block used to be walked three times for. The indexing goes
+-                // unchecked: every pair row is a row of its side's column,
+-                // every non-negative index was validated against its
+-                // dictionary at decode, and a map holds one id per entry.
+-                let mut neq = vec![0u8; BLOCK];
+-                let mut base = 0usize;
+-                while base < npairs {
+-                    let m = BLOCK.min(npairs - base);
+-                    for (i, ne) in neq[..m].iter_mut().enumerate() {
+-                        // Safety: see above.
+-                        let (ka, kb) = unsafe {
+-                            (
+-                                *aix.get_unchecked(*pa.get_unchecked(base + i) as usize),
+-                                *bix.get_unchecked(*pb.get_unchecked(base + i) as usize),
+-                            )
+-                        };
+-                        // Safety: see above.
+-                        let xa = if ka < 0 {
+-                            -1
+-                        } else {
+-                            unsafe { *amap.get_unchecked(ka as usize) }
+-                        };
+-                        // Safety: see above.
+-                        let xb = if kb < 0 {
+-                            -1
+-                        } else {
+-                            unsafe { *bmap.get_unchecked(kb as usize) }
+-                        };
+-                        *ne = (xa != xb) as u8;
+-                    }
+-                    alloc::room(&mut hits, m, "the changed cells in one column")?;
+-                    scan_mask(&neq[..m], base, |p| hits.push(p));
+-                    base += BLOCK;
+-                }
++                Way::Coded { amap, bmap }
+             } else if let (Some(aw), Some(bw), false) =
+                 (&a_col.c.words, &b_col.c.words, needs_normalising(opt))
+             {
+-                // Words of one kind on both sides: two cells read the same
+-                // exactly when their words are equal, so no cell is written out
+-                // to find that it did not change.
+-                let any_null = !aw.nulls.is_empty() || !bw.nulls.is_empty();
+-                let mut neq = vec![0u8; BLOCK];
+-                let mut base = 0usize;
+-                while base < npairs {
+-                    let m = BLOCK.min(npairs - base);
+-                    let (xs, ys) = (&pa[base..base + m], &pb[base..base + m]);
+-                    for i in 0..m {
+-                        neq[i] = (aw.values[xs[i] as usize] != bw.values[ys[i] as usize]) as u8;
++                Way::Words { aw, bw }
++            } else if a_col.c.words.is_some() || b_col.c.words.is_some() {
++                Way::WordsAsText
++            } else if !needs_normalising(opt) {
++                Way::Bytes {
++                    ab: a_col.base(),
++                    bb: b_col.base(),
++                }
++            } else {
++                Way::BytesNormalised {
++                    ab: a_col.base(),
++                    bb: b_col.base(),
++                }
++            };
++
++            // One block of pairs from `base`: a byte per pair, set where the
++            // column differs.
++            let fill = |base: usize, neq: &mut [u8]| {
++                let m = neq.len();
++                let (xs, ys) = (&pa[base..base + m], &pb[base..base + m]);
++                match &way {
++                    Way::Coded { amap, bmap } => {
++                        let (aix, bix) = (&a_col.c.index, &b_col.c.index);
++                        for (i, ne) in neq.iter_mut().enumerate() {
++                            // Safety: every pair row is a row of its side's
++                            // column, every non-negative index was validated
++                            // against its dictionary at decode, and a map
++                            // holds one id per entry.
++                            let (ka, kb) = unsafe {
++                                (
++                                    *aix.get_unchecked(*xs.get_unchecked(i) as usize),
++                                    *bix.get_unchecked(*ys.get_unchecked(i) as usize),
++                                )
++                            };
++                            // Safety: see above.
++                            let xa = if ka < 0 {
++                                -1
++                            } else {
++                                unsafe { *amap.get_unchecked(ka as usize) }
++                            };
++                            // Safety: see above.
++                            let xb = if kb < 0 {
++                                -1
++                            } else {
++                                unsafe { *bmap.get_unchecked(kb as usize) }
++                            };
++                            *ne = (xa != xb) as u8;
++                        }
+                     }
+-                    if any_null {
++                    Way::Words { aw, bw } => {
+                         for i in 0..m {
+-                            neq[i] |=
+-                                (aw.is_null(xs[i] as usize) != bw.is_null(ys[i] as usize)) as u8;
++                            if let Some(&soon) = ys.get(i + PREFETCH_AHEAD) {
++                                prefetch_at(bw.values.as_ptr().wrapping_add(soon as usize).cast());
++                            }
++                            neq[i] = (aw.values[xs[i] as usize] != bw.values[ys[i] as usize]) as u8;
++                        }
++                        if !aw.nulls.is_empty() || !bw.nulls.is_empty() {
++                            for i in 0..m {
++                                neq[i] |= (aw.is_null(xs[i] as usize) != bw.is_null(ys[i] as usize))
++                                    as u8;
++                            }
+                         }
+                     }
+-                    alloc::room(&mut hits, m, "the changed cells in one column")?;
+-                    scan_mask(&neq[..m], base, |p| hits.push(p));
+-                    base += BLOCK;
+-                }
+-            } else if a_col.c.words.is_some() || b_col.c.words.is_some() {
+-                // Words under --trim, --ignore-case, --empty-is-null or
+-                // --tolerance: each cell is written out and compared as the
+-                // text it reads as, the way the CSV path compares it.
+-                let mut neq = vec![0u8; BLOCK];
+-                let mut base = 0usize;
+-                while base < npairs {
+-                    let m = BLOCK.min(npairs - base);
+-                    for i in 0..m {
+-                        neq[i] = cell_differs(
+-                            a_col.at(pa[base + i] as usize),
+-                            b_col.at(pb[base + i] as usize),
+-                            opt,
+-                        ) as u8;
++                    Way::WordsAsText => {
++                        for i in 0..m {
++                            neq[i] = cell_differs(
++                                a_col.at(xs[i] as usize),
++                                b_col.at(ys[i] as usize),
++                                opt,
++                            ) as u8;
++                        }
+                     }
+-                    alloc::room(&mut hits, m, "the changed cells in one column")?;
+-                    scan_mask(&neq[..m], base, |p| hits.push(p));
+-                    base += BLOCK;
+-                }
+-            } else {
+-                // The two buffers are found once rather than per cell: which
+-                // one a slice belongs to is a property of the column, and
+-                // asking per access costs a branch and a bounds check on every
+-                // one of ten million rows.
+-                let (ab, bb) = (a_col.base(), b_col.base());
+-                let mut neq = vec![0u8; BLOCK];
+-                let mut base = 0usize;
+-                if !needs_normalising(opt) {
+-                    // No normalising asked: a cell is absent when it is null
+-                    // or empty, and two present cells differ when their bytes
+-                    // do -- `cell_differs` with the flags off, without the
+-                    // per-pair flag reads and `Look`s it pays to say so.
+-                    while base < npairs {
+-                        let m = BLOCK.min(npairs - base);
++                    Way::Bytes { ab, bb } => {
++                        // B's rows come in no order, and each costs two
++                        // misses: its handle, then its bytes. Both are
++                        // fetched ahead, the bytes a stage behind the handle,
++                        // by when the handle is in cache.
++                        let handle = |row: usize| -> *const u8 {
++                            if b_col.c.dictionary {
++                                b_col.c.index.as_ptr().wrapping_add(row).cast()
++                            } else {
++                                b_col.c.values.as_ptr().wrapping_add(row).cast()
++                            }
++                        };
+                         for i in 0..m {
+-                            let x = a_col.slice_at(pa[base + i] as usize);
+-                            let y = b_col.slice_at(pb[base + i] as usize);
++                            if let Some(&soon) = ys.get(i + PREFETCH_AHEAD) {
++                                prefetch_at(handle(soon as usize));
++                            }
++                            if let Some(&near) = ys.get(i + PREFETCH_AHEAD / 2) {
++                                let y = b_col.slice_at(near as usize);
++                                if !y.is_null() {
++                                    prefetch_at(bb.as_ptr().wrapping_add(y.offset()));
++                                }
++                            }
++                            let x = a_col.slice_at(xs[i] as usize);
++                            let y = b_col.slice_at(ys[i] as usize);
+                             let (xa, ya) = (
+                                 x.is_null() || x.length() == 0,
+                                 y.is_null() || y.length() == 0,
+@@ -1645,26 +1839,62 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+                                         != bb[y.offset()..y.offset() + y.length()]))
+                                 as u8;
+                         }
+-                        alloc::room(&mut hits, m, "the changed cells in one column")?;
+-                        scan_mask(&neq[..m], base, |p| hits.push(p));
+-                        base += BLOCK;
+                     }
+-                } else {
+-                    while base < npairs {
+-                        let m = BLOCK.min(npairs - base);
++                    Way::BytesNormalised { ab, bb } => {
+                         for i in 0..m {
+                             neq[i] = cell_differs(
+-                                look(ab, a_col.slice_at(pa[base + i] as usize)),
+-                                look(bb, b_col.slice_at(pb[base + i] as usize)),
++                                look(ab, a_col.slice_at(xs[i] as usize)),
++                                look(bb, b_col.slice_at(ys[i] as usize)),
+                                 opt,
+                             ) as u8;
+                         }
+-                        alloc::room(&mut hits, m, "the changed cells in one column")?;
+-                        scan_mask(&neq[..m], base, |p| hits.push(p));
+-                        base += BLOCK;
+                     }
+                 }
+-            }
++            };
++            // The pairs in `lo..hi`, a block at a time: where the column
++            // differs, in pair order.
++            let scan = |lo: usize, hi: usize| -> Result<Vec<usize>> {
++                let mut hits: Vec<usize> = Vec::new();
++                let mut neq = vec![0u8; BLOCK];
++                let mut base = lo;
++                while base < hi {
++                    let m = BLOCK.min(hi - base);
++                    fill(base, &mut neq[..m]);
++                    alloc::room(&mut hits, m, "the changed cells in one column")?;
++                    scan_mask(&neq[..m], base, |p| hits.push(p));
++                    base += m;
++                }
++                Ok(hits)
++            };
++            // The column's threads, which read its two sides, compare it too,
++            // each a run of whole blocks; the runs' hits are joined in order,
++            // so the result is the single pass's.
++            let ways = if npairs >= 1 << 16 { per.max(1) } else { 1 };
++            let hits = if ways == 1 {
++                scan(0, npairs)?
++            } else {
++                let step = npairs.div_ceil(ways).div_ceil(BLOCK) * BLOCK;
++                let part = |k: usize| scan((k * step).min(npairs), ((k + 1) * step).min(npairs));
++                let parts: Vec<Result<Vec<usize>>> = std::thread::scope(|scope| {
++                    let others: Vec<_> = (1..ways)
++                        .map(|k| parallel::spawn_at(scope, &part, k))
++                        .collect();
++                    let mut all = vec![part(0)];
++                    all.extend(
++                        others
++                            .into_iter()
++                            .map(|h| h.join().unwrap_or_else(|_| Err(panicked()))),
++                    );
++                    all
++                });
++                let mut hits = Vec::new();
++                for p in parts {
++                    let p = p?;
++                    alloc::room(&mut hits, p.len(), "the changed cells in one column")?;
++                    hits.extend(p);
++                }
++                hits
++            };
  
-             let mut hits: Vec<usize> = Vec::new();
-             // The fast path: both sides dictionary encoded, so the two
-@@ -1701,9 +1848,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+             for p in hits {
+                 let x = a_col.at(pa[p] as usize);
+@@ -1701,9 +1931,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
              // changed pairs known, their cells come out of these columns with
              // no second read of the file.
              if stash {
@@ -470,7 +796,7 @@ index 23934a3..e7ddbab 100644
              mine.push((c, out));
          }
      };
-@@ -1725,6 +1874,16 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1725,6 +1957,16 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
      }
  
      phases.mark("compared columns (par)");
@@ -487,7 +813,7 @@ index 23934a3..e7ddbab 100644
  
      let columns: Vec<ColumnStat> = compared
          .iter()
-@@ -1812,15 +1971,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1812,15 +2054,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                          mine.push((c, (a, b)));
                      }
                  };
@@ -511,7 +837,7 @@ index 23934a3..e7ddbab 100644
                  for got in gathered {
                      for (c, pair) in got? {
                          sides[c] = pair;
-@@ -1920,13 +2078,15 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1920,13 +2161,15 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
      let to_cells = |r: Vec<Val>| -> Vec<Cell> { r.into_iter().map(Cell::Value).collect() };
  
      let dup_section = |s: &KeySide<'_>, ix: &Index| -> Section {
@@ -534,7 +860,7 @@ index 23934a3..e7ddbab 100644
          all.sort_by(|x, y| {
              y.1.cmp(&x.1)
                  .then_with(|| compare_keys(&x.0, &y.0, key_size))
-@@ -2001,6 +2161,17 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -2001,6 +2244,17 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
  mod tests {
      use super::*;
  
