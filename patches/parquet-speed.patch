@@ -1,5 +1,5 @@
 diff --git a/src/engine/pqdiff.rs b/src/engine/pqdiff.rs
-index 23934a3..d22aeda 100644
+index 23934a3..e7ddbab 100644
 --- a/src/engine/pqdiff.rs
 +++ b/src/engine/pqdiff.rs
 @@ -36,8 +36,8 @@ use std::fs::File;
@@ -300,7 +300,19 @@ index 23934a3..d22aeda 100644
              }
          }
          at = (at + 1) & into.mask as usize;
-@@ -1156,6 +1247,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -951,6 +1042,11 @@ struct ColOut {
+     /// the files list them.
+     export_added: Cells,
+     export_removed: Cells,
++    /// For `COMPARA_PHASES`: when the column's read began (seconds into the
++    /// phase), how long it took for both files, and how long the comparison.
++    began: f64,
++    read: f64,
++    compare: f64,
+ }
+ 
+ const BLOCK: usize = 4096;
+@@ -1156,6 +1252,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
          .flat_map(|j| [(false, j), (true, j)])
          .collect();
      let next = AtomicUsize::new(0);
@@ -310,7 +322,7 @@ index 23934a3..d22aeda 100644
      let read_keys = || -> Vec<(usize, Result<parquet::Column>)> {
          let mut mine = Vec::new();
          loop {
-@@ -1171,7 +1265,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1171,7 +1270,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
              };
              mine.push((
                  at,
@@ -319,7 +331,7 @@ index 23934a3..d22aeda 100644
              ));
          }
      };
-@@ -1333,6 +1427,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1333,6 +1432,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
              if let Some(&soon) = ai.hashes.get(at + PREFETCH_AHEAD) {
                  prefetch_slot(&bi.slots, bi.mask, soon);
              }
@@ -329,7 +341,7 @@ index 23934a3..d22aeda 100644
              let row = ai.firsts[at];
              let mate = lookup(
                  &as_id,
-@@ -1366,6 +1463,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1366,6 +1468,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
              if let Some(&soon) = bi.hashes.get(at + PREFETCH_AHEAD) {
                  prefetch_slot(&ai.slots, ai.mask, soon);
              }
@@ -339,7 +351,7 @@ index 23934a3..d22aeda 100644
              let row = bi.firsts[at];
              if lookup(
                  &as_id,
-@@ -1473,7 +1573,23 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1473,7 +1578,26 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
      // values costs a couple of hundred megabytes on each side while it is being
      // read, and it is released before the next is asked for. `lanes` is that
      // choice, made above.
@@ -355,16 +367,19 @@ index 23934a3..d22aeda 100644
 +    let fit = lanes.clamp(1, nc.max(1));
 +    let per = threads.max(1).div_ceil(fit);
 +    let lanes = fit.min(threads.max(1).div_ceil(per)).max(1);
++    // The work of a column is the bytes its pages expand to, not what it
++    // holds: a dictionary column holds a handle per row and decodes almost
++    // nothing.
++    let expanded = |meta: &parquet::Meta, n: &str| meta.expanded[slot_of(&meta.names, n)];
 +    let mut order: Vec<usize> = (0..nc).collect();
 +    order.sort_by_key(|&c| {
-+        std::cmp::Reverse(
-+            held(&a_meta, &resolved.compared[c]) + held(&b_meta, &resolved.compared[c]),
-+        )
++        let n = &resolved.compared[c];
++        std::cmp::Reverse(expanded(&a_meta, n) + expanded(&b_meta, n))
 +    });
      let next = AtomicUsize::new(0);
      let compared = &resolved.compared;
      let (pa, pb) = (&pair_a, &pair_b);
-@@ -1491,21 +1607,40 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1491,21 +1615,40 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
          .map(|n| held(&a_meta, n) + held(&b_meta, n))
          .sum();
      let stash = exporting
@@ -416,7 +431,11 @@ index 23934a3..d22aeda 100644
          if a_col.rows() != a_keys.rows || b_col.rows() != b_keys.rows {
              return Err(Error::new(
                  "parquet columns disagree about how many rows the file has",
-@@ -1517,10 +1652,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1514,18 +1657,22 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+         Ok((a_col, b_col))
+     };
+ 
++    let phase_start = std::time::Instant::now();
      let work = || -> Result<Vec<(usize, ColOut)>> {
          let mut mine = Vec::new();
          loop {
@@ -430,7 +449,14 @@ index 23934a3..d22aeda 100644
              let mut out = ColOut {
                  bits: alloc::filled(0u64, words, "one bit per pair in the column")?,
                  ..ColOut::default()
-@@ -1701,8 +1837,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+             };
++            let began = std::time::Instant::now();
+             let (a_col, b_col) = read_pair(c)?;
++            let read_done = std::time::Instant::now();
+ 
+             let mut hits: Vec<usize> = Vec::new();
+             // The fast path: both sides dictionary encoded, so the two
+@@ -1701,9 +1848,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
              // changed pairs known, their cells come out of these columns with
              // no second read of the file.
              if stash {
@@ -438,9 +464,30 @@ index 23934a3..d22aeda 100644
 -                    Some((a_col, b_col));
 +                *stashed[c].lock().unwrap_or_else(|e| e.into_inner()) = Some((a_col, b_col));
              }
++            out.began = (began - phase_start).as_secs_f64();
++            out.read = (read_done - began).as_secs_f64();
++            out.compare = read_done.elapsed().as_secs_f64();
              mine.push((c, out));
          }
-@@ -1812,15 +1947,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+     };
+@@ -1725,6 +1874,16 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+     }
+ 
+     phases.mark("compared columns (par)");
++    if phases.on() {
++        phases.detail(&format!("{lanes} at once, {per} thread(s) each"));
++        for &c in &order {
++            let o = &cols[c];
++            phases.detail(&format!(
++                "{:<20} from {:.3}s  read {:.3}s  compare {:.3}s",
++                compared[c], o.began, o.read, o.compare
++            ));
++        }
++    }
+ 
+     let columns: Vec<ColumnStat> = compared
+         .iter()
+@@ -1812,15 +1971,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                          mine.push((c, (a, b)));
                      }
                  };
@@ -464,7 +511,7 @@ index 23934a3..d22aeda 100644
                  for got in gathered {
                      for (c, pair) in got? {
                          sides[c] = pair;
-@@ -1920,13 +2054,15 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1920,13 +2078,15 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
      let to_cells = |r: Vec<Val>| -> Vec<Cell> { r.into_iter().map(Cell::Value).collect() };
  
      let dup_section = |s: &KeySide<'_>, ix: &Index| -> Section {
@@ -487,7 +534,7 @@ index 23934a3..d22aeda 100644
          all.sort_by(|x, y| {
              y.1.cmp(&x.1)
                  .then_with(|| compare_keys(&x.0, &y.0, key_size))
-@@ -2001,6 +2137,17 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -2001,6 +2161,17 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
  mod tests {
      use super::*;
  
@@ -569,7 +616,7 @@ index c0668aa..b65ce88 100644
      }
  
 diff --git a/src/parquet.rs b/src/parquet.rs
-index 1e14514..ea12400 100644
+index 1e14514..2f1f502 100644
 --- a/src/parquet.rs
 +++ b/src/parquet.rs
 @@ -23,9 +23,12 @@
@@ -600,7 +647,17 @@ index 1e14514..ea12400 100644
  }
  
  impl Default for Slice {
-@@ -620,46 +631,83 @@ fn expand_append(
+@@ -187,6 +198,9 @@ pub struct Meta {
+     /// in memory: a word or a handle per row, and for a compressed byte-array
+     /// column the expanded pages its handles point into.
+     pub held: Vec<u64>,
++    /// What the footer says each column's pages expand to, every row group
++    /// together: the bytes a read of it decodes, so a measure of its work.
++    pub expanded: Vec<u64>,
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -620,46 +634,83 @@ fn expand_append(
  /// Snappy raw block format: a varint of the uncompressed length, then a stream
  /// of literal and copy elements.
  ///
@@ -704,7 +761,7 @@ index 1e14514..ea12400 100644
          let tag = input[at];
          at += 1;
          if tag & 0x03 == 0 {
-@@ -667,8 +715,8 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
+@@ -667,8 +718,8 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
              let mut len = (tag >> 2) as usize + 1;
              if len > 60 {
                  let extra = len - 60;
@@ -715,7 +772,7 @@ index 1e14514..ea12400 100644
                  }
                  let mut v = 0usize;
                  for i in 0..extra {
-@@ -677,34 +725,43 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
+@@ -677,34 +728,43 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
                  at += extra;
                  len = v + 1;
              }
@@ -768,7 +825,7 @@ index 1e14514..ea12400 100644
                  }
                  let mut o = 0usize;
                  for i in 0..4 {
-@@ -715,27 +772,37 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
+@@ -715,27 +775,37 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
              }
          };
          if offset == 0 || offset > dst - base || len > end - dst {
@@ -821,7 +878,27 @@ index 1e14514..ea12400 100644
  }
  
  /// At least `n` entries in `v`, growing it only when it is shorter. What is
-@@ -974,37 +1041,266 @@ pub(crate) fn read_meta(fm: &FileMeta) -> Meta {
+@@ -964,47 +1034,286 @@ pub(crate) fn read_meta(fm: &FileMeta) -> Meta {
+             rows.saturating_mul(8).saturating_add(expanded)
+         })
+         .collect();
++    let expanded = (0..fm.names.len())
++        .map(|c| {
++            fm.groups
++                .iter()
++                .filter_map(|g| g.columns.get(c))
++                .map(|m| m.total_uncompressed_size.max(0) as u64)
++                .sum()
++        })
++        .collect();
+     Meta {
+         names: fm.names.clone(),
+         rows: fm.rows,
+         row_groups: fm.groups.len(),
+         held,
++        expanded,
+     }
+ }
  
  /// Reads one column across every row group. `which` indexes into [`Meta::names`];
  /// `fm` is the file's footer, parsed once by the caller.
@@ -897,7 +974,7 @@ index 1e14514..ea12400 100644
 +    // A column that never met a page at all is plain and empty, not dictionary.
 +    if col.dictionary && col.index.is_empty() && col.dict.is_empty() {
 +        col.dictionary = false;
-+    }
+     }
 +    Ok(col)
 +}
 +
@@ -911,7 +988,7 @@ index 1e14514..ea12400 100644
 +    /// bounds what their pages expand to.
 +    bytes: usize,
 +}
-+
+ 
 +/// The row groups cut into up to `ways` runs of about equal expanded size, or
 +/// `None` when the column is read in one pass: one way asked for, one row
 +/// group, or chunk counts that do not add up to the file's rows. A run has to
@@ -1046,7 +1123,7 @@ index 1e14514..ea12400 100644
 +        }
 +        self.len += page.len();
 +        Ok(true)
-     }
++    }
 +    fn bytes(&self, from: usize, to: usize) -> &[u8] {
 +        assert!(from <= to && to <= self.len);
 +        // Safety: everything below `self.len` has been written.
@@ -1063,7 +1140,7 @@ index 1e14514..ea12400 100644
 +    values: Vec<Slice>,
 +    codec: Option<Codec>,
 +}
- 
++
 +/// The page walk of a byte-array column over `groups`, expanding compressed
 +/// pages into `owned`. `rows` sizes the per-row vectors and `uncompressed`
 +/// the arena, both up front. `Ok(None)` when `owned` is a region a page does
@@ -1100,7 +1177,7 @@ index 1e14514..ea12400 100644
  
      // Reused across pages so the per-page work allocates nothing, and sized
      // once from the footer's row count so appending a page never has to move
-@@ -1012,7 +1308,7 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
+@@ -1012,7 +1321,7 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
      let mut defs: Vec<i32> = Vec::new();
      let mut idx: Vec<i32> = Vec::new();
      let mut got: Vec<Slice> = Vec::new();
@@ -1109,7 +1186,7 @@ index 1e14514..ea12400 100644
  
      // The column starts out held as dictionary indices and stays that way only
      // if every page cooperates. A writer that gives up on the dictionary
-@@ -1022,7 +1318,7 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
+@@ -1022,7 +1331,7 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
      // a dictionary entry is already a slice.
      let mut dictionary = true;
  
@@ -1118,7 +1195,7 @@ index 1e14514..ea12400 100644
          let c = &rg.columns[which];
          if c.ty != TYPE_BYTE_ARRAY {
              return unsupported("only BYTE_ARRAY parquet columns are read here", path);
-@@ -1036,7 +1332,10 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
+@@ -1036,7 +1345,10 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
          if codec.is_none() {
              codec = Some(chunk_codec);
              if chunk_codec != Codec::None {
@@ -1130,7 +1207,7 @@ index 1e14514..ea12400 100644
              }
          } else if codec != Some(chunk_codec) {
              return fail(
-@@ -1070,19 +1369,20 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
+@@ -1070,19 +1382,20 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
              // from. `in_owned` is the whole of the distinction.
              let (page_from, page_len, page_base, in_owned) = if chunk_codec != Codec::None {
                  let was = owned.len();
@@ -1155,7 +1232,7 @@ index 1e14514..ea12400 100644
              } else {
                  &data[page_from..page_from + page_len]
              };
-@@ -1187,7 +1487,7 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
+@@ -1187,7 +1500,7 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
                      if dictionary {
                          // Fold what has been read into the plain form. This
                          // copies eight-byte handles, not values.
@@ -1164,7 +1241,7 @@ index 1e14514..ea12400 100644
                          for &k in &index {
                              values.push(if k >= 0 {
                                  dict[k as usize]
-@@ -1235,26 +1535,167 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
+@@ -1235,26 +1548,167 @@ pub(crate) fn read_column(data: &[u8], fm: &FileMeta, which: usize, path: &str)
              at = h.after + body_len;
          }
      }
@@ -1338,7 +1415,7 @@ index 1e14514..ea12400 100644
      let width = match ty {
          TYPE_BOOLEAN => 0,
          TYPE_INT32 | TYPE_FLOAT => 4,
-@@ -1269,9 +1710,143 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) ->
+@@ -1269,9 +1723,143 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) ->
              );
          }
      };
@@ -1483,7 +1560,7 @@ index 1e14514..ea12400 100644
      let mut nulls: Vec<u64> = Vec::new();
      let mut dict: Vec<[u8; 8]> = Vec::new();
      let mut page: Vec<u8> = Vec::new();
-@@ -1279,7 +1854,7 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) ->
+@@ -1279,7 +1867,7 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) ->
      let mut idx: Vec<i32> = Vec::new();
      let mut got: Vec<[u8; 8]> = Vec::new();
  
@@ -1492,7 +1569,7 @@ index 1e14514..ea12400 100644
          let Some(c) = rg.columns.get(which) else {
              return fail("a row group is missing a column", path);
          };
-@@ -1322,7 +1897,10 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) ->
+@@ -1322,7 +1910,10 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) ->
                      return fail("a parquet page holds fewer values than it says", path);
                  }
              } else if h.ty == PAGE_DATA {
@@ -1504,7 +1581,7 @@ index 1e14514..ea12400 100644
                      return fail(
                          "a parquet column holds more values than the file has rows",
                          path,
-@@ -1386,21 +1964,24 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) ->
+@@ -1386,21 +1977,24 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) ->
                  }
  
                  if real == n_vals {
@@ -1534,7 +1611,7 @@ index 1e14514..ea12400 100644
                      }
                  }
                  seen += n_vals as i64;
-@@ -1412,10 +1993,7 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) ->
+@@ -1412,10 +2006,7 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) ->
              at = h.after + h.compressed as usize;
          }
      }
@@ -1546,7 +1623,7 @@ index 1e14514..ea12400 100644
  }
  
  /// PLAIN values of a word-sized type, appended to `out` as their words.
-@@ -1567,9 +2145,402 @@ mod tests {
+@@ -1567,9 +2158,402 @@ mod tests {
          }
      }
  
@@ -1949,3 +2026,27 @@ index 1e14514..ea12400 100644
 +        }
 +    }
  }
+diff --git a/src/phases.rs b/src/phases.rs
+index 68dcd19..c7f8f37 100644
+--- a/src/phases.rs
++++ b/src/phases.rs
+@@ -30,6 +30,19 @@ impl Phases {
+         }
+     }
+ 
++    /// Whether `COMPARA_PHASES` asked for the timings.
++    pub fn on(&self) -> bool {
++        self.on
++    }
++
++    /// One indented line under the last phase: a part of it, timed by the
++    /// caller.
++    pub fn detail(&self, line: &str) {
++        if self.on {
++            eprintln!("    {}{line}", self.tag);
++        }
++    }
++
+     pub fn mark(&mut self, what: &str) {
+         let now = Instant::now();
+         if self.on {

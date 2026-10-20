@@ -82,13 +82,13 @@ jobs:
             --pairs "50k-pyarrow=$d/50000/A.parquet,$d/50000/B.parquet;500k-pyarrow=$d/500000/A.parquet,$d/500000/B.parquet;5M-pyarrow=$d/5000000/A.parquet,$d/5000000/B.parquet;5M-duckdb=$d/5000000-duckdb/A.parquet,$d/5000000-duckdb/B.parquet;5M-csv=$d/5000000/A.csv,$d/5000000/B.csv;2M-wide-zstd=$d/wide/w_a.parquet,$d/wide/w_b.parquet|account_id,txn_id|updated_at" \
             --threads 1,2,4 --out results
 
-      - name: Phases, head and base, 5M pairs, four threads
+      - name: Phases of the head build, 5M pairs, one and four threads
         run: |
-          for build in base head; do
+          for t in 1 4; do
             for pair in 5000000 5000000-duckdb; do
-              out=$(COMPARA_PHASES=1 compara-$build/target/release/compara compare \
-                data/$pair/A.parquet data/$pair/B.parquet -k id,k2 --threads 4 --summary 2>&1 \
-                | grep -E '^\s+[a-z]' | sed -E 's/ +/ /g' | paste -sd ';')
-              echo "::notice title=phases $build $pair::$out"
+              out=$(COMPARA_PHASES=1 compara-head/target/release/compara compare \
+                data/$pair/A.parquet data/$pair/B.parquet -k id,k2 --threads $t --summary 2>&1 \
+                | grep -E '^\s+[a-z0-9]' | sed -E 's/ +/ /g' | paste -sd ';')
+              echo "::notice title=phases head $pair T=$t::$out"
             done
           done
