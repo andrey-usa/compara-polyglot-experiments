@@ -1,0 +1,89 @@
+name: Ladder A/B (compara next and a patch, against DuckDB and Polars)
+
+# compara's `next` branch from its public repository, built as it is and with
+# patches/parquet-speed.patch applied, then both builds, DuckDB and Polars on
+# the size-ladder pairs at one, two and four threads (scripts/ladder_ab.py).
+# Results come back as annotations, one per thread count, plus the phases of
+# the head build on the largest pair.
+
+on:
+  push:
+    branches: [experiment-14]
+  workflow_dispatch:
+
+concurrency:
+  group: benchmark-host
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ladder:
+    name: ladder a/b
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: What this runner is
+        run: |
+          cpu=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs)
+          echo "::notice title=host::$cpu, $(nproc) cores, $(free -g | awk '/Mem:/{print $2}') GB"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+
+      - uses: actions/checkout@v7
+        with:
+          repository: andrey-usa/compara
+          ref: next
+          path: compara-base
+
+      - name: Build base and head
+        run: |
+          cp -r compara-base compara-head
+          git -C compara-head apply "$PWD/patches/parquet-speed.patch"
+          cargo build --release --locked --manifest-path compara-base/Cargo.toml --bin compara
+          cargo build --release --locked --manifest-path compara-head/Cargo.toml --bin compara
+          echo "::notice title=builds::base $(git -C compara-base rev-parse --short HEAD), head = base + patches/parquet-speed.patch"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install polars duckdb pyarrow numpy
+
+      - name: Fixtures
+        run: |
+          python3 scripts/bench_sizes_gen.py --sizes 50000,500000,5000000 --out data
+          # The 5M pair again as DuckDB writes it: 122,880-row groups, its own
+          # encoding choices.
+          mkdir -p data/5000000-duckdb
+          python3 - <<'PY'
+          import duckdb
+          for side in "AB":
+              duckdb.sql(f"COPY (SELECT * FROM 'data/5000000/{side}.parquet') TO "
+                         f"'data/5000000-duckdb/{side}.parquet' (FORMAT parquet)")
+          PY
+          ls -la data/*
+
+      - name: Ladder
+        run: |
+          d=data
+          python3 scripts/ladder_ab.py \
+            --builds "base=$PWD/compara-base/target/release/compara,head=$PWD/compara-head/target/release/compara" \
+            --pairs "50k-pyarrow=$d/50000/A.parquet,$d/50000/B.parquet;500k-pyarrow=$d/500000/A.parquet,$d/500000/B.parquet;5M-pyarrow=$d/5000000/A.parquet,$d/5000000/B.parquet;5M-duckdb=$d/5000000-duckdb/A.parquet,$d/5000000-duckdb/B.parquet;5M-csv=$d/5000000/A.csv,$d/5000000/B.csv" \
+            --threads 1,2,4 --out results
+
+      - name: Phases, head and base, 5M pairs, four threads
+        run: |
+          for build in base head; do
+            for pair in 5000000 5000000-duckdb; do
+              out=$(COMPARA_PHASES=1 compara-$build/target/release/compara compare \
+                data/$pair/A.parquet data/$pair/B.parquet -k id,k2 --threads 4 --summary 2>&1 \
+                | grep -E '^\s+[a-z]' | sed -E 's/ +/ /g' | paste -sd ';')
+              echo "::notice title=phases $build $pair::$out"
+            done
+          done
