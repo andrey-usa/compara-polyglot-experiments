@@ -1,5 +1,5 @@
 diff --git a/src/engine/pqdiff.rs b/src/engine/pqdiff.rs
-index 23934a3..08d4dce 100644
+index 23934a3..d22aeda 100644
 --- a/src/engine/pqdiff.rs
 +++ b/src/engine/pqdiff.rs
 @@ -36,8 +36,8 @@ use std::fs::File;
@@ -12,7 +12,295 @@ index 23934a3..08d4dce 100644
  
  use memmap2::Mmap;
  
-@@ -1156,6 +1156,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -250,6 +250,14 @@ pub(super) fn tail_word(v: &[u8], rem: usize) -> u64 {
+     }
+     v[0] as u64 | (v[n / 2] as u64) << (8 * (n / 2)) | (v[n - 1] as u64) << (8 * (n - 1))
+ }
++/// [`fold_bytes`] of one eight-byte word, the same value without the loop
++/// and the tail test: a word key column is hashed once per row on both sides.
++#[inline]
++fn fold_word(h: u64, w: &[u8; 8]) -> u64 {
++    let mut h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(PRIME);
++    h ^= h >> 29;
++    (h ^ 8).wrapping_mul(PRIME)
++}
+ fn fold_absent(h: u64) -> u64 {
+     (h ^ 0x9e3779b97f4a7c15).wrapping_mul(PRIME)
+ }
+@@ -405,23 +413,53 @@ struct KeySide<'m> {
+     rows: usize,
+ }
+ 
+-fn row_hash(as_id: &[bool], s: &KeySide<'_>, row: usize, opt: &Options) -> u64 {
+-    let mut h = SEED;
++/// The key hash of rows `from..from + out.len()` of `s`, into `out`.
++///
++/// A column at a time rather than a row at a time: the per-row form paid for
++/// its setup -- which columns are ids, whether anything normalises -- on every
++/// row, about 140 instructions a row for a key of two integers, where the loop
++/// over one column of words is a load, a multiply and a shift. Each row's hash
++/// folds its columns in the same order either way, so the value is the same.
++fn hash_rows(as_id: &[bool], s: &KeySide<'_>, from: usize, out: &mut [u64], opt: &Options) {
++    out.fill(SEED);
++    let rows = from..from + out.len();
+     for (j, &coded) in as_id.iter().enumerate() {
+         if coded {
+-            h = fold_id(h, s.id[j][row]);
++            for (h, &id) in out.iter_mut().zip(&s.id[j][rows.clone()]) {
++                *h = fold_id(*h, id);
++            }
+             continue;
+         }
+-        let c = s.col[j].at(row);
+-        if absent(c, opt) {
+-            h = fold_absent(h);
+-        } else if !needs_normalising(opt) {
+-            h = fold_bytes(h, c.bytes);
+-        } else {
+-            h = fold_bytes(h, value_of(c, opt).unwrap_or_default().as_bytes());
++        // A word is absent only when null and is never normalised away, so
++        // this is the general case below with nothing left to decide.
++        if let (Some(w), false) = (&s.col[j].c.words, needs_normalising(opt)) {
++            let values = &w.values[rows.clone()];
++            if w.nulls.is_empty() {
++                for (h, v) in out.iter_mut().zip(values) {
++                    *h = fold_word(*h, v);
++                }
++            } else {
++                for ((h, v), r) in out.iter_mut().zip(values).zip(rows.clone()) {
++                    *h = if w.is_null(r) {
++                        fold_absent(*h)
++                    } else {
++                        fold_word(*h, v)
++                    };
++                }
++            }
++            continue;
++        }
++        for (h, r) in out.iter_mut().zip(rows.clone()) {
++            let c = s.col[j].at(r);
++            *h = if absent(c, opt) {
++                fold_absent(*h)
++            } else if !needs_normalising(opt) {
++                fold_bytes(*h, c.bytes)
++            } else {
++                fold_bytes(*h, value_of(c, opt).unwrap_or_default().as_bytes())
++            };
+         }
+     }
+-    h
+ }
+ 
+ fn row_eq(
+@@ -437,6 +475,14 @@ fn row_eq(
+             if x.id[j][rx] != y.id[j][ry] {
+                 return false;
+             }
++        } else if let (Some(xw), Some(yw), false) =
++            (&x.col[j].c.words, &y.col[j].c.words, needs_normalising(opt))
++        {
++            // `same` on two words: both null, or neither and the same word.
++            let null = xw.is_null(rx);
++            if null != yw.is_null(ry) || (!null && xw.values[rx] != yw.values[ry]) {
++                return false;
++            }
+         } else if !same(x.col[j].at(rx), y.col[j].at(ry), opt) {
+             return false;
+         }
+@@ -446,12 +492,14 @@ fn row_eq(
+ 
+ /// An open-addressed table over one file's distinct keys, first occurrence wins.
+ ///
+-/// A slot is one word: the top twenty-four bits of the key's hash, and the
+-/// position in `firsts` plus one, with zero meaning empty. Carrying the hash
++/// A slot is one word: the top bits of the key's hash, and the row of the
++/// key's first occurrence plus one, with zero meaning empty. Carrying the hash
+ /// *inside* the slot is the point -- a probe that misses is settled by the word
+ /// it already loaded, where a table of bare positions would have to follow each
+ /// one into a separate array of hashes and take a second cache miss to reject
+-/// it. At ten million keys those second misses were the join.
++/// it. At ten million keys those second misses were the join. Holding the row
++/// rather than a position in `firsts` saves the hop a hit took through
++/// `firsts` to find it, a miss of its own on every probe that matched.
+ #[derive(Default)]
+ struct Index {
+     slots: Vec<u32>,
+@@ -461,8 +509,11 @@ struct Index {
+     /// so the slot stays four bytes at any scale this port runs.
+     pos_bits: u32,
+     pos_mask: u32,
++    /// The first row of each distinct key, in row order.
+     firsts: Vec<i32>,
+-    counts: Vec<u32>,
++    /// Per row, how many more times the key that first appears there
++    /// appears again; empty while no key has.
++    extra: Vec<u32>,
+     /// Per distinct key, for probing the other side.
+     hashes: Vec<u64>,
+     rows: i64,
+@@ -485,10 +536,10 @@ impl Index {
+     }
+ 
+     /// Packs a slot: the top `32 - pos_bits` bits of the hash above the
+-    /// position plus one. Zero tag bits (past two billion rows) degrades to
+-    /// no tag rather than a wrong answer.
+-    fn slot_for(&self, hash: u64, pos: usize) -> u32 {
+-        let pos = pos as u32 + 1;
++    /// row plus one. Zero tag bits (past two billion rows) degrades to no tag
++    /// rather than a wrong answer.
++    fn slot_for(&self, hash: u64, row: usize) -> u32 {
++        let pos = row as u32 + 1;
+         let tag_bits = 32 - self.pos_bits;
+         if tag_bits == 0 {
+             pos
+@@ -506,8 +557,8 @@ impl Index {
+         (word >> self.pos_bits) == (hash >> (64 - tag_bits)) as u32
+     }
+ 
+-    /// The `firsts` position a non-empty slot holds.
+-    fn pos_of(&self, word: u32) -> usize {
++    /// The first row a non-empty slot holds.
++    fn row_of(&self, word: u32) -> usize {
+         ((word & self.pos_mask) - 1) as usize
+     }
+ 
+@@ -550,14 +601,60 @@ fn prefetch_slot(slots: &[u32], mask: u64, h: u64) {
+     }
+ }
+ 
++/// Starts the fetch of what [`row_eq`] reads of `row` in `s`: each key column's
++/// id, word or slice handle there.
++///
++/// The sweep's probes land on rows of the other file in no order, so after
++/// the slot the next miss is these, one per key column, and their address is
++/// known as soon as the slot is: a stage behind the slot's own prefetch, the
++/// slot is in cache and names the row.
++#[inline]
++fn prefetch_row(as_id: &[bool], s: &KeySide<'_>, row: usize) {
++    #[cfg(target_arch = "x86_64")]
++    {
++        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
++        let fetch = |p: *const i8| {
++            // Safety: a prefetch has no architectural effect, and the address
++            // is computed without dereferencing anything.
++            unsafe { _mm_prefetch::<_MM_HINT_T0>(p) }
++        };
++        for (j, &coded) in as_id.iter().enumerate() {
++            if coded {
++                fetch(s.id[j].as_ptr().wrapping_add(row).cast());
++                continue;
++            }
++            let c = &s.col[j].c;
++            if let Some(w) = &c.words {
++                fetch(w.values.as_ptr().wrapping_add(row).cast());
++            } else if c.dictionary {
++                fetch(c.index.as_ptr().wrapping_add(row).cast());
++            } else {
++                fetch(c.values.as_ptr().wrapping_add(row).cast());
++            }
++        }
++    }
++    #[cfg(not(target_arch = "x86_64"))]
++    {
++        let _ = (as_id, s, row);
++    }
++}
++
++/// The second stage of the sweep's prefetch: the slot `h` lands in, fetched
++/// [`PREFETCH_AHEAD`] / 2 probes ago, names the row a hit will compare.
++#[inline]
++fn prefetch_mate(as_id: &[bool], into: &Index, there: &KeySide<'_>, h: u64) {
++    let word = into.slots[(h & into.mask) as usize];
++    if word != 0 && into.tag_is(word, h) {
++        prefetch_row(as_id, there, into.row_of(word));
++    }
++}
++
+ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -> Result<Index> {
+     let n = s.rows;
+     let mut hs = alloc::filled(0u64, n, "one hash per row")?;
+     let ways = if n < (1 << 15) { 1 } else { threads.max(1) };
+     if ways == 1 {
+-        for (r, h) in hs.iter_mut().enumerate() {
+-            *h = row_hash(as_id, s, r, opt);
+-        }
++        hash_rows(as_id, s, 0, &mut hs, opt);
+     } else {
+         let per = n.div_ceil(ways);
+         // How many chunks got a thread. The OS can refuse one -- a thread wants
+@@ -567,12 +664,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
+         let mut spawned = 0usize;
+         std::thread::scope(|scope| {
+             for (p, chunk) in hs.chunks_mut(per).enumerate() {
+-                let go = move || {
+-                    let from = p * per;
+-                    for (i, h) in chunk.iter_mut().enumerate() {
+-                        *h = row_hash(as_id, s, from + i, opt);
+-                    }
+-                };
++                let go = move || hash_rows(as_id, s, p * per, chunk, opt);
+                 if std::thread::Builder::new().spawn_scoped(scope, go).is_err() {
+                     break;
+                 }
+@@ -580,9 +672,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
+             }
+         });
+         let left = (spawned * per).min(n);
+-        for (r, h) in hs.iter_mut().enumerate().skip(left) {
+-            *h = row_hash(as_id, s, r, opt);
+-        }
++        hash_rows(as_id, s, left, &mut hs[left..], opt);
+     }
+ 
+     let mut ix = Index {
+@@ -605,7 +695,6 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
+     ix.mask = cap as u64 - 1;
+     ix.set_pos_bits(n);
+     alloc::grow(&mut ix.firsts, n, "one row per distinct key")?;
+-    alloc::grow(&mut ix.counts, n, "one count per distinct key")?;
+     alloc::grow(&mut ix.hashes, n, "one hash per distinct key")?;
+ 
+     for (r, &h) in hs.iter().enumerate() {
+@@ -616,17 +705,19 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
+         loop {
+             let slot = ix.slots[at];
+             if slot == 0 {
+-                ix.slots[at] = ix.slot_for(h, ix.firsts.len());
++                ix.slots[at] = ix.slot_for(h, r);
+                 ix.firsts.push(r as i32);
+-                ix.counts.push(1);
+                 ix.hashes.push(h);
+                 break;
+             }
+             if ix.tag_is(slot, h) {
+-                let pos = ix.pos_of(slot);
+-                if row_eq(as_id, s, ix.firsts[pos] as usize, s, r, opt) {
+-                    ix.counts[pos] += 1;
+-                    if ix.counts[pos] == 2 {
++                let first = ix.row_of(slot);
++                if row_eq(as_id, s, first, s, r, opt) {
++                    if ix.extra.is_empty() {
++                        ix.extra = alloc::filled(0u32, n, "a repeat count per row")?;
++                    }
++                    ix.extra[first] += 1;
++                    if ix.extra[first] == 1 {
+                         ix.dup_keys += 1;
+                         ix.dup_rows += 1; // the first occurrence counts once the key repeats
+                     }
+@@ -657,9 +748,9 @@ fn lookup(
+             return -1;
+         }
+         if into.tag_is(slot, h) {
+-            let first = into.firsts[into.pos_of(slot)];
+-            if row_eq(as_id, there, first as usize, here, row, opt) {
+-                return first;
++            let first = into.row_of(slot);
++            if row_eq(as_id, there, first, here, row, opt) {
++                return first as i32;
+             }
+         }
+         at = (at + 1) & into.mask as usize;
+@@ -1156,6 +1247,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
          .flat_map(|j| [(false, j), (true, j)])
          .collect();
      let next = AtomicUsize::new(0);
@@ -22,7 +310,7 @@ index 23934a3..08d4dce 100644
      let read_keys = || -> Vec<(usize, Result<parquet::Column>)> {
          let mut mine = Vec::new();
          loop {
-@@ -1171,7 +1174,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1171,7 +1265,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
              };
              mine.push((
                  at,
@@ -31,7 +319,27 @@ index 23934a3..08d4dce 100644
              ));
          }
      };
-@@ -1473,7 +1476,23 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1333,6 +1427,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+             if let Some(&soon) = ai.hashes.get(at + PREFETCH_AHEAD) {
+                 prefetch_slot(&bi.slots, bi.mask, soon);
+             }
++            if let Some(&near) = ai.hashes.get(at + PREFETCH_AHEAD / 2) {
++                prefetch_mate(&as_id, &bi, &b_keys, near);
++            }
+             let row = ai.firsts[at];
+             let mate = lookup(
+                 &as_id,
+@@ -1366,6 +1463,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+             if let Some(&soon) = bi.hashes.get(at + PREFETCH_AHEAD) {
+                 prefetch_slot(&ai.slots, ai.mask, soon);
+             }
++            if let Some(&near) = bi.hashes.get(at + PREFETCH_AHEAD / 2) {
++                prefetch_mate(&as_id, &ai, &a_keys, near);
++            }
+             let row = bi.firsts[at];
+             if lookup(
+                 &as_id,
+@@ -1473,7 +1573,23 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
      // values costs a couple of hundred megabytes on each side while it is being
      // read, and it is released before the next is asked for. `lanes` is that
      // choice, made above.
@@ -56,7 +364,7 @@ index 23934a3..08d4dce 100644
      let next = AtomicUsize::new(0);
      let compared = &resolved.compared;
      let (pa, pb) = (&pair_a, &pair_b);
-@@ -1491,21 +1510,40 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1491,21 +1607,40 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
          .map(|n| held(&a_meta, n) + held(&b_meta, n))
          .sum();
      let stash = exporting
@@ -108,7 +416,7 @@ index 23934a3..08d4dce 100644
          if a_col.rows() != a_keys.rows || b_col.rows() != b_keys.rows {
              return Err(Error::new(
                  "parquet columns disagree about how many rows the file has",
-@@ -1517,10 +1555,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1517,10 +1652,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
      let work = || -> Result<Vec<(usize, ColOut)>> {
          let mut mine = Vec::new();
          loop {
@@ -122,7 +430,7 @@ index 23934a3..08d4dce 100644
              let mut out = ColOut {
                  bits: alloc::filled(0u64, words, "one bit per pair in the column")?,
                  ..ColOut::default()
-@@ -1701,8 +1740,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1701,8 +1837,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
              // changed pairs known, their cells come out of these columns with
              // no second read of the file.
              if stash {
@@ -132,7 +440,7 @@ index 23934a3..08d4dce 100644
              }
              mine.push((c, out));
          }
-@@ -1812,15 +1850,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+@@ -1812,15 +1947,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                          mine.push((c, (a, b)));
                      }
                  };
@@ -156,6 +464,110 @@ index 23934a3..08d4dce 100644
                  for got in gathered {
                      for (c, pair) in got? {
                          sides[c] = pair;
+@@ -1920,13 +2054,15 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+     let to_cells = |r: Vec<Val>| -> Vec<Cell> { r.into_iter().map(Cell::Value).collect() };
+ 
+     let dup_section = |s: &KeySide<'_>, ix: &Index| -> Section {
+-        let mut all: Vec<(Vec<Val>, i64)> = ix
+-            .firsts
+-            .iter()
+-            .zip(&ix.counts)
+-            .filter(|(_, n)| **n >= 2)
+-            .map(|(&r, &n)| (key_values(s, r), n as i64))
+-            .collect();
++        let mut all: Vec<(Vec<Val>, i64)> = if ix.extra.is_empty() {
++            Vec::new()
++        } else {
++            ix.firsts
++                .iter()
++                .filter(|&&r| ix.extra[r as usize] > 0)
++                .map(|&r| (key_values(s, r), 1 + ix.extra[r as usize] as i64))
++                .collect()
++        };
+         all.sort_by(|x, y| {
+             y.1.cmp(&x.1)
+                 .then_with(|| compare_keys(&x.0, &y.0, key_size))
+@@ -2001,6 +2137,17 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn fold_word_is_fold_bytes_of_the_word() {
++        for (h, w) in [
++            (SEED, [0u8; 8]),
++            (1, [1, 2, 3, 4, 5, 6, 7, 8]),
++            (u64::MAX, [0xff; 8]),
++        ] {
++            assert_eq!(fold_word(h, &w), fold_bytes(h, &w));
++        }
++    }
++
+     #[test]
+     fn tail_word_is_the_zero_padded_tail() {
+         let buf: Vec<u8> = (0..40u32).map(|i| (0x21 + i * 7 % 200) as u8).collect();
+diff --git a/src/engine/turbo/text.rs b/src/engine/turbo/text.rs
+index c0668aa..b65ce88 100644
+--- a/src/engine/turbo/text.rs
++++ b/src/engine/turbo/text.rs
+@@ -210,7 +210,8 @@ fn skip_json_string<S: Scan>(scan: S, data: &[u8], mut at: usize, end: usize) ->
+     }
+ }
+ 
+-/// Skips a nested object or array, which is not a cell value.
++/// Past a nested object or array: the byte after its closing bracket, or `end`
++/// where it does not close.
+ fn skip_json_nested<S: Scan>(scan: S, data: &[u8], mut pos: usize, end: usize) -> usize {
+     let mut depth = 0i32;
+     while pos < end {
+@@ -1042,9 +1043,13 @@ impl RowParser {
+                 pos = close;
+                 Some(pack(from as u64, (to - from) as u64, escaped))
+             } else if data[pos] == b'{' || data[pos] == b'[' {
+-                // Not a cell value. Left absent rather than guessed at.
++                // An object or array is a cell of its JSON text, as written:
++                // two that differ anywhere differ. Left absent, as it once
++                // was, two different objects read as the same missing value
++                // and the change went unreported.
++                let from = pos;
+                 pos = skip_json_nested(scan, data, pos, end);
+-                None
++                Some(pack(from as u64, (pos - from) as u64, false))
+             } else {
+                 // A number, true, false or null: it runs to the next comma,
+                 // brace or space.
+@@ -1578,8 +1583,8 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn null_a_nested_value_and_a_missing_key_are_all_absent() {
+-        let text = "{\"k\":\"1\",\"v\":null,\"w\":{\"deep\":1},\"x\":[1,2]}\n";
++    fn null_and_a_missing_key_are_absent_and_a_nested_value_is_its_text() {
++        let text = "{\"k\":\"1\",\"v\":null,\"w\":{\"deep\":[1,\"]}\"]},\"x\":[1, 2],\"y\":3}\n";
+         let slab = json_slab(text);
+         let parser = RowParser::json(
+             vec![
+@@ -1588,14 +1593,19 @@ mod tests {
+                 Some("w".into()),
+                 Some("x".into()),
+                 Some("missing".into()),
++                Some("y".into()),
+             ],
+             0,
+             false,
+         );
+-        let mut out = vec![0; 5];
++        let mut out = vec![0; 6];
+         let next = parser.parse(slab.data(), 0, text.len(), &mut out);
+         assert_eq!(slab.raw(out[0]), b"1");
+-        assert_eq!(out[1..], [ABSENT; 4]);
++        assert_eq!([out[1], out[4]], [ABSENT; 2]);
++        // A bracket inside a string does not close the object.
++        assert_eq!(slab.raw(out[2]), b"{\"deep\":[1,\"]}\"]}");
++        assert_eq!(slab.raw(out[3]), b"[1, 2]");
++        assert_eq!(slab.raw(out[5]), b"3");
+         assert_eq!(next, text.len());
+     }
+ 
 diff --git a/src/parquet.rs b/src/parquet.rs
 index 1e14514..ea12400 100644
 --- a/src/parquet.rs

@@ -11,7 +11,9 @@ annotation per thread count (annotations are what the API serves back without
 a log download).
 
 usage: python3 scripts/ladder_ab.py --builds base=PATH,head=PATH \
-           --pairs NAME=A,B[;NAME=A,B...] --threads 1,2,4 --out results
+           --pairs NAME=A,B[|KEY[|IGNORE]][;...] --threads 1,2,4 --out results
+
+KEY defaults to id,k2 (the size-ladder shape) and IGNORE to nothing.
 """
 import argparse
 import json
@@ -57,7 +59,12 @@ def main():
     args = ap.parse_args()
 
     builds = dict(b.split("=", 1) for b in args.builds.split(","))
-    pairs = [(n, *ab.split(",")) for n, ab in (p.split("=", 1) for p in args.pairs.split(";"))]
+    pairs = []
+    for spec in args.pairs.split(";"):
+        name, rest = spec.split("=", 1)
+        files, key, ignore = (rest.split("|") + [KEY, ""])[:3]
+        a, b = files.split(",")
+        pairs.append((name, a, b, key or KEY, ignore))
     threads = [int(t) for t in args.threads.split(",")]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -68,7 +75,7 @@ def main():
     tools = list(builds) + [c for c in args.contenders.split(",") if c]
     med = {}
     for t in threads:
-        for name, a, b in pairs:
+        for name, a, b, key, ignore in pairs:
             nrounds, warmup = rounds_for(a)
             gate = {}
             for tool in tools:
@@ -76,11 +83,14 @@ def main():
                     work = out / name / str(t) / tool / mode
                     work.mkdir(parents=True, exist_ok=True)
                     if tool in builds:
-                        cmd = [builds[tool], "compare", a, b, "-k", KEY, "--threads", str(t)]
+                        cmd = [builds[tool], "compare", a, b, "-k", key, "--threads", str(t)]
+                        if ignore:
+                            cmd += ["-i", ignore]
                         cmd += ["--summary"] if mode == "counts" else ["--export-dir", str(work)]
                     else:
-                        cmd = [sys.executable, str(CONTENDERS), tool, a, b, "--key", KEY,
-                               "--json", str(work / "counts.json"), "--threads", str(t)]
+                        cmd = [sys.executable, str(CONTENDERS), tool, a, b, "--key", key,
+                               "--ignore", ignore, "--json", str(work / "counts.json"),
+                               "--threads", str(t)]
                         if mode == "rows":
                             cmd += ["--rows-out", str(work)]
                     env = dict(os.environ, POLARS_MAX_THREADS=str(t))
@@ -115,7 +125,7 @@ def main():
     for t in threads:
         lines += [f"## {t} thread(s)", "", f"| pair | {head} |", "|---" * (len(tools) + 1) + "|"]
         note = [f"T={t} counts/rows s: {head}"]
-        for name, _, _ in pairs:
+        for name, *_ in pairs:
             cells = [f"{med[(t, name, tool, 'counts')]:.3f} / {med[(t, name, tool, 'rows')]:.3f}"
                      for tool in tools]
             lines.append(f"| {name} | " + " | ".join(cells) + " |")

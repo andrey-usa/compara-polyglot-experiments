@@ -67,14 +67,19 @@ jobs:
               duckdb.sql(f"COPY (SELECT * FROM 'data/5000000/{side}.parquet') TO "
                          f"'data/5000000-duckdb/{side}.parquet' (FORMAT parquet)")
           PY
-          ls -la data/*
+          # A wide pair (20 columns, keyed on two of them) as compara's own
+          # generator writes it, zstd: the shape the README's table measures.
+          cargo build --release --locked --manifest-path compara-base/Cargo.toml --bin compara-gen-data
+          compara-base/target/release/compara-gen-data --rows 2m --out-dir data/wide --prefix w \
+            --format parquet --compression zstd
+          ls -la data/* data/wide
 
       - name: Ladder
         run: |
           d=data
           python3 scripts/ladder_ab.py \
             --builds "base=$PWD/compara-base/target/release/compara,head=$PWD/compara-head/target/release/compara" \
-            --pairs "50k-pyarrow=$d/50000/A.parquet,$d/50000/B.parquet;500k-pyarrow=$d/500000/A.parquet,$d/500000/B.parquet;5M-pyarrow=$d/5000000/A.parquet,$d/5000000/B.parquet;5M-duckdb=$d/5000000-duckdb/A.parquet,$d/5000000-duckdb/B.parquet;5M-csv=$d/5000000/A.csv,$d/5000000/B.csv" \
+            --pairs "50k-pyarrow=$d/50000/A.parquet,$d/50000/B.parquet;500k-pyarrow=$d/500000/A.parquet,$d/500000/B.parquet;5M-pyarrow=$d/5000000/A.parquet,$d/5000000/B.parquet;5M-duckdb=$d/5000000-duckdb/A.parquet,$d/5000000-duckdb/B.parquet;5M-csv=$d/5000000/A.csv,$d/5000000/B.csv;2M-wide-zstd=$d/wide/w_a.parquet,$d/wide/w_b.parquet|account_id,txn_id|updated_at" \
             --threads 1,2,4 --out results
 
       - name: Phases, head and base, 5M pairs, four threads
