@@ -1,0 +1,135 @@
+name: Scale ladder (compara vs DuckDB vs PyArrow, summary only)
+
+permissions:
+  contents: read
+
+# The 10M-to-100M extension of bench-sizes, asked for on 2026-10-21: at every
+# rung, is the Rust compara still the fastest way to compare two files when
+# nobody writes any diff rows -- the cheapest run each tool can do?
+#
+# Tools: compara (built from this branch's rust/, the 0.5.3-alpha.1 tree),
+# DuckDB and PyArrow at their latest pip releases, through the repository's
+# own contenders.py and its PyArrow sibling. Polars is not here: bench-sizes
+# already covers it up to 5M, and this ladder's question names DuckDB and
+# PyArrow. Summary mode only, CSV and Parquet, composite key (id,k2),
+# 4 threads, counts gated per cell across the tools that finish.
+#
+# One runner per rung (the scale-ceiling pattern): a rung compares tools on
+# one host, never machines; a rung that dies is a result, not a reason to
+# stop the ladder; and one rung on its own runner has that runner's whole
+# disk and RAM. Fixtures are generated inside the rung job and die with it --
+# the full ladder's fixtures together would exceed any one runner's disk.
+#
+# Cloud note: GitHub-hosted ubuntu-latest is a standard 4 vCPU / 16 GB cloud
+# VM shape, so absolute seconds transfer to comparable cloud instances in a
+# way a dev box's never would.
+
+on:
+  # Push runs it, as bench-sizes does: a workflow_dispatch on a branch-only
+  # file needs GitHub to have indexed the workflow first, which can lag.
+  push:
+    branches: [bench-scale]
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: "Comma-separated row counts, one matrix rung each"
+        default: "10000000,20000000,30000000,40000000,50000000,60000000,70000000,80000000,90000000,100000000"
+      formats:
+        description: "Comma-separated: csv, parquet"
+        default: "csv,parquet"
+      threads:
+        description: "Threads for every tool"
+        default: "4"
+
+concurrency:
+  group: bench-scale
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: the ladder
+    runs-on: ubuntu-latest
+    outputs:
+      sizes: ${{ steps.split.outputs.sizes }}
+    steps:
+      - id: split
+        env:
+          SIZES: ${{ github.event.inputs.sizes || '10000000,20000000,30000000,40000000,50000000,60000000,70000000,80000000,90000000,100000000' }}
+        run: |
+          python3 -c "import json,os;print('sizes='+json.dumps([s.strip() for s in os.environ['SIZES'].split(',') if s.strip()]))" \
+              | tee -a "$GITHUB_OUTPUT"
+
+  rung:
+    name: "rung: ${{ matrix.size }} rows"
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        size: ${{ fromJSON(needs.plan.outputs.sizes) }}
+    env:
+      FORMATS: ${{ github.event.inputs.formats || 'csv,parquet' }}
+      THREADS: ${{ github.event.inputs.threads || '4' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The ladder needs every gigabyte: a 100M-row pair is ~10 GB across
+      # both formats, and the runner ships with ~25 GB of toolchains this
+      # job never uses (the scale-ceiling step, unchanged).
+      - name: Free disk space
+        run: |
+          before=$(df --output=avail -m / | tail -1)
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          after=$(df --output=avail -m / | tail -1)
+          echo "freed $(( (after - before) / 1024 )) GB, $(( after / 1024 )) GB now available"
+
+      - name: What this runner is
+        run: |
+          {
+            echo "## Host — ${{ matrix.size }} rows"
+            echo
+            echo '```'
+            grep -m1 "model name" /proc/cpuinfo
+            echo "cores: $(nproc)"
+            echo "runner: $RUNNER_NAME"
+            free -g | head -2
+            df -h / | tail -1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build compara from this branch
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install the contenders at their latest releases
+        run: pip install duckdb pyarrow numpy
+
+      - name: Generate this rung's fixtures
+        run: python3 scripts/bench_sizes_gen.py --sizes "${{ matrix.size }}" --out data
+
+      - name: Run the rung
+        run: |
+          python3 scripts/bench_scale_ladder.py \
+            --size "${{ matrix.size }}" --formats "$FORMATS" --threads "$THREADS" \
+            --compara "$PWD/rust/target/release/compara" \
+            --data data --out results
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-scale-${{ matrix.size }}-${{ github.run_id }}
+          path: results/
+          retention-days: 30
