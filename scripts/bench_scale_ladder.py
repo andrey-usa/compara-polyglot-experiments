@@ -86,10 +86,14 @@ def main():
     ap.add_argument("--size", required=True)
     ap.add_argument("--formats", required=True)
     ap.add_argument("--threads", required=True)
-    ap.add_argument("--compara", required=True)
+    ap.add_argument("--compara", default="",
+                    help="path to the compara binary (only needed when compara is in --tools)")
     ap.add_argument("--data", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--tools", default="compara,duckdb,pyarrow",
+                    help="comma-separated subset of compara,duckdb,pyarrow")
     args = ap.parse_args()
+    tools = tuple(t.strip() for t in args.tools.split(",") if t.strip())
 
     size = args.size
     n = int(size)
@@ -99,10 +103,20 @@ def main():
     nrounds = 3 if n <= 50_000_000 else 2
 
     versions = {}
-    p = subprocess.run([args.compara, "--version"], capture_output=True, text=True)
-    versions["compara"] = (p.stdout or p.stderr).strip()
+    if args.compara and Path(args.compara).exists():
+        p = subprocess.run([args.compara, "--version"], capture_output=True, text=True)
+        versions["compara"] = (p.stdout or p.stderr).strip()
+    else:
+        versions["compara"] = "(not in this job)"
     p = subprocess.run([sys.executable, "-c",
-                        "import duckdb, pyarrow; print(f'duckdb {duckdb.__version__} / pyarrow {pyarrow.__version__}')"],
+                        "import importlib\n"
+                        "out = []\n"
+                        "for m in ('duckdb', 'pyarrow'):\n"
+                        "    try:\n"
+                        "        mod = importlib.import_module(m); out.append(f'{m} {mod.__version__}')\n"
+                        "    except ImportError:\n"
+                        "        pass\n"
+                        "print(' / '.join(out))"],
                        capture_output=True, text=True)
     versions["contenders"] = p.stdout.strip()
     print("versions:", versions, flush=True)
@@ -136,11 +150,11 @@ def main():
             return dt, peak, {"added": c["added"], "removed": c["removed"],
                               "changed": c["changed"]}, None
 
-        for tool in TOOLS:
+        for tool in tools:
             records[(fmt, tool)] = {"secs": [], "peak_mb": 0.0,
                                     "counts": None, "error": None}
         for r in range(nrounds):
-            order = TOOLS[r % len(TOOLS):] + TOOLS[:r % len(TOOLS)]
+            order = tools[r % len(tools):] + tools[:r % len(tools)]
             for tool in order:
                 rec = records[(fmt, tool)]
                 if rec["error"] and r > 0:
@@ -156,16 +170,34 @@ def main():
                     print(f"  {tool:8s} round {r}: {dt:9.3f}s peak {peak:8.0f} MB", flush=True)
         gate = {t: (records[(fmt, t)]["counts"]["added"], records[(fmt, t)]["counts"]["removed"],
                     records[(fmt, t)]["counts"]["changed"])
-                for t in TOOLS if records[(fmt, t)]["counts"]}
+                for t in tools if records[(fmt, t)]["counts"]}
         if len(set(gate.values())) > 1:
             raise SystemExit(f"COUNT MISMATCH at {size}/{fmt}: {gate}")
         print(f"  gate OK (finishers agree): {gate}", flush=True)
+        dump(records, fmts, tools, versions, size, nrounds, args, out)
 
+    table = dump(records, fmts, tools, versions, size, nrounds, args, out)
+    print(table, flush=True)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as f:
+            f.write(table + "\n")
+
+
+def dump(records, fmts, tools, versions, size, nrounds, args, out):
+    """(Re)write results.tsv + RESULTS.md from whatever has completed so far.
+
+    Called after every format, not just at the end: run 39669226917 lost its
+    finished 100M CSV rounds (compara 32.3s, DuckDB 236s) because the table
+    was only written after the last cell, and the step died before that.
+    """
     with (out / "results.tsv").open("w") as f:
         f.write("size\tfmt\ttool\tstatus\tmedian_s\trounds_s\tpeak_mb\tadded\tremoved\tchanged\n")
         for fmt in fmts:
-            for tool in TOOLS:
-                rec = records[(fmt, tool)]
+            for tool in tools:
+                rec = records.get((fmt, tool))
+                if rec is None:
+                    continue
                 if rec["error"] or not rec["secs"]:
                     f.write(f"{size}\t{fmt}\t{tool}\tFAIL\t\t\t{rec['peak_mb']:.0f}\t\t\t\t{rec['error'] or ''}\n")
                 else:
@@ -182,23 +214,22 @@ def main():
              "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for fmt in fmts:
         def cell(tool):
-            rec = records[(fmt, tool)]
+            rec = records.get((fmt, tool))
+            if rec is None:
+                return "—"
             return f"{statistics.median(rec['secs']):.3f}" if rec["secs"] else "FAIL"
         def peak(tool):
-            return f"{records[(fmt, tool)]['peak_mb']:.0f}"
+            rec = records.get((fmt, tool))
+            return f"{rec['peak_mb']:.0f}" if rec else "—"
         lines.append(f"| {fmt} | {cell('compara')} | {cell('duckdb')} | {cell('pyarrow')} | "
                      f"{peak('compara')} | {peak('duckdb')} | {peak('pyarrow')} |")
-    fails = [f"{fmt}/{t}: {records[(fmt, t)]['error']}" for fmt in fmts for t in TOOLS
-             if records[(fmt, t)]["error"]]
+    fails = [f"{fmt}/{t}: {records[(fmt, t)]['error']}" for fmt in fmts for t in tools
+             if records.get((fmt, t)) and records[(fmt, t)]["error"]]
     if fails:
         lines += ["", "Failures:"] + [f"- {x}" for x in fails]
     table = "\n".join(lines) + "\n"
     (out / "RESULTS.md").write_text(table)
-    print(table, flush=True)
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a") as f:
-            f.write(table + "\n")
+    return table
 
 
 if __name__ == "__main__":

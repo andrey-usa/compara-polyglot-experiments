@@ -120,10 +120,11 @@ jobs:
       - name: Generate this rung's fixtures
         run: python3 scripts/bench_sizes_gen.py --sizes "${{ matrix.size }}" --out data
 
-      - name: Run the rung
+      - name: Run the rung (compara + DuckDB)
         run: |
           python3 scripts/bench_scale_ladder.py \
             --size "${{ matrix.size }}" --formats "$FORMATS" --threads "$THREADS" \
+            --tools compara,duckdb \
             --compara "$PWD/rust/target/release/compara" \
             --data data --out results
 
@@ -131,5 +132,73 @@ jobs:
         if: always()
         with:
           name: bench-scale-${{ matrix.size }}-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+
+  # PyArrow runs in a job of its own. In run 39669226917 every rung at 60M+
+  # died with exit 143 during PyArrow's first CSV round: its whole-table
+  # joins already peaked at 15.0 GB at 50M (the runner has 15 GB), and at
+  # 60M+ the memory blow took the whole step -- and the finished compara /
+  # DuckDB cells -- down with it. Isolated here, a PyArrow death is a clean
+  # per-rung result (this job fails, nothing else does), which is also what
+  # it is for a user on a standard 16 GB cloud VM.
+  rung-pyarrow:
+    name: "rung-pyarrow: ${{ matrix.size }} rows"
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        size: ${{ fromJSON(needs.plan.outputs.sizes) }}
+    env:
+      FORMATS: ${{ github.event.inputs.formats || 'csv,parquet' }}
+      THREADS: ${{ github.event.inputs.threads || '4' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          before=$(df --output=avail -m / | tail -1)
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          after=$(df --output=avail -m / | tail -1)
+          echo "freed $(( (after - before) / 1024 )) GB, $(( after / 1024 )) GB now available"
+
+      - name: What this runner is
+        run: |
+          {
+            echo "## Host (PyArrow) — ${{ matrix.size }} rows"
+            echo
+            echo '```'
+            grep -m1 "model name" /proc/cpuinfo
+            echo "cores: $(nproc)"
+            echo "runner: $RUNNER_NAME"
+            free -g | head -2
+            df -h / | tail -1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install PyArrow at its latest release
+        run: pip install pyarrow numpy
+
+      - name: Generate this rung's fixtures
+        run: python3 scripts/bench_sizes_gen.py --sizes "${{ matrix.size }}" --out data
+
+      - name: Run the rung (PyArrow only)
+        run: |
+          python3 scripts/bench_scale_ladder.py \
+            --size "${{ matrix.size }}" --formats "$FORMATS" --threads "$THREADS" \
+            --tools pyarrow \
+            --data data --out results
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-scale-pyarrow-${{ matrix.size }}-${{ github.run_id }}
           path: results/
           retention-days: 30
