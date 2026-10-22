@@ -1,0 +1,102 @@
+name: Ports by thread count
+
+# Every port on one runner per format, at each thread count asked for, with the
+# tables published as check-run annotations as well as the step summary, so
+# they can be read from the API without downloading an artifact.
+#
+# One job per format, never one per port: a table compares ports, and ports in
+# two jobs ran on two machines.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Row count (2m, 5m, 10m ...)"
+        default: "2m"
+      formats:
+        description: "Comma-separated: csv, tsv, ndjson, parquet (one job each)"
+        default: "csv,tsv,ndjson,parquet"
+      threads:
+        description: "Comma-separated thread counts"
+        default: "1,2,4"
+      repeats:
+        description: "Runs per build and thread count; the best is kept"
+        default: "5"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      formats: ${{ steps.p.outputs.formats }}
+    steps:
+      - id: p
+        run: |
+          python3 -c "import json,os; print('formats=' + json.dumps([f.strip() for f in os.environ['F'].split(',') if f.strip()]))" >> "$GITHUB_OUTPUT"
+        env:
+          F: ${{ inputs.formats }}
+
+  bench:
+    needs: plan
+    name: "${{ matrix.format }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        format: ${{ fromJson(needs.plan.outputs.formats) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+
+      - name: Install Zig
+        uses: ./.github/actions/setup-zig
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
+
+      - name: Build every port
+        run: scripts/build_ports.sh c rust zig cpp cpp-gen
+
+      - name: Run the tables
+        env:
+          ROWS: ${{ inputs.rows }}
+          THREADS: ${{ inputs.threads }}
+          REPEATS: ${{ inputs.repeats }}
+        run: |
+          host="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs), $(nproc) cores"
+          echo "host: $host"
+          total_mb=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo)
+          cap=$(( total_mb - 2048 ))
+          mkdir -p /tmp/tables
+          for t in ${THREADS//,/ }; do
+            python3 scripts/bench_formats_ports.py \
+              --rows "$ROWS" --formats "${{ matrix.format }}" --repeats "$REPEATS" \
+              --threads "$t" --memory-cap "$cap" --keep --data-dir /tmp/bench-data \
+              --md-out "/tmp/tables/t$t.md" --json-out "/tmp/tables/t$t.json" \
+              | tee -a /tmp/tables/log.txt
+            {
+              echo "### $ROWS ${{ matrix.format }}, $t thread(s) — $host"
+              echo
+              cat "/tmp/tables/t$t.md"
+            } > "/tmp/tables/t$t.annot"
+            cat "/tmp/tables/t$t.annot" >> "$GITHUB_STEP_SUMMARY"
+            python3 - "/tmp/tables/t$t.annot" "ports ${{ matrix.format }} t=$t" <<'EOF'
+          import sys
+          text = open(sys.argv[1]).read()
+          esc = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::notice title={sys.argv[2]}::{esc}")
+          EOF
+          done
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ports-threads-${{ matrix.format }}-${{ github.run_id }}
+          path: /tmp/tables
+          retention-days: 30
