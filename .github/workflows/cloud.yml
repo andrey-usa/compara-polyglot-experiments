@@ -107,12 +107,26 @@ jobs:
           cache: false
       - name: Start MinIO, Azurite and fake-gcs-server
         run: |
-          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio12345 \
-            minio/minio server /data
-          docker run -d --name azurite -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
+          start() { # name, docker run arguments...
+            local name=$1; shift
+            if ! out=$(docker run -d --name "$name" "$@" 2>&1); then
+              echo "::error title=cloud emulator $name::$(echo "$out" | tail -c 600 | tr '\n' ' ')"
+              return 1
+            fi
+          }
+          start minio -p 9000:9000 -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio12345 \
+            quay.io/minio/minio:latest server /data
+          start azurite -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:latest \
             azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
-          docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server -scheme http -port 4443 \
+          start gcs -p 4443:4443 fsouza/fake-gcs-server:latest -scheme http -port 4443 \
             -public-host localhost:4443
+          sleep 5
+          docker ps -a --format '{{.Names}} {{.Status}}'
+          for n in minio azurite gcs; do
+            if [ "$(docker inspect -f '{{.State.Running}}' $n)" != true ]; then
+              echo "::error title=cloud emulator $n::not running: $(docker logs $n 2>&1 | tail -c 600 | tr '\n' ' ')"
+            fi
+          done
       - name: Build
         working-directory: cloud
         run: cargo build --release --locked --bin compara --bin compara-gen-data
