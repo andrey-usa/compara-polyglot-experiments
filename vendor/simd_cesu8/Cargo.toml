@@ -1,0 +1,64 @@
+[build-dependencies.rustc_version]
+version = "0.4.0"
+
+[dependencies.simdutf8]
+default-features = false
+version = "0.1.4"
+
+[dev-dependencies.cesu8]
+version = "1.1.0"
+
+[dev-dependencies.criterion]
+features = ["html_reports"]
+version = "0.5.1"
+
+[features]
+bench = []
+default = ["std"]
+nightly = []
+std = ["simdutf8/std"]
+
+[lib]
+path = "src/lib.rs"
+
+[lints.clippy]
+alloc_instead_of_core = "deny"
+doc_markdown = "allow"
+missing_safety_doc = "deny"
+multiple_unsafe_ops_per_block = "deny"
+std_instead_of_alloc = "deny"
+std_instead_of_core = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[lints.clippy.pedantic]
+level = "deny"
+priority = -1
+
+[lints.rust]
+missing_docs = "deny"
+
+[package]
+authors = ["Sean C. Roach <me@seancroach.dev>"]
+autobenches = false
+autobins = false
+autoexamples = false
+autolib = false
+autotests = false
+categories = ["encoding", "no-std"]
+description = "An extremely fast, SIMD accelerated, encoding and decoding library for CESU-8 and Modified UTF-8."
+edition = "2021"
+homepage = "https://github.com/seancroach/simd_cesu8"
+keywords = ["cesu8", "decode", "encode", "mutf8", "no_std"]
+license = "Apache-2.0 OR MIT"
+name = "simd_cesu8"
+readme = "README.md"
+repository = "https://github.com/seancroach/simd_cesu8"
+rust-version = "1.85.0"
+version = "1.2.0"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[profile.bench]
+debug = 2

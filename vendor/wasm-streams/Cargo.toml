@@ -1,0 +1,58 @@
+[dependencies.futures-util]
+features = ["io", "sink"]
+version = "^0.3.31"
+
+[dependencies.js-sys]
+version = "^0.3.85"
+
+[dependencies.wasm-bindgen]
+version = "0.2.108"
+
+[dependencies.wasm-bindgen-futures]
+version = "^0.4.58"
+
+[dependencies.web-sys]
+features = ["AbortSignal", "QueuingStrategy", "ReadableStream", "ReadableStreamType", "ReadableWritablePair", "ReadableStreamByobReader", "ReadableStreamReaderMode", "ReadableStreamReadResult", "ReadableStreamByobRequest", "ReadableStreamDefaultReader", "ReadableByteStreamController", "ReadableStreamGetReaderOptions", "ReadableStreamDefaultController", "StreamPipeOptions", "TransformStream", "TransformStreamDefaultController", "Transformer", "UnderlyingSink", "UnderlyingSource", "WritableStream", "WritableStreamDefaultController", "WritableStreamDefaultWriter"]
+version = "^0.3.85"
+
+[dev-dependencies.gloo-timers]
+features = ["futures"]
+version = "^0.3.0"
+
+[dev-dependencies.pin-project]
+version = "^1"
+
+[dev-dependencies.tokio]
+features = ["macros", "rt"]
+version = "^1"
+
+[dev-dependencies.wasm-bindgen-test]
+version = "0.3.58"
+
+[dev-dependencies.web-sys]
+features = ["console", "AbortSignal", "ErrorEvent", "PromiseRejectionEvent", "Response", "ReadableStream", "Window"]
+version = "^0.3.85"
+
+[lib]
+path = "src/lib.rs"
+
+[package]
+authors = ["Mattias Buelens <mattias@buelens.com>"]
+autobenches = false
+autobins = false
+autoexamples = false
+autolib = false
+autotests = false
+description = """
+Bridging between web streams and Rust streams using WebAssembly
+"""
+edition = "2021"
+exclude = [".github/", "tests/panic-unwind/"]
+license = "MIT OR Apache-2.0"
+name = "wasm-streams"
+readme = "README.md"
+repository = "https://github.com/MattiasBuelens/wasm-streams/"
+version = "0.5.0"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]

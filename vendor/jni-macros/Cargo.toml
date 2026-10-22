@@ -1,0 +1,47 @@
+[build-dependencies.rustc_version]
+version = "0.4"
+
+[dependencies.proc-macro2]
+version = "1.0"
+
+[dependencies.quote]
+version = "1.0"
+
+[dependencies.simd_cesu8]
+version = "1.0.1"
+
+[dependencies.syn]
+features = ["full"]
+version = "2.0"
+
+[dev-dependencies.javac]
+version = "0.1.0"
+
+[dev-dependencies.rusty-fork]
+version = "0.3.0"
+
+[dev-dependencies.thiserror]
+version = "2"
+
+[dev-dependencies.trybuild]
+version = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[package]
+autobenches = false
+autobins = false
+autoexamples = false
+autolib = false
+autotests = false
+categories = ["api-bindings", "development-tools::procedural-macro-helpers"]
+description = "Procedural macros for the jni crate"
+edition = "2024"
+include = ["build.rs", "src/**", "examples/**"]
+keywords = ["jni", "java", "jvm", "android", "ndk"]
+license = "MIT OR Apache-2.0"
+name = "jni-macros"
+readme = "README.md"
+repository = "https://github.com/jni-rs/jni-rs"
+version = "0.22.4"

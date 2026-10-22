@@ -1,0 +1,94 @@
+[build-dependencies.walkdir]
+version = "2"
+
+[dependencies.cfg-if]
+version = "1.0.0"
+
+[dependencies.combine]
+version = "4.1.0"
+
+[dependencies.jni-macros]
+version = "=0.22.4"
+
+[dependencies.jni-sys]
+version = "0.4.1"
+
+[dependencies.log]
+version = "0.4.4"
+
+[dependencies.simd_cesu8]
+version = "1.1.1"
+
+[dependencies.thiserror]
+version = "2"
+
+[dev-dependencies.assert_matches]
+version = "1.5.0"
+
+[dev-dependencies.criterion]
+features = ["html_reports"]
+version = "0.7"
+
+[dev-dependencies.javac]
+version = "0.1.0"
+
+[dev-dependencies.lazy_static]
+version = "1"
+
+[dev-dependencies.rusty-fork]
+version = "0.3.0"
+
+[dev-dependencies.static_assertions]
+version = "1"
+
+[dev-dependencies.trybuild]
+version = "1"
+
+[features]
+_cfg_test = []
+default = []
+invocation = ["dep:java-locator", "dep:libloading"]
+
+[lib]
+path = "src/lib.rs"
+
+[package]
+authors = ["jni team"]
+autobenches = false
+autobins = false
+autoexamples = false
+autolib = false
+autotests = false
+categories = ["api-bindings"]
+description = "Rust bindings to the JNI"
+documentation = "https://docs.rs/jni"
+edition = "2024"
+exclude = ["/benches", "/examples", "/mylib-example", "/tests"]
+keywords = ["ffi", "jni", "java"]
+license = "MIT OR Apache-2.0"
+name = "jni"
+readme = "README.md"
+repository = "https://github.com/jni-rs/jni-rs"
+rust-version = "1.85.0"
+version = "0.22.4"
+
+[package.metadata.docs.rs]
+features = ["invocation"]
+
+[target.'cfg(not(target_os = "android"))'.dependencies.java-locator]
+optional = true
+version = "0.1.3"
+
+[target.'cfg(not(target_os = "android"))'.dependencies.libloading]
+optional = true
+version = "0.8"
+
+[target."cfg(windows)".dependencies.windows-link]
+version = "0.2"
+
+[target."cfg(windows)".dev-dependencies.bytemuck]
+version = "1.13.0"
+
+[target."cfg(windows)".dev-dependencies.windows-sys]
+features = ["Win32_System_Threading", "Win32_Foundation"]
+version = "0.61"
