@@ -1,0 +1,94 @@
+name: Vendor cloud dependencies
+
+# Resolves the Rust port's dependencies plus the object-storage stack
+# (object_store with S3, GCS, Azure and HTTP) against the manifest and lock in
+# `vendor-src/`, vendors them for Linux, and commits the vendor tree and the
+# resulting lock to the `cloud-vendor` branch, so a machine without a crates
+# registry can build the same thing from git.
+
+on:
+  push:
+    branches: [experiment-15]
+    paths:
+      - "vendor-src/**"
+      - ".github/workflows/vendor-cloud.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+
+      - name: Resolve
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/v/src/bin && cd /tmp/v
+          cp "$GITHUB_WORKSPACE/vendor-src/Cargo.toml" "$GITHUB_WORKSPACE/vendor-src/Cargo.lock" .
+          echo 'fn main() {}' > src/main.rs
+          echo '' > src/lib.rs
+          echo 'fn main() {}' > src/bin/gen_data.rs
+          echo 'fn main() {}' > src/bin/bench.rs
+          if [ -f "$GITHUB_WORKSPACE/vendor-src/add.sh" ]; then
+            bash "$GITHUB_WORKSPACE/vendor-src/add.sh"
+          fi
+          cargo fetch
+          {
+            echo "### resolved"
+            echo '```'
+            cargo tree -e normal --depth 1 | head -40
+            for c in object_store reqwest rustls ring aws-lc-rs aws-lc-sys tokio hyper; do
+              cargo tree -e normal -i "$c" --depth 0 2>/dev/null | head -1 || true
+            done
+            echo '```'
+          } > /tmp/resolved.md
+          cat /tmp/resolved.md
+          python3 - /tmp/resolved.md "vendor resolved" <<'EOF'
+          import sys
+          text = open(sys.argv[1]).read()[:3800]
+          print(f"::notice title={sys.argv[2]}::" + text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          EOF
+
+      - name: Vendor for Linux
+        run: |
+          set -euo pipefail
+          cargo install cargo-vendor-filterer --locked
+          cd /tmp/v
+          cargo vendor-filterer --platform=x86_64-unknown-linux-gnu \
+            --platform=aarch64-unknown-linux-gnu vendor > /tmp/vendor-config.toml
+          du -sh vendor
+          ls vendor | wc -l
+
+      - name: Commit to cloud-vendor
+        run: |
+          set -euo pipefail
+          git config user.name "andrey-usa"
+          git config user.email "62624421+andrey-usa@users.noreply.github.com"
+          work=/tmp/branch
+          if git ls-remote --exit-code --heads origin cloud-vendor >/dev/null; then
+            git fetch --depth 1 origin cloud-vendor
+            git worktree add "$work" FETCH_HEAD
+            (cd "$work" && git switch -c cloud-vendor)
+          else
+            git worktree add --detach "$work"
+            (cd "$work" && git switch --orphan cloud-vendor)
+          fi
+          cd "$work"
+          git rm -rq --ignore-unmatch . || true
+          rm -rf vendor
+          cp -r /tmp/v/vendor vendor
+          cp /tmp/v/Cargo.toml /tmp/v/Cargo.lock .
+          cp /tmp/vendor-config.toml vendor-config.toml
+          git add -A
+          git commit -qm "Vendored dependencies for $(git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD)" || exit 0
+          git push -q origin HEAD:cloud-vendor
+          echo "::notice title=vendor pushed::$(git rev-parse --short HEAD), $(du -sh vendor | cut -f1), $(ls vendor | wc -l) crates"
