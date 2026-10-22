@@ -1,0 +1,13 @@
+k,v,w
+CAFÉ,alpha,1
+  padded  ,beta,2
+K,gamma,3
+"has,comma",delta,4
+"a""b",epsilon,5
+"two
+lines",zeta,6
+dup,eta,7
+dup,eta,8
+blank,,9
+gone,theta,10
+z,omega,11

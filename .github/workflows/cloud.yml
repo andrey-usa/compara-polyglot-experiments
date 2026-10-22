@@ -1,0 +1,281 @@
+name: Cloud and containers
+
+# compara's object storage, HTTP and container support (the copy in `cloud/`),
+# checked where it has to work:
+#
+# - build: every release target, the way release.yml builds it (glibc 2.28
+#   through zigbuild on Linux), the test suite on Linux, and a smoke test;
+# - emulators: S3 (MinIO), Azure (Azurite) and GCS (fake-gcs-server), each
+#   compared against the local answer, inputs and outputs both;
+# - container: the image from the Dockerfile, run read-only, non-root, and
+#   under memory limits that turbo cannot meet.
+#
+# Results are annotations: `cloud <job> ...`.
+
+on:
+  push:
+    branches: [experiment-15]
+    paths:
+      - "cloud/**"
+      - ".github/workflows/cloud.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "build ${{ matrix.target }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, glibc: "2.28", test: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, glibc: "2.28" }
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: cloud
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          cache: false
+      - uses: actions/setup-python@v7
+        if: matrix.glibc
+        with:
+          python-version: "3.13"
+      - name: cargo-zigbuild
+        if: matrix.glibc
+        run: pip install ziglang cargo-zigbuild
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
+          CARGO_BUILD_WARNINGS: warn
+        run: |
+          start=$(date +%s)
+          if [ -n "${{ matrix.glibc }}" ]; then
+            cargo zigbuild --release --locked --bin compara --target ${{ matrix.target }}.${{ matrix.glibc }}
+          else
+            cargo build --release --locked --bin compara --target ${{ matrix.target }}
+          fi
+          bin=target/${{ matrix.target }}/release/compara
+          [ -f "$bin" ] || bin="$bin.exe"
+          size=$(wc -c < "$bin")
+          echo "::notice title=cloud build ${{ matrix.target }}::$(( size / 1024 )) KB, built in $(( $(date +%s) - start ))s"
+      - name: Smoke test
+        if: "!contains(matrix.target, 'x86_64-apple') || runner.arch == 'X64'"
+        run: |
+          bin=target/${{ matrix.target }}/release/compara
+          "$bin" --version
+          "$bin" env
+          printf 'id,v\nk1,a\nk2,b\n' > a.csv && printf 'id,v\nk1,a\nk2,c\n' > b.csv
+          gzip -c a.csv > a.csv.gz
+          code=0; "$bin" compare a.csv.gz b.csv -k id --summary || code=$?
+          [ "$code" = 1 ]
+          code=0; cat a.csv | "$bin" compare - b.csv -k id --json - || code=$?
+          [ "$code" = 1 ]
+      - name: Tests
+        if: matrix.test
+        run: |
+          set -o pipefail
+          cargo test --release --locked --no-fail-fast 2>&1 | tee /tmp/test.log
+          python3 - <<'EOF'
+          import re
+          text = open("/tmp/test.log").read()
+          passed = sum(int(m) for m in re.findall(r"test result: \w+\. (\d+) passed", text))
+          failed = re.findall(r"^test (\S+) \.\.\. FAILED", text, re.M)
+          print(f"::notice title=cloud tests::{passed} passed, {len(failed)} failed {failed}")
+          EOF
+
+  emulators:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - name: Start MinIO, Azurite and fake-gcs-server
+        run: |
+          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio12345 \
+            minio/minio server /data
+          docker run -d --name azurite -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
+          docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server -scheme http -port 4443 \
+            -public-host localhost:4443
+      - name: Build
+        working-directory: cloud
+        run: cargo build --release --locked --bin compara --bin compara-gen-data
+      - name: Fixtures, uploaded to each
+        env:
+          AWS_ACCESS_KEY_ID: minio
+          AWS_SECRET_ACCESS_KEY: minio12345
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -eux
+          mkdir -p /tmp/fx && cd /tmp/fx
+          gen=$GITHUB_WORKSPACE/cloud/target/release/compara-gen-data
+          $gen --rows 200k --out-dir . --prefix t
+          $gen --rows 200k --out-dir . --prefix t --format parquet --compression zstd
+          $gen --rows 200k --out-dir . --prefix t --format ndjson
+          gzip -k t_a.csv
+          ls -la
+          for i in $(seq 30); do curl -sf http://localhost:9000/minio/health/live && break; sleep 1; done
+          aws --endpoint-url http://localhost:9000 s3 mb s3://bkt
+          AZ="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+          az storage container create -n cont --connection-string "$AZ" -o none
+          curl -sf -X POST http://localhost:4443/storage/v1/b -H 'content-type: application/json' -d '{"name":"bkt"}'
+          for f in t_a.csv t_b.csv t_a.csv.gz t_a.parquet t_b.parquet t_a.ndjson t_b.ndjson; do
+            aws --endpoint-url http://localhost:9000 s3 cp "$f" "s3://bkt/$f" --only-show-errors
+            az storage blob upload -c cont -f "$f" -n "$f" --connection-string "$AZ" -o none --only-show-errors
+            curl -sf -X POST "http://localhost:4443/upload/storage/v1/b/bkt/o?uploadType=media&name=$f" \
+              --data-binary @"$f" -o /dev/null
+          done
+      - name: Compare from each store against the local answer
+        run: |
+          set -u
+          cd /tmp/fx
+          bin=$GITHUB_WORKSPACE/cloud/target/release/compara
+          K="-k account_id,txn_id -i updated_at"
+          strip() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); d.pop('meta',None); print(json.dumps(d,sort_keys=True))" "$1"; }
+          run() { # name, a, b, env...
+            name=$1 a=$2 b=$3; shift 3
+            rm -rf "out-$name"; mkdir -p "out-$name"
+            start=$(date +%s.%N)
+            env "$@" $bin compare "$a" "$b" $K --json "out-$name/s.json" --export-dir "out-$name/x" 2> "out-$name/err"
+            code=$?
+            secs=$(python3 -c "import time; print(round(time.time()-$start,2))")
+            echo "$code" > "out-$name/code"
+            echo "$name exit $code ${secs}s: $(tr '\n' ' ' < out-$name/err | cut -c1-300)"
+          }
+          S3="AWS_ENDPOINT_URL=http://localhost:9000 AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio12345 AWS_REGION=us-east-1"
+          AZ="AZURE_STORAGE_USE_EMULATOR=true"
+          GS="GOOGLE_BASE_URL=http://localhost:4443 GOOGLE_SKIP_SIGNATURE=true GOOGLE_ALLOW_HTTP=true"
+          : > report.txt
+          for fmt in csv parquet ndjson; do
+            run "local-$fmt" t_a.$fmt t_b.$fmt X=1 >> report.txt
+            run "s3-$fmt" s3://bkt/t_a.$fmt s3://bkt/t_b.$fmt $S3 >> report.txt
+            run "az-$fmt" az://cont/t_a.$fmt az://cont/t_b.$fmt $AZ >> report.txt
+            run "gs-$fmt" gs://bkt/t_a.$fmt gs://bkt/t_b.$fmt $GS >> report.txt
+            run "http-$fmt" http://localhost:4443/storage/v1/b/bkt/o/t_a.$fmt?alt=media \
+              http://localhost:4443/storage/v1/b/bkt/o/t_b.$fmt?alt=media X=1 >> report.txt
+          done
+          run "s3-gz" s3://bkt/t_a.csv.gz s3://bkt/t_b.csv $S3 >> report.txt
+          ok=0; bad=0
+          for fmt in csv parquet ndjson gz; do
+            ref=local-${fmt/gz/csv}
+            for store in s3 az gs http; do
+              d=out-$store-$fmt; [ -d "$d" ] || continue
+              if [ "$(cat $d/code)" = "$(cat out-$ref/code)" ] && [ "$(strip $d/s.json)" = "$(strip out-$ref/s.json)" ] \
+                 && diff -rq "$d/x" "out-$ref/x" >/dev/null; then
+                ok=$((ok+1)); echo "SAME $store $fmt" >> report.txt
+              else
+                bad=$((bad+1)); echo "DIFFERENT $store $fmt" >> report.txt
+              fi
+            done
+          done
+          cat report.txt
+          python3 - report.txt "cloud emulators $ok same, $bad different" <<'EOF'
+          import sys
+          text = open(sys.argv[1]).read()[:3800]
+          print(f"::notice title={sys.argv[2]}::" + text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          EOF
+          [ "$bad" = 0 ]
+      - name: Outputs to each store
+        run: |
+          set -eu
+          cd /tmp/fx
+          bin=$GITHUB_WORKSPACE/cloud/target/release/compara
+          K="-k account_id,txn_id -i updated_at"
+          export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio12345 AWS_DEFAULT_REGION=us-east-1
+          AZ="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+          : > out.txt
+          env AWS_ENDPOINT_URL=http://localhost:9000 AWS_REGION=us-east-1 COMPARA_UPLOAD_ONE_SHOT=1000000 COMPARA_UPLOAD_PART=5242880 \
+            $bin compare t_a.csv t_b.csv $K -o s3://bkt/out/report.html --json s3://bkt/out/s.json --export-dir s3://bkt/out/x/ || true
+          aws --endpoint-url http://localhost:9000 s3 ls --recursive s3://bkt/out/ >> out.txt
+          env AZURE_STORAGE_USE_EMULATOR=true $bin compare t_a.csv t_b.csv $K -o az://cont/out/report.html --export-dir az://cont/out/x/ || true
+          az storage blob list -c cont --prefix out/ --connection-string "$AZ" --query "[].{n:name,s:properties.contentLength}" -o tsv >> out.txt
+          env GOOGLE_BASE_URL=http://localhost:4443 GOOGLE_SKIP_SIGNATURE=true GOOGLE_ALLOW_HTTP=true \
+            $bin compare t_a.csv t_b.csv $K -o gs://bkt/out/report.html --export-dir gs://bkt/out/x/ || true
+          curl -sf "http://localhost:4443/storage/v1/b/bkt/o?prefix=out/" | python3 -c "import json,sys; [print(o['name'], o['size']) for o in json.load(sys.stdin).get('items',[])]" >> out.txt
+          cat out.txt
+          python3 - out.txt "cloud outputs" <<'EOF'
+          import sys
+          text = open(sys.argv[1]).read()[:3800]
+          print(f"::notice title={sys.argv[2]}::" + text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          EOF
+
+  container:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - name: Build the image (source target)
+        run: |
+          start=$(date +%s)
+          docker build -t compara:src cloud
+          echo "::notice title=cloud image::$(docker image ls compara:src --format '{{.Size}}'), built in $(( $(date +%s) - start ))s"
+      - name: Fixtures
+        working-directory: cloud
+        run: |
+          cargo build --release --locked --bin compara-gen-data
+          mkdir -p /tmp/data && chmod 777 /tmp/data
+          target/release/compara-gen-data --rows 2m --out-dir /tmp/data --prefix m
+          cp examples/*.csv /tmp/data/
+      - name: Run it the ways a cluster does
+        run: |
+          set -u
+          K="-k account_id,txn_id -i updated_at"
+          : > c.txt
+          note() { echo "$*" | tee -a c.txt; }
+          note "--- env at --memory 512m --cpus 1.5"
+          docker run --rm --memory 512m --cpus 1.5 compara:src env | tee -a c.txt
+          note "--- read-only root, non-root, tmpfs /tmp"
+          docker run --rm --read-only --tmpfs /tmp -v /tmp/data:/data:ro compara:src \
+            compare orders_2026-08.csv orders_2026-09.csv -k order_id,line_no -i updated_at --summary 2>&1 | tee -a c.txt
+          note "exit ${PIPESTATUS[0]}"
+          note "--- read-only root without a writable /tmp, gzip from stdin (needs a temp file)"
+          gzip -c /tmp/data/orders_2026-08.csv | docker run --rm -i --read-only -v /tmp/data:/data:ro compara:src \
+            compare - orders_2026-09.csv -k order_id,line_no 2>&1 | tee -a c.txt
+          note "exit ${PIPESTATUS[1]}"
+          free=$(docker run --rm -v /tmp/data:/data:ro compara:src compare m_a.csv m_b.csv $K 2>&1 | tail -1)
+          note "--- 2M-row CSV pair, no limit: $free"
+          for mem in 256m 160m 112m 80m 48m; do
+            docker rm -f lim >/dev/null 2>&1
+            start=$(date +%s.%N)
+            docker run --name lim --memory $mem --memory-swap $mem -v /tmp/data:/data:ro compara:src \
+              compare m_a.csv m_b.csv $K > out.txt 2> err.txt
+            code=$?
+            secs=$(python3 -c "import time; print(round(time.time()-$start,1))")
+            oom=$(docker inspect lim --format '{{.State.OOMKilled}}')
+            same=$([ "$(sed 's/ | [a-z]* [0-9.]*s$//' out.txt)" = "$(echo "$free" | sed 's/ | [a-z]* [0-9.]*s$//')" ] && echo same || echo DIFFERENT)
+            note "--memory $mem: exit $code, OOMKilled $oom, ${secs}s, counts $same: $(tail -c 300 out.txt) | $(tr '\n' ' ' < err.txt | cut -c1-240)"
+          done
+          python3 - c.txt "cloud container" <<'EOF'
+          import sys
+          text = open(sys.argv[1]).read()[-3800:]
+          print(f"::notice title={sys.argv[2]}::" + text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          EOF
+      - name: The arm64 image, cross-compiled
+        run: |
+          docker buildx create --use >/dev/null
+          start=$(date +%s)
+          docker buildx build --platform linux/arm64 -t compara:arm64 --load cloud
+          echo "::notice title=cloud image arm64::built in $(( $(date +%s) - start ))s"
+          docker run --rm --platform linux/arm64 compara:arm64 --version || true

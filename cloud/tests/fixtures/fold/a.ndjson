@@ -1,0 +1,5 @@
+{"id": "k1", "name": "Alpha", "note": "plain", "amount": "10.0", "tag": "x", "pad": "  "}
+{"id": "k2", "name": "CAF\u00c9", "note": "same", "amount": "20.0", "tag": "y", "pad": "  "}
+{"id": "k3", "name": null, "note": "left", "amount": "30.0", "tag": "z", "pad": "  "}
+{"id": "k4", "name": "Delta", "note": "Cr\u00e8me", "amount": "40.0", "tag": "w", "pad": "p"}
+{"id": "k5", "name": "na\u00efve", "note": "gone", "amount": "50.0", "tag": "v", "pad": "p"}

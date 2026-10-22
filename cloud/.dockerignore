@@ -1,0 +1,5 @@
+# Only the manifest and the sources go into a build.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
