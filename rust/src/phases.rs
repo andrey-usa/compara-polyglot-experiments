@@ -30,6 +30,19 @@ impl Phases {
         }
     }
 
+    /// Whether `COMPARA_PHASES` asked for the timings.
+    pub fn on(&self) -> bool {
+        self.on
+    }
+
+    /// One indented line under the last phase: a part of it, timed by the
+    /// caller.
+    pub fn detail(&self, line: &str) {
+        if self.on {
+            eprintln!("    {}{line}", self.tag);
+        }
+    }
+
     pub fn mark(&mut self, what: &str) {
         let now = Instant::now();
         if self.on {

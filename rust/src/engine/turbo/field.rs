@@ -448,6 +448,47 @@ pub(super) fn next_of2_with<S: Scan>(
     end
 }
 
+/// The offset of the first byte at or after `from` that is `a`, `b` or `c`,
+/// or `end`.
+#[inline(always)]
+pub(super) fn next_of3_with<S: Scan>(
+    scan: S,
+    data: &[u8],
+    from: usize,
+    end: usize,
+    a: u8,
+    b: u8,
+    c: u8,
+) -> usize {
+    let data = &data[..end.min(data.len())];
+    let mut at = from;
+    if S::WIDE {
+        while at + STEP <= data.len() {
+            let hits = scan.hits(data, at, a, b) | scan.hits(data, at, c, c);
+            if hits != 0 {
+                return at + hits.trailing_zeros() as usize;
+            }
+            at += STEP;
+        }
+    }
+    let (ba, bb, bc) = (broadcast(a), broadcast(b), broadcast(c));
+    while at + 8 <= data.len() {
+        let word = word_at(data, at);
+        let hits = match_bits(word, ba) | match_bits(word, bb) | match_bits(word, bc);
+        if hits != 0 {
+            return at + (hits.trailing_zeros() >> 3) as usize;
+        }
+        at += 8;
+    }
+    while at < data.len() {
+        if data[at] == a || data[at] == b || data[at] == c {
+            return at;
+        }
+        at += 1;
+    }
+    end
+}
+
 /// The offset of the first `target` at or after `from`, or `end`.
 #[inline(always)]
 pub(super) fn next_of1_with<S: Scan>(

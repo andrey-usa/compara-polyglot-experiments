@@ -11,24 +11,25 @@
 //! differ, because the JSON reader joins by name.
 
 use super::field::{
-    ABSENT, Delims, Field, Scan, Swar, Wide, next_of1_with, next_of2, next_of2_with, pack,
-    skip_quoted, skip_quoted_with,
+    ABSENT, Delims, Field, Scan, Swar, Wide, next_of1_with, next_of2, next_of2_with, next_of3_with,
+    pack, skip_quoted, skip_quoted_with,
 };
 use super::slab::{Dialect, Slab, text_of};
 use crate::error::{Error, Result};
 use std::path::Path;
 
-/// Newline-delimited JSON if the first thing that is not whitespace is a brace.
+/// Newline-delimited JSON if the first thing that is not whitespace is a brace
+/// or a bracket: a top-level JSON array is the same rows, wrapped.
 ///
-/// A CSV header can begin with anything else, and a `{` in the first column of a
-/// CSV header is not something this project has ever had to read.
+/// A CSV header can begin with anything else, and a `{` or `[` in the first
+/// column of a CSV header is not something this project has ever had to read.
 pub(super) fn sniff_dialect(data: &[u8]) -> Dialect {
     let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
     for &b in data.iter().take(64) {
         if json_space(b) {
             continue;
         }
-        return if b == b'{' {
+        return if b == b'{' || b == b'[' {
             Dialect::Json
         } else {
             Dialect::Csv
@@ -39,6 +40,17 @@ pub(super) fn sniff_dialect(data: &[u8]) -> Dialect {
 
 fn json_space(c: u8) -> bool {
     c == b' ' || c == b'\t' || c == b'\r' || c == b'\n'
+}
+
+/// Whether the file opens with a top-level `[`: the rows then sit inside a
+/// JSON array, and row boundaries answer to its brackets and separators.
+/// Only asked once per file, where the parser is built.
+pub(super) fn json_is_array(data: &[u8]) -> bool {
+    let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
+    data.iter()
+        .take(64)
+        .find(|&&b| !json_space(b))
+        .is_some_and(|&b| b == b'[')
 }
 
 /// Guesses the delimiter from the header line, defaulting to a comma.
@@ -91,7 +103,8 @@ pub(super) fn csv_header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec
 }
 
 /// A JSON file has no header row, so the column names are the keys of the first
-/// object, in the order it lists them.
+/// object, in the order it lists them. A top-level array of objects answers
+/// the same way; an empty one has no object to take the names from.
 pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
     let data = slab.data();
     let end = data.len();
@@ -99,6 +112,13 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
     let mut pos = 0usize;
     while pos < end && json_space(data[pos]) {
         pos += 1;
+    }
+    // A top-level array's opening bracket wraps the rows; it is not one.
+    if pos < end && data[pos] == b'[' {
+        pos += 1;
+        while pos < end && json_space(data[pos]) {
+            pos += 1;
+        }
     }
     if pos >= end || data[pos] != b'{' {
         return Err(Error::new(format!(
@@ -190,7 +210,80 @@ fn skip_json_string<S: Scan>(scan: S, data: &[u8], mut at: usize, end: usize) ->
     }
 }
 
-/// Skips a nested object or array, which is not a cell value.
+/// The column of a top-level array's first object: how far its `{` sits from
+/// the start of its line, when nothing but spaces precede it there. A
+/// pretty-printer indents every row of the array alike and anything nested in
+/// a row further, so a line opening an object at this column is most likely a
+/// row. `None` when the array is not laid out a row per line (`[{` on one line).
+pub(super) fn json_row_indent(data: &[u8]) -> Option<usize> {
+    let mut pos = usize::from(data.starts_with(b"\xEF\xBB\xBF")) * 3;
+    while pos < data.len() && json_space(data[pos]) {
+        pos += 1;
+    }
+    if pos >= data.len() || data[pos] != b'[' {
+        return None;
+    }
+    pos += 1;
+    while pos < data.len() && json_space(data[pos]) {
+        pos += 1;
+    }
+    if pos >= data.len() || data[pos] != b'{' {
+        return None;
+    }
+    let line = data[..pos].iter().rposition(|&b| b == b'\n')? + 1;
+    data[line..pos]
+        .iter()
+        .all(|&b| b == b' ' || b == b'\t')
+        .then_some(pos - line)
+}
+
+/// Where the rows of a top-level JSON array start, one for each of `splits`:
+/// the first object at or past the split that opens at the array's own depth,
+/// or nothing when no row starts past it. Increasing and distinct.
+///
+/// A pretty-printed array puts nested objects on lines of their own too, so the
+/// line a split lands on cannot tell a row from an object inside one; only the
+/// depth can, and only a walk from the start knows the depth. Braces alone
+/// keep it, as in [`end_of_array_row`]: an array nested in a row sits inside the
+/// row's braces. One pass on one thread, as far as the last split.
+pub(super) fn json_array_row_starts(data: &[u8], from: usize, splits: &[usize]) -> Vec<usize> {
+    let end = data.len();
+    let mut starts: Vec<usize> = Vec::with_capacity(splits.len());
+    let mut next = 0usize;
+    let mut depth = 0usize;
+    let mut at = from;
+    while next < splits.len() && at < end {
+        let b = next_of3_with(Swar, data, at, end, b'"', b'{', b'}');
+        if b >= end {
+            break;
+        }
+        match data[b] {
+            b'"' => {
+                at = skip_json_string(Swar, data, b, end).0;
+                continue;
+            }
+            b'{' => {
+                if depth == 0 && b >= splits[next] {
+                    if starts.last().is_none_or(|&s| b > s) {
+                        starts.push(b);
+                    }
+                    while next < splits.len() && splits[next] <= b {
+                        next += 1;
+                    }
+                }
+                depth += 1;
+            }
+            // A stray brace in a malformed file does not take the depth below
+            // the array's.
+            _ => depth = depth.saturating_sub(1),
+        }
+        at = b + 1;
+    }
+    starts
+}
+
+/// Past a nested object or array: the byte after its closing bracket, or `end`
+/// where it does not close.
 fn skip_json_nested<S: Scan>(scan: S, data: &[u8], mut pos: usize, end: usize) -> usize {
     let mut depth = 0i32;
     while pos < end {
@@ -292,6 +385,12 @@ pub(super) enum RowParser {
         /// member after slot `i` is tried as `i + 1` first, and a right guess
         /// has to give exactly the slot the table would.
         canon: Vec<i32>,
+        /// The file wraps its rows in a top-level array: `[`, `]` and the `,`
+        /// separators are container syntax, and an object can span lines.
+        /// ndjson keeps the plain one-memchr row end -- it is most of the
+        /// JSON this reader ever sees, and the container walk costs it
+        /// three quarters again of a sweep.
+        array: bool,
     },
 }
 
@@ -724,7 +823,7 @@ impl RowParser {
         }
     }
 
-    pub(super) fn json(wanted: Vec<Option<String>>, key_size: usize) -> Self {
+    pub(super) fn json(wanted: Vec<Option<String>>, key_size: usize, array: bool) -> Self {
         let mut n = 16usize;
         while n < wanted.len() * 4 {
             n <<= 1;
@@ -745,6 +844,7 @@ impl RowParser {
             slots,
             slot_mask,
             canon: Vec::new(),
+            array,
         };
         let canon: Vec<i32> = match &parser {
             RowParser::Json { wanted, .. } => wanted
@@ -925,6 +1025,7 @@ impl RowParser {
             wanted,
             key_size,
             canon,
+            array,
             ..
         } = self
         else {
@@ -933,15 +1034,24 @@ impl RowParser {
         out.fill(ABSENT);
         let mut found = 0; // key slots filled, for the early exit below
         let mut guess = 0; // the slot the next member most likely fills
+        let mut open = false; // the early exit left the object unfinished
         let mut pos = start;
         while pos < end && json_space(data[pos]) {
             pos += 1;
+        }
+        // The opening bracket of a top-level array is container syntax, not a
+        // row: step past it and the first object starts the rows.
+        if *array && pos < end && data[pos] == b'[' {
+            pos += 1;
+            while pos < end && json_space(data[pos]) {
+                pos += 1;
+            }
         }
         if pos >= end {
             return end;
         }
         if data[pos] != b'{' {
-            return end_of_json_row(scan, data, pos, end); // not an object: skip the line
+            return end_of_json_row(scan, data, pos, end, *array, false); // not an object: skip the line
         }
         pos += 1;
 
@@ -1005,9 +1115,13 @@ impl RowParser {
                 pos = close;
                 Some(pack(from as u64, (to - from) as u64, escaped))
             } else if data[pos] == b'{' || data[pos] == b'[' {
-                // Not a cell value. Left absent rather than guessed at.
+                // An object or array is a cell of its JSON text, as written:
+                // two that differ anywhere differ. Left absent, as it once
+                // was, two different objects read as the same missing value
+                // and the change went unreported.
+                let from = pos;
                 pos = skip_json_nested(scan, data, pos, end);
-                None
+                Some(pack(from as u64, (pos - from) as u64, false))
             } else {
                 // A number, true, false or null: it runs to the next comma,
                 // brace or space.
@@ -1043,6 +1157,7 @@ impl RowParser {
                         // Every key found and nothing else wanted: the rest of
                         // the object is bytes to skip, not fields to parse.
                         if found == wanted.len() {
+                            open = true;
                             break;
                         }
                     }
@@ -1051,7 +1166,7 @@ impl RowParser {
                 }
             }
         }
-        end_of_json_row(scan, data, pos, end)
+        end_of_json_row(scan, data, pos, end, *array, open)
     }
 
     pub(super) fn slot_for(&self, key: &[u8]) -> Option<usize> {
@@ -1329,9 +1444,83 @@ fn json_member_at<S: Scan>(
 /// that does put a raw newline inside a string is not JSON, and this reader will
 /// split the row there -- which is what every ndjson reader does, because the
 /// format has no other way to say where a row ends.
+/// `array` selects the walk: ndjson rows end at the newline, one memchr
+/// exactly as ever, and everything below is the top-level array's syntax.
+///
+/// With `open`, the row's object was left unfinished -- the key-only parse
+/// stops as soon as it has the keys -- and its remaining bytes run to the
+/// closing brace first. Braces alone keep the depth: a `}` closes an object
+/// wherever it sits, and a string hides its own braces behind `skip_json_string`.
 #[inline(always)]
-fn end_of_json_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize) -> usize {
-    let stop = next_of1_with(scan, data, pos, end, b'\n');
+fn end_of_json_row<S: Scan>(
+    scan: S,
+    data: &[u8],
+    pos: usize,
+    end: usize,
+    array: bool,
+    open: bool,
+) -> usize {
+    if !array {
+        let stop = next_of1_with(scan, data, pos, end, b'\n');
+        return if stop >= end { end } else { stop + 1 };
+    }
+    end_of_array_row(scan, data, pos, end, open)
+}
+
+/// The array half of [`end_of_json_row`], kept out of its body: the ndjson
+/// half is two instructions and inlines into every row's parse, and carrying
+/// the container walk there cost the sweep real time.
+fn end_of_array_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize, open: bool) -> usize {
+    let mut at = pos;
+    if open {
+        let mut depth = 1i32;
+        while at < end {
+            let b = next_of3_with(scan, data, at, end, b'"', b'{', b'}');
+            if b >= end {
+                return end;
+            }
+            match data[b] {
+                b'"' => at = skip_json_string(scan, data, b, end).0,
+                b'{' => {
+                    depth += 1;
+                    at = b + 1;
+                }
+                _ => {
+                    depth -= 1;
+                    at = b + 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        if depth > 0 {
+            return end;
+        }
+    }
+    // Between rows a top-level array puts its own bytes: the `,` separator,
+    // which the next object follows on the same line or a later one, and the
+    // closing `]`, after which there are no more rows. Anything else ends at
+    // the next newline, exactly as a bare ndjson row always has.
+    let mut cur = at;
+    while cur < end && json_space(data[cur]) {
+        cur += 1;
+    }
+    if cur < end && data[cur] == b',' {
+        cur += 1;
+        while cur < end && json_space(data[cur]) {
+            cur += 1;
+        }
+        if cur >= end || data[cur] == b']' {
+            return end;
+        }
+        if data[cur] == b'{' {
+            return cur;
+        }
+    } else if cur < end && data[cur] == b']' {
+        return end;
+    }
+    let stop = next_of1_with(scan, data, at, end, b'\n');
     if stop >= end { end } else { stop + 1 }
 }
 
@@ -1354,6 +1543,126 @@ mod tests {
     }
 
     #[test]
+    fn a_bracket_is_json_too() {
+        assert_eq!(sniff_dialect(b"[{\"a\":1}]"), Dialect::Json);
+        assert_eq!(sniff_dialect(b"\xEF\xBB\xBF [ {\"a\":1} ]"), Dialect::Json);
+        assert_eq!(sniff_dialect(b"[]"), Dialect::Json);
+    }
+
+    #[test]
+    fn an_array_s_header_is_its_first_object_s_keys() {
+        let slab = json_slab("[{\"b\":1,\"a\":\"x\"}]\n");
+        let names = json_header(&slab, Path::new("x")).expect("a header");
+        assert_eq!(names, ["b", "a"]);
+        // An empty array has no object to take the names from.
+        let empty = json_slab("[]\n");
+        assert!(json_header(&empty, Path::new("x")).is_err());
+    }
+
+    /// Every row's key, walked as the sweep walks: one parse call per row, a
+    /// missing key marked -- a bracket read as a row would show up here.
+    fn array_keys(text: &str) -> Vec<String> {
+        let slab = json_slab(text);
+        let parser = RowParser::json(vec![Some("k".into())], 1, true);
+        let mut out = vec![ABSENT; 1];
+        let mut rows = Vec::new();
+        let mut at = 0;
+        while at < text.len() {
+            let next = parser.parse(slab.data(), at, text.len(), &mut out);
+            assert!(next > at, "a row parse always advances");
+            at = next;
+            rows.push(if out[0] == ABSENT {
+                "<none>".to_string()
+            } else {
+                String::from_utf8(slab.raw(out[0]).to_vec()).expect("a key")
+            });
+        }
+        rows
+    }
+
+    #[test]
+    fn an_array_of_objects_one_per_line_reads_like_ndjson() {
+        let ndjson = "{\"k\":\"a\",\"v\":1}\n{\"k\":\"b\",\"v\":2}\n";
+        let array = "[\n{\"k\":\"a\",\"v\":1},\n{\"k\":\"b\",\"v\":2}\n]\n";
+        assert_eq!(array_keys(ndjson), ["a", "b"]);
+        assert_eq!(array_keys(array), array_keys(ndjson));
+    }
+
+    #[test]
+    fn a_compact_array_splits_on_the_object_separator() {
+        let array = "[{\"k\":\"a\"},{\"k\":\"b\"}, {\"k\":\"c\"}]";
+        assert_eq!(array_keys(array), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_pretty_printed_array_reads_one_object_across_lines() {
+        let pretty =
+            "[\n  {\n    \"k\": \"a\",\n    \"v\": 1\n  },\n  {\n    \"k\": \"b\"\n  }\n]\n";
+        assert_eq!(array_keys(pretty), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_split_of_an_array_starts_at_a_row_not_a_nested_object() {
+        // Row 0 holds a nested object on a line of its own, and a string with
+        // braces and an escaped quote; row 1 opens on the line after.
+        let text = "[\n  {\n    \"k\": \"{ \\\" }\",\n    \"m\": {\n      \"x\": 1\n    }\n  },\n  {\n    \"k\": \"b\"\n  }\n]\n";
+        let data = text.as_bytes();
+        let nested = text.find("{\n      \"x\"").expect("the nested object");
+        let row1 = text.rfind("  {\n    \"k\": \"b\"").expect("row 1") + 2;
+        // A split before row 0 starts there; anywhere in row 0, the nested
+        // object's line included, at row 1; one past row 1, nowhere.
+        assert_eq!(json_array_row_starts(data, 0, &[3]), [4]);
+        for split in [5, nested - 1, nested, nested + 1, row1] {
+            assert_eq!(
+                json_array_row_starts(data, 0, &[split]),
+                [row1],
+                "split {split}"
+            );
+        }
+        assert!(json_array_row_starts(data, 0, &[row1 + 1]).is_empty());
+        // Two splits on the same row give it once.
+        assert_eq!(
+            json_array_row_starts(data, 0, &[nested, nested + 2]),
+            [row1]
+        );
+        assert_eq!(json_row_indent(data), Some(2));
+        assert_eq!(json_row_indent(b"[{\"k\":1}]"), None);
+        assert_eq!(json_row_indent(b"{\"k\":1}\n"), None);
+    }
+
+    #[test]
+    fn an_array_with_nested_values_and_escaped_braces_reads_alike() {
+        // Nested values are not cells, exactly as in ndjson, and braces inside
+        // a string are not the object's end.
+        let ndjson =
+            "{\"k\":\"a } {\",\"v\":{\"n\":[1,{\"x\":\"}\\\"\"}]}}\n{\"k\":\"b\",\"v\":2}\n";
+        let array =
+            "[{\"k\":\"a } {\",\"v\":{\"n\":[1,{\"x\":\"}\\\"\"}]}},\n{\"k\":\"b\",\"v\":2}]";
+        assert_eq!(array_keys(ndjson), ["a } {", "b"]);
+        assert_eq!(array_keys(array), array_keys(ndjson));
+    }
+
+    #[test]
+    fn the_key_only_and_full_parses_agree_across_an_array() {
+        // The early exit leaves the object unfinished; both parses must still
+        // find the same rows and the same keys.
+        let array = "[\n  {\n    \"k\": \"a\",\n    \"v\": \"w x\",\n    \"n\": {\"deep\": [1, 2]}\n  },\n  {\n    \"k\": \"b\"\n  }\n]\n";
+        let slab = json_slab(array);
+        let full = RowParser::json(vec![Some("k".into()), Some("v".into())], 1, true);
+        let keys = RowParser::json(vec![Some("k".into())], 1, true);
+        let mut out = vec![ABSENT; 2];
+        let next = full.parse(slab.data(), 0, array.len(), &mut out);
+        assert_eq!(slab.raw(out[0]), b"a");
+        assert_eq!(slab.raw(out[1]), b"w x");
+        let mut key = vec![ABSENT; 1];
+        assert_eq!(keys.parse(slab.data(), 0, array.len(), &mut key), next);
+        assert_eq!(slab.raw(key[0]), b"a");
+        let last = keys.parse(slab.data(), next, array.len(), &mut key);
+        assert_eq!(slab.raw(key[0]), b"b");
+        assert_eq!(last, array.len());
+    }
+
+    #[test]
     fn the_header_is_the_first_object_s_keys_in_order() {
         let slab = json_slab("{\"b\":1,\"a\":\"x\",\"n\":null}\n");
         let names = json_header(&slab, Path::new("x")).expect("a header");
@@ -1364,7 +1673,7 @@ mod tests {
     fn values_are_read_by_key_whatever_order_they_come_in() {
         let text = "{\"k\":\"1\",\"v\":\"a\"}\n{\"v\":\"b\",\"k\":\"2\"}\n";
         let slab = json_slab(text);
-        let parser = RowParser::json(vec![Some("k".into()), Some("v".into())], 0);
+        let parser = RowParser::json(vec![Some("k".into()), Some("v".into())], 0, false);
         let mut out = vec![ABSENT; 2];
         let next = parser.parse(slab.data(), 0, text.len(), &mut out);
         assert_eq!(slab.raw(out[0]), b"1");
@@ -1375,8 +1684,8 @@ mod tests {
     }
 
     #[test]
-    fn null_a_nested_value_and_a_missing_key_are_all_absent() {
-        let text = "{\"k\":\"1\",\"v\":null,\"w\":{\"deep\":1},\"x\":[1,2]}\n";
+    fn null_and_a_missing_key_are_absent_and_a_nested_value_is_its_text() {
+        let text = "{\"k\":\"1\",\"v\":null,\"w\":{\"deep\":[1,\"]}\"]},\"x\":[1, 2],\"y\":3}\n";
         let slab = json_slab(text);
         let parser = RowParser::json(
             vec![
@@ -1385,13 +1694,19 @@ mod tests {
                 Some("w".into()),
                 Some("x".into()),
                 Some("missing".into()),
+                Some("y".into()),
             ],
             0,
+            false,
         );
-        let mut out = vec![0; 5];
+        let mut out = vec![0; 6];
         let next = parser.parse(slab.data(), 0, text.len(), &mut out);
         assert_eq!(slab.raw(out[0]), b"1");
-        assert_eq!(out[1..], [ABSENT; 4]);
+        assert_eq!([out[1], out[4]], [ABSENT; 2]);
+        // A bracket inside a string does not close the object.
+        assert_eq!(slab.raw(out[2]), b"{\"deep\":[1,\"]}\"]}");
+        assert_eq!(slab.raw(out[3]), b"[1, 2]");
+        assert_eq!(slab.raw(out[5]), b"3");
         assert_eq!(next, text.len());
     }
 
@@ -1399,7 +1714,7 @@ mod tests {
     fn a_newline_inside_a_string_does_not_end_the_row() {
         let text = "{\"k\":\"a\\nb\",\"v\":\"1\"}\n{\"k\":\"c\",\"v\":\"2\"}\n";
         let slab = json_slab(text);
-        let parser = RowParser::json(vec![Some("k".into()), Some("v".into())], 0);
+        let parser = RowParser::json(vec![Some("k".into()), Some("v".into())], 0, false);
         let mut out = vec![ABSENT; 2];
         let next = parser.parse(slab.data(), 0, text.len(), &mut out);
         assert_eq!(slab.logical(out[0]).collect::<Vec<u8>>(), b"a\nb");
@@ -1413,8 +1728,8 @@ mod tests {
         // stops there -- while a repeated compared column keeps its last value.
         let text = "{\"k\":\"1\",\"v\":\"a\",\"k\":\"2\",\"v\":\"b\"}\n{\"k\":\"3\"}\n";
         let slab = json_slab(text);
-        let full = RowParser::json(vec![Some("k".into()), Some("v".into())], 1);
-        let keys = RowParser::json(vec![Some("k".into())], 1);
+        let full = RowParser::json(vec![Some("k".into()), Some("v".into())], 1, false);
+        let keys = RowParser::json(vec![Some("k".into())], 1, false);
         let mut out = vec![ABSENT; 2];
         let next = full.parse(slab.data(), 0, text.len(), &mut out);
         assert_eq!(slab.raw(out[0]), b"1");
@@ -1470,6 +1785,7 @@ mod tests {
                         Some("note".into()),
                     ],
                     1,
+                    false,
                 ),
                 json.as_bytes(),
             ),
@@ -1499,6 +1815,7 @@ mod tests {
         let parser = RowParser::json(
             vec![Some("k".into()), Some("v".into()), Some("k".into())],
             1,
+            false,
         );
         let mut out = vec![ABSENT; 3];
         parser.parse(slab.data(), 0, text.len(), &mut out);

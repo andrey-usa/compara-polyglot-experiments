@@ -48,8 +48,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
-    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_header, json_rows_match,
-    shared_tail, sniff_dialect,
+    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_array_row_starts, json_header,
+    json_is_array, json_row_indent, json_rows_match, shared_tail, sniff_dialect,
 };
 
 use crate::alloc;
@@ -380,6 +380,48 @@ fn hash_field(slab: &Slab, f: Field, opt: &Options, normalise: bool, seed: u64) 
     (h ^ len).wrapping_mul(PRIME)
 }
 
+/// Each occupied slot's row becomes its key's position: the marks in `words`
+/// before the row, which is `before` for the whole words and a popcount for the
+/// rest.
+///
+/// That is one popcount per key, ten million of them at 10M rows, and a baseline
+/// x86-64 build has no POPCNT instruction: `count_ones` becomes a dozen
+/// instructions instead of one. So, as the row parse does for AVX2, the loop is
+/// compiled a second time for POPCNT and chosen once per call where the CPU has
+/// it -- every x86-64 CPU since 2008 does. A build for such a CPU compiles the
+/// one loop.
+fn rows_to_positions(part: &mut [u32], pos_mask: u32, words: &[u64], before: &[u32]) {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "popcnt")))]
+    if std::arch::is_x86_feature_detected!("popcnt") {
+        // Safety: the CPU has POPCNT, which is all the copy assumes.
+        return unsafe { rows_to_positions_popcnt(part, pos_mask, words, before) };
+    }
+    rows_to_positions_with(part, pos_mask, words, before)
+}
+
+/// [`rows_to_positions_with`] compiled for POPCNT.
+///
+/// # Safety
+/// The CPU has POPCNT.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "popcnt")))]
+#[target_feature(enable = "popcnt")]
+unsafe fn rows_to_positions_popcnt(part: &mut [u32], pos_mask: u32, words: &[u64], before: &[u32]) {
+    rows_to_positions_with(part, pos_mask, words, before)
+}
+
+#[inline(always)]
+fn rows_to_positions_with(part: &mut [u32], pos_mask: u32, words: &[u64], before: &[u32]) {
+    for word in part.iter_mut() {
+        if *word != EMPTY_SLOT {
+            let row = ((*word & pos_mask) - 1) as usize;
+            let w = row >> 6;
+            let below = words[w] & ((1u64 << (row & 63)) - 1);
+            let position = (before[w] + below.count_ones()) as usize;
+            *word = (*word & !pos_mask) | (position as u32 + 1);
+        }
+    }
+}
+
 fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325;
     // Hoisted from per-field: the options do not change mid-sweep.
@@ -448,23 +490,21 @@ fn row_end(ix: &RowIndex, row: i32, size: usize) -> usize {
     }
 }
 
-/// From this many rows the key index is built on every thread
-/// (`RowIndex::insert_parallel`); below it the serial insertion takes well
-/// under a second and is left alone. `COMPARA_PARALLEL_INSERT=1` (set and not
-/// "0") takes the parallel insertion at any size, for the tests.
-const PARALLEL_INSERT_ROWS: usize = 1 << 20;
-
 /// The fewest slots a region of a parallel insertion is given.
 const MIN_REGION: usize = 64;
 
-fn parallel_insert(rows: usize, threads: usize) -> bool {
+/// Whether the key index is built on every thread (`RowIndex::insert_parallel`).
+/// Serial insertion measured faster than parallel (0.948x wall, -14% CPU at
+/// 4 threads on 10M rows, CI A/B median of 7), so it is the default;
+/// `COMPARA_PARALLEL_INSERT` set and not "0" opts back into the parallel
+/// insertion.
+fn parallel_insert(threads: usize) -> bool {
     if threads < 2 {
         return false;
     }
-    let forced = std::env::var("COMPARA_PARALLEL_INSERT")
+    std::env::var("COMPARA_PARALLEL_INSERT")
         .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
-    forced || rows >= PARALLEL_INSERT_ROWS
+        .unwrap_or(false)
 }
 
 /// One region's outcome in a parallel insertion: repeated keys' counts and
@@ -671,8 +711,8 @@ impl RowIndex {
     /// row depends on nothing but where it starts, while the table depends on the
     /// order rows arrive — first occurrence of a key wins, and the duplicate
     /// counts follow from that. Handing rows to threads as they come would make
-    /// the answer depend on thread scheduling; past `PARALLEL_INSERT_ROWS` the
-    /// insertion is split by key instead (`insert_parallel`), each thread taking
+    /// the answer depend on thread scheduling; when the parallel insertion is
+    /// opted into, the insertion is split by key instead (`insert_parallel`), each thread taking
     /// every row of its own keys in file order, which leaves the answer the
     /// serial one.
     fn build(
@@ -793,7 +833,7 @@ impl RowIndex {
         // key arrays too -- or every page the insertion touched would first
         // have to be taken back from that reading. Called before them, B's
         // insertion at 150M rows took 11.1s where it takes 5.9s alone.
-        let parallel = parallel_insert(total, threads);
+        let parallel = parallel_insert(threads);
         let arrays = if parallel {
             Some((
                 alloc::filled(0i32, total, "one row per distinct key")?,
@@ -1042,12 +1082,7 @@ impl RowIndex {
                     .ok()
                     .and_then(|mut p| p.take())
                     .ok_or_else(|| Error::new("an index region taken twice"))?;
-                for word in part.iter_mut() {
-                    if *word != EMPTY_SLOT {
-                        let row = ((*word & pos_mask) - 1) as usize;
-                        *word = (*word & !pos_mask) | (position(row) as u32 + 1);
-                    }
-                }
+                rows_to_positions(part, pos_mask, &words, &before);
                 Ok(())
             });
             for d in done {
@@ -1553,6 +1588,13 @@ where
 /// run again on counted bounds, which is exactly what it did before. A chunk
 /// that started on a wrong guess parsed garbage, so its rows *and its errors*
 /// are discarded unread.
+///
+/// A top-level JSON array is checked the same way. Pretty-printed, it spreads
+/// a row over lines, and a line that opens an object may open one nested in a
+/// row; a chunk started there read half rows and dropped the rest, so a
+/// 200k-row array counted as 100,718 at four threads. Its counted bounds come
+/// from a walk that keeps the depth. Newline-delimited JSON needs no check: a
+/// newline cannot sit inside a JSON value, so every line is a row.
 #[allow(clippy::too_many_arguments)]
 fn sweep_text(
     side: &Side,
@@ -1569,7 +1611,7 @@ fn sweep_text(
         return Ok((Vec::new(), Vec::new()));
     }
     let dialect = side.slab.dialect();
-    if dialect == Dialect::Csv {
+    if dialect == Dialect::Csv || (dialect == Dialect::Json && json_is_array(data)) {
         let bounds = chunk_bounds(data, from, threads, dialect, false);
         let parts = bounds.len() - 1;
         let mut swept = sweep_chunks(side, keys, whole, &bounds, key_size, opt, sink).into_iter();
@@ -1743,8 +1785,11 @@ fn sweep_columnar(
 /// position is inside a field. Counting them is a scan for one byte, far cheaper
 /// than parsing, and it splits across the same threads.
 ///
-/// JSON needs none of that: a raw newline inside a string is not valid JSON, so
-/// every newline ends a record.
+/// Newline-delimited JSON needs none of that: a raw newline inside a string is
+/// not valid JSON, so every newline ends a record. A pretty-printed top-level
+/// array does: its rows span lines, and objects nested in them open lines too.
+/// The guess is the next line that opens an object at the column the first row
+/// opened at; counted, it is the next object at the array's own depth.
 fn chunk_bounds(
     data: &[u8],
     from: usize,
@@ -1762,6 +1807,18 @@ fn chunk_bounds(
     let nominal: Vec<usize> = (1..threads)
         .map(|i| from + (end - from) * i / threads)
         .collect();
+    let array = dialect == Dialect::Json && json_is_array(data);
+    if array && counted {
+        let mut bounds = vec![from];
+        bounds.extend(
+            json_array_row_starts(data, from, &nominal)
+                .into_iter()
+                .filter(|&at| at > from && at < end),
+        );
+        bounds.push(end);
+        return bounds;
+    }
+    let indent = if array { json_row_indent(data) } else { None };
 
     // Quotes before each split point, counted once per byte rather than once per
     // byte per split point.
@@ -1797,24 +1854,59 @@ fn chunk_bounds(
     let mut bounds = vec![from];
     for (i, &start) in nominal.iter().enumerate() {
         let mut in_quotes = quotes[i] % 2 == 1;
-        let mut at = start;
-        while at < end {
-            match data[at] {
-                b'"' if quoted => in_quotes = !in_quotes,
-                b'\n' if !in_quotes => {
-                    at += 1;
-                    break;
+        let at = if dialect == Dialect::Json {
+            json_row_start(data, start, end, indent)
+        } else {
+            let mut at = start;
+            while at < end {
+                match data[at] {
+                    b'"' if quoted => in_quotes = !in_quotes,
+                    b'\n' if !in_quotes => {
+                        at += 1;
+                        break;
+                    }
+                    _ => {}
                 }
-                _ => {}
+                at += 1;
             }
-            at += 1;
-        }
+            at
+        };
         if at > *bounds.last().expect("a first bound") && at < end {
             bounds.push(at);
         }
     }
     bounds.push(end);
     bounds
+}
+
+/// The first JSON row start at or after `at`, as a guess: the next line whose
+/// first byte that is not JSON space opens an object, at column `indent` when
+/// that is known. ndjson rows are one to a line, but a pretty-printed top-level
+/// array spreads one object over several lines, so only the line that opens
+/// the object is a row start -- anything else, the array's own brackets and the
+/// object's inner lines, belongs to the chunk already reading it. An object
+/// nested in a row opens a line too, further in; at the rows' own column it
+/// can still fool the guess, and `sweep_text` checks it. A compact array has no
+/// newlines at all and so reads as one chunk.
+fn json_row_start(data: &[u8], mut at: usize, end: usize, indent: Option<usize>) -> usize {
+    while at < end {
+        let stop = next_of1(data, at, end, b'\n');
+        if stop >= end {
+            return end;
+        }
+        let mut first = stop + 1;
+        while first < end && matches!(data[first], b' ' | b'\t' | b'\r') {
+            first += 1;
+        }
+        if first < end
+            && data[first] == b'{'
+            && indent.is_none_or(|column| first - (stop + 1) == column)
+        {
+            return first;
+        }
+        at = stop + 1;
+    }
+    end
 }
 
 // ---------------------------------------------------------------------------
@@ -3554,11 +3646,13 @@ impl Input {
             } => {
                 let has = |n: &String| header.iter().any(|c| c == n);
                 let json = slab.dialect() == Dialect::Json;
+                let array = json && json_is_array(slab.data());
                 let build = |names: &[&String]| -> RowParser {
                     if json {
                         RowParser::json(
                             names.iter().map(|n| has(n).then(|| (*n).clone())).collect(),
                             key_size,
+                            array,
                         )
                     } else {
                         RowParser::csv(
@@ -3792,7 +3886,11 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
         } => {
             let json = slab.dialect() == Dialect::Json;
             let parser = if json {
-                RowParser::json(header.iter().cloned().map(Some).collect(), 0)
+                RowParser::json(
+                    header.iter().cloned().map(Some).collect(),
+                    0,
+                    json_is_array(slab.data()),
+                )
             } else {
                 RowParser::csv(delimiter, (0..width).map(Some).collect())
             };

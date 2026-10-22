@@ -36,6 +36,7 @@ use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use memmap2::Mmap;
@@ -130,7 +131,7 @@ fn absent(c: Look<'_>, opt: &Options) -> bool {
         return true;
     }
     // A written-out value is never empty, trimmed or not, so only a null is.
-    needs_normalising(opt) && c.kind.is_none() && absent_normalised(c, opt)
+    c.kind.is_none() && needs_normalising(opt) && absent_normalised(c, opt)
 }
 
 #[cold]
@@ -248,6 +249,14 @@ pub(super) fn tail_word(v: &[u8], rem: usize) -> u64 {
         return lo | (hi << (8 * (n - 4)));
     }
     v[0] as u64 | (v[n / 2] as u64) << (8 * (n / 2)) | (v[n - 1] as u64) << (8 * (n - 1))
+}
+/// [`fold_bytes`] of one eight-byte word, the same value without the loop
+/// and the tail test: a word key column is hashed once per row on both sides.
+#[inline]
+fn fold_word(h: u64, w: &[u8; 8]) -> u64 {
+    let mut h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(PRIME);
+    h ^= h >> 29;
+    (h ^ 8).wrapping_mul(PRIME)
 }
 fn fold_absent(h: u64) -> u64 {
     (h ^ 0x9e3779b97f4a7c15).wrapping_mul(PRIME)
@@ -404,23 +413,53 @@ struct KeySide<'m> {
     rows: usize,
 }
 
-fn row_hash(as_id: &[bool], s: &KeySide<'_>, row: usize, opt: &Options) -> u64 {
-    let mut h = SEED;
+/// The key hash of rows `from..from + out.len()` of `s`, into `out`.
+///
+/// A column at a time rather than a row at a time: the per-row form paid for
+/// its setup -- which columns are ids, whether anything normalises -- on every
+/// row, about 140 instructions a row for a key of two integers, where the loop
+/// over one column of words is a load, a multiply and a shift. Each row's hash
+/// folds its columns in the same order either way, so the value is the same.
+fn hash_rows(as_id: &[bool], s: &KeySide<'_>, from: usize, out: &mut [u64], opt: &Options) {
+    out.fill(SEED);
+    let rows = from..from + out.len();
     for (j, &coded) in as_id.iter().enumerate() {
         if coded {
-            h = fold_id(h, s.id[j][row]);
+            for (h, &id) in out.iter_mut().zip(&s.id[j][rows.clone()]) {
+                *h = fold_id(*h, id);
+            }
             continue;
         }
-        let c = s.col[j].at(row);
-        if absent(c, opt) {
-            h = fold_absent(h);
-        } else if !needs_normalising(opt) {
-            h = fold_bytes(h, c.bytes);
-        } else {
-            h = fold_bytes(h, value_of(c, opt).unwrap_or_default().as_bytes());
+        // A word is absent only when null and is never normalised away, so
+        // this is the general case below with nothing left to decide.
+        if let (Some(w), false) = (&s.col[j].c.words, needs_normalising(opt)) {
+            let values = &w.values[rows.clone()];
+            if w.nulls.is_empty() {
+                for (h, v) in out.iter_mut().zip(values) {
+                    *h = fold_word(*h, v);
+                }
+            } else {
+                for ((h, v), r) in out.iter_mut().zip(values).zip(rows.clone()) {
+                    *h = if w.is_null(r) {
+                        fold_absent(*h)
+                    } else {
+                        fold_word(*h, v)
+                    };
+                }
+            }
+            continue;
+        }
+        for (h, r) in out.iter_mut().zip(rows.clone()) {
+            let c = s.col[j].at(r);
+            *h = if absent(c, opt) {
+                fold_absent(*h)
+            } else if !needs_normalising(opt) {
+                fold_bytes(*h, c.bytes)
+            } else {
+                fold_bytes(*h, value_of(c, opt).unwrap_or_default().as_bytes())
+            };
         }
     }
-    h
 }
 
 fn row_eq(
@@ -436,6 +475,14 @@ fn row_eq(
             if x.id[j][rx] != y.id[j][ry] {
                 return false;
             }
+        } else if let (Some(xw), Some(yw), false) =
+            (&x.col[j].c.words, &y.col[j].c.words, needs_normalising(opt))
+        {
+            // `same` on two words: both null, or neither and the same word.
+            let null = xw.is_null(rx);
+            if null != yw.is_null(ry) || (!null && xw.values[rx] != yw.values[ry]) {
+                return false;
+            }
         } else if !same(x.col[j].at(rx), y.col[j].at(ry), opt) {
             return false;
         }
@@ -445,12 +492,14 @@ fn row_eq(
 
 /// An open-addressed table over one file's distinct keys, first occurrence wins.
 ///
-/// A slot is one word: the top twenty-four bits of the key's hash, and the
-/// position in `firsts` plus one, with zero meaning empty. Carrying the hash
+/// A slot is one word: the top bits of the key's hash, and the row of the
+/// key's first occurrence plus one, with zero meaning empty. Carrying the hash
 /// *inside* the slot is the point -- a probe that misses is settled by the word
 /// it already loaded, where a table of bare positions would have to follow each
 /// one into a separate array of hashes and take a second cache miss to reject
-/// it. At ten million keys those second misses were the join.
+/// it. At ten million keys those second misses were the join. Holding the row
+/// rather than a position in `firsts` saves the hop a hit took through
+/// `firsts` to find it, a miss of its own on every probe that matched.
 #[derive(Default)]
 struct Index {
     slots: Vec<u32>,
@@ -460,8 +509,11 @@ struct Index {
     /// so the slot stays four bytes at any scale this port runs.
     pos_bits: u32,
     pos_mask: u32,
+    /// The first row of each distinct key, in row order.
     firsts: Vec<i32>,
-    counts: Vec<u32>,
+    /// Per row, how many more times the key that first appears there
+    /// appears again; empty while no key has.
+    extra: Vec<u32>,
     /// Per distinct key, for probing the other side.
     hashes: Vec<u64>,
     rows: i64,
@@ -484,10 +536,10 @@ impl Index {
     }
 
     /// Packs a slot: the top `32 - pos_bits` bits of the hash above the
-    /// position plus one. Zero tag bits (past two billion rows) degrades to
-    /// no tag rather than a wrong answer.
-    fn slot_for(&self, hash: u64, pos: usize) -> u32 {
-        let pos = pos as u32 + 1;
+    /// row plus one. Zero tag bits (past two billion rows) degrades to no tag
+    /// rather than a wrong answer.
+    fn slot_for(&self, hash: u64, row: usize) -> u32 {
+        let pos = row as u32 + 1;
         let tag_bits = 32 - self.pos_bits;
         if tag_bits == 0 {
             pos
@@ -505,8 +557,8 @@ impl Index {
         (word >> self.pos_bits) == (hash >> (64 - tag_bits)) as u32
     }
 
-    /// The `firsts` position a non-empty slot holds.
-    fn pos_of(&self, word: u32) -> usize {
+    /// The first row a non-empty slot holds.
+    fn row_of(&self, word: u32) -> usize {
         ((word & self.pos_mask) - 1) as usize
     }
 
@@ -549,14 +601,77 @@ fn prefetch_slot(slots: &[u32], mask: u64, h: u64) {
     }
 }
 
+/// Starts the fetch of the cache line at `p`, which need not be valid: a
+/// prefetch has no effect but on the cache.
+#[inline]
+fn prefetch_at(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // Safety: a prefetch has no architectural effect, and the address is not
+    // dereferenced.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(p.cast());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = p;
+    }
+}
+
+/// Starts the fetch of what [`row_eq`] reads of `row` in `s`: each key column's
+/// id, word or slice handle there.
+///
+/// The sweep's probes land on rows of the other file in no order, so after
+/// the slot the next miss is these, one per key column, and their address is
+/// known as soon as the slot is: a stage behind the slot's own prefetch, the
+/// slot is in cache and names the row.
+#[inline]
+fn prefetch_row(as_id: &[bool], s: &KeySide<'_>, row: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        let fetch = |p: *const i8| {
+            // Safety: a prefetch has no architectural effect, and the address
+            // is computed without dereferencing anything.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(p) }
+        };
+        for (j, &coded) in as_id.iter().enumerate() {
+            if coded {
+                fetch(s.id[j].as_ptr().wrapping_add(row).cast());
+                continue;
+            }
+            let c = &s.col[j].c;
+            if let Some(w) = &c.words {
+                fetch(w.values.as_ptr().wrapping_add(row).cast());
+            } else if c.dictionary {
+                fetch(c.index.as_ptr().wrapping_add(row).cast());
+            } else {
+                fetch(c.values.as_ptr().wrapping_add(row).cast());
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (as_id, s, row);
+    }
+}
+
+/// The second stage of the sweep's prefetch: the slot `h` lands in, fetched
+/// [`PREFETCH_AHEAD`] / 2 probes ago, names the row a hit will compare.
+#[inline]
+fn prefetch_mate(as_id: &[bool], into: &Index, there: &KeySide<'_>, h: u64) {
+    let word = into.slots[(h & into.mask) as usize];
+    if word != 0 && into.tag_is(word, h) {
+        prefetch_row(as_id, there, into.row_of(word));
+    }
+}
+
 fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -> Result<Index> {
     let n = s.rows;
     let mut hs = alloc::filled(0u64, n, "one hash per row")?;
     let ways = if n < (1 << 15) { 1 } else { threads.max(1) };
     if ways == 1 {
-        for (r, h) in hs.iter_mut().enumerate() {
-            *h = row_hash(as_id, s, r, opt);
-        }
+        hash_rows(as_id, s, 0, &mut hs, opt);
     } else {
         let per = n.div_ceil(ways);
         // How many chunks got a thread. The OS can refuse one -- a thread wants
@@ -566,12 +681,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
         let mut spawned = 0usize;
         std::thread::scope(|scope| {
             for (p, chunk) in hs.chunks_mut(per).enumerate() {
-                let go = move || {
-                    let from = p * per;
-                    for (i, h) in chunk.iter_mut().enumerate() {
-                        *h = row_hash(as_id, s, from + i, opt);
-                    }
-                };
+                let go = move || hash_rows(as_id, s, p * per, chunk, opt);
                 if std::thread::Builder::new().spawn_scoped(scope, go).is_err() {
                     break;
                 }
@@ -579,9 +689,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
             }
         });
         let left = (spawned * per).min(n);
-        for (r, h) in hs.iter_mut().enumerate().skip(left) {
-            *h = row_hash(as_id, s, r, opt);
-        }
+        hash_rows(as_id, s, left, &mut hs[left..], opt);
     }
 
     let mut ix = Index {
@@ -604,7 +712,6 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
     ix.mask = cap as u64 - 1;
     ix.set_pos_bits(n);
     alloc::grow(&mut ix.firsts, n, "one row per distinct key")?;
-    alloc::grow(&mut ix.counts, n, "one count per distinct key")?;
     alloc::grow(&mut ix.hashes, n, "one hash per distinct key")?;
 
     for (r, &h) in hs.iter().enumerate() {
@@ -615,17 +722,19 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
         loop {
             let slot = ix.slots[at];
             if slot == 0 {
-                ix.slots[at] = ix.slot_for(h, ix.firsts.len());
+                ix.slots[at] = ix.slot_for(h, r);
                 ix.firsts.push(r as i32);
-                ix.counts.push(1);
                 ix.hashes.push(h);
                 break;
             }
             if ix.tag_is(slot, h) {
-                let pos = ix.pos_of(slot);
-                if row_eq(as_id, s, ix.firsts[pos] as usize, s, r, opt) {
-                    ix.counts[pos] += 1;
-                    if ix.counts[pos] == 2 {
+                let first = ix.row_of(slot);
+                if row_eq(as_id, s, first, s, r, opt) {
+                    if ix.extra.is_empty() {
+                        ix.extra = alloc::filled(0u32, n, "a repeat count per row")?;
+                    }
+                    ix.extra[first] += 1;
+                    if ix.extra[first] == 1 {
                         ix.dup_keys += 1;
                         ix.dup_rows += 1; // the first occurrence counts once the key repeats
                     }
@@ -656,9 +765,9 @@ fn lookup(
             return -1;
         }
         if into.tag_is(slot, h) {
-            let first = into.firsts[into.pos_of(slot)];
-            if row_eq(as_id, there, first as usize, here, row, opt) {
-                return first;
+            let first = into.row_of(slot);
+            if row_eq(as_id, there, first, here, row, opt) {
+                return first as i32;
             }
         }
         at = (at + 1) & into.mask as usize;
@@ -950,6 +1059,11 @@ struct ColOut {
     /// the files list them.
     export_added: Cells,
     export_removed: Cells,
+    /// For `COMPARA_PHASES`: when the column's read began (seconds into the
+    /// phase), how long it took for both files, and how long the comparison.
+    began: f64,
+    read: f64,
+    compare: f64,
 }
 
 const BLOCK: usize = 4096;
@@ -1051,8 +1165,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let b_map = map(b_path)?;
     let a_name = a_path.display().to_string();
     let b_name = b_path.display().to_string();
-    let a_meta = parquet::read_meta(&a_map, &a_name)?;
-    let b_meta = parquet::read_meta(&b_map, &b_name)?;
+    // The footer is parsed once per file; every column read below reuses it.
+    let a_fm = parquet::read_file_meta(&a_map, &a_name)?;
+    let b_fm = parquet::read_file_meta(&b_map, &b_name)?;
+    let a_meta = parquet::read_meta(&a_fm);
+    let b_meta = parquet::read_meta(&b_fm);
 
     let resolved = resolve(&a_meta.names, &b_meta.names, opt)?;
     let key_size = opt.key.len();
@@ -1152,6 +1269,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         .flat_map(|j| [(false, j), (true, j)])
         .collect();
     let next = AtomicUsize::new(0);
+    // Fewer key columns than threads leaves threads over, and each read
+    // splits its row groups among its share of them.
+    let key_ways = (threads / jobs.len().max(1)).max(1);
     let read_keys = || -> Vec<(usize, Result<parquet::Column>)> {
         let mut mine = Vec::new();
         loop {
@@ -1160,14 +1280,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 return mine;
             }
             let (from_b, j) = jobs[at];
-            let (data, meta, name) = if from_b {
-                (&b_map, &b_meta, &b_name)
+            let (data, fm, meta, name) = if from_b {
+                (&b_map, &b_fm, &b_meta, &b_name)
             } else {
-                (&a_map, &a_meta, &a_name)
+                (&a_map, &a_fm, &a_meta, &a_name)
             };
             mine.push((
                 at,
-                parquet::read_column(data, slot_of(&meta.names, &opt.key[j]), name),
+                parquet::read_column(data, fm, slot_of(&meta.names, &opt.key[j]), name, key_ways),
             ));
         }
     };
@@ -1306,6 +1426,18 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     } else {
         0
     };
+    // The two sweeps run concurrently in one scope, so a_ways + b_ways is the
+    // live thread count; uncapped that is twice the budget whenever both
+    // passes are active. Share the budget between the passes in proportion
+    // to their key counts, keeping one way per active pass.
+    let budget = threads.max(1);
+    let (a_ways, b_ways) = if budget < 2 || a_ways + b_ways <= budget {
+        (a_ways, b_ways)
+    } else {
+        let total = (ai.firsts.len() + bi.firsts.len()).max(1);
+        let a = ((ai.firsts.len() * budget / total).max(1)).min(budget - 1);
+        (a, budget - a)
+    };
 
     let a_range = |p: usize| -> Result<Part> {
         let mut out = Part::default();
@@ -1316,6 +1448,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         for at in lo..hi {
             if let Some(&soon) = ai.hashes.get(at + PREFETCH_AHEAD) {
                 prefetch_slot(&bi.slots, bi.mask, soon);
+            }
+            if let Some(&near) = ai.hashes.get(at + PREFETCH_AHEAD / 2) {
+                prefetch_mate(&as_id, &bi, &b_keys, near);
             }
             let row = ai.firsts[at];
             let mate = lookup(
@@ -1349,6 +1484,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         for at in lo..hi {
             if let Some(&soon) = bi.hashes.get(at + PREFETCH_AHEAD) {
                 prefetch_slot(&ai.slots, ai.mask, soon);
+            }
+            if let Some(&near) = bi.hashes.get(at + PREFETCH_AHEAD / 2) {
+                prefetch_mate(&as_id, &ai, &a_keys, near);
             }
             let row = bi.firsts[at];
             if lookup(
@@ -1457,22 +1595,77 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // values costs a couple of hundred megabytes on each side while it is being
     // read, and it is released before the next is asked for. `lanes` is that
     // choice, made above.
-    let lanes = lanes.clamp(1, nc.max(1));
+    //
+    // Fewer columns than threads would leave threads idle, with the largest
+    // column -- read one side and then the other -- as the whole of the
+    // phase. Each column in flight gets `per` threads instead: both sides read
+    // at once, and each side's row groups split among its half. That can mean
+    // fewer columns in flight than the budget allows, never more, and the
+    // largest columns are taken first so that the last to finish is a small
+    // one.
+    let fit = lanes.clamp(1, nc.max(1));
+    let per = threads.max(1).div_ceil(fit);
+    let lanes = fit.min(threads.max(1).div_ceil(per)).max(1);
+    // The work of a column is the bytes its pages expand to, not what it
+    // holds: a dictionary column holds a handle per row and decodes almost
+    // nothing.
+    let expanded = |meta: &parquet::Meta, n: &str| meta.expanded[slot_of(&meta.names, n)];
+    let mut order: Vec<usize> = (0..nc).collect();
+    order.sort_by_key(|&c| {
+        let n = &resolved.compared[c];
+        std::cmp::Reverse(expanded(&a_meta, n) + expanded(&b_meta, n))
+    });
     let next = AtomicUsize::new(0);
     let compared = &resolved.compared;
     let (pa, pb) = (&pair_a, &pair_b);
     let (added_held, removed_held) = (&added.held, &removed.held);
-    let read_pair = |c: usize| -> Result<(Col<'_>, Col<'_>)> {
-        let a_col = Col::new(
-            parquet::read_column(&a_map, slot_of(&a_meta.names, &compared[c]), &a_name)?,
+    // The export's changed rows need every compared column's cell at the pairs
+    // that changed, which are known only after every column is compared. Two
+    // ways to have them then: read each column a second time, or keep the
+    // decoded columns from the first pass. The second costs roughly rows × 8
+    // bytes × 2 sides per word column while it is held, so it is taken only
+    // when the memory budget leaves room for it with margin; otherwise the
+    // export falls back to the second read.
+    let stash_bytes: u64 = resolved
+        .compared
+        .iter()
+        .map(|n| held(&a_meta, n) + held(&b_meta, n))
+        .sum();
+    let stash = exporting
+        && memory::available(opt.memory).saturating_sub(floor) >= stash_bytes + stash_bytes / 4;
+    let stashed: Vec<Mutex<Option<(Col<'_>, Col<'_>)>>> =
+        (0..nc).map(|_| Mutex::new(None)).collect();
+    let read_a = |c: usize, ways: usize| {
+        parquet::read_column(
             &a_map,
-            a_kind(&compared[c]),
-        );
-        let b_col = Col::new(
-            parquet::read_column(&b_map, slot_of(&b_meta.names, &compared[c]), &b_name)?,
+            &a_fm,
+            slot_of(&a_meta.names, &compared[c]),
+            &a_name,
+            ways,
+        )
+    };
+    let read_b = |c: usize, ways: usize| {
+        parquet::read_column(
             &b_map,
-            b_kind(&compared[c]),
-        );
+            &b_fm,
+            slot_of(&b_meta.names, &compared[c]),
+            &b_name,
+            ways,
+        )
+    };
+    let read_pair = |c: usize| -> Result<(Col<'_>, Col<'_>)> {
+        let (a, b) = if per < 2 {
+            (read_a(c, 1), read_b(c, 1))
+        } else {
+            let b_side = || read_b(c, per / 2);
+            std::thread::scope(|scope| {
+                let b = parallel::spawn(scope, &b_side);
+                let a = read_a(c, per - per / 2);
+                (a, b.join().unwrap_or_else(|_| Err(panicked())))
+            })
+        };
+        let a_col = Col::new(a?, &a_map, a_kind(&compared[c]));
+        let b_col = Col::new(b?, &b_map, b_kind(&compared[c]));
         if a_col.rows() != a_keys.rows || b_col.rows() != b_keys.rows {
             return Err(Error::new(
                 "parquet columns disagree about how many rows the file has",
@@ -1481,116 +1674,227 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         Ok((a_col, b_col))
     };
 
+    let phase_start = std::time::Instant::now();
     let work = || -> Result<Vec<(usize, ColOut)>> {
         let mut mine = Vec::new();
         loop {
-            let c = next.fetch_add(1, AtomicOrdering::Relaxed);
-            if c >= nc {
+            let at = next.fetch_add(1, AtomicOrdering::Relaxed);
+            if at >= nc {
                 return Ok(mine);
             }
+            let c = order[at];
             let mut out = ColOut {
                 bits: alloc::filled(0u64, words, "one bit per pair in the column")?,
                 ..ColOut::default()
             };
+            let began = std::time::Instant::now();
             let (a_col, b_col) = read_pair(c)?;
+            let read_done = std::time::Instant::now();
 
-            let mut hits: Vec<usize> = Vec::new();
-            // The fast path: both sides dictionary encoded, so the two
-            // dictionaries go into one id space and the per-row work is two
-            // gathers and an integer compare.
-            let coded = a_col.c.dictionary && b_col.c.dictionary && opt.tolerance == 0.0;
-            if coded {
+            // How a pair's two cells are told apart, decided once per column.
+            enum Way<'c> {
+                // Both sides dictionary encoded: the two dictionaries go into
+                // one id space, and the per-row work is two gathers and an
+                // integer compare.
+                Coded {
+                    amap: Vec<i32>,
+                    bmap: Vec<i32>,
+                },
+                // Words of one kind on both sides: two cells read the same
+                // exactly when their words are equal, so no cell is written
+                // out to find that it did not change.
+                Words {
+                    aw: &'c parquet::Words,
+                    bw: &'c parquet::Words,
+                },
+                // Words under --trim, --ignore-case, --empty-is-null or
+                // --tolerance: each cell is compared as the text it reads as,
+                // the way the CSV path compares it.
+                WordsAsText,
+                // Byte arrays, with the two buffers found once rather than per
+                // cell: which one a slice belongs to is a property of the
+                // column, and asking per access costs a branch and a bounds
+                // check on every one of ten million rows.
+                Bytes {
+                    ab: &'c [u8],
+                    bb: &'c [u8],
+                },
+                BytesNormalised {
+                    ab: &'c [u8],
+                    bb: &'c [u8],
+                },
+            }
+            let way = if a_col.c.dictionary && b_col.c.dictionary && opt.tolerance == 0.0 {
                 let mut ids = Ids::default();
                 let amap = code(&a_col, &mut ids, opt)?;
                 let bmap = code(&b_col, &mut ids, opt)?;
-                let (aix, bix) = (&a_col.c.index, &b_col.c.index);
-                let mut xa = vec![0i32; BLOCK];
-                let mut xb = vec![0i32; BLOCK];
-                let mut neq = vec![0u8; BLOCK];
-                let mut base = 0usize;
-                while base < npairs {
-                    let m = BLOCK.min(npairs - base);
-                    for i in 0..m {
-                        let k = aix[pa[base + i] as usize];
-                        xa[i] = if k < 0 { -1 } else { amap[k as usize] };
-                    }
-                    for i in 0..m {
-                        let k = bix[pb[base + i] as usize];
-                        xb[i] = if k < 0 { -1 } else { bmap[k as usize] };
-                    }
-                    for i in 0..m {
-                        neq[i] = (xa[i] != xb[i]) as u8;
-                    }
-                    alloc::room(&mut hits, m, "the changed cells in one column")?;
-                    scan_mask(&neq[..m], base, |p| hits.push(p));
-                    base += BLOCK;
-                }
+                Way::Coded { amap, bmap }
             } else if let (Some(aw), Some(bw), false) =
                 (&a_col.c.words, &b_col.c.words, needs_normalising(opt))
             {
-                // Words of one kind on both sides: two cells read the same
-                // exactly when their words are equal, so no cell is written out
-                // to find that it did not change.
-                let any_null = !aw.nulls.is_empty() || !bw.nulls.is_empty();
-                let mut neq = vec![0u8; BLOCK];
-                let mut base = 0usize;
-                while base < npairs {
-                    let m = BLOCK.min(npairs - base);
-                    let (xs, ys) = (&pa[base..base + m], &pb[base..base + m]);
-                    for i in 0..m {
-                        neq[i] = (aw.values[xs[i] as usize] != bw.values[ys[i] as usize]) as u8;
-                    }
-                    if any_null {
-                        for i in 0..m {
-                            neq[i] |=
-                                (aw.is_null(xs[i] as usize) != bw.is_null(ys[i] as usize)) as u8;
-                        }
-                    }
-                    alloc::room(&mut hits, m, "the changed cells in one column")?;
-                    scan_mask(&neq[..m], base, |p| hits.push(p));
-                    base += BLOCK;
-                }
+                Way::Words { aw, bw }
             } else if a_col.c.words.is_some() || b_col.c.words.is_some() {
-                // Words under --trim, --ignore-case, --empty-is-null or
-                // --tolerance: each cell is written out and compared as the
-                // text it reads as, the way the CSV path compares it.
-                let mut neq = vec![0u8; BLOCK];
-                let mut base = 0usize;
-                while base < npairs {
-                    let m = BLOCK.min(npairs - base);
-                    for i in 0..m {
-                        neq[i] = cell_differs(
-                            a_col.at(pa[base + i] as usize),
-                            b_col.at(pb[base + i] as usize),
-                            opt,
-                        ) as u8;
-                    }
-                    alloc::room(&mut hits, m, "the changed cells in one column")?;
-                    scan_mask(&neq[..m], base, |p| hits.push(p));
-                    base += BLOCK;
+                Way::WordsAsText
+            } else if !needs_normalising(opt) {
+                Way::Bytes {
+                    ab: a_col.base(),
+                    bb: b_col.base(),
                 }
             } else {
-                // The two buffers are found once rather than per cell: which
-                // one a slice belongs to is a property of the column, and
-                // asking per access costs a branch and a bounds check on every
-                // one of ten million rows.
-                let (ab, bb) = (a_col.base(), b_col.base());
-                let mut neq = vec![0u8; BLOCK];
-                let mut base = 0usize;
-                while base < npairs {
-                    let m = BLOCK.min(npairs - base);
-                    for i in 0..m {
-                        neq[i] = cell_differs(
-                            look(ab, a_col.slice_at(pa[base + i] as usize)),
-                            look(bb, b_col.slice_at(pb[base + i] as usize)),
-                            opt,
-                        ) as u8;
+                Way::BytesNormalised {
+                    ab: a_col.base(),
+                    bb: b_col.base(),
+                }
+            };
+
+            // One block of pairs from `base`: a byte per pair, set where the
+            // column differs.
+            let fill = |base: usize, neq: &mut [u8]| {
+                let m = neq.len();
+                let (xs, ys) = (&pa[base..base + m], &pb[base..base + m]);
+                match &way {
+                    Way::Coded { amap, bmap } => {
+                        let (aix, bix) = (&a_col.c.index, &b_col.c.index);
+                        for (i, ne) in neq.iter_mut().enumerate() {
+                            // Safety: every pair row is a row of its side's
+                            // column, every non-negative index was validated
+                            // against its dictionary at decode, and a map
+                            // holds one id per entry.
+                            let (ka, kb) = unsafe {
+                                (
+                                    *aix.get_unchecked(*xs.get_unchecked(i) as usize),
+                                    *bix.get_unchecked(*ys.get_unchecked(i) as usize),
+                                )
+                            };
+                            // Safety: see above.
+                            let xa = if ka < 0 {
+                                -1
+                            } else {
+                                unsafe { *amap.get_unchecked(ka as usize) }
+                            };
+                            // Safety: see above.
+                            let xb = if kb < 0 {
+                                -1
+                            } else {
+                                unsafe { *bmap.get_unchecked(kb as usize) }
+                            };
+                            *ne = (xa != xb) as u8;
+                        }
                     }
+                    Way::Words { aw, bw } => {
+                        for i in 0..m {
+                            if let Some(&soon) = ys.get(i + PREFETCH_AHEAD) {
+                                prefetch_at(bw.values.as_ptr().wrapping_add(soon as usize).cast());
+                            }
+                            neq[i] = (aw.values[xs[i] as usize] != bw.values[ys[i] as usize]) as u8;
+                        }
+                        if !aw.nulls.is_empty() || !bw.nulls.is_empty() {
+                            for i in 0..m {
+                                neq[i] |= (aw.is_null(xs[i] as usize) != bw.is_null(ys[i] as usize))
+                                    as u8;
+                            }
+                        }
+                    }
+                    Way::WordsAsText => {
+                        for i in 0..m {
+                            neq[i] = cell_differs(
+                                a_col.at(xs[i] as usize),
+                                b_col.at(ys[i] as usize),
+                                opt,
+                            ) as u8;
+                        }
+                    }
+                    Way::Bytes { ab, bb } => {
+                        // B's rows come in no order, and each costs two
+                        // misses: its handle, then its bytes. Both are
+                        // fetched ahead, the bytes a stage behind the handle,
+                        // by when the handle is in cache.
+                        let handle = |row: usize| -> *const u8 {
+                            if b_col.c.dictionary {
+                                b_col.c.index.as_ptr().wrapping_add(row).cast()
+                            } else {
+                                b_col.c.values.as_ptr().wrapping_add(row).cast()
+                            }
+                        };
+                        for i in 0..m {
+                            if let Some(&soon) = ys.get(i + PREFETCH_AHEAD) {
+                                prefetch_at(handle(soon as usize));
+                            }
+                            if let Some(&near) = ys.get(i + PREFETCH_AHEAD / 2) {
+                                let y = b_col.slice_at(near as usize);
+                                if !y.is_null() {
+                                    prefetch_at(bb.as_ptr().wrapping_add(y.offset()));
+                                }
+                            }
+                            let x = a_col.slice_at(xs[i] as usize);
+                            let y = b_col.slice_at(ys[i] as usize);
+                            let (xa, ya) = (
+                                x.is_null() || x.length() == 0,
+                                y.is_null() || y.length() == 0,
+                            );
+                            neq[i] = ((xa != ya)
+                                || (!xa
+                                    && !ya
+                                    && ab[x.offset()..x.offset() + x.length()]
+                                        != bb[y.offset()..y.offset() + y.length()]))
+                                as u8;
+                        }
+                    }
+                    Way::BytesNormalised { ab, bb } => {
+                        for i in 0..m {
+                            neq[i] = cell_differs(
+                                look(ab, a_col.slice_at(xs[i] as usize)),
+                                look(bb, b_col.slice_at(ys[i] as usize)),
+                                opt,
+                            ) as u8;
+                        }
+                    }
+                }
+            };
+            // The pairs in `lo..hi`, a block at a time: where the column
+            // differs, in pair order.
+            let scan = |lo: usize, hi: usize| -> Result<Vec<usize>> {
+                let mut hits: Vec<usize> = Vec::new();
+                let mut neq = vec![0u8; BLOCK];
+                let mut base = lo;
+                while base < hi {
+                    let m = BLOCK.min(hi - base);
+                    fill(base, &mut neq[..m]);
                     alloc::room(&mut hits, m, "the changed cells in one column")?;
                     scan_mask(&neq[..m], base, |p| hits.push(p));
-                    base += BLOCK;
+                    base += m;
                 }
-            }
+                Ok(hits)
+            };
+            // The column's threads, which read its two sides, compare it too,
+            // each a run of whole blocks; the runs' hits are joined in order,
+            // so the result is the single pass's.
+            let ways = if npairs >= 1 << 16 { per.max(1) } else { 1 };
+            let hits = if ways == 1 {
+                scan(0, npairs)?
+            } else {
+                let step = npairs.div_ceil(ways).div_ceil(BLOCK) * BLOCK;
+                let part = |k: usize| scan((k * step).min(npairs), ((k + 1) * step).min(npairs));
+                let parts: Vec<Result<Vec<usize>>> = std::thread::scope(|scope| {
+                    let others: Vec<_> = (1..ways)
+                        .map(|k| parallel::spawn_at(scope, &part, k))
+                        .collect();
+                    let mut all = vec![part(0)];
+                    all.extend(
+                        others
+                            .into_iter()
+                            .map(|h| h.join().unwrap_or_else(|_| Err(panicked()))),
+                    );
+                    all
+                });
+                let mut hits = Vec::new();
+                for p in parts {
+                    let p = p?;
+                    alloc::room(&mut hits, p.len(), "the changed cells in one column")?;
+                    hits.extend(p);
+                }
+                hits
+            };
 
             for p in hits {
                 let x = a_col.at(pa[p] as usize);
@@ -1623,6 +1927,15 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 out.export_added = added_list.cells(&b_col, |r| r, opt)?;
                 out.export_removed = removed_list.cells(&a_col, |r| r, opt)?;
             }
+            // Kept for the export's gather below instead of dropped: with the
+            // changed pairs known, their cells come out of these columns with
+            // no second read of the file.
+            if stash {
+                *stashed[c].lock().unwrap_or_else(|e| e.into_inner()) = Some((a_col, b_col));
+            }
+            out.began = (began - phase_start).as_secs_f64();
+            out.read = (read_done - began).as_secs_f64();
+            out.compare = read_done.elapsed().as_secs_f64();
             mine.push((c, out));
         }
     };
@@ -1644,6 +1957,16 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     }
 
     phases.mark("compared columns (par)");
+    if phases.on() {
+        phases.detail(&format!("{lanes} at once, {per} thread(s) each"));
+        for &c in &order {
+            let o = &cols[c];
+            phases.detail(&format!(
+                "{:<20} from {:.3}s  read {:.3}s  compare {:.3}s",
+                compared[c], o.began, o.read, o.compare
+            ));
+        }
+    }
 
     let columns: Vec<ColumnStat> = compared
         .iter()
@@ -1677,12 +2000,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
 
     // --- the export -------------------------------------------------------
     if let Some((added_list, removed_list)) = &export_lists {
-        // Which pairs changed is known only now, after every column, so their
-        // cells take a second pass: each column is read again, on as many
-        // lanes as the first pass had, and written out at those pairs alone.
-        // Holding every column from the first pass instead would cost eight
-        // bytes a row per column per file for the whole run, the memory this
-        // path exists not to spend.
+        // Which pairs changed is known only now, after every column.
         let mut changed_found: Vec<usize> =
             alloc::sized(changed_total as usize, "the changed pairs")?;
         for (w, &word) in any.iter().enumerate() {
@@ -1695,34 +2013,63 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         let changed_list = Listed::new(changed_found, &a_keys, |p| pair_a[p] as usize, opt)?;
         let mut sides: Vec<Sides> = (0..nc).map(|_| Default::default()).collect();
         if !changed_list.found.is_empty() {
-            let next = AtomicUsize::new(0);
-            let again = || -> Result<Vec<(usize, Sides)>> {
-                let mut mine = Vec::new();
-                loop {
-                    let c = next.fetch_add(1, AtomicOrdering::Relaxed);
-                    if c >= nc {
-                        return Ok(mine);
+            if stash {
+                // The columns stayed in memory: each changed pair's cells come
+                // out of them directly, and each column is released as it is
+                // gathered.
+                for (sides_c, slot) in sides.iter_mut().zip(stashed.iter()) {
+                    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some((a_col, b_col)) = guard.take() else {
+                        return Err(Error::new("a stashed column went missing"));
+                    };
+                    drop(guard);
+                    let mut a = Cells::with_room(changed_list.found.len())?;
+                    let mut b = Cells::with_room(changed_list.found.len())?;
+                    for &p in &changed_list.found {
+                        a.push(a_col.at(pa[p] as usize), opt)?;
+                        b.push(b_col.at(pb[p] as usize), opt)?;
                     }
-                    let (a_col, b_col) = read_pair(c)?;
-                    let a = changed_list.cells(&a_col, |p| pa[p] as usize, opt)?;
-                    let b = changed_list.cells(&b_col, |p| pb[p] as usize, opt)?;
-                    mine.push((c, (a, b)));
+                    // As `Listed::cells` does: the file lists rows in key
+                    // order, not pair order.
+                    let a = a.permuted(&changed_list.order)?;
+                    let b = b.permuted(&changed_list.order)?;
+                    *sides_c = (a, b);
                 }
-            };
-            let gathered: Vec<Result<Vec<(usize, Sides)>>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..lanes).map(|_| parallel::spawn(scope, &again)).collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
-                    .collect()
-            });
-            for got in gathered {
-                for (c, pair) in got? {
-                    sides[c] = pair;
+                phases.mark("export cells (stash)");
+            } else {
+                // No room to keep the columns: each is read again, on as many
+                // lanes as the first pass had, and written out at the changed
+                // pairs alone.
+                let next = AtomicUsize::new(0);
+                let again = || -> Result<Vec<(usize, Sides)>> {
+                    let mut mine = Vec::new();
+                    loop {
+                        let c = next.fetch_add(1, AtomicOrdering::Relaxed);
+                        if c >= nc {
+                            return Ok(mine);
+                        }
+                        let (a_col, b_col) = read_pair(c)?;
+                        let a = changed_list.cells(&a_col, |p| pa[p] as usize, opt)?;
+                        let b = changed_list.cells(&b_col, |p| pb[p] as usize, opt)?;
+                        mine.push((c, (a, b)));
+                    }
+                };
+                let gathered: Vec<Result<Vec<(usize, Sides)>>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> =
+                        (0..lanes).map(|_| parallel::spawn(scope, &again)).collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
+                        .collect()
+                });
+                for got in gathered {
+                    for (c, pair) in got? {
+                        sides[c] = pair;
+                    }
                 }
+                phases.mark("export cells (par)");
             }
         }
-        phases.mark("export cells (par)");
 
         let dir = Path::new(opt.export_dir.as_deref().unwrap_or_default());
         create_export_dir(dir)?;
@@ -1814,13 +2161,15 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let to_cells = |r: Vec<Val>| -> Vec<Cell> { r.into_iter().map(Cell::Value).collect() };
 
     let dup_section = |s: &KeySide<'_>, ix: &Index| -> Section {
-        let mut all: Vec<(Vec<Val>, i64)> = ix
-            .firsts
-            .iter()
-            .zip(&ix.counts)
-            .filter(|(_, n)| **n >= 2)
-            .map(|(&r, &n)| (key_values(s, r), n as i64))
-            .collect();
+        let mut all: Vec<(Vec<Val>, i64)> = if ix.extra.is_empty() {
+            Vec::new()
+        } else {
+            ix.firsts
+                .iter()
+                .filter(|&&r| ix.extra[r as usize] > 0)
+                .map(|&r| (key_values(s, r), 1 + ix.extra[r as usize] as i64))
+                .collect()
+        };
         all.sort_by(|x, y| {
             y.1.cmp(&x.1)
                 .then_with(|| compare_keys(&x.0, &y.0, key_size))
@@ -1894,6 +2243,17 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fold_word_is_fold_bytes_of_the_word() {
+        for (h, w) in [
+            (SEED, [0u8; 8]),
+            (1, [1, 2, 3, 4, 5, 6, 7, 8]),
+            (u64::MAX, [0xff; 8]),
+        ] {
+            assert_eq!(fold_word(h, &w), fold_bytes(h, &w));
+        }
+    }
 
     #[test]
     fn tail_word_is_the_zero_padded_tail() {
