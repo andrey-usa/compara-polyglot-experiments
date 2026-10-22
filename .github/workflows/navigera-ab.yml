@@ -1,0 +1,59 @@
+name: navigera A/B
+
+# Did the hand-off work slow navigera down? The `navigera/` copy (head, plain
+# and --natural) against `navigera-base/` (the branch it started from), on
+# one runner with its own Chrome, rounds interleaved: a cold one-shot command
+# and a session (start, goto, ax, eval, quit) against the bench site.
+# Results are annotations: `navigera ab`.
+
+on:
+  push:
+    branches: [experiment-16]
+    paths:
+      - "navigera-base/**"
+      - "navigera-ab/ab.py"
+      - ".github/workflows/navigera-ab.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    name: "navigera ab"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - name: Build base and head
+        run: |
+          set -eux
+          (cd navigera-base && cargo build --release --locked)
+          (cd navigera && cargo build --release --locked)
+          google-chrome --version
+      - name: A/B
+        run: |
+          set +e -uo pipefail
+          python3 navigera/bench/site/server.py --port 0 > site.out 2>&1 &
+          for _ in $(seq 50); do grep -q LISTENING site.out && break; sleep 0.2; done
+          url=$(grep -o 'http://[^ ]*' site.out | head -1)
+          python3 navigera-ab/ab.py \
+            --build "base=navigera-base/target/release/navigera" \
+            --build "head=navigera/target/release/navigera" \
+            --build "head-natural=navigera/target/release/navigera --natural" \
+            --site "$url" --rounds 25 2>&1 | tee ab.md
+          code=${PIPESTATUS[0]}
+          python3 - ab.md <<'PY'
+          import sys
+          text = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
+          print("::notice title=navigera ab::" + text[-3800:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          PY
+          cat ab.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
