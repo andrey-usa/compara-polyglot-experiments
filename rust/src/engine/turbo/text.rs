@@ -308,18 +308,25 @@ fn skip_json_nested<S: Scan>(scan: S, data: &[u8], mut pos: usize, end: usize) -
     end
 }
 
-/// [`guard_span_with`] a register at a time, for a row with no quote before
-/// the answer: the delimiters in each register are counted rather than visited,
-/// and the one wanted is picked out of the last register's mask. On a twenty-
-/// column row that is six registers where the field walk took nineteen steps
-/// of a few dozen instructions each, and the walk ran once for every row of A
-/// the join proves -- a quarter of the whole comparison's instructions.
+/// [`guard_span_with`] a register at a time: the delimiters in each register
+/// are counted rather than visited, and the one wanted is picked out of the
+/// last register's mask. On a twenty-column row that is six registers where the
+/// field walk took nineteen steps of a few dozen instructions each, and the
+/// walk ran once for every row of A the join proves -- a quarter of the whole
+/// comparison's instructions.
 ///
-/// `None` hands the row to the field walk: a quote, which may open a quoted
-/// field whose delimiters do not count, or too few bytes left for a register.
-/// The answer is otherwise the walk's: the `commas`-th delimiter, or the
-/// newline where the last field ends the row, and `Some(None)` where the row
-/// ends early or runs past `hi`.
+/// Quoted fields are followed by quote parity: a delimiter or newline between
+/// an opening quote and its closing one does not count, and a doubled quote is
+/// a close and an open back to back. That is the walk's reading only while
+/// every quote that opens is where the walk would open a field: at the row's
+/// start, after a delimiter, or straight after a closing quote (the second half
+/// of a doubled one). Any other -- a quote inside an unquoted field, which the
+/// walk keeps as content -- before the answer hands the row to the walk.
+///
+/// `None` hands the row to the field walk: such a quote, or too few bytes left
+/// for a register. The answer is otherwise the walk's: the `commas`-th
+/// delimiter, or the newline where the last field ends the row, and
+/// `Some(None)` where the row ends early or runs past `hi`.
 #[inline(always)]
 fn guard_span_counted<S: Scan>(
     scan: S,
@@ -334,18 +341,22 @@ fn guard_span_counted<S: Scan>(
     }
     let mut need = commas;
     let mut at = lo;
-    while at < hi {
+    // Up to the first quote every delimiter counts, and most rows never meet
+    // one: they pay one compare for stops and one for delimiters a register.
+    loop {
+        if at >= hi {
+            return Some(None);
+        }
         if at + STEP > data.len() {
             return None;
         }
         let room = hi - at;
         let valid = if room >= STEP {
-            u64::MAX
+            u64::MAX >> (64 - STEP)
         } else {
             (1u64 << room) - 1
         };
         let delims = scan.hits(data, at, delimiter, delimiter) & valid;
-        // A newline ends the row and a quote ends what can be counted.
         let stops = scan.hits(data, at, b'\n', b'"') & valid;
         let before = if stops == 0 {
             u64::MAX
@@ -355,24 +366,101 @@ fn guard_span_counted<S: Scan>(
         let counted = delims & before;
         let seen = counted.count_ones() as usize;
         if seen >= need {
-            let mut m = counted;
-            for _ in 1..need {
-                m &= m - 1;
-            }
-            return Some(Some(at + m.trailing_zeros() as usize - lo));
+            return Some(Some(at + nth_bit(counted, need) - lo));
         }
         if stops != 0 {
             let stop = at + stops.trailing_zeros() as usize;
-            if data[stop] == b'"' {
-                return None;
+            if data[stop] == b'\n' {
+                // It ends the last field, or the row was too short.
+                return Some((need - seen == 1).then_some(stop - lo));
             }
-            // The newline: it ends the last field, or the row was too short.
-            return Some((need - seen == 1).then_some(stop - lo));
+            break;
         }
         need -= seen;
         at += STEP;
     }
+    guard_span_quoted(scan, data, lo, hi, delimiter, need, at)
+}
+
+/// [`guard_span_counted`] from the register holding the row's first quote,
+/// with `need` delimiters still to find: the same count by quote parity.
+#[inline(always)]
+fn guard_span_quoted<S: Scan>(
+    scan: S,
+    data: &[u8],
+    lo: usize,
+    hi: usize,
+    delimiter: u8,
+    mut need: usize,
+    mut at: usize,
+) -> Option<Option<usize>> {
+    const TOP: usize = STEP - 1;
+    let mut inside = 0u64; // all ones while a quoted field carries over
+    // Whether the byte before the register lets a quote open a field: the
+    // row's start, a delimiter, or a quote -- one that closed, as an opening
+    // one leaves the register's first byte inside, where a quote only closes.
+    let mut opens_field = u64::from(at == lo || data[at - 1] == delimiter || data[at - 1] == b'"');
+    while at < hi {
+        if at + STEP > data.len() {
+            return None;
+        }
+        let room = hi - at;
+        let valid = if room >= STEP {
+            u64::MAX >> (64 - STEP)
+        } else {
+            (1u64 << room) - 1
+        };
+        let delims = scan.hits(data, at, delimiter, delimiter) & valid;
+        let quotes = scan.hits(data, at, b'"', b'"') & valid;
+        let newlines = scan.hits(data, at, b'\n', b'\n') & valid;
+        // Bit i set: byte i is inside quotes once it is read. A quote that
+        // leaves the bit set opened, one that clears it closed.
+        let quoted = prefix_xor(quotes) ^ inside;
+        let closing = quotes & !quoted;
+        let opening = quotes & quoted;
+        let stray = opening & !(((delims | closing) << 1) | opens_field);
+        let free_newline = newlines & !quoted;
+        let before = if free_newline == 0 {
+            u64::MAX
+        } else {
+            (1u64 << free_newline.trailing_zeros()) - 1
+        };
+        let counted = delims & !quoted & before;
+        let seen = counted.count_ones() as usize;
+        let (answer, found) = if seen >= need {
+            let bit = nth_bit(counted, need);
+            (bit, Some(at + bit - lo))
+        } else if free_newline != 0 {
+            // The newline: it ends the last field, or the row was too short.
+            let bit = free_newline.trailing_zeros() as usize;
+            (bit, (need - seen == 1).then_some(at + bit - lo))
+        } else {
+            (STEP, None)
+        };
+        if stray & 1u64.checked_shl(answer as u32).map_or(u64::MAX, |b| b - 1) != 0 {
+            return None;
+        }
+        if answer < STEP {
+            return Some(found);
+        }
+        need -= seen;
+        opens_field = ((delims | closing) >> TOP) & 1;
+        if quotes.count_ones() & 1 == 1 {
+            inside = !inside;
+        }
+        at += STEP;
+    }
     Some(None)
+}
+
+/// The offset of the `n`-th set bit of `mask`, counting from one; `mask` has at
+/// least `n`.
+#[inline(always)]
+fn nth_bit(mut mask: u64, n: usize) -> usize {
+    for _ in 1..n {
+        mask &= mask - 1;
+    }
+    mask.trailing_zeros() as usize
 }
 
 /// A quoted CSV field, flagged when it holds a doubled quote. A quote inside the
@@ -394,9 +482,83 @@ fn plain_field(data: &[u8], from: usize, to: usize) -> Field {
     pack(from as u64, (stop - from) as u64, false)
 }
 
+/// Each bit of `x` replaced by the parity of it and the bits below it: for a
+/// mask of quotes, the bytes from an opening quote up to (not including) its
+/// closing one.
+#[inline(always)]
+pub(super) fn prefix_xor(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
+}
+
 /// The offset of the newline ending the row that starts at `pos`.
 #[inline(always)]
 fn end_of_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize) -> usize {
+    if S::WIDE {
+        return end_of_row_counted(scan, data, pos, end);
+    }
+    end_of_row_walked(scan, data, pos, end)
+}
+
+/// [`end_of_row`] a register at a time: the first newline with an even number
+/// of quotes before it. That is the walk's answer -- it jumps from each quote
+/// it meets to the one that closes it, a doubled quote inside being two of
+/// them -- without a scan per quoted field: on a row of thirteen quoted fields
+/// the walk made twenty-six calls, and quoted CSV swept three times slower
+/// than the same rows unquoted.
+#[inline(always)]
+fn end_of_row_counted<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize) -> usize {
+    // An `end` past the slab is answered as the walk answers it: unchanged.
+    let limit = end.min(data.len());
+    // Up to the first quote this is the walk -- one compare a register, and
+    // most rows have no quote past their keys.
+    let first = next_of2_with(scan, data, pos, limit, b'\n', b'"');
+    if first >= limit {
+        return end;
+    }
+    if data[first] == b'\n' {
+        return first;
+    }
+    let mut at = first;
+    let mut inside = 0u64; // all ones while a quoted field carries over
+    while at < limit {
+        if at + STEP > data.len() {
+            // The last bytes of the slab: the walk, from a known state.
+            if inside != 0 {
+                at = skip_quoted_with(scan, data, at, limit);
+            }
+            let found = end_of_row_walked(scan, data, at, limit);
+            return if found >= limit { end } else { found };
+        }
+        let room = limit - at;
+        let valid = if room >= STEP {
+            u64::MAX >> (64 - STEP)
+        } else {
+            (1u64 << room) - 1
+        };
+        let quotes = scan.hits(data, at, b'"', b'"') & valid;
+        let newlines = scan.hits(data, at, b'\n', b'\n') & valid;
+        let quoted = prefix_xor(quotes) ^ inside;
+        let free = newlines & !quoted;
+        if free != 0 {
+            return at + free.trailing_zeros() as usize;
+        }
+        if quotes.count_ones() & 1 == 1 {
+            inside = !inside;
+        }
+        at += STEP;
+    }
+    end
+}
+
+/// The walk [`end_of_row`] was: from each quote to the one that closes it.
+#[inline(always)]
+fn end_of_row_walked<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize) -> usize {
     let mut at = pos;
     while at < end {
         let next = next_of2_with(scan, data, at, end, b'\n', b'"');
@@ -1920,6 +2082,35 @@ mod tests {
         );
     }
 
+    /// The quote-parity row end agrees with the walk from quote to quote.
+    #[test]
+    fn end_of_row_counted_agrees_with_the_walk() {
+        let Some(w) = Wide::detect() else {
+            return;
+        };
+        let mut seed = 0x7a3c_91d2_55e1_0b4fu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..30_000 {
+            let len = (next() % 260) as usize + 1;
+            let data: Vec<u8> = (0..len)
+                .map(|_| b"ab,\"\"\n\rxyz"[(next() % 10) as usize])
+                .collect();
+            let from = (next() % len as u64) as usize;
+            let end = from + (next() % (len - from + 1) as u64) as usize;
+            assert_eq!(
+                end_of_row_counted(w, &data, from, end),
+                end_of_row_walked(Swar, &data, from, end),
+                "{:?} from {from} end {end}",
+                String::from_utf8_lossy(&data)
+            );
+        }
+    }
+
     /// The register count agrees with the field walk on rows of every shape:
     /// quoted fields, stray quotes, CRLF, short rows, and an end inside a row.
     #[test]
@@ -1964,6 +2155,57 @@ mod tests {
                     String::from_utf8_lossy(&data)
                 );
             }
+        }
+    }
+
+    /// Well-formed quoted rows -- doubled quotes, delimiters and newlines inside
+    /// quotes -- are answered by the count, not handed back to the walk.
+    #[test]
+    fn guard_span_counted_answers_quoted_rows() {
+        let Some(w) = Wide::detect() else {
+            return;
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..5_000 {
+            let mut row = Vec::new();
+            let fields = (next() % 20) as usize + 1;
+            for f in 0..fields {
+                if f > 0 {
+                    row.push(b',');
+                }
+                let body: Vec<u8> = (0..next() % 12)
+                    .map(|_| b"ab,\n\"x"[(next() % 6) as usize])
+                    .collect();
+                if body.iter().any(|b| matches!(b, b',' | b'\n' | b'"')) || next() % 2 == 0 {
+                    row.push(b'"');
+                    for &b in &body {
+                        row.push(b);
+                        if b == b'"' {
+                            row.push(b'"');
+                        }
+                    }
+                    row.push(b'"');
+                } else {
+                    row.extend_from_slice(&body);
+                }
+            }
+            row.push(b'\n');
+            row.extend_from_slice(&[b'z'; 70]);
+            let hi = row.len() - 70;
+            let commas = (next() % 22) as usize + 1;
+            let walk = guard_span_with(Swar, &row, 0, hi, b',', commas);
+            assert_eq!(
+                guard_span_counted(w, &row, 0, hi, b',', commas),
+                Some(walk),
+                "{:?} commas {commas}",
+                String::from_utf8_lossy(&row)
+            );
         }
     }
 
