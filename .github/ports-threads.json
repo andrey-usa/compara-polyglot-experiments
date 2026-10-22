@@ -1,1 +1,6 @@
-{"rows": "2m", "formats": "csv,tsv,ndjson,parquet", "threads": "1,2,4", "repeats": 5}
+{
+  "rows": "10m",
+  "formats": "csv,tsv,ndjson,parquet",
+  "threads": "1,4",
+  "repeats": 5
+}
