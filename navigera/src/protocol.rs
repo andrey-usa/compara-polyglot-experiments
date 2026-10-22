@@ -619,6 +619,13 @@ pub enum Command {
     /// List open tabs: index, target id, and whether it is the active tab.
     #[serde(rename = "tab-list")]
     TabList {},
+    /// Put the browser on screen, with the same tabs and sign-ins: hand the
+    /// session to a person (a login, a 2FA prompt, a CAPTCHA).
+    #[serde(rename = "show")]
+    Show {},
+    /// Take it off screen again (headless), with the same tabs and sign-ins.
+    #[serde(rename = "hide")]
+    Hide {},
     /// Open a fresh tab (optionally at a URL) and make it active.
     #[serde(rename = "tab-new")]
     TabNew {
@@ -884,6 +891,8 @@ const OPS: &[(&str, &str, &str)] = &[
     ("screenshot", "[--path <f.png>] [--full-page]", "PNG of the viewport (or whole page)"),
     ("tab-new", "[<url>]", "open a tab and make it active"),
     ("tab-list", "", "list tabs"),
+    ("show", "", "put the browser on screen with the same tabs and sign-ins, to hand the session to a person (a login, 2FA, a CAPTCHA); `hide` takes it back off"),
+    ("hide", "", "take the browser off screen again (headless), with the same tabs and sign-ins"),
     ("tab-select", "<index>", "switch the active tab"),
     ("tab-close", "[<index>]", "close a tab (default: active)"),
     ("dialog", "--accept [--prompt-text <t>] | --dismiss", "how alert/confirm/prompt are answered (default: accept; every dialog is reported)"),
@@ -1718,6 +1727,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
         // one-shot it just launches and closes.
         "quit" | "close" => Command::Quit { close_browser: extract_present(&mut args, "--close-browser") },
         "tab-list" => Command::TabList {},
+        "show" => Command::Show {},
+        "hide" => Command::Hide {},
         "tab-new" => Command::TabNew {
             url: match str_flag(&mut args, "--url")? {
                 Some(u) => Some(u),
@@ -1980,6 +1991,70 @@ impl Driver {
         Ok(json!(crate::cdp::logs::requests_text(&picked, &origin_of(&self.session.url()))))
     }
 
+    /// `show` / `hide`: the same session in a browser on screen, or off it.
+    /// A `--profile` browser restarts on its own profile, which keeps
+    /// everything; a browser navigera launched is replaced by one carrying its
+    /// cookies and the open tabs' storage (`state save` / `load`). Either way
+    /// the tabs reopen at their pages and the active one stays active.
+    fn relaunch(&mut self, visible: bool) -> anyhow::Result<Value> {
+        let what = if visible { "show" } else { "hide" };
+        if self.session.is_lightpanda() {
+            anyhow::bail!("{what}: Lightpanda has no window; use the chrome engine");
+        }
+        if self.session.is_attached() && self.session.profile_dir().is_none() {
+            anyhow::bail!("{what}: this is your own browser (--attach); it is already where you see it");
+        }
+        let urls = self.session.tab_urls();
+        let active = self.session.active_page();
+        let exe = self.session.profile_executable().unwrap_or(self.session.executable()).to_string();
+        let timeout_ms = self.session.timeout_ms();
+        let new = match self.session.profile_dir() {
+            Some(dir) => {
+                self.session.close_browser()?;
+                let target = crate::browser::AttachTarget::Profile {
+                    name: dir.display().to_string(),
+                    executable: Some(exe),
+                    headless: !visible,
+                    from: None,
+                    from_profile: None,
+                };
+                BrowserSession::attach(&target, timeout_ms)
+            }
+            None => {
+                let state = self.session.storage_state()?;
+                let mut new = BrowserSession::launch_with("chrome", !visible, Some(&exe), timeout_ms, None);
+                if let Ok(new) = &mut new {
+                    new.load_storage_state(&state)?;
+                }
+                new
+            }
+        }
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{what}: could not start the browser {}: {e:#}",
+                if visible { "on screen (is there a display?)" } else { "headless" }
+            )
+        })?;
+        let old = std::mem::replace(&mut self.session, new);
+        if !old.is_attached() {
+            old.close();
+        }
+        for (i, url) in urls.iter().enumerate() {
+            if i > 0 {
+                self.session.new_page().map_err(|e| anyhow::anyhow!("{what}: reopen tab {i}: {e:#}"))?;
+            }
+            if !url.is_empty() && url != "about:blank" {
+                let _ = self.session.goto(url);
+            }
+        }
+        if active < urls.len() {
+            let _ = self.session.select_page(active);
+        }
+        let mut state = self.state_json();
+        state["visible"] = json!(visible);
+        Ok(state)
+    }
+
     fn tabs_json(&self) -> Value {
         let active = self.session.active_page();
         let tabs: Vec<Value> = self
@@ -2010,6 +2085,8 @@ impl Driver {
             Command::Quit { .. }
                 | Command::Dialog { .. }
                 | Command::TabList {}
+                | Command::Show {}
+                | Command::Hide {}
                 | Command::Status {}
                 | Command::Console { .. }
                 | Command::Errors { .. }
@@ -2715,6 +2792,8 @@ impl Driver {
                 Ok(state)
             }
             Command::TabList {} => Ok(self.tabs_json()),
+            Command::Show {} => self.relaunch(true),
+            Command::Hide {} => self.relaunch(false),
             Command::TabNew { url } => {
                 self.session.new_page().map_err(|e| anyhow::anyhow!("tab-new: {e:#}"))?;
                 if let Some(url) = url {

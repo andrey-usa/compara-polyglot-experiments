@@ -181,3 +181,41 @@ fn natural_mode_shows_no_sign_of_automation() {
         assert!(before["header_ua_headless"] == true && before["worker_ua_headless"] == true, "{before}");
     }
 }
+
+/// `show` puts a headless session on screen with its tabs and sign-ins, for
+/// a person to take over (a 2FA prompt, a CAPTCHA); `hide` takes it back.
+/// Both for a browser navigera launched and for a `--profile` one. Needs a
+/// display: on Linux, run under `xvfb-run`.
+#[test]
+fn show_and_hide_keep_the_tabs_and_the_sign_in() {
+    if chrome().is_none() || (cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_none()) {
+        return;
+    }
+    let Some(site) = site() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("p").display().to_string();
+    for (label, start) in [("launched", vec!["start"]), ("profile", vec!["start", "--profile", &profile, "--headless"])]
+    {
+        let s = Session { name: session_name(&format!("show-{label}")), close_browser: label == "profile" };
+        ok(&s.name, &start);
+        ok(&s.name, &["goto", &format!("{}/login", site.url)]);
+        ok(&s.name, &["tab-new", &format!("{}/whoami", site.url)]);
+        let shown = ok(&s.name, &["show"]);
+        assert_eq!(shown["visible"], true, "{label}: {shown}");
+        let tabs = ok(&s.name, &["tab-list"]);
+        assert_eq!(tabs["tabs"].as_array().map(Vec::len), Some(2), "{label}: the tabs came along: {tabs}");
+        assert!(tabs["url"].as_str().unwrap().ends_with("/whoami"), "{label}: the active tab stayed active: {tabs}");
+        let ua = ok(&s.name, &["eval", "navigator.userAgent"]).to_string();
+        assert!(!ua.contains("Headless"), "{label}: on screen is a windowed browser: {ua}");
+        ok(&s.name, &["reload"]);
+        let who: Value = serde_json::from_str(ok(&s.name, &["title"]).as_str().unwrap()).unwrap();
+        assert_eq!(who["user"], "ada", "{label}: signed in on screen: {who}");
+        let hidden = ok(&s.name, &["hide"]);
+        assert_eq!(hidden["visible"], false, "{label}: {hidden}");
+        ok(&s.name, &["reload"]);
+        let who: Value = serde_json::from_str(ok(&s.name, &["title"]).as_str().unwrap()).unwrap();
+        assert!(who["cookie"].as_str().unwrap().contains("seen=1") && who["user"] == "ada", "{label}: {who}");
+    }
+}

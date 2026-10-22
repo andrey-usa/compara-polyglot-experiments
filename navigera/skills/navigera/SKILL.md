@@ -104,12 +104,20 @@ the error and doesn't fix it.
 ## The user's own browser (their logins and settings)
 
 ```bash
+navigera profiles                      # what can be handed over: the user's browsers and profiles (name, email, attach-ready?)
 navigera -s me start --attach          # the user's running Chrome 144+ (they enable chrome://inspect/#remote-debugging once, then click Allow)
+navigera -s me start --profile agent --from chrome   # a browser of your own, starting signed in as the user's Chrome is (a copy)
 navigera -s me start --profile work    # or a separate persistent browser: sign in once, it stays open between sessions
 navigera -s me quit                    # disconnects; the browser stays open (quit --close-browser closes it)
 ```
 
 navigera works in a window of its own there and never closes the user's tabs.
+Add `--natural` when a site treats headless browsers differently.
+
+A step only the person can do -- a login, a 2FA code, a CAPTCHA: `navigera -s me
+show` puts the browser on their screen with the same tabs and sign-ins; tell them
+what to do, wait for the page they will reach (`wait --url /dashboard --timeout-ms
+300000`), then `navigera -s me hide` and carry on.
 
 ## Reading a page: `ax`
 

@@ -458,8 +458,10 @@ pub struct BrowserSession {
     /// Connected to a browser navigera doesn't own (`--attach`,
     /// `--profile`): closing only disconnects.
     attached: bool,
-    /// The user data directory of a `--profile` browser.
+    /// The user data directory of a `--profile` browser, and the browser
+    /// binary that runs it.
     profile_dir: Option<std::path::PathBuf>,
+    profile_exe: Option<String>,
     /// `set …` overrides (keyed by what they set): applied to every open
     /// tab and replayed on tabs opened later.
     overrides: std::collections::BTreeMap<&'static str, Vec<(&'static str, serde_json::Value)>>,
@@ -598,6 +600,7 @@ impl BrowserSession {
             abandoned: std::sync::Mutex::new(None),
             attached: false,
             profile_dir: None,
+            profile_exe: None,
             overrides: Default::default(),
             init_scripts: Vec::new(),
             init_ids: Default::default(),
@@ -618,6 +621,7 @@ impl BrowserSession {
             AttachTarget::Profile { name, .. } => Some(cdp::attach::profile_dir(name)?),
             AttachTarget::Running(_) => None,
         };
+        let mut profile_exe = None;
         let (ws_url, what) = match target {
             AttachTarget::Running(spec) => (cdp::attach::resolve(spec)?, format!("attach {spec}")),
             AttachTarget::Profile { name, executable, headless, from, from_profile } => {
@@ -633,6 +637,7 @@ impl BrowserSession {
                 }
                 let extra = if natural() { natural_flags(&exe, *headless) } else { Vec::new() };
                 let url = cdp::attach::ensure_profile_browser(&exe, &dir, *headless, &extra)?;
+                profile_exe = Some(exe);
                 (url, what)
             }
         };
@@ -653,6 +658,7 @@ impl BrowserSession {
             abandoned: std::sync::Mutex::new(None),
             attached: true,
             profile_dir,
+            profile_exe,
             overrides: Default::default(),
             init_scripts: Vec::new(),
             init_ids: Default::default(),
@@ -1592,6 +1598,26 @@ impl BrowserSession {
     /// The launched executable (browser binary or `lightpanda`).
     pub fn executable(&self) -> &str {
         &self.exe
+    }
+
+    /// The user data directory of a `--profile` browser.
+    pub fn profile_dir(&self) -> Option<&std::path::Path> {
+        self.profile_dir.as_deref()
+    }
+
+    /// The browser binary of a `--profile` browser.
+    pub fn profile_executable(&self) -> Option<&str> {
+        self.profile_exe.as_deref()
+    }
+
+    /// The navigation timeout this session was given, in ms.
+    pub fn timeout_ms(&self) -> f64 {
+        self.timeout_ms
+    }
+
+    /// Every tab's current URL, in tab order.
+    pub fn tab_urls(&self) -> Vec<String> {
+        self.pages.iter().map(|p| p.url(self.timeout(None)).unwrap_or_default()).collect()
     }
 }
 

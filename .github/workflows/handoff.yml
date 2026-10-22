@@ -54,7 +54,8 @@ jobs:
         run: |
           set +e -o pipefail
           if [ "$RUNNER_OS" = Linux ]; then
-            cargo test --locked --no-fail-fast 2>&1 | tee test.log
+            # A display for `show`.
+            xvfb-run -a cargo test --locked --no-fail-fast 2>&1 | tee test.log
           else
             cargo test --locked --no-fail-fast --lib --test handoff --test attach 2>&1 | tee test.log
           fi
@@ -65,7 +66,7 @@ jobs:
           passed = sum(int(m) for m in re.findall(r"test result: \w+\. (\d+) passed", text))
           failed = re.findall(r"^test (\S+) \.\.\. FAILED", text, re.M)
           ran = re.findall(r"^test (\S+) \.\.\. (ok|FAILED)", text, re.M)
-          handoff = [f"{n}: {r}" for n, r in ran if "signed_in" in n or "natural" in n]
+          handoff = [f"{n}: {r}" for n, r in ran if "signed_in" in n or "natural" in n or "show_and_hide" in n]
           panics = re.findall(r"panicked at .*?\n(.*?)\n", text, re.S)
           msg = f"{passed} passed, {len(failed)} failed {failed}\n" + "\n".join(handoff)
           if panics:
