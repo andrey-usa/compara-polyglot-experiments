@@ -19,12 +19,17 @@ on:
       - "cloud/**"
       - ".github/workflows/cloud.yml"
   workflow_dispatch:
+    inputs:
+      only:
+        description: "Run one job (build, emulators, action, kubernetes, container); empty for all"
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'build'
     name: "build ${{ matrix.target }}"
     strategy:
       fail-fast: false
@@ -95,6 +100,7 @@ jobs:
           EOF
 
   emulators:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'emulators'
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -258,6 +264,7 @@ jobs:
           EOF
 
   action:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'action'
     # The composite action in cloud/action.yml, run the way a workflow runs
     # it, on a binary built here (`binary:`), since there is no release of
     # this code to download: its outputs, its job summary, and the exit it
@@ -341,6 +348,7 @@ jobs:
           $ok
 
   kubernetes:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'kubernetes'
     # The README's Job on a kind cluster: the image from the Dockerfile, run
     # non-root on a read-only root with an emptyDir for /tmp and a memory
     # limit, reading and writing S3 -- SeaweedFS in the same cluster -- with
@@ -376,6 +384,10 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           set -eux
+          diagnose() {
+            echo "::error title=cloud kubernetes setup::pods: $(kubectl get pods -o wide 2>&1 | tr '\n' ' ') | s3 log: $(kubectl logs deploy/s3 --tail=15 2>&1 | tr '\n' ' ' | tail -c 1500) | forward: $(tail -c 400 /tmp/pf.log 2>/dev/null | tr '\n' ' ') | events: $(kubectl get events --sort-by=.lastTimestamp 2>&1 | tail -6 | tr '\n' ' ')"
+          }
+          trap diagnose ERR
           cat > /tmp/s3.json <<'JSON'
           {"identities": [{"name": "compara", "credentials": [{"accessKey": "compara", "secretKey": "secret12345"}],
             "actions": ["Admin", "Read", "List", "Tagging", "Write"]}]}
@@ -407,8 +419,13 @@ jobs:
           spec: {selector: {app: s3}, ports: [{port: 8333, targetPort: 8333}]}
           YAML
           kubectl rollout status deploy/s3 --timeout=180s
-          (kubectl port-forward svc/s3 8333:8333 > /tmp/pf.log 2>&1 &)
-          for i in $(seq 60); do aws --endpoint-url http://localhost:8333 s3 mb s3://bkt 2>/dev/null && break; sleep 2; done
+          nohup kubectl port-forward --address 127.0.0.1 svc/s3 8333:8333 > /tmp/pf.log 2>&1 &
+          made=no
+          for i in $(seq 90); do
+            if aws --endpoint-url http://localhost:8333 s3 mb s3://bkt 2>/tmp/mb.err; then made=yes; break; fi
+            sleep 2
+          done
+          [ $made = yes ] || { echo "mb: $(tail -c 300 /tmp/mb.err)"; false; }
           mkdir -p /tmp/k && cd /tmp/k
           gen=$GITHUB_WORKSPACE/cloud/target/release/compara-gen-data
           $gen --rows 1m --out-dir . --prefix pq --format parquet
@@ -432,7 +449,7 @@ jobs:
           set -u
           cd /tmp/k
           # The forward from the step before may have gone with it.
-          (kubectl port-forward svc/s3 8333:8333 > /tmp/pf2.log 2>&1 &)
+          nohup kubectl port-forward --address 127.0.0.1 svc/s3 8333:8333 > /tmp/pf2.log 2>&1 &
           sleep 3
           bin=$GITHUB_WORKSPACE/cloud/target/release/compara
           : > k.txt
@@ -492,6 +509,7 @@ jobs:
           [ "$bad" = 0 ]
 
   container:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'container'
     runs-on: ubuntu-24.04
     defaults:
       run:
