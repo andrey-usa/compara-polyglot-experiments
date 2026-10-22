@@ -77,6 +77,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
 
     // The end of the object first: its size comes with it, and for Parquet
     // the footer.
+    let mut public = false;
     let (size, tail, etag) = match tail(&reader, spec).await {
         Ok(found) => found,
         Err(Refused(status)) if signable(&url) && matches!(reader, Reader::Http(..)) => {
@@ -87,6 +88,18 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
                 ))
             })?;
             tail(&reader, spec).await.map_err(|e| e.into_error(spec))?
+        }
+        // No credentials anywhere: a public bucket reads unsigned.
+        Err(FetchError::Other(message)) if store_scheme && no_credentials(&message) => {
+            let unsigned = store_signed(spec, &url, false).await?;
+            match tail(&unsigned, spec).await {
+                Ok(found) => {
+                    reader = unsigned;
+                    public = true;
+                    found
+                }
+                Err(_) => return Err(Error::new(format!("{spec}: {message}"))),
+            }
         }
         // No such object, but perhaps a prefix: `s3://bucket/orders` for the
         // parts under `orders/`.
@@ -152,6 +165,9 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
     fetch_ranges(&reader, &file, ranges, etag.as_deref(), spec).await?;
     file.sync_data().ok();
     let secs = started.elapsed().as_secs_f64();
+    if public {
+        note.push_str(", unsigned (no credentials here; a public bucket)");
+    }
     source.steps.push(format!(
         "downloaded {} of {}{note} in {secs:.1}s ({}/s)",
         human(fetched),
@@ -202,19 +218,42 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
         None => key,
     };
     let url = url::Url::parse(root).map_err(|e| Error::new(format!("{spec}: not a URL: {e}")))?;
-    let Reader::Store(store, _) = store_for(root, &url).await? else {
+    let trimmed = prefix.trim_end_matches('/');
+    let list = |store: Arc<dyn ObjectStore>| async move {
+        if trimmed.is_empty() {
+            store.list(None).try_collect::<Vec<_>>().await
+        } else {
+            store
+                .list(Some(&ObjectPath::from(trimmed)))
+                .try_collect()
+                .await
+        }
+    };
+    let Reader::Store(mut store, _) = store_for(root, &url).await? else {
         unreachable!("store_for returns a store");
     };
-    let trimmed = prefix.trim_end_matches('/');
-    let listed: Vec<object_store::ObjectMeta> = if trimmed.is_empty() {
-        store.list(None).try_collect().await
-    } else {
-        store
-            .list(Some(&ObjectPath::from(trimmed)))
-            .try_collect()
-            .await
-    }
-    .map_err(|e| Error::new(format!("cannot list {spec}: {}", explain(&e.to_string()))))?;
+    let mut public = false;
+    let listed: Vec<object_store::ObjectMeta> = match list(store.clone()).await {
+        Ok(listed) => listed,
+        Err(e) => {
+            let message = explain(&e.to_string());
+            // No credentials anywhere: a public bucket lists unsigned.
+            let retried = if no_credentials(&message) {
+                let Reader::Store(unsigned, _) = store_signed(root, &url, false).await? else {
+                    unreachable!("store_signed returns a store");
+                };
+                list(unsigned.clone()).await.ok().map(|l| (unsigned, l))
+            } else {
+                None
+            };
+            let Some((unsigned, listed)) = retried else {
+                return Err(Error::new(format!("cannot list {spec}: {message}")));
+            };
+            store = unsigned;
+            public = true;
+            listed
+        }
+    };
     let relative = |m: &object_store::ObjectMeta| -> String {
         let loc = m.location.as_ref();
         loc.strip_prefix(trimmed)
@@ -374,7 +413,7 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
                 footer_at.push(at);
                 write_at(&combined.file, b"PAR1", base)?;
             }
-            fetch_jobs(footers, &combined.file).await?;
+            fetch_jobs(footers, &combined.file, spec).await?;
             let mut wanted = 0;
             for ((p, &base), &at) in parts.iter().zip(&bases).zip(&footer_at) {
                 let mut footer = vec![0u8; (p.size - at) as usize];
@@ -415,11 +454,14 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
             .map(|j| j.range.end - j.range.start)
             .sum::<u64>()
             + parts.iter().map(|p| p.tail.len() as u64).sum::<u64>();
-        fetch_jobs(jobs, &combined.file).await?;
+        fetch_jobs(jobs, &combined.file, spec).await?;
         for (p, &base) in parts.iter().zip(&bases) {
             combined.placed(&p.name, base, p.size, !parquet)?;
         }
         let secs = started.elapsed().as_secs_f64();
+        if public {
+            columns.push_str(", unsigned (no credentials here; a public bucket)");
+        }
         source.steps.push(format!(
             "downloaded {} of {} in {} objects{columns} in {secs:.1}s ({}/s)",
             human(fetched),
@@ -549,6 +591,11 @@ impl From<object_store::Error> for FetchError {
 /// A store error, with what to do about the common one: no credentials.
 fn explain(e: &str) -> String {
     let lower = e.to_ascii_lowercase();
+    if let Some(trouble) = PROFILE_TROUBLE.get()
+        && (lower.contains("credential") || lower.contains("metadata"))
+    {
+        return format!("{e}. No usable credentials: {trouble}");
+    }
     if lower.contains("credential") || lower.contains("metadata") || lower.contains("token") {
         format!(
             "{e}. No usable credentials: set the cloud's usual variables (AWS_ACCESS_KEY_ID and \
@@ -680,7 +727,7 @@ async fn fetch_ranges(
             spec,
         })
         .collect();
-    fetch_jobs(jobs, file).await
+    fetch_jobs(jobs, file, spec).await
 }
 
 /// A range of one object, written to the local file `shift` bytes further on
@@ -704,7 +751,7 @@ fn concurrency() -> usize {
 /// Fetches every job into `file`, cut into parts of at most [`PART`] bytes,
 /// [`concurrency`] at a time across all of them: many small objects keep as
 /// many requests in flight as one large one.
-async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File) -> Result<()> {
+async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> {
     let parts: Vec<(&Job, Range<u64>)> = jobs
         .iter()
         .flat_map(|job| {
@@ -718,17 +765,57 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File) -> Result<()> {
             out
         })
         .collect();
-    futures::stream::iter(parts)
+    let total: u64 = parts.iter().map(|(_, r)| r.end - r.start).sum();
+    let done = std::sync::atomic::AtomicU64::new(0);
+    let done = &done;
+    let work = futures::stream::iter(parts)
         .map(|(job, part)| async move {
+            let len = part.end - part.start;
             fetch_part(job.reader, file, part, job.shift, job.etag)
                 .await
-                .map_err(|e| e.into_error(job.spec))
+                .map_err(|e| e.into_error(job.spec))?;
+            done.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+            Ok::<(), Error>(())
         })
         .buffer_unordered(concurrency())
-        .try_collect::<Vec<()>>()
-        .await?;
-    Ok(())
+        .try_collect::<Vec<()>>();
+    // A long download says how far it has got, every so often, so a log --
+    // a CI job's, a pod's -- shows it moving.
+    let started = Instant::now();
+    let every = std::env::var("COMPARA_PROGRESS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(PROGRESS_EVERY_SECS);
+    let ticker = async {
+        if every <= 0.0 {
+            return std::future::pending::<()>().await;
+        }
+        let mut every = tokio::time::interval(std::time::Duration::from_secs_f64(every));
+        every.tick().await;
+        loop {
+            every.tick().await;
+            let got = done.load(std::sync::atomic::Ordering::Relaxed);
+            let secs = started.elapsed().as_secs_f64();
+            eprintln!(
+                "{label}: {} of {} ({}%) in {secs:.0}s, {}/s",
+                human(got),
+                human(total),
+                got * 100 / total.max(1),
+                human((got as f64 / secs.max(1e-3)) as u64)
+            );
+        }
+    };
+    let work = std::pin::pin!(work);
+    let ticker = std::pin::pin!(ticker);
+    match futures::future::select(work, ticker).await {
+        futures::future::Either::Left((result, _)) => result.map(|_| ()),
+        futures::future::Either::Right(((), _)) => unreachable!("the ticker never ends"),
+    }
 }
+
+/// How often, in seconds, a download in progress says how far it has got
+/// (`COMPARA_PROGRESS`; 0 for never).
+const PROGRESS_EVERY_SECS: f64 = 10.0;
 
 /// One part, pinned to the version of the object the first request saw: a
 /// part of a later version fails rather than lands beside parts of the
@@ -927,6 +1014,18 @@ fn client_options() -> object_store::ClientOptions {
 
 /// A signed store for the URL's cloud, configured from the environment.
 async fn store_for(spec: &str, url: &url::Url) -> Result<Reader> {
+    store_signed(spec, url, true).await
+}
+
+/// Whether a store error is the absence of credentials, the one an unsigned
+/// request to a public bucket gets past.
+fn no_credentials(message: &str) -> bool {
+    message.contains("No usable credentials")
+}
+
+/// A store as [`store_for`] builds it, or with `signed` false one that sends
+/// its requests unsigned: a public bucket's, read with no credentials at all.
+async fn store_signed(spec: &str, url: &url::Url, signed: bool) -> Result<Reader> {
     let (scheme, path) = object_store::ObjectStoreScheme::parse(url)
         .map_err(|e| Error::new(format!("{spec}: {e}")))?;
     let fail = |e: object_store::Error| Error::new(format!("{spec}: {}", explain(&e.to_string())));
@@ -936,7 +1035,7 @@ async fn store_for(spec: &str, url: &url::Url) -> Result<Reader> {
                 .with_url(spec)
                 .with_client_options(client_options());
             for (key, value) in aws_profile() {
-                b = b.with_config(key, value);
+                b = b.with_config(*key, value);
             }
             let endpoint = std::env::var("AWS_ENDPOINT_URL")
                 .or_else(|_| std::env::var("AWS_ENDPOINT"))
@@ -967,19 +1066,24 @@ async fn store_for(spec: &str, url: &url::Url) -> Result<Reader> {
                     b = b.with_region(region);
                 }
             }
+            if !signed {
+                b = b.with_skip_signature(true);
+            }
             Arc::new(b.build().map_err(fail)?)
         }
-        object_store::ObjectStoreScheme::GoogleCloudStorage => Arc::new(
-            object_store::gcp::GoogleCloudStorageBuilder::from_env()
+        object_store::ObjectStoreScheme::GoogleCloudStorage => {
+            let mut b = object_store::gcp::GoogleCloudStorageBuilder::from_env()
                 .with_url(spec)
                 .with_client_options(
                     client_options().with_allow_http(allow_http("GOOGLE", &["GOOGLE_BASE_URL"])),
-                )
-                .build()
-                .map_err(fail)?,
-        ),
-        object_store::ObjectStoreScheme::MicrosoftAzure => Arc::new(
-            object_store::azure::MicrosoftAzureBuilder::from_env()
+                );
+            if !signed {
+                b = b.with_skip_signature(true);
+            }
+            Arc::new(b.build().map_err(fail)?)
+        }
+        object_store::ObjectStoreScheme::MicrosoftAzure => {
+            let mut b = object_store::azure::MicrosoftAzureBuilder::from_env()
                 .with_url(spec)
                 .with_client_options(client_options().with_allow_http(allow_http(
                     "AZURE",
@@ -988,10 +1092,17 @@ async fn store_for(spec: &str, url: &url::Url) -> Result<Reader> {
                         "AZURE_ENDPOINT",
                         "AZURE_STORAGE_EMULATOR_HOST",
                     ],
-                )))
-                .build()
-                .map_err(fail)?,
-        ),
+                )));
+            if !signed {
+                b = b.with_skip_signature(true);
+            } else if azure_cli_only() {
+                // Signed in with `az login` and nothing else: the CLI's token,
+                // as the Azure tools use it, rather than a managed identity
+                // this machine does not have.
+                b = b.with_use_azure_cli(true);
+            }
+            Arc::new(b.build().map_err(fail)?)
+        }
         other => {
             return Err(Error::new(format!(
                 "{spec}: {other:?} URLs are not read here"
@@ -1001,23 +1112,78 @@ async fn store_for(spec: &str, url: &url::Url) -> Result<Reader> {
     Ok(Reader::Store(store, path))
 }
 
+/// Whether the only Azure credentials here are an Azure CLI sign-in: no key,
+/// SAS, secret, token or identity endpoint in the environment, and `az` on
+/// the PATH with a profile in `~/.azure`.
+fn azure_cli_only() -> bool {
+    let configured = [
+        "AZURE_STORAGE_ACCOUNT_KEY",
+        "AZURE_STORAGE_ACCESS_KEY",
+        "AZURE_STORAGE_KEY",
+        "AZURE_STORAGE_SAS_KEY",
+        "AZURE_STORAGE_SAS_TOKEN",
+        "AZURE_STORAGE_TOKEN",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "AZURE_STORAGE_USE_EMULATOR",
+        "AZURE_USE_AZURE_CLI",
+        "AZURE_SKIP_SIGNATURE",
+        "IDENTITY_ENDPOINT",
+        "MSI_ENDPOINT",
+    ]
+    .iter()
+    .any(|k| std::env::var_os(k).is_some());
+    if configured {
+        return false;
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let signed_in = std::env::var_os("AZURE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".azure")))
+        .is_some_and(|d| d.join("azureProfile.json").is_file());
+    let names: &[&str] = if cfg!(windows) {
+        &["az.cmd", "az.exe"]
+    } else {
+        &["az"]
+    };
+    signed_in
+        && std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|d| names.iter().any(|n| d.join(n).is_file()))
+        })
+}
+
 fn scheme_is(url: &url::Url, scheme: &str) -> bool {
     url.scheme().eq_ignore_ascii_case(scheme)
 }
 
-/// Keys, token and region from a shared credentials file, as the AWS CLI reads
-/// them, when the environment has no keys of its own. `AWS_PROFILE` names the
-/// profile (default `default`). A profile that only points elsewhere -- SSO, a
-/// role to assume, a credential process -- has no keys here; the environment
-/// (`aws configure export-credentials --format env`) or an attached role is
-/// the way to give those.
-fn aws_profile() -> Vec<(object_store::aws::AmazonS3ConfigKey, String)> {
+/// Keys, token and region from the shared files, as the AWS CLI reads them,
+/// when the environment has no keys of its own. `AWS_PROFILE` (or
+/// `AWS_DEFAULT_PROFILE`) names the profile, `default` by default. Static keys
+/// are read from `~/.aws/credentials`; a profile that only points elsewhere
+/// -- `credential_process`, SSO, a role to assume -- is asked for keys the way
+/// the SDKs ask: its `credential_process` run, or else the AWS CLI's
+/// `aws configure export-credentials`, which resolves all of them. Read once.
+fn aws_profile() -> &'static [(object_store::aws::AmazonS3ConfigKey, String)] {
+    static PROFILE: std::sync::OnceLock<Vec<(object_store::aws::AmazonS3ConfigKey, String)>> =
+        std::sync::OnceLock::new();
+    PROFILE.get_or_init(read_aws_profile)
+}
+
+fn aws_profile_name() -> String {
+    std::env::var("AWS_PROFILE")
+        .or_else(|_| std::env::var("AWS_DEFAULT_PROFILE"))
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "default".into())
+}
+
+fn read_aws_profile() -> Vec<(object_store::aws::AmazonS3ConfigKey, String)> {
     use object_store::aws::AmazonS3ConfigKey as K;
     if std::env::var("AWS_ACCESS_KEY_ID").is_ok() {
         return Vec::new();
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
+    let profile = aws_profile_name();
     let file = |var: &str, name: &str| -> Option<String> {
         let path = std::env::var_os(var).map(PathBuf::from).or_else(|| {
             home.as_ref()
@@ -1025,39 +1191,110 @@ fn aws_profile() -> Vec<(object_store::aws::AmazonS3ConfigKey, String)> {
         })?;
         std::fs::read_to_string(path).ok()
     };
+    let credentials = file("AWS_SHARED_CREDENTIALS_FILE", "credentials")
+        .map(|t| ini_section(&t, &profile))
+        .unwrap_or_default();
+    let config = file("AWS_CONFIG_FILE", "config")
+        .map(|t| {
+            let name = if profile == "default" {
+                "default".to_string()
+            } else {
+                format!("profile {profile}")
+            };
+            ini_section(&t, &name)
+        })
+        .unwrap_or_default();
+    let get = |k: &str| {
+        credentials
+            .iter()
+            .chain(&config)
+            .find(|(name, _)| name == k)
+            .map(|(_, v)| v.clone())
+    };
     let mut out = Vec::new();
-    if let Some(text) = file("AWS_SHARED_CREDENTIALS_FILE", "credentials") {
-        let section = ini_section(&text, &profile);
-        for (name, key) in [
-            ("aws_access_key_id", K::AccessKeyId),
-            ("aws_secret_access_key", K::SecretAccessKey),
-            ("aws_session_token", K::Token),
-        ] {
-            if let Some(v) = section
-                .iter()
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.clone())
-            {
-                out.push((key, v));
+    for (name, key) in [
+        ("aws_access_key_id", K::AccessKeyId),
+        ("aws_secret_access_key", K::SecretAccessKey),
+        ("aws_session_token", K::Token),
+    ] {
+        if let Some(v) = get(name) {
+            out.push((key, v));
+        }
+    }
+    let delegated = [
+        "credential_process",
+        "sso_session",
+        "sso_start_url",
+        "role_arn",
+    ]
+    .iter()
+    .any(|k| get(k).is_some());
+    if out.is_empty() && delegated {
+        let process = get("credential_process");
+        let output = match &process {
+            Some(command) if cfg!(windows) => std::process::Command::new("cmd")
+                .args(["/C", command])
+                .output(),
+            Some(command) => std::process::Command::new("sh")
+                .args(["-c", command])
+                .output(),
+            None => std::process::Command::new("aws")
+                .args(["configure", "export-credentials", "--profile", &profile])
+                .args(["--format", "process"])
+                .output(),
+        };
+        match output {
+            Ok(o) if o.status.success() => {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                    for (name, key) in [
+                        ("AccessKeyId", K::AccessKeyId),
+                        ("SecretAccessKey", K::SecretAccessKey),
+                        ("SessionToken", K::Token),
+                    ] {
+                        if let Some(text) = v[name].as_str() {
+                            out.push((key, text.to_string()));
+                        }
+                    }
+                }
+            }
+            Ok(o) => {
+                let why = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                let _ = PROFILE_TROUBLE.set(format!(
+                    "the AWS profile `{profile}` gave no credentials ({}){}",
+                    if why.is_empty() {
+                        format!("exit {}", o.status)
+                    } else {
+                        why
+                    },
+                    if get("sso_session").is_some() || get("sso_start_url").is_some() {
+                        format!("; `aws sso login --profile {profile}` first")
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            Err(e) => {
+                let _ = PROFILE_TROUBLE.set(format!(
+                    "the AWS profile `{profile}` needs {} to give credentials, which could \
+                     not be run ({e}); or export them: `aws configure export-credentials \
+                     --profile {profile} --format env`",
+                    if process.is_some() {
+                        "its credential_process"
+                    } else {
+                        "the AWS CLI"
+                    }
+                ));
             }
         }
     }
-    if let Some(text) = file("AWS_CONFIG_FILE", "config") {
-        let name = if profile == "default" {
-            "default".to_string()
-        } else {
-            format!("profile {profile}")
-        };
-        if let Some(v) = ini_section(&text, &name)
-            .into_iter()
-            .find(|(k, _)| k == "region")
-            .map(|(_, v)| v)
-        {
-            out.push((K::Region, v));
-        }
+    if let Some(v) = get("region") {
+        out.push((K::Region, v));
     }
     out
 }
+
+/// Why the AWS profile gave no credentials, for the error that follows.
+static PROFILE_TROUBLE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn ini_section(text: &str, name: &str) -> Vec<(String, String)> {
     let mut inside = false;

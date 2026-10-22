@@ -190,9 +190,9 @@ engine, which reads more of the format, failed too: {turbo_err}"
 
 /// The heap below which a CSV pair that does not fit `turbo` is refused
 /// rather than handed to `sortmerge`: about what that engine needs for its
-/// batches, run buffers and merge on a 2M-row pair (measured: 40 MB runs,
-/// 30 MB aborts), with room.
-const SORTMERGE_FLOOR: u64 = 64 << 20;
+/// batches, run buffers and merge on a 2M-row pair (measured: 44 MB runs,
+/// 30 MB aborts), with room. An 80 MB container's heap is above it.
+const SORTMERGE_FLOOR: u64 = 48 << 20;
 
 /// Turns [`Engine::Auto`] into a concrete backend.
 ///

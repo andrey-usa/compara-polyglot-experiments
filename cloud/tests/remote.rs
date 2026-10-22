@@ -623,3 +623,79 @@ fn parts_under_a_prefix_are_one_table() {
         assert!(got.1.contains(says), "{spec}: {}", got.1);
     }
 }
+
+/// Runs `compara compare` with the environment cleared of every credential
+/// the test process may carry, and `env` set; exit code and stderr.
+fn compare_bare(a: &str, b: &str, env: &[(&str, &str)]) -> (i32, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_compara"));
+    cmd.args(["compare", a, b]).args(KEY);
+    for (k, _) in std::env::vars() {
+        if k.starts_with("AWS_") || k.starts_with("AZURE_") || k.starts_with("GOOGLE_") {
+            cmd.env_remove(k);
+        }
+    }
+    let out = cmd
+        .env("HOME", std::env::temp_dir().join("compara-no-home"))
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// With no credentials anywhere, a public bucket is read unsigned and says
+/// so; a private one still fails on the credentials. A profile whose keys come
+/// from a `credential_process` -- what SSO and assumed roles reduce to -- is
+/// run for them.
+#[test]
+fn public_buckets_need_no_credentials_and_profiles_run_their_process() {
+    let f = fixture("20k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    let Some(public) = Server::start(&f.0, &[]) else {
+        return;
+    };
+    let endpoint = [
+        ("AWS_ENDPOINT_URL", public.url.as_str()),
+        ("AWS_REGION", "us-east-1"),
+    ];
+    let (code, err) = compare_bare("s3://bkt/t_a.csv", "s3://bkt/t_b.csv", &endpoint);
+    assert_eq!(code, want.0, "{err}");
+    assert!(err.contains("unsigned"), "{err}");
+    drop(public);
+
+    let Some(private) = Server::start(&f.0, &["--private"]) else {
+        return;
+    };
+    let endpoint = [
+        ("AWS_ENDPOINT_URL", private.url.as_str()),
+        ("AWS_REGION", "us-east-1"),
+    ];
+    let (code, err) = compare_bare("s3://bkt/t_a.csv", "s3://bkt/t_b.csv", &endpoint);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("No usable credentials"), "{err}");
+
+    let home = f.0.join("home");
+    std::fs::create_dir_all(home.join(".aws")).unwrap();
+    std::fs::write(
+        home.join(".aws/config"),
+        "[profile ci]\nregion = us-east-1\ncredential_process = echo '{\"Version\": 1, \
+         \"AccessKeyId\": \"AKIDEXAMPLE\", \"SecretAccessKey\": \"secret\"}'\n",
+    )
+    .unwrap();
+    let home = home.to_string_lossy().into_owned();
+    let env = [
+        ("AWS_ENDPOINT_URL", private.url.as_str()),
+        ("AWS_PROFILE", "ci"),
+        ("HOME", home.as_str()),
+    ];
+    if cfg!(unix) {
+        let (code, err) = compare_bare("s3://bkt/t_a.csv", "s3://bkt/t_b.csv", &env);
+        assert_eq!(code, want.0, "{err}");
+        assert!(!err.contains("unsigned"), "{err}");
+    }
+}

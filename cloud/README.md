@@ -108,11 +108,14 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
 
 | Scheme | Credentials, as that cloud's own tools find them |
 |---|---|
-| `s3://`, `s3a://` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, a `~/.aws` profile (`AWS_PROFILE`), web identity (EKS), the ECS task role, instance metadata. `AWS_ENDPOINT_URL` for MinIO, R2, Ceph and the like; `AWS_SKIP_SIGNATURE=true` for a public bucket. The bucket's region is looked up when none is set. |
-| `gs://` | `GOOGLE_APPLICATION_CREDENTIALS`, application default credentials, the metadata server (GKE, Cloud Run). |
-| `az://`, `abfs(s)://`, `azure://`, `adl://` | `AZURE_STORAGE_ACCOUNT_NAME` with a key (`AZURE_STORAGE_ACCOUNT_KEY`), a SAS token (`AZURE_STORAGE_SAS_KEY`), a service principal, or managed or workload identity. |
+| `s3://`, `s3a://` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, a `~/.aws` profile (`AWS_PROFILE`) -- static keys, or SSO, an assumed role or a `credential_process`, resolved the way the AWS CLI resolves them -- web identity (EKS), the ECS task role, instance metadata. `AWS_ENDPOINT_URL` for MinIO, R2, Ceph and the like. The bucket's region is looked up when none is set. |
+| `gs://` | `GOOGLE_APPLICATION_CREDENTIALS`, application default credentials (`gcloud auth application-default login`), the metadata server (GKE, Cloud Run). |
+| `az://`, `abfs(s)://`, `azure://`, `adl://` | `AZURE_STORAGE_ACCOUNT_NAME` with a key (`AZURE_STORAGE_ACCOUNT_KEY`), a SAS token (`AZURE_STORAGE_SAS_KEY`), a service principal, managed or workload identity, or an `az login` when there is nothing else. |
 | `http://`, `https://` | none: the URL is fetched as given, so a presigned S3 URL or an Azure SAS URL works as it is. A refused one that names a bucket or a storage account is retried signed. |
 
+- **No credentials, no setup**: with none to be found, a public bucket
+  (open data on S3 or GCS) is read unsigned, and the note on stderr says so;
+  a private one fails with what to set.
 - **Parquet is read as far as the comparison reads it**: the footer, then
   only the column chunks of the key and compared columns. `--compare` on two
   columns of a 200-column table fetches those two; `compara columns` fetches
