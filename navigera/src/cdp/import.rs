@@ -58,7 +58,7 @@ const COPIED: &[&str] = &[
 /// 1`), display name or signed-in email; the default is the one the browser
 /// used last. Returns a line saying what was copied.
 pub fn import_profile(from: &str, which: Option<&str>, dest: &Path, name: &str) -> Result<String> {
-    let (source, label) = match super::attach::default_user_data_dir(from) {
+    let (source, label) = match user_data_dir(from) {
         Some(dir) => (dir, from.to_string()),
         None => (PathBuf::from(from), format!("user data directory {from}")),
     };
@@ -132,6 +132,88 @@ pub fn import_profile(from: &str, which: Option<&str>, dest: &Path, name: &str) 
         .map(|s| format!(" ({s})"))
         .unwrap_or_default();
     Ok(format!("copied {label} profile {profile}{who} into profile {name}: {files} files, {} KB", bytes / 1024))
+}
+
+/// What a session can be handed, for `navigera profiles`: each installed
+/// Chrome-family browser's profiles (directory, name, signed-in email), and
+/// whether `--attach` reaches that browser right now; and navigera's own
+/// `--profile` browsers, and whether each runs.
+pub fn list_profiles() -> Value {
+    let mut browsers = Vec::new();
+    for channel in ["chrome", "beta", "dev", "canary", "chromium", "edge", "brave"] {
+        let Some(dir) = user_data_dir(channel) else {
+            continue;
+        };
+        if !dir.join("Local State").is_file() {
+            continue;
+        }
+        let state: Value = std::fs::read_to_string(dir.join("Local State"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(Value::Null);
+        let last = state["profile"]["last_used"].as_str().unwrap_or("Default");
+        let mut profiles: Vec<Value> = state["profile"]["info_cache"]
+            .as_object()
+            .map(|cache| {
+                cache
+                    .iter()
+                    .filter(|(d, _)| dir.join(d).is_dir())
+                    .map(|(d, info)| {
+                        serde_json::json!({
+                            "dir": d,
+                            "name": info["name"].as_str().unwrap_or(""),
+                            "email": info["user_name"].as_str().unwrap_or(""),
+                            "last_used": d == last,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        profiles.sort_by(|a, b| a["dir"].as_str().cmp(&b["dir"].as_str()));
+        let attach = super::attach::live_endpoint(&dir).is_some();
+        browsers.push(serde_json::json!({
+            "browser": channel,
+            "user_data_dir": dir.display().to_string(),
+            "attach_ready": attach,
+            "hand_off": if attach {
+                format!("start --attach {channel}  (or --profile <name> --from {channel})")
+            } else {
+                format!("start --profile <name> --from {channel} [--from-profile <dir|name|email>]")
+            },
+            "profiles": profiles,
+        }));
+    }
+    let mut own = Vec::new();
+    let base = super::attach::profile_dir("x").ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    for e in base.and_then(|b| std::fs::read_dir(b).ok()).into_iter().flatten().flatten() {
+        let dir = e.path();
+        if dir.is_dir() {
+            own.push(serde_json::json!({
+                "name": e.file_name().to_string_lossy(),
+                "dir": dir.display().to_string(),
+                "running": super::attach::live_endpoint(&dir).is_some(),
+            }));
+        }
+    }
+    own.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    serde_json::json!({ "browsers": browsers, "navigera_profiles": own })
+}
+
+/// A channel's user data directory, Brave included.
+fn user_data_dir(channel: &str) -> Option<PathBuf> {
+    if channel != "brave" {
+        return super::attach::default_user_data_dir(channel);
+    }
+    if cfg!(windows) {
+        Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("BraveSoftware\\Brave-Browser\\User Data"))
+    } else if cfg!(target_os = "macos") {
+        Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/BraveSoftware/Brave-Browser"))
+    } else {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        Some(base.join("BraveSoftware/Brave-Browser"))
+    }
 }
 
 /// The profile directory to copy: `which` as a directory name, a display

@@ -778,7 +778,8 @@ const DEFAULT_ATTACH: &str = "chrome";
 
 /// True when `word` is a command name (so it can't be `--attach`'s value).
 fn is_command_word(word: &str) -> bool {
-    matches!(word, "serve" | "mcp" | "skill" | "install-skill" | "help") || OPS.iter().any(|(name, _, _)| *name == word)
+    matches!(word, "serve" | "mcp" | "skill" | "install-skill" | "profiles" | "help")
+        || OPS.iter().any(|(name, _, _)| *name == word)
 }
 
 /// Pull `--attach [value]` out of argv; a bare `--attach` means `chrome`.
@@ -816,6 +817,8 @@ pub enum Local {
         dir: String,
     },
     Version,
+    /// List the browsers and profiles a session can be handed.
+    Profiles,
 }
 
 /// Result of [`parse_args`]: launch config plus an optional one-shot command.
@@ -886,6 +889,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("dialog", "--accept [--prompt-text <t>] | --dismiss", "how alert/confirm/prompt are answered (default: accept; every dialog is reported)"),
     ("quit", "[--close-browser]", "close the browser and the session server; attached (--attach/--profile): only disconnect, unless --close-browser"),
     ("mcp", "[--headed] [--profile <name> | --attach [<where>]]", "serve the Model Context Protocol on stdio (for Cline, Roo, Kilo, Continue, VS Code, Claude Desktop, Cursor); the browser starts on the first tool call"),
+    ("profiles", "", "list what a session can be handed: your browsers' profiles (name, email, whether --attach can reach them now) and navigera's own --profile browsers"),
     ("skill", "", "print the agent skill (usage guide) for this version"),
     ("install-skill", "[--dir <skills dir>] [--claude | --continue] [--global]", "install the skill for agents (default ./.agents/skills, read by Cline and Kilo; --claude: ./.claude/skills; --continue: ./.continue/skills)"),
 ];
@@ -1286,6 +1290,12 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
             return Ok(ParsedArgs { config, command: None, start: false, local: None, mcp: true });
         }
         "skill" => return parsed(config, None, false, Some(Local::Skill)),
+        "profiles" => {
+            if let Some(extra) = args.front() {
+                return invalid(format!("unexpected argument {extra:?} after profiles"));
+            }
+            return parsed(config, None, false, Some(Local::Profiles));
+        }
         "install-skill" => {
             let claude = extract_present(&mut args, "--claude");
             let continue_ = extract_present(&mut args, "--continue");
@@ -3159,6 +3169,14 @@ pub fn run_local(local: &Local, config: &SessionConfig, output: &mut dyn Write) 
             let _ = write!(output, "{SKILL_MD}");
             ExitCode::SUCCESS
         }
+        Local::Profiles => {
+            let response = json!({ "id": null, "ok": true, "result": crate::cdp::import::list_profiles() });
+            if print_cli_response(output, &response, config) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
         Local::InstallSkill { dir } => {
             let response = match install_skill(dir) {
                 Ok(path) => json!({ "id": null, "ok": true, "result": { "installed": path } }),
@@ -3500,6 +3518,29 @@ mod tests {
         assert_eq!(p.config.profile.as_deref(), Some("work"));
         assert!(p.config.headless);
         assert!(parse_args(argv(&["navigera", "-s", "me", "start", "--attach", "--profile", "w"])).is_err());
+        // --from seeds a --profile; --natural goes anywhere.
+        let p = parse_args(argv(&[
+            "navigera",
+            "-s",
+            "me",
+            "start",
+            "--profile",
+            "agent",
+            "--from",
+            "chrome",
+            "--from-profile",
+            "Work",
+            "--natural",
+        ]))
+        .unwrap();
+        assert_eq!(p.config.from.as_deref(), Some("chrome"));
+        assert_eq!(p.config.from_profile.as_deref(), Some("Work"));
+        assert!(p.config.natural);
+        let p = parse_args(argv(&["navigera", "--natural", "-s", "me", "start"])).unwrap();
+        assert!(p.config.natural);
+        assert!(parse_args(argv(&["navigera", "-s", "me", "start", "--from", "chrome"])).is_err());
+        assert!(parse_args(argv(&["navigera", "-s", "me", "start", "--profile", "a", "--from-profile", "x"])).is_err());
+        assert_eq!(parse_args(argv(&["navigera", "profiles"])).unwrap().local, Some(Local::Profiles));
         assert!(parse_args(argv(&["navigera", "--engine", "lightpanda", "-s", "me", "start", "--attach"])).is_err());
     }
 

@@ -48,6 +48,8 @@ jobs:
             macOS) "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version ;;
             Windows) ls "/c/Program Files/Google/Chrome/Application/" ;;
           esac
+      - name: What can be handed over
+        run: cargo run --quiet --locked -- profiles --pretty
       - name: Tests
         run: |
           set +e -o pipefail
