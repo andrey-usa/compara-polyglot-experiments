@@ -4,7 +4,7 @@ name: navigera A/B
 # and --natural) against `navigera-base/` (the branch it started from), on
 # one runner with its own Chrome, rounds interleaved: a cold one-shot command
 # and a session (start, goto, ax, eval, quit) against the bench site.
-# Results are annotations: `navigera ab`.
+# Results are annotations: `navigera ab` (medians, ms).
 
 on:
   push:

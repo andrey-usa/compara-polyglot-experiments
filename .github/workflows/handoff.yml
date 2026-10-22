@@ -4,7 +4,7 @@ name: Hand-off
 # browser's profile starts signed in, and --natural shows a page no sign of
 # automation -- on the runner's own Chrome on Linux, macOS and Windows, where
 # the cookie key lives in a keyring, the Keychain and DPAPI respectively.
-# Results are annotations: `handoff <os>`.
+# Results are annotations: `handoff <os>` (passed, failed, the hand-off tests).
 
 on:
   push:
