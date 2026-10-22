@@ -12,6 +12,7 @@ on:
     paths:
       - "navigera-base/**"
       - "navigera-ab/ab.py"
+      - "navigera/src/**"
       - ".github/workflows/navigera-ab.yml"
   workflow_dispatch:
 

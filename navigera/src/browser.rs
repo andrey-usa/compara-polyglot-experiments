@@ -153,7 +153,9 @@ fn windowed_user_agent(exe: &str, major: u32) -> String {
 
 /// The major version of a Chrome-family executable: from the version
 /// directory beside it on Windows (where `--version` opens a window instead
-/// of printing), else from `--version` (a few tens of milliseconds).
+/// of printing), else from `--version`, which costs a launch about 30 ms, so
+/// the answer is noted in the session directory against the binary's path,
+/// size and modification time (an update asks again).
 pub fn chrome_major(exe: &str) -> Option<u32> {
     let parse = |text: &str| -> Option<u32> {
         text.split(|c: char| c.is_whitespace() || c == '/')
@@ -176,13 +178,22 @@ pub fn chrome_major(exe: &str) -> Option<u32> {
             })
             .max();
     }
+    let note = exe_note(exe, "chrome-version", false);
+    if let Some(major) = note.as_ref().and_then(|n| std::fs::read_to_string(n).ok()).and_then(|t| t.trim().parse().ok())
+    {
+        return Some(major);
+    }
     let out = std::process::Command::new(exe)
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    parse(&String::from_utf8_lossy(&out.stdout))
+    let major = parse(&String::from_utf8_lossy(&out.stdout))?;
+    if let Some(note) = note {
+        let _ = std::fs::write(note, major.to_string());
+    }
+    Some(major)
 }
 
 /// Chrome refuses to start its sandbox as root (containers, CI images);
@@ -203,14 +214,25 @@ const NO_SANDBOX_WARNING: &str = "navigera: this machine can't give Chrome its s
 /// modification time and by the boot, so a Chrome update or a reboot (after
 /// which the machine may allow a sandbox) brings the attempt back.
 fn no_sandbox_note(exe: &str) -> Option<std::path::PathBuf> {
+    exe_note(exe, "no-sandbox", true)
+}
+
+/// A note about `exe` in the private session directory, named `what` and
+/// keyed by the binary's path, size and modification time (and the boot,
+/// when `per_boot`).
+fn exe_note(exe: &str, what: &str, per_boot: bool) -> Option<std::path::PathBuf> {
     let meta = std::fs::metadata(exe).ok()?;
     let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
     let path = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.into());
-    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    let boot = if per_boot {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default()
+    } else {
+        String::new()
+    };
     let key = format!("{}\n{}\n{modified}\n{}", path.display(), meta.len(), boot.trim());
     // FNV-1a: the same across builds, which std's hasher does not promise.
     let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
-    Some(crate::session::session_dir().ok()?.join(format!("no-sandbox-{hash:016x}")))
+    Some(crate::session::session_dir().ok()?.join(format!("{what}-{hash:016x}")))
 }
 
 /// Whether a launch failed because this machine can't give Chrome a
