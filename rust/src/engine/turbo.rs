@@ -422,6 +422,29 @@ fn rows_to_positions_with(part: &mut [u32], pos_mask: u32, words: &[u64], before
     }
 }
 
+/// [`key_hash`] for the common case, read straight off the mapped bytes: no
+/// normalising option and no test hook, which the sweep asks once rather than
+/// once a row. The same number by the same steps; `None` for an escaped key,
+/// which goes through `key_hash` and its decoder.
+#[inline(always)]
+fn key_hash_plain(data: &[u8], keys: &[Field]) -> Option<u64> {
+    const PRIME: u64 = 0x100_0000_01b3;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &f in keys {
+        if !field::is_real(f) || field::len_of(f) == 0 {
+            h = (h ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(PRIME);
+            continue;
+        }
+        if field::is_escaped(f) {
+            return None;
+        }
+        let (at, len) = (field::offset_of(f), field::len_of(f));
+        h = hash_bytes(data.get(at..at + len)?, h);
+        h = (h ^ len as u64).wrapping_mul(PRIME);
+    }
+    Some(h)
+}
+
 fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325;
     // Hoisted from per-field: the options do not change mid-sweep.
@@ -853,6 +876,7 @@ impl RowIndex {
         }
         idx.first_row = alloc::sized(total, "one row per distinct key")?;
         idx.occurrences = alloc::sized(total, "one count per distinct key")?;
+        idx.rows = total as i64;
         let mut probe = vec![ABSENT; side.width];
         let mut mine = vec![ABSENT; side.width];
         for row in 0..total {
@@ -866,7 +890,10 @@ impl RowIndex {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// Indexes row `row`, which is already in `row_at` and `row_hash`.
+    /// Indexes row `row`, which is already in `row_at` and `row_hash`. The
+    /// caller counts the rows (`self.rows`): this runs once a row, serially,
+    /// and is inlined into its loop.
+    #[inline(always)]
     fn insert(
         &mut self,
         side: &Side,
@@ -876,16 +903,20 @@ impl RowIndex {
         probe: &mut [Field],
         mine: &mut [Field],
     ) -> Result<()> {
-        self.rows += 1;
         let at = self.row_at[row as usize];
         let hash = self.row_hash[row as usize];
 
         let mut slot = self.slot(hash);
         let mut mine_parsed = false;
         loop {
-            let word = self.table[slot];
+            debug_assert!(slot < self.table.len());
+            // Safety: `slot` and `next` mask into the table, whose length is
+            // a power of two at least `mask + 1`.
+            let word = unsafe { *self.table.get_unchecked(slot) };
             if word == EMPTY_SLOT {
-                self.table[slot] = self.slot_for(hash, self.first_row.len());
+                let fresh = self.slot_for(hash, self.first_row.len());
+                // Safety: as above.
+                unsafe { *self.table.get_unchecked_mut(slot) = fresh };
                 self.first_row.push(row);
                 self.occurrences.push(1);
                 // Two thirds, which is what `build` sizes the table for. Half was
@@ -1665,6 +1696,8 @@ fn sweep_chunks(
 ) -> Vec<Result<(Chunk, usize, Option<Part>)>> {
     let data = side.slab.data();
     let parts = bounds.len() - 1;
+    // Asked once for the file rather than once a row (see `key_hash_plain`).
+    let plain_keys = !needs_normalising(opt) && narrow_hash().is_none();
     in_parallel(parts, |i| {
         let (begin, stop) = (bounds[i], bounds[i + 1]);
         let mut chunk = Chunk {
@@ -1710,7 +1743,11 @@ fn sweep_chunks(
                      use --engine native"
                 )));
             }
-            chunk.push(pos as u64, key_hash(&side.slab, &fields, key_size, opt))?;
+            let hash = match plain_keys.then(|| key_hash_plain(data, &fields[..key_size])) {
+                Some(Some(h)) => h,
+                _ => key_hash(&side.slab, &fields, key_size, opt),
+            };
+            chunk.push(pos as u64, hash)?;
             // The row before this one ends where this one starts, and its
             // pages are still hot: the fused join takes it now, rather than
             // re-reading it after the sweep.

@@ -1632,7 +1632,7 @@ mod tests {
             let hi = lo + (next() % (len - lo + 40) as u64) as usize;
             let hi = hi.min(data.len());
             let commas = (next() % 25) as usize;
-            for delimiter in [b',', b'\t'] {
+            for delimiter in *b",\t" {
                 let walk = guard_span_with(Swar, &data, lo, hi, delimiter, commas);
                 // Safety: `w` proves AVX2.
                 let counted = unsafe { guard_span_wide(w, &data, lo, hi, delimiter, commas) };
