@@ -412,7 +412,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: secret12345
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          set -u
+          set -u +e +o pipefail
           cd /tmp/k
           bin=$GITHUB_WORKSPACE/cloud/target/release/compara
           : > k.txt
@@ -539,7 +539,7 @@ jobs:
           aws --endpoint-url http://localhost:8333 s3 cp --recursive /tmp/d/orders s3://bkt/orders/ --only-show-errors
       - name: Every version, both ways
         run: |
-          set -u
+          set -u +e +o pipefail
           cd /tmp/d
           bin=$GITHUB_WORKSPACE/cloud/target/release/compara
           K="-k day,account_id,txn_id"
