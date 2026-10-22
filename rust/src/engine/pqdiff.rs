@@ -1293,7 +1293,12 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     };
     let mut read: Vec<Option<Result<parquet::Column>>> = (0..jobs.len()).map(|_| None).collect();
     {
-        let lanes = threads.clamp(1, jobs.len().max(1));
+        // Two lanes even on one thread: the two files are read at once, as
+        // the text path sweeps them and the index build below builds them --
+        // a side to a thread is the floor `--threads 1` gets everywhere, the
+        // C port's reading of it too. One lane read the four key columns of a
+        // 2M pair one after another, 0.14 s against the C port's 0.04 s.
+        let lanes = threads.max(2).clamp(1, jobs.len().max(1));
         let gathered: Vec<Vec<(usize, Result<parquet::Column>)>> = std::thread::scope(|scope| {
             // One lane runs here rather than waiting on a thread of its own.
             let rest: Vec<_> = (1..lanes)
@@ -1604,7 +1609,15 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // largest columns are taken first so that the last to finish is a small
     // one.
     let fit = lanes.clamp(1, nc.max(1));
-    let per = threads.max(1).div_ceil(fit);
+    // On one thread, a column's two sides are read at once, by the same floor
+    // as the key columns above. With two threads or more, two columns at a
+    // time read a side after the other measured faster than one column with
+    // its sides at once.
+    let per = if threads <= 1 {
+        2
+    } else {
+        threads.div_ceil(fit)
+    };
     let lanes = fit.min(threads.max(1).div_ceil(per)).max(1);
     // The work of a column is the bytes its pages expand to, not what it
     // holds: a dictionary column holds a handle per row and decodes almost
