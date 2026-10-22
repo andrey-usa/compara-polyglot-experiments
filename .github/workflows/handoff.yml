@@ -1,0 +1,73 @@
+name: Hand-off
+
+# navigera (the copy in `navigera/`): a --profile seeded from another
+# browser's profile starts signed in, and --natural shows a page no sign of
+# automation -- on the runner's own Chrome on Linux, macOS and Windows, where
+# the cookie key lives in a keyring, the Keychain and DPAPI respectively.
+# Results are annotations: `handoff <os>`.
+
+on:
+  push:
+    branches: [experiment-16]
+    paths:
+      - "navigera/**"
+      - ".github/workflows/handoff.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: "handoff ${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: navigera
+    env:
+      NAVIGERA_REQUIRE_BROWSER: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Chrome
+        run: |
+          case "$RUNNER_OS" in
+            Linux) google-chrome --version ;;
+            macOS) "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version ;;
+            Windows) ls "/c/Program Files/Google/Chrome/Application/" ;;
+          esac
+      - name: Tests
+        run: |
+          set +e -o pipefail
+          if [ "$RUNNER_OS" = Linux ]; then
+            cargo test --locked --no-fail-fast 2>&1 | tee test.log
+          else
+            cargo test --locked --no-fail-fast --lib --test handoff --test attach 2>&1 | tee test.log
+          fi
+          code=${PIPESTATUS[0]}
+          python3 - test.log "handoff $RUNNER_OS" <<'PY'
+          import re, sys
+          text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          passed = sum(int(m) for m in re.findall(r"test result: \w+\. (\d+) passed", text))
+          failed = re.findall(r"^test (\S+) \.\.\. FAILED", text, re.M)
+          ran = re.findall(r"^test (\S+) \.\.\. (ok|FAILED)", text, re.M)
+          handoff = [f"{n}: {r}" for n, r in ran if "signed_in" in n or "natural" in n]
+          panics = re.findall(r"panicked at .*?\n(.*?)\n", text, re.S)
+          msg = f"{passed} passed, {len(failed)} failed {failed}\n" + "\n".join(handoff)
+          if panics:
+              msg += "\n" + "\n".join(p[:600] for p in panics[:4])
+          print(f"::notice title={sys.argv[2]}::" + msg[:3800].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          PY
+          exit $code
