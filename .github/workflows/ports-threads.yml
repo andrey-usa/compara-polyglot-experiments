@@ -7,7 +7,17 @@ name: Ports by thread count
 # One job per format, never one per port: a table compares ports, and ports in
 # two jobs ran on two machines.
 
+# A new workflow is dispatchable only from the default branch, so pushes to
+# the experiment branch run it too, with the settings in
+# `.github/ports-threads.json` (the dispatch inputs win when given).
 on:
+  push:
+    branches: [experiment-15]
+    paths:
+      - "rust/**"
+      - "c/**"
+      - ".github/ports-threads.json"
+      - ".github/workflows/ports-threads.yml"
   workflow_dispatch:
     inputs:
       rows:
@@ -31,12 +41,26 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       formats: ${{ steps.p.outputs.formats }}
+      rows: ${{ steps.p.outputs.rows }}
+      threads: ${{ steps.p.outputs.threads }}
+      repeats: ${{ steps.p.outputs.repeats }}
     steps:
+      - uses: actions/checkout@v7
       - id: p
-        run: |
-          python3 -c "import json,os; print('formats=' + json.dumps([f.strip() for f in os.environ['F'].split(',') if f.strip()]))" >> "$GITHUB_OUTPUT"
         env:
-          F: ${{ inputs.formats }}
+          ROWS: ${{ inputs.rows }}
+          FORMATS: ${{ inputs.formats }}
+          THREADS: ${{ inputs.threads }}
+          REPEATS: ${{ inputs.repeats }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          cfg = json.load(open(".github/ports-threads.json"))
+          get = lambda k: os.environ.get(k.upper()) or str(cfg[k])
+          print("formats=" + json.dumps([f.strip() for f in get("formats").split(",") if f.strip()]))
+          for k in ("rows", "threads", "repeats"):
+              print(f"{k}={get(k)}")
+          EOF
 
   bench:
     needs: plan
@@ -65,9 +89,9 @@ jobs:
 
       - name: Run the tables
         env:
-          ROWS: ${{ inputs.rows }}
-          THREADS: ${{ inputs.threads }}
-          REPEATS: ${{ inputs.repeats }}
+          ROWS: ${{ needs.plan.outputs.rows }}
+          THREADS: ${{ needs.plan.outputs.threads }}
+          REPEATS: ${{ needs.plan.outputs.repeats }}
         run: |
           host="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs), $(nproc) cores"
           echo "host: $host"
