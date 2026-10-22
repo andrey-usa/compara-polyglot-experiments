@@ -33,6 +33,7 @@ pub(crate) fn split_version(spec: &str) -> (&str, Option<u64>) {
 }
 
 /// Whether paths listed under a root (relative to it) are a Delta table's.
+#[cfg_attr(not(feature = "cloud"), allow(dead_code))]
 pub(crate) fn is_delta<'a>(mut relative: impl Iterator<Item = &'a str>) -> bool {
     relative.any(|r| r.starts_with("_delta_log/"))
 }

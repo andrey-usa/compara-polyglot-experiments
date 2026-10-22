@@ -37,10 +37,19 @@ jobs:
           cache: false
       - name: Build base, head, and head without the cloud feature
         run: |
-          set -eux
-          (cd base && cargo build --release --locked --bin compara)
-          (cd cloud && cargo build --release --locked --bin compara --bin compara-gen-data)
-          (cd cloud && cargo build --release --locked --no-default-features --bin compara --target-dir target-nocloud)
+          set -uo pipefail
+          build() {
+            local dir=$1; shift
+            (cd "$dir" && cargo build --release --locked "$@") > build.log 2>&1
+            local code=$?
+            if [ $code != 0 ]; then
+              echo "::error title=cloud ab build $dir $*::$(grep -v '^ *Compiling' build.log | tail -40 | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+              exit $code
+            fi
+          }
+          build base --bin compara
+          build cloud --bin compara --bin compara-gen-data
+          build cloud --no-default-features --bin compara --target-dir target-nocloud
           ls -la base/target/release/compara cloud/target/release/compara cloud/target-nocloud/release/compara
           echo "::notice title=cloud ab sizes ${{ matrix.format }}::base $(stat -c%s base/target/release/compara) B, head $(stat -c%s cloud/target/release/compara) B, head without cloud $(stat -c%s cloud/target-nocloud/release/compara) B"
       - name: Data

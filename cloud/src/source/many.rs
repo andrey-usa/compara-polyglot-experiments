@@ -446,12 +446,14 @@ impl Combined {
 
     /// Room for `len` bytes at the end, for a part written there by someone
     /// else (a download); where it starts.
+    #[cfg_attr(not(feature = "cloud"), allow(dead_code))]
     pub(crate) fn reserve(&mut self, len: u64) -> u64 {
         let at = self.end;
         self.end += len;
         at
     }
 
+    #[cfg_attr(not(feature = "cloud"), allow(dead_code))]
     pub(crate) fn end(&self) -> u64 {
         self.end
     }

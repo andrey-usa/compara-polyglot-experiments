@@ -540,6 +540,7 @@ pub(crate) fn read_file_meta(data: &[u8], path: &str) -> Result<FileMeta> {
 /// for its stored size. The two readers here disagree only on a dictionary
 /// offset past the first data page, which one of them then starts at and the
 /// other ignores; the range covers both.
+#[cfg_attr(not(feature = "cloud"), allow(dead_code))]
 pub(crate) fn chunk_ranges(
     footer: &[u8],
     want: &dyn Fn(&str) -> bool,
