@@ -130,9 +130,13 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
   header and Parquet parts a schema, and the error names the part that does
   not. From object storage the parts are fetched together, sixteen ranges in
   flight across all of them, and Parquet parts only as far as the comparison
-  reads them. Names starting with `.` or `_` (`_SUCCESS`, `.crc`) are passed
-  over; a Delta or Iceberg table is refused rather than read as every file of
-  every version.
+  reads them. Hive partitions are columns: under `orders/`, the parts of
+  `date=2026-10-01/region=eu/` carry `date` and `region` (as text), so
+  `-k date,order_id` keys a table whose ids repeat from day to day, and a
+  partitioned table compares with a flat export that has those columns.
+  Names starting with `.` or `_` (`_SUCCESS`, `.crc`) are passed over; a
+  Delta or Iceberg table is refused rather than read as every file of every
+  version.
 - **Every range is read from one version of the object** (`If-Match` on its
   ETag): an object overwritten mid-read is an error, not a file stitched
   from two versions. Throttled and dropped ranges are retried.
@@ -177,7 +181,8 @@ Its outputs are `identical`, `changed`, `added`, `removed` and `summary`
 (the JSON summary's path).
 
 A Kubernetes Job comparing two Parquet snapshots with the pod's IAM role
-(IRSA) and failing when they differ:
+(IRSA), its summary written next to the data; without `--exit-zero` the Job
+fails when they differ:
 
 ```yaml
 apiVersion: batch/v1
@@ -193,7 +198,7 @@ spec:
         - name: compara
           image: ghcr.io/andrey-usa/compara:latest
           args: [compare, s3://lake/orders/v1.parquet, s3://lake/orders/v2.parquet,
-                 -k, order_id, --json, s3://reports/orders/summary.json]
+                 -k, order_id, --json, s3://reports/orders/summary.json, --exit-zero]
           resources: {limits: {memory: 2Gi, cpu: "4"}}
           securityContext: {readOnlyRootFilesystem: true, runAsNonRoot: true}
           volumeMounts: [{name: tmp, mountPath: /tmp}]

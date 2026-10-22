@@ -553,9 +553,9 @@ fn parts_under_a_prefix_are_one_table() {
             }
             std::fs::write(bucket.join(format!("{fmt}-{side}/_SUCCESS")), "").unwrap();
         }
-        // The CSV parts again, gzipped.
+        // The CSV parts again, gzipped, in the same partitions.
         for (n, p) in [(1, "p"), (2, "q")] {
-            let to = bucket.join(format!("gz-{side}/part-{n}.csv.gz"));
+            let to = bucket.join(format!("gz-{side}/date=2026-10-0{n}/part-0.csv.gz"));
             std::fs::create_dir_all(to.parent().unwrap()).unwrap();
             let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
             gz.write_all(&std::fs::read(gen_dir.join(format!("{p}_{side}.csv"))).unwrap())
@@ -578,7 +578,9 @@ fn parts_under_a_prefix_are_one_table() {
             "s3://bkt/parquet-a/date=*/*.parquet",
             "s3://bkt/csv-b/**/part-?.csv",
         ),
-        ("s3://bkt/gz-a/", "s3://bkt/gz-b/*.csv.gz"),
+        ("s3://bkt/gz-a/", "s3://bkt/gz-b/**/*.csv.gz"),
+        // Partitioned text, read whole and given its column on the way.
+        ("s3://bkt/csv-a/", "s3://bkt/gz-b/"),
     ] {
         let got = compare(a, b, &KEY, &env, None);
         assert_eq!(

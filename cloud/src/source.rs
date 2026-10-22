@@ -183,9 +183,14 @@ impl Source {
     }
 
     /// The files of a local directory or glob, in path order, as one.
-    fn local_many(spec: &str, files: Vec<PathBuf>) -> Result<Source> {
+    fn local_many(spec: &str, files: Vec<(String, PathBuf)>) -> Result<Source> {
         let started = Instant::now();
         let mut combined = many::Combined::new()?;
+        let relative: Vec<String> = files.iter().map(|f| f.0.clone()).collect();
+        let partitions = many::table_partitions(&relative);
+        if let Some((names, _)) = &partitions {
+            combined.set_partitions(names.clone());
+        }
         let mut source = Source {
             spec: spec.to_string(),
             path: combined.path.clone(),
@@ -193,9 +198,15 @@ impl Source {
             temps: vec![combined.path.clone()],
             steps: Vec::new(),
         };
-        for file in &files {
+        let total: u64 = files
+            .iter()
+            .map(|f| std::fs::metadata(&f.1).map(|m| m.len()).unwrap_or(0))
+            .sum();
+        room_for(total, spec)?;
+        for (i, (_, file)) in files.iter().enumerate() {
             source.stored += std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-            combined.append_file(&file.display().to_string(), file)?;
+            let values = partitions.as_ref().map_or(&[][..], |p| &p.1[i][..]);
+            combined.append_file(&file.display().to_string(), file, values)?;
         }
         combined.finish()?;
         source.steps.push(format!(
@@ -400,7 +411,51 @@ pub fn temp_dir_writable() -> bool {
     }
 }
 
-pub(crate) fn human(bytes: u64) -> String {
+/// The bytes free to this process on the filesystem holding `dir`, where the
+/// platform says.
+pub fn free_space(dir: &Path) -> Option<u64> {
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn statvfs(path: *const std::ffi::c_char, buf: *mut u64) -> std::ffi::c_int;
+        }
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // struct statvfs on 64-bit Linux: f_bsize, f_frsize, f_blocks,
+        // f_bfree, f_bavail, ... -- all 64-bit, well inside 32 words.
+        let mut buf = [0u64; 32];
+        // SAFETY: a NUL-terminated path and a buffer larger than the struct.
+        if unsafe { statvfs(path.as_ptr(), buf.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        Some(buf[4].saturating_mul(buf[1]))
+    }
+    #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// Refuses, before anything is written, a temporary file the temporary
+/// directory has no room for: an error up front that says how much is needed
+/// and where, rather than "No space left on device" partway through a
+/// download.
+pub(crate) fn room_for(bytes: u64, what: &str) -> Result<()> {
+    let dir = std::env::temp_dir();
+    match free_space(&dir) {
+        Some(free) if bytes > free => Err(Error::new(format!(
+            "{what} needs {} in {}, which has {} free; set TMPDIR to a larger disk (in \
+             Kubernetes, an emptyDir with room for it)",
+            human(bytes),
+            dir.display(),
+            human(free)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+pub fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;
     let mut u = 0;
@@ -418,6 +473,20 @@ pub(crate) fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_temp_file_with_no_room_is_refused_up_front() {
+        assert!(room_for(0, "nothing").is_ok());
+        if free_space(&std::env::temp_dir()).is_some() {
+            let e = room_for(u64::MAX, "s3://b/huge.csv")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("s3://b/huge.csv needs") && e.contains("TMPDIR"),
+                "{e}"
+            );
+        }
+    }
 
     #[test]
     fn urls_are_remote_and_paths_are_not() {

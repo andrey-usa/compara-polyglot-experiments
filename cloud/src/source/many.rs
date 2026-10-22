@@ -147,9 +147,70 @@ pub(crate) fn refuse_table(spec: &str, format: &str) -> Error {
     ))
 }
 
+/// The Hive partitions in a part's path below the root it was listed from:
+/// `date=2026-10-01/region=eu/part-0.parquet` holds `date` and `region`.
+/// Values are percent-decoded, as Hive writes them, and Hive's name for a
+/// null partition is read as empty.
+pub(crate) fn partitions_of(relative: &str) -> Vec<(String, String)> {
+    let segments: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
+    let dirs = &segments[..segments.len().saturating_sub(1)];
+    dirs.iter()
+        .filter_map(|s| s.split_once('='))
+        .filter(|(k, _)| !k.is_empty())
+        .map(|(k, v)| {
+            let v = percent_decode(v);
+            let v = if v == "__HIVE_DEFAULT_PARTITION__" {
+                String::new()
+            } else {
+                v
+            };
+            (percent_decode(k), v)
+        })
+        .collect()
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The partition columns of a table of parts, given each part's path below
+/// the root: the names every part's path has, in the same order, and each
+/// part's values. Parts that do not agree have no partition columns.
+pub(crate) fn table_partitions(relative: &[String]) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let all: Vec<Vec<(String, String)>> = relative.iter().map(|r| partitions_of(r)).collect();
+    let names: Vec<String> = all.first()?.iter().map(|(k, _)| k.clone()).collect();
+    if names.is_empty()
+        || all
+            .iter()
+            .any(|p| p.len() != names.len() || p.iter().zip(&names).any(|((k, _), n)| k != n))
+    {
+        return None;
+    }
+    let values = all
+        .into_iter()
+        .map(|p| p.into_iter().map(|(_, v)| v).collect())
+        .collect();
+    Some((names, values))
+}
+
 /// The files a local directory or glob names, in path order; `None` for a
 /// spec that is neither, read as one file.
-pub(super) fn local_files(spec: &str) -> Result<Option<Vec<PathBuf>>> {
+pub(super) fn local_files(spec: &str) -> Result<Option<Vec<(String, PathBuf)>>> {
     let path = Path::new(spec);
     let (root, pattern) = if path.is_dir() {
         (path.to_path_buf(), None)
@@ -194,7 +255,7 @@ pub(super) fn local_files(spec: &str) -> Result<Option<Vec<PathBuf>>> {
         }));
     }
     files.sort();
-    Ok(Some(files.into_iter().map(|f| f.1).collect()))
+    Ok(Some(files))
 }
 
 /// Every file under `dir`, with its path relative to the walk's root.
@@ -286,9 +347,14 @@ pub(crate) struct Combined {
     kind: Option<Kind>,
     first: String,
     header: Option<Vec<u8>>,
-    /// Per Parquet part: where it starts, its metadata, its name.
-    footers: Vec<(u64, Vec<u8>, String)>,
+    /// Per Parquet part: where it starts, its metadata, its name, and its
+    /// partition values.
+    footers: Vec<(u64, Vec<u8>, String, Vec<String>)>,
     pub(crate) parts: usize,
+    /// The table's partition columns, from its paths.
+    partitions: Vec<String>,
+    /// Which of them a text part gets: those its header does not have.
+    text_partitions: Option<Vec<usize>>,
 }
 
 impl Combined {
@@ -303,7 +369,19 @@ impl Combined {
             header: None,
             footers: Vec::new(),
             parts: 0,
+            partitions: Vec::new(),
+            text_partitions: None,
         })
+    }
+
+    /// The partition columns the parts' paths hold, for each part's values to
+    /// be added to it as columns.
+    pub(crate) fn set_partitions(&mut self, names: Vec<String>) {
+        self.partitions = names;
+    }
+
+    pub(crate) fn has_partitions(&self) -> bool {
+        !self.partitions.is_empty()
     }
 
     /// Room for `len` bytes at the end, for a part written there by someone
@@ -318,8 +396,9 @@ impl Combined {
         self.end
     }
 
-    /// Appends a local part, decompressing a gzip or zstd one.
-    pub(crate) fn append_file(&mut self, name: &str, path: &Path) -> Result<()> {
+    /// Appends a local part, decompressing a gzip or zstd one; `values` are
+    /// its partition values, one per [`Combined::set_partitions`] name.
+    pub(crate) fn append_file(&mut self, name: &str, path: &Path, values: &[String]) -> Result<()> {
         let mut input =
             File::open(path).map_err(|e| Error::new(format!("cannot read {name}: {e}")))?;
         let mut head = [0u8; 6];
@@ -331,6 +410,27 @@ impl Combined {
         let base = self.end;
         self.file.seek(SeekFrom::Start(base))?;
         let out = self.file.try_clone()?;
+        if self.has_partitions() && !head[..n].starts_with(b"PAR1") {
+            // Text with its partition values added to every row as it is
+            // copied: the one case that rewrites a part rather than copying it.
+            let reader: Box<dyn Read> = match compression(&head[..n]) {
+                None => Box::new(input),
+                Some("gzip") => Box::new(flate2::read::MultiGzDecoder::new(
+                    std::io::BufReader::with_capacity(1 << 20, input),
+                )),
+                Some("zstd") => Box::new(zstd::stream::read::Decoder::new(input)?),
+                Some(other) => {
+                    return Err(Error::new(format!(
+                        "{name} is {other}-compressed, which is not read here; gzip and zstd are"
+                    )));
+                }
+            };
+            let written = self
+                .with_partitions(reader, out, base, values)
+                .map_err(|e| Error::new(format!("cannot read {name}: {e}")))?;
+            self.end = base + written;
+            return self.placed(name, base, written, false, values);
+        }
         let written = match compression(&head[..n]) {
             None => std::io::copy(&mut input, &mut self.file).inspect(|&n| {
                 crate::memory::write_behind(&self.file, base, n, Some((base, n)));
@@ -352,14 +452,129 @@ impl Combined {
         }
         .map_err(|e| Error::new(format!("cannot read {name}: {e}")))?;
         self.end = base + written;
-        self.placed(name, base, written, false)
+        self.placed(name, base, written, false, values)
+    }
+
+    /// Copies a text part to `out` at `base`, each row given the partition
+    /// values as fields of its own -- the header the names -- minding quoted
+    /// fields that hold newlines; JSON rows get them as their first keys.
+    /// Columns the first part already has are left as they are. The bytes
+    /// written.
+    fn with_partitions(
+        &mut self,
+        input: Box<dyn Read>,
+        out: File,
+        base: u64,
+        values: &[String],
+    ) -> std::io::Result<u64> {
+        let mut input = std::io::BufReader::with_capacity(1 << 20, input);
+        let mut w =
+            std::io::BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::at(out, base));
+        let mut line = Vec::with_capacity(4096);
+        let mut written = 0u64;
+        let mut first = true;
+        let mut quoted = false;
+        let mut delimiter = b',';
+        let mut json = false;
+        let mut take: Vec<usize> = Vec::new();
+        let mut put = |w: &mut dyn Write, bytes: &[u8]| -> std::io::Result<()> {
+            written += bytes.len() as u64;
+            w.write_all(bytes)
+        };
+        loop {
+            line.clear();
+            if std::io::BufRead::read_until(&mut input, b'\n', &mut line)? == 0 {
+                break;
+            }
+            let body_end = line.len()
+                - usize::from(line.ends_with(b"\n"))
+                - usize::from(line.ends_with(b"\r\n"));
+            let (body, ending) = line.split_at(body_end);
+            let ending: &[u8] = if ending.is_empty() { b"\n" } else { ending };
+            if first {
+                first = false;
+                let text = String::from_utf8_lossy(body);
+                let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+                json = trimmed.starts_with('{');
+                delimiter = crate::columns::detect_delimiter(&text);
+                let partitions = &self.partitions;
+                let has = |n: &str| {
+                    if json {
+                        trimmed.contains(&format!("\"{n}\":"))
+                            || trimmed.contains(&format!("\"{n}\" :"))
+                    } else {
+                        text.split(delimiter as char)
+                            .any(|c| c.trim().trim_matches('"') == n)
+                    }
+                };
+                take = self
+                    .text_partitions
+                    .get_or_insert_with(|| {
+                        (0..partitions.len())
+                            .filter(|&i| !has(&partitions[i]))
+                            .collect()
+                    })
+                    .clone();
+                if !json {
+                    put(&mut w, body)?;
+                    for &i in &take {
+                        put(&mut w, &[delimiter])?;
+                        put(&mut w, &field(&self.partitions[i], delimiter))?;
+                    }
+                    put(&mut w, ending)?;
+                    continue;
+                }
+            }
+            if json {
+                match body.iter().position(|b| !b.is_ascii_whitespace()) {
+                    Some(at) if body[at] == b'{' && !take.is_empty() => {
+                        put(&mut w, &body[..=at])?;
+                        for (k, &i) in take.iter().enumerate() {
+                            if k > 0 {
+                                put(&mut w, b",")?;
+                            }
+                            put(&mut w, &json_string(&self.partitions[i]))?;
+                            put(&mut w, b":")?;
+                            put(&mut w, &json_string(&values[i]))?;
+                        }
+                        let rest = &body[at + 1..];
+                        if rest.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'}') {
+                            put(&mut w, b",")?;
+                        }
+                        put(&mut w, rest)?;
+                    }
+                    _ => put(&mut w, body)?,
+                }
+            } else {
+                put(&mut w, body)?;
+                quoted ^= body.iter().filter(|&&b| b == b'"').count() % 2 == 1;
+                // A row ends where a line ends outside quotes; a blank line is
+                // not a row and gets nothing.
+                if !quoted && !body.is_empty() && body != b"\r" {
+                    for &i in &take {
+                        put(&mut w, &[delimiter])?;
+                        put(&mut w, &field(&values[i], delimiter))?;
+                    }
+                }
+            }
+            put(&mut w, ending)?;
+        }
+        w.flush()?;
+        Ok(written)
     }
 
     /// Takes in a part that is in place at `base`, `len` bytes, the byte after
     /// it reserved for a newline when `spare`: checks it is what the parts
     /// before it were, and for text blanks out its header and ends its last
-    /// line.
-    pub(crate) fn placed(&mut self, name: &str, base: u64, len: u64, spare: bool) -> Result<()> {
+    /// line. `values` are its partition values.
+    pub(crate) fn placed(
+        &mut self,
+        name: &str,
+        base: u64,
+        len: u64,
+        spare: bool,
+        values: &[String],
+    ) -> Result<()> {
         if len == 0 {
             if spare {
                 write_at(&self.file, b"\n", base)?;
@@ -425,7 +640,8 @@ impl Combined {
                 }
                 let mut meta = vec![0u8; meta_len as usize];
                 read_at(&self.file, &mut meta, base + len - 8 - meta_len)?;
-                self.footers.push((base, meta, name.to_string()));
+                self.footers
+                    .push((base, meta, name.to_string(), values.to_vec()));
                 if spare {
                     write_at(&self.file, b"\0", base + len)?;
                 }
@@ -486,13 +702,28 @@ impl Combined {
             return Err(Error::new("every file is empty"));
         }
         if self.kind == Some(Kind::Parquet) {
-            let parts: Vec<(u64, &[u8])> = self
-                .footers
+            let footers = std::mem::take(&mut self.footers);
+            let parts: Vec<(u64, &[u8])> = footers
                 .iter()
-                .map(|(b, m, _)| (*b, m.as_slice()))
+                .map(|(b, m, ..)| (*b, m.as_slice()))
                 .collect();
-            let names: Vec<&str> = self.footers.iter().map(|f| f.2.as_str()).collect();
-            let meta = crate::parquet::merge_footers(&parts, &names)?;
+            let names: Vec<&str> = footers.iter().map(|f| f.2.as_str()).collect();
+            let meta = if self.partitions.is_empty() {
+                crate::parquet::merge_footers(&parts, &names)?
+            } else {
+                let values: Vec<Vec<String>> = footers.iter().map(|f| f.3.clone()).collect();
+                let partitions = crate::parquet::Partitions {
+                    names: &self.partitions,
+                    values: &values,
+                };
+                let (file, end) = (&self.file, &mut self.end);
+                crate::parquet::merge_footers_with(&parts, &names, &partitions, &mut |bytes| {
+                    let at = *end;
+                    write_at(file, bytes, at)?;
+                    *end += bytes.len() as u64;
+                    Ok(at)
+                })?
+            };
             let at = self.end;
             write_at(&self.file, &meta, at)?;
             let mut close = (meta.len() as u32).to_le_bytes().to_vec();
@@ -507,13 +738,34 @@ impl Combined {
 
     /// One line for stderr: how many parts became how much.
     pub(crate) fn note(&self) -> String {
+        let partitions = if self.partitions.is_empty() {
+            String::new()
+        } else {
+            format!(", partitioned by {}", self.partitions.join(", "))
+        };
         format!(
-            "{} {} files read as one ({})",
+            "{} {} files read as one ({}{partitions})",
             self.parts,
             self.kind.map_or("", |k| k.label()),
             human(self.end)
         )
     }
+}
+
+/// A value as one delimited field, quoted when it has to be.
+fn field(value: &str, delimiter: u8) -> Vec<u8> {
+    if value
+        .bytes()
+        .any(|b| b == delimiter || b == b'"' || b == b'\n' || b == b'\r')
+    {
+        format!("\"{}\"", value.replace('"', "\"\"")).into_bytes()
+    } else {
+        value.as_bytes().to_vec()
+    }
+}
+
+fn json_string(value: &str) -> Vec<u8> {
+    serde_json::to_vec(value).unwrap_or_else(|_| b"\"\"".to_vec())
 }
 
 fn copy_buffered(input: &mut impl Read, out: File, at: u64) -> std::io::Result<u64> {
@@ -603,6 +855,24 @@ mod tests {
             Some("Iceberg")
         );
         assert_eq!(table_format(["a/part-0.parquet"]), None);
+    }
+
+    #[test]
+    fn partitions_come_from_key_value_directories() {
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            partitions_of("date=2026-10-01/region=eu%2Fwest/part-0.parquet"),
+            vec![pair("date", "2026-10-01"), pair("region", "eu/west")]
+        );
+        assert_eq!(partitions_of("part-0.parquet"), vec![]);
+        assert_eq!(partitions_of("d=__HIVE_DEFAULT_PARTITION__/x.csv")[0].1, "");
+        let rel = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (names, values) =
+            table_partitions(&rel(&["d=1/a.csv", "d=2/b.csv"])).expect("partitioned");
+        assert_eq!(names, vec!["d".to_string()]);
+        assert_eq!(values, vec![vec!["1".to_string()], vec!["2".to_string()]]);
+        assert!(table_partitions(&rel(&["d=1/a.csv", "e=2/b.csv"])).is_none());
+        assert!(table_partitions(&rel(&["d=1/a.csv", "b.csv"])).is_none());
     }
 
     #[test]

@@ -340,6 +340,157 @@ jobs:
           echo "::notice title=cloud action::$($ok && echo all checks pass || echo a check failed): differ.changed=$D_CHANGED differ.identical=$D_IDENTICAL same.identical=$S_IDENTICAL fail=$F_OUTCOME missing=$M_OUTCOME"
           $ok
 
+  kubernetes:
+    # The README's Job on a kind cluster: the image from the Dockerfile, run
+    # non-root on a read-only root with an emptyDir for /tmp and a memory
+    # limit, reading and writing S3 -- SeaweedFS in the same cluster -- with
+    # keys from a Secret. A Parquet pair, a partitioned table of CSV parts,
+    # and a 2M-row CSV pair under a 160 MiB limit, each against the answer
+    # the same files give locally.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - name: Build
+        working-directory: cloud
+        run: cargo build --release --locked --bin compara --bin compara-gen-data
+      - name: Image and cluster
+        run: |
+          set -eux
+          docker build -t compara:k8s cloud
+          command -v kind || { curl -fsSLo /tmp/kind https://github.com/kubernetes-sigs/kind/releases/download/v0.30.0/kind-linux-amd64 && sudo install /tmp/kind /usr/local/bin/kind; }
+          kind create cluster --name c --wait 180s
+          kind load docker-image compara:k8s --name c
+          docker pull -q chrislusf/seaweedfs:4.47
+          kind load docker-image chrislusf/seaweedfs:4.47 --name c
+      - name: S3 in the cluster, and the fixtures in it
+        env:
+          AWS_ACCESS_KEY_ID: compara
+          AWS_SECRET_ACCESS_KEY: secret12345
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -eux
+          cat > /tmp/s3.json <<'JSON'
+          {"identities": [{"name": "compara", "credentials": [{"accessKey": "compara", "secretKey": "secret12345"}],
+            "actions": ["Admin", "Read", "List", "Tagging", "Write"]}]}
+          JSON
+          kubectl create configmap s3-config --from-file=s3.json=/tmp/s3.json
+          kubectl create secret generic s3-keys --from-literal=AWS_ACCESS_KEY_ID=compara \
+            --from-literal=AWS_SECRET_ACCESS_KEY=secret12345
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: s3}
+          spec:
+            selector: {matchLabels: {app: s3}}
+            template:
+              metadata: {labels: {app: s3}}
+              spec:
+                containers:
+                  - name: s3
+                    image: chrislusf/seaweedfs:4.47
+                    imagePullPolicy: IfNotPresent
+                    args: [server, -s3, -s3.config=/etc/sw/s3.json, -dir=/data, -ip=127.0.0.1, -ip.bind=0.0.0.0]
+                    ports: [{containerPort: 8333}]
+                    volumeMounts: [{name: cfg, mountPath: /etc/sw}, {name: data, mountPath: /data}]
+                volumes: [{name: cfg, configMap: {name: s3-config}}, {name: data, emptyDir: {}}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: s3}
+          spec: {selector: {app: s3}, ports: [{port: 8333, targetPort: 8333}]}
+          YAML
+          kubectl rollout status deploy/s3 --timeout=180s
+          (kubectl port-forward svc/s3 8333:8333 > /tmp/pf.log 2>&1 &)
+          for i in $(seq 60); do aws --endpoint-url http://localhost:8333 s3 mb s3://bkt 2>/dev/null && break; sleep 2; done
+          mkdir -p /tmp/k && cd /tmp/k
+          gen=$GITHUB_WORKSPACE/cloud/target/release/compara-gen-data
+          $gen --rows 1m --out-dir . --prefix pq --format parquet
+          $gen --rows 2m --out-dir . --prefix m
+          $gen --rows 100k --seed 1 --out-dir gen --prefix p
+          $gen --rows 40k --seed 2 --out-dir gen --prefix q
+          for side in a b; do
+            mkdir -p parts-$side/date=2026-10-01 parts-$side/date=2026-10-02
+            cp gen/p_$side.csv parts-$side/date=2026-10-01/part-0.csv
+            cp gen/q_$side.csv parts-$side/date=2026-10-02/part-0.csv
+          done
+          for f in pq_a.parquet pq_b.parquet m_a.csv m_b.csv $(find parts-a parts-b -type f); do
+            aws --endpoint-url http://localhost:8333 s3 cp "$f" "s3://bkt/$f" --only-show-errors
+          done
+      - name: Jobs
+        env:
+          AWS_ACCESS_KEY_ID: compara
+          AWS_SECRET_ACCESS_KEY: secret12345
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -u
+          cd /tmp/k
+          # The forward from the step before may have gone with it.
+          (kubectl port-forward svc/s3 8333:8333 > /tmp/pf2.log 2>&1 &)
+          sleep 3
+          bin=$GITHUB_WORKSPACE/cloud/target/release/compara
+          : > k.txt
+          job() { # name, memory limit, compara arguments...
+            local name=$1 mem=$2; shift 2
+            local args; args=$(printf '"%s", ' "$@"); args="[${args%, }]"
+            kubectl apply -f - <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: $name}
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: compara
+                    image: compara:k8s
+                    imagePullPolicy: Never
+                    args: $args
+                    env: [{name: AWS_ENDPOINT_URL, value: "http://s3:8333"}, {name: AWS_REGION, value: us-east-1}]
+                    envFrom: [{secretRef: {name: s3-keys}}]
+                    resources: {limits: {memory: $mem, cpu: "2"}}
+                    securityContext: {readOnlyRootFilesystem: true, runAsNonRoot: true, allowPrivilegeEscalation: false}
+                    volumeMounts: [{name: tmp, mountPath: /tmp}]
+                volumes: [{name: tmp, emptyDir: {}}]
+          YAML
+            for i in $(seq 120); do
+              s=$(kubectl get job "$name" -o jsonpath='{.status.succeeded}/{.status.failed}')
+              [ "$s" != "/" ] && break
+              sleep 3
+            done
+            reason=$(kubectl get pods -l job-name="$name" -o jsonpath='{.items[0].status.containerStatuses[0].state.terminated.reason}/{.items[0].status.containerStatuses[0].state.terminated.exitCode}')
+            echo "--- $name ($mem): $s, $reason" | tee -a k.txt
+            kubectl logs "job/$name" 2>&1 | tail -6 | tee -a k.txt
+          }
+          same() { # name, s3 summary, local a, local b, args...
+            local name=$1 remote=$2 a=$3 b=$4; shift 4
+            aws --endpoint-url http://localhost:8333 s3 cp "$remote" "got-$name.json" --only-show-errors
+            "$bin" compare "$a" "$b" "$@" --json "want-$name.json" > /dev/null 2>&1
+            strip() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); d.pop('meta',None); print(json.dumps(d,sort_keys=True))" "$1"; }
+            if [ "$(strip got-$name.json)" = "$(strip want-$name.json)" ]; then echo "SAME $name" | tee -a k.txt; else echo "DIFFERENT $name" | tee -a k.txt; bad=1; fi
+          }
+          bad=0
+          K="-k account_id,txn_id -i updated_at"
+          job parquet 512Mi compare s3://bkt/pq_a.parquet s3://bkt/pq_b.parquet $K --json s3://bkt/out/parquet.json --exit-zero
+          same parquet s3://bkt/out/parquet.json pq_a.parquet pq_b.parquet $K
+          job parts 512Mi compare s3://bkt/parts-a/ s3://bkt/parts-b/ -k date,account_id,txn_id -i updated_at --json s3://bkt/out/parts.json --exit-zero
+          same parts s3://bkt/out/parts.json parts-a parts-b -k date,account_id,txn_id -i updated_at
+          job tight 160Mi compare s3://bkt/m_a.csv s3://bkt/m_b.csv $K --json s3://bkt/out/tight.json --exit-zero
+          same tight s3://bkt/out/tight.json m_a.csv m_b.csv $K
+          python3 - k.txt "cloud kubernetes" <<'EOF'
+          import sys
+          text = open(sys.argv[1]).read()[-3800:]
+          print(f"::notice title={sys.argv[2]}::" + text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          EOF
+          [ "$bad" = 0 ]
+
   container:
     runs-on: ubuntu-24.04
     defaults:
@@ -397,6 +548,18 @@ jobs:
           text = open(sys.argv[1]).read()[-3800:]
           print(f"::notice title={sys.argv[2]}::" + text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
           EOF
+      - name: The release target, from a prebuilt binary
+        run: |
+          # As release.yml builds the published image: the binary from the
+          # release tarball, by --build-context, not compiled in the image.
+          mkdir -p image-dist/amd64
+          id=$(docker create compara:src)
+          docker cp "$id:/usr/local/bin/compara" image-dist/amd64/compara
+          docker rm "$id" >/dev/null
+          docker buildx build --target release --build-context dist=image-dist --load -t compara:release cloud
+          v=$(docker run --rm compara:release --version)
+          out=$(docker run --rm --read-only -v /tmp/data:/data:ro compara:release compare orders_2026-08.csv orders_2026-09.csv -k order_id,line_no --exit-zero 2>&1 | tail -1)
+          echo "::notice title=cloud image release target::$v | $(docker image ls compara:release --format '{{.Size}}') | $out"
       - name: The arm64 image, cross-compiled
         run: |
           docker buildx create --use >/dev/null

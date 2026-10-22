@@ -36,7 +36,8 @@ A, B and FILE are paths, `-` for standard input, or with cloud support s3://,
 gs://, az:// and https:// URLs. Gzip and zstd files are read as what they hold.
 A directory, a quoted glob ('out/date=*/*.parquet', `**` for any depth) or an
 object storage prefix (s3://bucket/orders/) is its files read as one table, in
-path order; names starting with `.` or `_` in a directory are passed over.
+path order; names starting with `.` or `_` in a directory are passed over, and
+Hive partition directories (date=2026-10-01/) are columns.
 
 columns and head read CSV, newline-delimited JSON and Parquet, and neither reads
 more of the file than it has to: `columns` on Parquet reads the footer, and
@@ -75,6 +76,9 @@ compare options:
       --summary           Print the counts and write nothing, and refuse any flag that would
                           (the default without -o, --json or --export-dir)
       --fail-on-dups      Exit 3 when either file has duplicate keys
+      --exit-zero         Exit 0 when the tables differ: for a scheduled job whose
+                          output is the report, where a difference is not a failure
+                          (a Kubernetes Job, an Airflow task)
 
 Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with --fail-on-dups).
 ";
@@ -200,12 +204,13 @@ struct Args {
 
 /// The options that take no value. Anything else consumes the token after it,
 /// which is how a file path can appear before, between or after the options.
-const FLAGS: [&str; 9] = [
+const FLAGS: [&str; 10] = [
     "trim",
     "ignore-case",
     "empty-is-null",
     "no-compress",
     "fail-on-dups",
+    "exit-zero",
     "summary",
     // `head --csv`. A value-taking flag left out of this list does not fail
     // quietly -- it eats the token after it -- but it does fail confusingly:
@@ -479,7 +484,11 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     if args.flag("fail-on-dups") && (c.a_dup_keys > 0 || c.b_dup_keys > 0) {
         return Ok(3);
     }
-    let code = if result.identical() { 0 } else { 1 };
+    let code = if result.identical() || args.flag("exit-zero") {
+        0
+    } else {
+        1
+    };
     // The process ends when this returns, and the kernel takes its memory back
     // in one step. Dropping the result first freed the report's rows a string
     // at a time -- several hundred thousand of them at the default row cap,
@@ -542,8 +551,11 @@ fn print_env() {
     }
     let tmp = std::env::temp_dir();
     let writable = compara::source::temp_dir_writable();
+    let free = compara::source::free_space(&tmp)
+        .map(|b| format!(", {} free", compara::source::human(b)))
+        .unwrap_or_default();
     println!(
-        "temp dir: {} ({})",
+        "temp dir: {} ({}{free})",
         tmp.display(),
         if writable {
             "writable"

@@ -663,7 +663,38 @@ fn part_schema(fm: &FileMeta) -> Vec<(String, bool, usize, i64)> {
 /// The files must have the same columns, in the same order, of the same types
 /// and nullability -- the pages of one are decoded with the schema of the
 /// first -- and each error says which file and which column differ.
+/// Columns a table holds in its paths rather than in its files: Hive
+/// partitions, `date=2026-10-01/`. `values` has, per part, a value per name.
+pub(crate) struct Partitions<'a> {
+    pub names: &'a [String],
+    pub values: &'a [Vec<String>],
+}
+
+/// [`merge_footers`] for parts that carry `partitions` in their paths: each
+/// partition column the files do not already have is added to the schema as
+/// text, and to every row group as a chunk of one dictionary value -- two
+/// pages of a few bytes, handed to `place` to write and say where.
+pub(crate) fn merge_footers_with(
+    parts: &[(u64, &[u8])],
+    names: &[&str],
+    partitions: &Partitions,
+    place: &mut dyn FnMut(&[u8]) -> Result<u64>,
+) -> Result<Vec<u8>> {
+    merge(parts, names, Some(partitions), place)
+}
+
 pub(crate) fn merge_footers(parts: &[(u64, &[u8])], names: &[&str]) -> Result<Vec<u8>> {
+    merge(parts, names, None, &mut |_| {
+        unreachable!("nothing to place")
+    })
+}
+
+fn merge(
+    parts: &[(u64, &[u8])],
+    names: &[&str],
+    partitions: Option<&Partitions>,
+    place: &mut dyn FnMut(&[u8]) -> Result<u64>,
+) -> Result<Vec<u8>> {
     let Some(&(_, first)) = parts.first() else {
         return fail("no parquet files to read", "");
     };
@@ -676,6 +707,12 @@ pub(crate) fn merge_footers(parts: &[(u64, &[u8])], names: &[&str]) -> Result<Ve
         whole
     };
     let schema0 = part_schema(&read_file_meta(&with_magic(first), names[0])?);
+    // The partition columns the files do not have themselves.
+    let extra: Vec<usize> = partitions.map_or(Vec::new(), |p| {
+        (0..p.names.len())
+            .filter(|&i| !schema0.iter().any(|c| c.0 == p.names[i]))
+            .collect()
+    });
     let mut rows = 0i64;
     let mut groups = Out { b: Vec::new() };
     let mut group_count = 0usize;
@@ -701,11 +738,28 @@ pub(crate) fn merge_footers(parts: &[(u64, &[u8])], names: &[&str]) -> Result<Ve
                 4 => {
                     let (_, n) = t.list()?;
                     for _ in 0..n {
-                        merge_row_group(&mut t, &mut groups, base, name)?;
+                        let added: Vec<(&str, &str)> = extra
+                            .iter()
+                            .map(|&i| {
+                                let pt = partitions.expect("extra columns come from partitions");
+                                (pt.names[i].as_str(), pt.values[p][i].as_str())
+                            })
+                            .collect();
+                        merge_row_group(&mut t, &mut groups, base, name, &added, place)?;
                     }
                     group_count += n;
                 }
                 8 | 9 => return unsupported("encrypted parquet files are not read here", name),
+                // The schema, with the partition columns added after the
+                // file's own.
+                2 if p == 0 && !extra.is_empty() => {
+                    let pt = partitions.expect("extra columns come from partitions");
+                    let added: Vec<&str> = extra.iter().map(|&i| pt.names[i].as_str()).collect();
+                    kept.push((id, ty, schema_with(&mut t, &added)?));
+                }
+                // Column orders name every column; with columns added they
+                // would not, and nothing here reads them.
+                7 if !extra.is_empty() => t.skip(ty)?,
                 _ if p == 0 => {
                     let from = t.at;
                     t.skip(ty)?;
@@ -743,7 +797,177 @@ pub(crate) fn merge_footers(parts: &[(u64, &[u8])], names: &[&str]) -> Result<Ve
     Ok(out.b)
 }
 
-fn merge_row_group(t: &mut Thrift, out: &mut Out, base: u64, name: &str) -> Result<()> {
+/// A row group's row count, read ahead of the columns that come before it.
+fn row_group_rows(t: &Thrift) -> Result<i64> {
+    let mut ahead = Thrift {
+        d: t.d,
+        at: t.at,
+        path: t.path,
+    };
+    let (mut id, mut last) = (0i16, 0i16);
+    loop {
+        let ty = ahead.field(&mut id, &mut last)?;
+        if ty == T_STOP {
+            return fail("a row group without a row count", t.path);
+        }
+        if id == 3 && ty == T_I64 {
+            return ahead.zigzag();
+        }
+        ahead.skip(ty)?;
+    }
+}
+
+/// The schema list with `added` text columns after the file's own, the root's
+/// child count raised to match.
+fn schema_with(t: &mut Thrift, added: &[&str]) -> Result<Vec<u8>> {
+    let mut out = Out { b: Vec::new() };
+    let (elem, n) = t.list()?;
+    if n == 0 || elem != T_STRUCT {
+        return fail("the parquet schema has no root", t.path);
+    }
+    out.list(T_STRUCT, n + added.len());
+    // The root: every field as it was, but the number of children.
+    let (mut id, mut last, mut olast) = (0i16, 0i16, 0i16);
+    loop {
+        let ty = t.field(&mut id, &mut last)?;
+        if ty == T_STOP {
+            out.b.push(T_STOP);
+            break;
+        }
+        if id == 5 && ty == T_I32 {
+            let children = t.zigzag()?;
+            out.field(5, &mut olast, T_I32);
+            out.zigzag(children + added.len() as i64);
+        } else {
+            out.copy(t, id, &mut olast, ty)?;
+        }
+    }
+    let from = t.at;
+    for _ in 1..n {
+        t.skip(T_STRUCT)?;
+    }
+    out.b.extend_from_slice(&t.d[from..t.at]);
+    for name in added {
+        // type BYTE_ARRAY, REQUIRED, the name, converted type UTF8.
+        let mut last = 0i16;
+        out.field(1, &mut last, T_I32);
+        out.zigzag(TYPE_BYTE_ARRAY);
+        out.field(3, &mut last, T_I32);
+        out.zigzag(0);
+        out.field(4, &mut last, T_BINARY);
+        out.varint(name.len() as u64);
+        out.b.extend_from_slice(name.as_bytes());
+        out.field(6, &mut last, T_I32);
+        out.zigzag(0);
+        out.b.push(T_STOP);
+    }
+    Ok(out.b)
+}
+
+/// One row group's chunk of a partition column: `rows` copies of `value`, as
+/// a dictionary of one and a page of zeros pointing at it.
+fn constant_chunk(
+    out: &mut Out,
+    name: &str,
+    value: &str,
+    rows: i64,
+    place: &mut dyn FnMut(&[u8]) -> Result<u64>,
+) -> Result<()> {
+    let mut dict_body = Out { b: Vec::new() };
+    dict_body
+        .b
+        .extend_from_slice(&(value.len() as u32).to_le_bytes());
+    dict_body.b.extend_from_slice(value.as_bytes());
+    // Bit width 1, then one RLE run of `rows` zeros.
+    let mut data_body = Out { b: vec![1] };
+    data_body.varint((rows.max(0) as u64) << 1);
+    data_body.b.push(0);
+    let page = |kind: i64, body: &[u8], header_id: i16, header: &dyn Fn(&mut Out)| {
+        let mut h = Out { b: Vec::new() };
+        let mut last = 0i16;
+        h.field(1, &mut last, T_I32);
+        h.zigzag(kind);
+        h.field(2, &mut last, T_I32);
+        h.zigzag(body.len() as i64);
+        h.field(3, &mut last, T_I32);
+        h.zigzag(body.len() as i64);
+        h.field(header_id, &mut last, T_STRUCT);
+        header(&mut h);
+        h.b.push(T_STOP);
+        h.b.extend_from_slice(body);
+        h.b
+    };
+    let dict = page(2, &dict_body.b, 7, &|h: &mut Out| {
+        let mut last = 0i16;
+        h.field(1, &mut last, T_I32);
+        h.zigzag(1);
+        h.field(2, &mut last, T_I32);
+        h.zigzag(ENC_PLAIN_DICTIONARY);
+        h.b.push(T_STOP);
+    });
+    let data = page(0, &data_body.b, 5, &|h: &mut Out| {
+        let mut last = 0i16;
+        h.field(1, &mut last, T_I32);
+        h.zigzag(rows);
+        h.field(2, &mut last, T_I32);
+        h.zigzag(ENC_PLAIN_DICTIONARY);
+        h.field(3, &mut last, T_I32);
+        h.zigzag(ENC_RLE);
+        h.field(4, &mut last, T_I32);
+        h.zigzag(ENC_RLE);
+        h.b.push(T_STOP);
+    });
+    let mut both = dict.clone();
+    both.extend_from_slice(&data);
+    let at = place(&both)? as i64;
+    let size = both.len() as i64;
+    // ColumnChunk: file_offset, then the metadata.
+    let mut last = 0i16;
+    out.field(2, &mut last, T_I64);
+    out.zigzag(at);
+    out.field(3, &mut last, T_STRUCT);
+    let mut m = 0i16;
+    out.field(1, &mut m, T_I32);
+    out.zigzag(TYPE_BYTE_ARRAY);
+    out.field(2, &mut m, T_LIST);
+    out.list(T_I32, 3);
+    for e in [ENC_PLAIN, ENC_RLE, ENC_PLAIN_DICTIONARY] {
+        out.zigzag(e);
+    }
+    out.field(3, &mut m, T_LIST);
+    out.list(T_BINARY, 1);
+    out.varint(name.len() as u64);
+    out.b.extend_from_slice(name.as_bytes());
+    out.field(4, &mut m, T_I32);
+    out.zigzag(0);
+    out.field(5, &mut m, T_I64);
+    out.zigzag(rows);
+    out.field(6, &mut m, T_I64);
+    out.zigzag(size);
+    out.field(7, &mut m, T_I64);
+    out.zigzag(size);
+    out.field(9, &mut m, T_I64);
+    out.zigzag(at + dict.len() as i64);
+    out.field(11, &mut m, T_I64);
+    out.zigzag(at);
+    out.b.push(T_STOP);
+    out.b.push(T_STOP);
+    Ok(())
+}
+
+fn merge_row_group(
+    t: &mut Thrift,
+    out: &mut Out,
+    base: u64,
+    name: &str,
+    added: &[(&str, &str)],
+    place: &mut dyn FnMut(&[u8]) -> Result<u64>,
+) -> Result<()> {
+    let rows = if added.is_empty() {
+        0
+    } else {
+        row_group_rows(t)?
+    };
     let (mut id, mut last, mut olast) = (0i16, 0i16, 0i16);
     loop {
         let ty = t.field(&mut id, &mut last)?;
@@ -755,9 +979,12 @@ fn merge_row_group(t: &mut Thrift, out: &mut Out, base: u64, name: &str) -> Resu
             1 if ty == T_LIST => {
                 let (elem, n) = t.list()?;
                 out.field(1, &mut olast, T_LIST);
-                out.list(elem, n);
+                out.list(elem, n + added.len());
                 for _ in 0..n {
                     merge_chunk(t, out, base, name)?;
+                }
+                for (column, value) in added {
+                    constant_chunk(out, column, value, rows, place)?;
                 }
             }
             5 => out.offset(t, id, &mut olast, ty, base)?,

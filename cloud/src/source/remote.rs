@@ -31,7 +31,7 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 
 use super::many::{self, Combined, read_at, write_at};
-use super::{Source, Want, human, temp_file};
+use super::{Source, Want, human, room_for, temp_file};
 use crate::error::{Error, Result};
 
 /// Bytes per ranged request.
@@ -162,6 +162,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
     }
     let ranges = coalesce(ranges, tail_at);
     let fetched: u64 = ranges.iter().map(|r| r.end - r.start).sum::<u64>() + tail.len() as u64;
+    room_for(fetched, spec)?;
     fetch_ranges(&reader, &file, ranges, etag.as_deref(), spec).await?;
     file.sync_data().ok();
     let secs = started.elapsed().as_secs_f64();
@@ -299,39 +300,21 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
     };
     let label = |m: &object_store::ObjectMeta| format!("{root}{}", m.location.as_ref());
 
+    let relative_names: Vec<String> = objects.iter().map(relative).collect();
+    let partitions = many::table_partitions(&relative_names);
+    if let Some((names, _)) = &partitions {
+        combined.set_partitions(names.clone());
+    }
+    let values_of =
+        |i: usize| -> Vec<String> { partitions.as_ref().map_or(Vec::new(), |p| p.1[i].clone()) };
+    let whole: Vec<(String, ObjectPath, Vec<String>)> = objects
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (label(m), m.location.clone(), values_of(i)))
+        .collect();
+
     if compressed {
-        // Downloaded whole, four at a time, and expanded into place in order.
-        for group in objects.chunks(4) {
-            let done = futures::future::try_join_all(group.iter().map(|m| {
-                let reader = Reader::Store(store.clone(), m.location.clone());
-                let name = label(m);
-                async move {
-                    let (size, tail, etag) = tail(&reader, &name)
-                        .await
-                        .map_err(|e| e.into_error(&name))?;
-                    let (path, file) = temp_file("part")?;
-                    let guard = TempPath(path);
-                    file.set_len(size)?;
-                    write_at(&file, &tail, size - tail.len() as u64)?;
-                    let rest = size - tail.len() as u64;
-                    if rest > 0 {
-                        fetch_ranges(
-                            &reader,
-                            &file,
-                            std::iter::once(0..rest).collect(),
-                            etag.as_deref(),
-                            &name,
-                        )
-                        .await?;
-                    }
-                    Ok::<_, Error>((name, guard))
-                }
-            }))
-            .await?;
-            for (name, temp) in done {
-                combined.append_file(&name, &temp.0)?;
-            }
-        }
+        append_whole(&store, &whole, &mut combined).await?;
     } else {
         // The end of every object first: sizes, versions, Parquet footers.
         let parts: Vec<Part> = futures::stream::iter(objects.iter().map(|m| {
@@ -354,6 +337,23 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
         .try_collect()
         .await?;
         let parquet = parts[0].size >= 12 && parts[0].tail.ends_with(b"PAR1");
+        if !parquet && combined.has_partitions() {
+            // Text gets its partition values written into every row, so it
+            // is downloaded whole and rewritten into place rather than read
+            // in place.
+            drop(parts);
+            append_whole(&store, &whole, &mut combined).await?;
+            let size = combined.finish()?;
+            let _ = size;
+            source.steps.push(format!(
+                "downloaded {} in {} objects in {:.1}s",
+                human(listed_bytes),
+                whole.len(),
+                started.elapsed().as_secs_f64()
+            ));
+            source.steps.push(combined.note());
+            return Ok(source);
+        }
         if let Some(odd) = parts
             .iter()
             .find(|p| (p.size >= 12 && p.tail.ends_with(b"PAR1")) != parquet)
@@ -454,9 +454,10 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
             .map(|j| j.range.end - j.range.start)
             .sum::<u64>()
             + parts.iter().map(|p| p.tail.len() as u64).sum::<u64>();
+        room_for(fetched, spec)?;
         fetch_jobs(jobs, &combined.file, spec).await?;
-        for (p, &base) in parts.iter().zip(&bases) {
-            combined.placed(&p.name, base, p.size, !parquet)?;
+        for (i, (p, &base)) in parts.iter().zip(&bases).enumerate() {
+            combined.placed(&p.name, base, p.size, !parquet, &values_of(i))?;
         }
         let secs = started.elapsed().as_secs_f64();
         if public {
@@ -474,6 +475,46 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
     let _ = size;
     source.steps.push(combined.note());
     Ok(source)
+}
+
+/// Downloads each object whole, four at a time, and appends it to `combined`
+/// in order -- expanded when compressed, its partition values added when
+/// text -- each download deleted once it is in.
+async fn append_whole(
+    store: &Arc<dyn ObjectStore>,
+    objects: &[(String, ObjectPath, Vec<String>)],
+    combined: &mut Combined,
+) -> Result<()> {
+    for group in objects.chunks(4) {
+        let done = futures::future::try_join_all(group.iter().map(|(name, location, values)| {
+            let reader = Reader::Store(store.clone(), location.clone());
+            async move {
+                let (size, tail, etag) =
+                    tail(&reader, name).await.map_err(|e| e.into_error(name))?;
+                let (path, file) = temp_file("part")?;
+                let guard = TempPath(path);
+                file.set_len(size)?;
+                write_at(&file, &tail, size - tail.len() as u64)?;
+                let rest = size - tail.len() as u64;
+                if rest > 0 {
+                    fetch_ranges(
+                        &reader,
+                        &file,
+                        std::iter::once(0..rest).collect(),
+                        etag.as_deref(),
+                        name,
+                    )
+                    .await?;
+                }
+                Ok::<_, Error>((name, guard, values))
+            }
+        }))
+        .await?;
+        for (name, temp, values) in done {
+            combined.append_file(name, &temp.0, values)?;
+        }
+    }
+    Ok(())
 }
 
 /// A temporary file removed when this goes.

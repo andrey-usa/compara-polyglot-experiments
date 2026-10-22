@@ -104,8 +104,10 @@ runs:
         REPORT: ${{ inputs.report }}
         FAIL: ${{ inputs.fail-on-differences }}
       run: |
-        set -uo pipefail
-        summary="$RUNNER_TEMP/compara-summary-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json"
+        # The runner starts bash with -e; compara's exit code is an answer
+        # here (1: the tables differ), not a failure of the script.
+        set +e -uo pipefail
+        summary="$RUNNER_TEMP/compara-summary-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RANDOM.json"
         report=()
         [ -n "$REPORT" ] && report=(-o "$REPORT")
         # ARGS is split as a shell would split it, quotes included.

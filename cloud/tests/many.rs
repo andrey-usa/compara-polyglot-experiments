@@ -119,15 +119,16 @@ fn a_directory_or_a_glob_is_its_files_in_path_order() {
             generate(&gen_dir, p, rows, seed, extra);
         }
     }
-    // A/date=.../part-N.<fmt>, the parts out of name order on disk, a Spark
-    // marker and a checksum file beside them.
+    // A/<date>/part-N.<fmt> (not `date=`: no partition column here), the
+    // parts out of name order on disk, a Spark marker and a checksum file
+    // beside them.
     for side in ["a", "b"] {
         for fmt in ["csv", "parquet", "ndjson"] {
             let root = d.0.join(format!("{fmt}-{side}"));
             for (dir, p) in [
-                ("date=2026-10-02", "q"),
-                ("date=2026-10-01", "p"),
-                ("date=2026-10-03", "r"),
+                ("2026-10-02", "q"),
+                ("2026-10-01", "p"),
+                ("2026-10-03", "r"),
             ] {
                 std::fs::create_dir_all(root.join(dir)).unwrap();
                 std::fs::copy(
@@ -137,7 +138,7 @@ fn a_directory_or_a_glob_is_its_files_in_path_order() {
                 .unwrap();
             }
             std::fs::write(root.join("_SUCCESS"), "").unwrap();
-            std::fs::write(root.join("date=2026-10-01").join(".part-0.crc"), "junk").unwrap();
+            std::fs::write(root.join("2026-10-01").join(".part-0.crc"), "junk").unwrap();
         }
         let parts: Vec<PathBuf> = ["p", "q", "r"]
             .iter()
@@ -155,7 +156,7 @@ fn a_directory_or_a_glob_is_its_files_in_path_order() {
     }
     // Globs, a different format on each side, `**` and a class.
     let got = compare(
-        &path("parquet-a/date=2026-10-0[1-3]/*.parquet".into()),
+        &path("parquet-a/2026-10-0[1-3]/*.parquet".into()),
         &path("ndjson-b/**/part-?.ndjson".into()),
         &KEY,
     );
@@ -261,4 +262,96 @@ fn parts_that_are_not_one_table_are_refused_by_name() {
     let got = compare(&d.0.join("same").to_string_lossy(), &one, &["-k", "id"]);
     assert_eq!(got.0, 1, "{}", got.1);
     assert!(got.2.contains("\"a_rows\":3"), "{}", got.2);
+}
+
+/// `name=value` directories are columns: keyed on one, rows that repeat a key
+/// in different partitions are different rows, and the answer is the one a
+/// flat file holding the column gives -- for Parquet, CSV and JSON parts,
+/// with either Parquet reader.
+#[test]
+fn partition_directories_are_columns() {
+    let d = scratch("partitions");
+    let gen_dir = d.0.join("gen");
+    for (p, rows, seed) in [("p", "20k", "1"), ("q", "8k", "2")] {
+        for extra in [
+            &[][..],
+            &["--format", "parquet"][..],
+            &["--format", "ndjson"][..],
+        ] {
+            generate(&gen_dir, p, rows, seed, extra);
+        }
+    }
+    for side in ["a", "b"] {
+        for fmt in ["csv", "parquet", "ndjson"] {
+            for (date, p) in [("2026-10-01", "p"), ("2026-10-02", "q")] {
+                let dir =
+                    d.0.join(format!("{fmt}-{side}/date={date}/region=eu%2Fwest"));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::copy(
+                    gen_dir.join(format!("{p}_{side}.{fmt}")),
+                    dir.join(format!("part-0.{fmt}")),
+                )
+                .unwrap();
+            }
+        }
+        // The flat equivalent: every row with its date and region.
+        let mut flat = String::new();
+        for (date, p) in [("2026-10-01", "p"), ("2026-10-02", "q")] {
+            let text = std::fs::read_to_string(gen_dir.join(format!("{p}_{side}.csv"))).unwrap();
+            let mut lines = text.lines();
+            let header = lines.next().unwrap();
+            if flat.is_empty() {
+                flat.push_str(&format!("{header},date,region\n"));
+            }
+            for l in lines {
+                flat.push_str(&format!("{l},{date},eu/west\n"));
+            }
+        }
+        std::fs::write(d.0.join(format!("flat_{side}.csv")), flat).unwrap();
+    }
+    let path = |s: &str| d.0.join(s).to_string_lossy().into_owned();
+    let key = ["-k", "date,region,account_id,txn_id", "-i", "updated_at"];
+    let want = compare(&path("flat_a.csv"), &path("flat_b.csv"), &key);
+    assert_eq!(want.0, 1, "{}", want.1);
+    assert!(want.2.contains("\"a_dup_keys\":"), "{}", want.2);
+    for (a, b, extra) in [
+        ("csv-a", "csv-b", &[][..]),
+        ("parquet-a", "parquet-b", &[][..]),
+        ("parquet-a", "parquet-b", &["--engine", "turbo"][..]),
+        ("ndjson-a", "ndjson-b", &[][..]),
+        ("parquet-a", "flat_b.csv", &[][..]),
+        ("ndjson-a", "csv-b", &[][..]),
+    ] {
+        let args = [&key[..], extra].concat();
+        let got = compare(&path(a), &path(b), &args);
+        assert_eq!(
+            (got.0, &got.2),
+            (want.0, &want.2),
+            "{a} {b} {extra:?}: {}",
+            got.1
+        );
+        assert!(
+            got.1.contains("partitioned by date, region"),
+            "{a}: {}",
+            got.1
+        );
+    }
+}
+
+/// `--exit-zero`: differences are reported and the process still succeeds,
+/// for a scheduled job; an error is still an error.
+#[test]
+fn exit_zero_reports_differences_without_failing() {
+    let d = scratch("exit-zero");
+    std::fs::write(d.0.join("a.csv"), "id,v\n1,a\n2,b\n").unwrap();
+    std::fs::write(d.0.join("b.csv"), "id,v\n1,a\n2,c\n").unwrap();
+    let a = d.0.join("a.csv").to_string_lossy().into_owned();
+    let b = d.0.join("b.csv").to_string_lossy().into_owned();
+    let got = compare(&a, &b, &["-k", "id"]);
+    assert_eq!(got.0, 1, "{}", got.1);
+    let got = compare(&a, &b, &["-k", "id", "--exit-zero"]);
+    assert_eq!(got.0, 0, "{}", got.1);
+    assert!(got.2.contains("\"changed\":1"), "{}", got.2);
+    let got = compare(&a, &b, &["-k", "nope", "--exit-zero"]);
+    assert_eq!(got.0, 2, "{}", got.1);
 }
