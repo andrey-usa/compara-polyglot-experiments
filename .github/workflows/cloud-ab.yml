@@ -1,0 +1,72 @@
+name: Cloud A/B
+
+# Did the cloud work slow compara down on local files? The `cloud/` copy
+# (head, with and without the `cloud` feature) against `base/` (the branch it
+# started from), on one runner per format, interleaved runs, counts checked
+# equal. Tables are annotations: `cloud ab ...`.
+
+on:
+  push:
+    branches: [experiment-15]
+    paths:
+      - "base/**"
+      - "cloud/bench_ab.py"
+      - ".github/workflows/cloud-ab.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    name: "ab ${{ matrix.format }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        format: [csv, tsv, ndjson, parquet]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - name: Build base, head, and head without the cloud feature
+        run: |
+          set -eux
+          (cd base && cargo build --release --locked --bin compara)
+          (cd cloud && cargo build --release --locked --bin compara --bin compara-gen-data)
+          (cd cloud && cargo build --release --locked --no-default-features --bin compara --target-dir target-nocloud)
+          ls -la base/target/release/compara cloud/target/release/compara cloud/target-nocloud/release/compara
+          echo "::notice title=cloud ab sizes ${{ matrix.format }}::base $(stat -c%s base/target/release/compara) B, head $(stat -c%s cloud/target/release/compara) B, head without cloud $(stat -c%s cloud/target-nocloud/release/compara) B"
+      - name: Data
+        run: |
+          set -eux
+          sudo mkdir -p /mnt/ab && sudo chown "$USER" /mnt/ab
+          gen=$GITHUB_WORKSPACE/cloud/target/release/compara-gen-data
+          for rows in 2m 10m; do
+            $gen --rows $rows --out-dir /mnt/ab --prefix r$rows --format ${{ matrix.format }}
+          done
+          ls -la /mnt/ab
+      - name: A/B
+        run: |
+          set -o pipefail
+          B="--build base=base/target/release/compara --build head=cloud/target/release/compara --build head-nocloud=cloud/target-nocloud/release/compara"
+          f=${{ matrix.format }}
+          : > /tmp/ab.log
+          python3 cloud/bench_ab.py $B --a /mnt/ab/r2m_a.$f --b /mnt/ab/r2m_b.$f --threads 1,4 --repeats 9 --label "2M rows, $f" | tee -a /tmp/ab.log
+          python3 cloud/bench_ab.py $B --a /mnt/ab/r10m_a.$f --b /mnt/ab/r10m_b.$f --threads 1,4 --repeats 5 --label "10M rows, $f" | tee -a /tmp/ab.log
+          if [ "$f" = csv ]; then
+            # Start-up: a pair of 800 rows, where process start is the time.
+            python3 cloud/bench_ab.py $B --a cloud/examples/orders_2026-08.csv --b cloud/examples/orders_2026-09.csv --key order_id,line_no --threads 1 --repeats 41 --label "start-up, 800-row pair" | tee -a /tmp/ab.log
+          fi
+          python3 - <<'PY'
+          import re
+          text = open("/tmp/ab.log").read()
+          for i, block in enumerate(re.findall(r"(####.*?)(?=\n####|\Z)", text, re.S)):
+              print("::notice title=cloud ab ${{ matrix.format }} " + str(i + 1) + "::" + block.strip()[:3800].replace("%", "%25").replace("\n", "%0A"))
+          PY
