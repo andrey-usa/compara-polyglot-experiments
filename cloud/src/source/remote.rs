@@ -30,6 +30,7 @@ use std::time::Instant;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 
+use super::many::{self, Combined, read_at, write_at};
 use super::{Source, Want, human, temp_file};
 use crate::error::{Error, Result};
 
@@ -61,6 +62,13 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
     let started = Instant::now();
     let url = url::Url::parse(spec).map_err(|e| Error::new(format!("{spec}: not a URL: {e}")))?;
     let scheme = url.scheme().to_ascii_lowercase();
+    let store_scheme = scheme != "http" && scheme != "https";
+    if store_scheme
+        && let Some((_, key)) = split_key(spec)
+        && (key.is_empty() || key.ends_with('/') || many::is_pattern(key))
+    {
+        return fetch_many(spec, want).await;
+    }
     let mut reader = if scheme == "http" || scheme == "https" {
         Reader::Http(http_client()?, spec.to_string())
     } else {
@@ -79,6 +87,18 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
                 ))
             })?;
             tail(&reader, spec).await.map_err(|e| e.into_error(spec))?
+        }
+        // No such object, but perhaps a prefix: `s3://bucket/orders` for the
+        // parts under `orders/`.
+        Err(Refused(404)) if store_scheme && !spec.ends_with('/') => {
+            let prefix = format!("{spec}/");
+            return match fetch_many(&prefix, want).await {
+                Ok(source) => Ok(source),
+                Err(e) if e.to_string().starts_with("no objects") => {
+                    Err(Error::new(format!("not found: {spec}")))
+                }
+                Err(e) => Err(e),
+            };
         }
         Err(e) => return Err(e.into_error(spec)),
     };
@@ -139,6 +159,288 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
         human((fetched as f64 / secs.max(1e-3)) as u64)
     ));
     Ok(source)
+}
+
+/// `scheme://bucket/` and the key after it, as the spec spells them: a glob
+/// is matched against keys as written, not as a URL parser would read `?`.
+fn split_key(spec: &str) -> Option<(&str, &str)> {
+    let (_, rest) = spec.split_once("://")?;
+    let slash = rest.find('/')?;
+    let root_len = spec.len() - rest.len() + slash + 1;
+    Some((&spec[..root_len], &spec[root_len..]))
+}
+
+/// Whether an object's name says it is compressed: it is then downloaded and
+/// expanded whole, rather than read in place.
+fn named_compressed(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    [".gz", ".gzip", ".zst", ".zstd", ".bz2", ".xz", ".zip"]
+        .iter()
+        .any(|e| k.ends_with(e))
+}
+
+/// One object of several.
+struct Part {
+    name: String,
+    reader: Reader,
+    size: u64,
+    tail: Vec<u8>,
+    etag: Option<String>,
+}
+
+/// Every object under a prefix, or matching a glob, read as one table (see
+/// [`many`]): listed, sorted by key, the end of each fetched, and then each
+/// fetched into its place in one local file -- for Parquet only as far as the
+/// comparison reads it, as for one object.
+async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
+    let started = Instant::now();
+    let (root, key) =
+        split_key(spec).ok_or_else(|| Error::new(format!("{spec}: no bucket in the URL")))?;
+    let pattern = many::is_pattern(key).then_some(key);
+    let prefix = match pattern {
+        Some(p) => many::literal_prefix(p),
+        None => key,
+    };
+    let url = url::Url::parse(root).map_err(|e| Error::new(format!("{spec}: not a URL: {e}")))?;
+    let Reader::Store(store, _) = store_for(root, &url).await? else {
+        unreachable!("store_for returns a store");
+    };
+    let trimmed = prefix.trim_end_matches('/');
+    let listed: Vec<object_store::ObjectMeta> = if trimmed.is_empty() {
+        store.list(None).try_collect().await
+    } else {
+        store
+            .list(Some(&ObjectPath::from(trimmed)))
+            .try_collect()
+            .await
+    }
+    .map_err(|e| Error::new(format!("cannot list {spec}: {}", explain(&e.to_string()))))?;
+    let relative = |m: &object_store::ObjectMeta| -> String {
+        let loc = m.location.as_ref();
+        loc.strip_prefix(trimmed)
+            .unwrap_or(loc)
+            .trim_start_matches('/')
+            .to_string()
+    };
+    if pattern.is_none() {
+        let names: Vec<String> = listed.iter().map(relative).collect();
+        if let Some(format) = many::table_format(names.iter().map(String::as_str)) {
+            return Err(many::refuse_table(spec, format));
+        }
+    }
+    let mut objects: Vec<object_store::ObjectMeta> = listed
+        .into_iter()
+        .filter(|m| {
+            m.size > 0
+                && match pattern {
+                    Some(p) => many::glob_matches(p, m.location.as_ref()),
+                    None => !many::hidden(&relative(m)),
+                }
+        })
+        .collect();
+    if objects.is_empty() {
+        return Err(Error::new(match pattern {
+            Some(_) => format!("no objects match {spec}"),
+            None => format!("no objects under {spec}"),
+        }));
+    }
+    objects.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
+    let listed_bytes: u64 = objects.iter().map(|m| m.size).sum();
+
+    let compressed = objects
+        .iter()
+        .any(|m| named_compressed(m.location.as_ref()));
+    let mut combined = Combined::new()?;
+    let mut source = Source {
+        spec: spec.to_string(),
+        path: combined.path.clone(),
+        stored: listed_bytes,
+        temps: vec![combined.path.clone()],
+        steps: Vec::new(),
+    };
+    let label = |m: &object_store::ObjectMeta| format!("{root}{}", m.location.as_ref());
+
+    if compressed {
+        // Downloaded whole, four at a time, and expanded into place in order.
+        for group in objects.chunks(4) {
+            let done = futures::future::try_join_all(group.iter().map(|m| {
+                let reader = Reader::Store(store.clone(), m.location.clone());
+                let name = label(m);
+                async move {
+                    let (size, tail, etag) = tail(&reader, &name)
+                        .await
+                        .map_err(|e| e.into_error(&name))?;
+                    let (path, file) = temp_file("part")?;
+                    let guard = TempPath(path);
+                    file.set_len(size)?;
+                    write_at(&file, &tail, size - tail.len() as u64)?;
+                    let rest = size - tail.len() as u64;
+                    if rest > 0 {
+                        fetch_ranges(
+                            &reader,
+                            &file,
+                            std::iter::once(0..rest).collect(),
+                            etag.as_deref(),
+                            &name,
+                        )
+                        .await?;
+                    }
+                    Ok::<_, Error>((name, guard))
+                }
+            }))
+            .await?;
+            for (name, temp) in done {
+                combined.append_file(&name, &temp.0)?;
+            }
+        }
+    } else {
+        // The end of every object first: sizes, versions, Parquet footers.
+        let parts: Vec<Part> = futures::stream::iter(objects.iter().map(|m| {
+            let reader = Reader::Store(store.clone(), m.location.clone());
+            let name = label(m);
+            async move {
+                let (size, tail, etag) = tail(&reader, &name)
+                    .await
+                    .map_err(|e| e.into_error(&name))?;
+                Ok::<_, Error>(Part {
+                    name,
+                    reader,
+                    size,
+                    tail,
+                    etag,
+                })
+            }
+        }))
+        .buffered(concurrency())
+        .try_collect()
+        .await?;
+        let parquet = parts[0].size >= 12 && parts[0].tail.ends_with(b"PAR1");
+        if let Some(odd) = parts
+            .iter()
+            .find(|p| (p.size >= 12 && p.tail.ends_with(b"PAR1")) != parquet)
+        {
+            return Err(Error::new(format!(
+                "{} is {} but {} is {}; the parts of one side must be of one format",
+                odd.name,
+                if parquet { "not Parquet" } else { "Parquet" },
+                parts[0].name,
+                if parquet { "Parquet" } else { "not" }
+            )));
+        }
+        // Text for `columns` needs the header, which the first part has.
+        let parts = if !parquet && want.footer_only {
+            &parts[..1]
+        } else {
+            &parts[..]
+        };
+        let mut bases = Vec::with_capacity(parts.len());
+        for p in parts {
+            bases.push(combined.reserve(p.size + u64::from(!parquet)));
+        }
+        combined.file.set_len(combined.end())?;
+        for (p, &base) in parts.iter().zip(&bases) {
+            write_at(&combined.file, &p.tail, base + p.size - p.tail.len() as u64)?;
+        }
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut columns = String::new();
+        if parquet {
+            // A footer longer than the tail first.
+            let mut footers: Vec<Job> = Vec::new();
+            let mut footer_at = Vec::with_capacity(parts.len());
+            for (p, &base) in parts.iter().zip(&bases) {
+                let t = &p.tail;
+                let len =
+                    u32::from_le_bytes(t[t.len() - 8..t.len() - 4].try_into().unwrap()) as u64;
+                let at = p
+                    .size
+                    .checked_sub(8 + len)
+                    .filter(|&a| a >= 4)
+                    .ok_or_else(|| {
+                        Error::new(format!(
+                            "{}: the parquet footer is longer than the file",
+                            p.name
+                        ))
+                    })?;
+                let tail_at = p.size - t.len() as u64;
+                if at < tail_at {
+                    footers.push(Job {
+                        reader: &p.reader,
+                        range: at..tail_at,
+                        shift: base,
+                        etag: p.etag.as_deref(),
+                        spec: &p.name,
+                    });
+                }
+                footer_at.push(at);
+                write_at(&combined.file, b"PAR1", base)?;
+            }
+            fetch_jobs(footers, &combined.file).await?;
+            let mut wanted = 0;
+            for ((p, &base), &at) in parts.iter().zip(&bases).zip(&footer_at) {
+                let mut footer = vec![0u8; (p.size - at) as usize];
+                read_at(&combined.file, &mut footer, base + at)?;
+                let (names, chunks) = crate::parquet::chunk_ranges(&footer, &|n| want.needs(n))
+                    .map_err(|e| e.context(format!("{}: ", p.name)))?;
+                if columns.is_empty() {
+                    wanted = names.iter().filter(|n| want.needs(n)).count();
+                    columns = format!(", {wanted} of {} columns", names.len());
+                }
+                for range in coalesce(chunks, p.size - p.tail.len() as u64) {
+                    jobs.push(Job {
+                        reader: &p.reader,
+                        range,
+                        shift: base,
+                        etag: p.etag.as_deref(),
+                        spec: &p.name,
+                    });
+                }
+            }
+            let _ = wanted;
+        } else {
+            for (p, &base) in parts.iter().zip(&bases) {
+                let rest = p.size - p.tail.len() as u64;
+                if rest > 0 {
+                    jobs.push(Job {
+                        reader: &p.reader,
+                        range: 0..rest,
+                        shift: base,
+                        etag: p.etag.as_deref(),
+                        spec: &p.name,
+                    });
+                }
+            }
+        }
+        let fetched: u64 = jobs
+            .iter()
+            .map(|j| j.range.end - j.range.start)
+            .sum::<u64>()
+            + parts.iter().map(|p| p.tail.len() as u64).sum::<u64>();
+        fetch_jobs(jobs, &combined.file).await?;
+        for (p, &base) in parts.iter().zip(&bases) {
+            combined.placed(&p.name, base, p.size, !parquet)?;
+        }
+        let secs = started.elapsed().as_secs_f64();
+        source.steps.push(format!(
+            "downloaded {} of {} in {} objects{columns} in {secs:.1}s ({}/s)",
+            human(fetched),
+            human(listed_bytes),
+            parts.len(),
+            human((fetched as f64 / secs.max(1e-3)) as u64)
+        ));
+    }
+    let size = combined.finish()?;
+    let _ = size;
+    source.steps.push(combined.note());
+    Ok(source)
+}
+
+/// A temporary file removed when this goes.
+struct TempPath(PathBuf);
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Writes the local file `from` to `dest`: in one request when it is small,
@@ -277,6 +579,24 @@ async fn tail(
                 .await;
             let got = match got {
                 Ok(g) => g,
+                // Azure takes no suffix range: the size first, then the end.
+                Err(object_store::Error::NotSupported { .. }) => {
+                    let meta = store.head(path).await?;
+                    if meta.size == 0 {
+                        return Ok((0, Vec::new(), meta.e_tag));
+                    }
+                    let from = meta.size.saturating_sub(TAIL);
+                    store
+                        .get_opts(
+                            path,
+                            GetOptions {
+                                range: Some(GetRange::Bounded(from..meta.size)),
+                                if_match: meta.e_tag.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .await?
+                }
                 // An empty object has no suffix to give.
                 Err(e) => {
                     let meta = store.head(path).await;
@@ -350,30 +670,63 @@ async fn fetch_ranges(
     etag: Option<&str>,
     spec: &str,
 ) -> Result<()> {
-    let parts: Vec<Range<u64>> = ranges
+    let jobs = ranges
         .into_iter()
-        .flat_map(|r| {
+        .map(|range| Job {
+            reader,
+            range,
+            shift: 0,
+            etag,
+            spec,
+        })
+        .collect();
+    fetch_jobs(jobs, file).await
+}
+
+/// A range of one object, written to the local file `shift` bytes further on
+/// than it sits in the object.
+struct Job<'a> {
+    reader: &'a Reader,
+    range: Range<u64>,
+    shift: u64,
+    etag: Option<&'a str>,
+    spec: &'a str,
+}
+
+fn concurrency() -> usize {
+    std::env::var("COMPARA_FETCH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(CONCURRENCY)
+}
+
+/// Fetches every job into `file`, cut into parts of at most [`PART`] bytes,
+/// [`concurrency`] at a time across all of them: many small objects keep as
+/// many requests in flight as one large one.
+async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File) -> Result<()> {
+    let parts: Vec<(&Job, Range<u64>)> = jobs
+        .iter()
+        .flat_map(|job| {
             let mut out = Vec::new();
-            let mut at = r.start;
-            while at < r.end {
-                let end = (at + PART).min(r.end);
-                out.push(at..end);
+            let mut at = job.range.start;
+            while at < job.range.end {
+                let end = (at + PART).min(job.range.end);
+                out.push((job, at..end));
                 at = end;
             }
             out
         })
         .collect();
-    let concurrency = std::env::var("COMPARA_FETCH_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(CONCURRENCY);
     futures::stream::iter(parts)
-        .map(|part| fetch_part(reader, file, part, etag))
-        .buffer_unordered(concurrency)
+        .map(|(job, part)| async move {
+            fetch_part(job.reader, file, part, job.shift, job.etag)
+                .await
+                .map_err(|e| e.into_error(job.spec))
+        })
+        .buffer_unordered(concurrency())
         .try_collect::<Vec<()>>()
-        .await
-        .map_err(|e| e.into_error(spec))?;
+        .await?;
     Ok(())
 }
 
@@ -386,11 +739,12 @@ async fn fetch_part(
     reader: &Reader,
     file: &File,
     part: Range<u64>,
+    shift: u64,
     etag: Option<&str>,
 ) -> std::result::Result<(), FetchError> {
     let mut attempt = 0u32;
     loop {
-        let result = fetch_part_once(reader, file, part.clone(), etag).await;
+        let result = fetch_part_once(reader, file, part.clone(), shift, etag).await;
         let retryable = match &result {
             Err(FetchError::Transient(_)) => matches!(reader, Reader::Http(..)),
             _ => false,
@@ -410,6 +764,7 @@ async fn fetch_part_once(
     reader: &Reader,
     file: &File,
     part: Range<u64>,
+    shift: u64,
     etag: Option<&str>,
 ) -> std::result::Result<(), FetchError> {
     let mut at = part.start;
@@ -428,7 +783,7 @@ async fn fetch_part_once(
             let mut stream = got.into_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
-                write_at(file, &chunk, at).map_err(|e| FetchError::Other(e.to_string()))?;
+                write_at(file, &chunk, at + shift).map_err(|e| FetchError::Other(e.to_string()))?;
                 at += chunk.len() as u64;
             }
         }
@@ -463,11 +818,12 @@ async fn fetch_part_once(
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| FetchError::Transient(e.to_string()))?;
-                write_at(file, &chunk, at).map_err(|e| FetchError::Other(e.to_string()))?;
+                write_at(file, &chunk, at + shift).map_err(|e| FetchError::Other(e.to_string()))?;
                 at += chunk.len() as u64;
             }
         }
     }
+    crate::memory::write_behind(file, part.start + shift, at - part.start, None);
     if at != part.end {
         return Err(FetchError::Transient(format!(
             "a range ended early: {} of {} bytes",
@@ -540,6 +896,17 @@ fn proxy_from_env() -> Option<String> {
     .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
 }
 
+/// Whether plain `http://` is allowed for this cloud: its endpoint is one (an
+/// emulator, a MinIO), or `<PREFIX>_ALLOW_HTTP` says so -- which object_store
+/// reads from the environment itself, into options replaced here.
+fn allow_http(prefix: &str, endpoints: &[&str]) -> bool {
+    std::env::var(format!("{prefix}_ALLOW_HTTP"))
+        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("true"))
+        || endpoints
+            .iter()
+            .any(|k| std::env::var(k).is_ok_and(|v| v.trim().starts_with("http://")))
+}
+
 fn client_options() -> object_store::ClientOptions {
     let mut options = object_store::ClientOptions::new()
         .with_connect_timeout(std::time::Duration::from_secs(30))
@@ -577,6 +944,7 @@ async fn store_for(spec: &str, url: &url::Url) -> Result<Reader> {
             if endpoint
                 .as_deref()
                 .is_some_and(|e| e.starts_with("http://"))
+                || allow_http("AWS", &[])
             {
                 b = b.with_allow_http(true);
             }
@@ -604,14 +972,23 @@ async fn store_for(spec: &str, url: &url::Url) -> Result<Reader> {
         object_store::ObjectStoreScheme::GoogleCloudStorage => Arc::new(
             object_store::gcp::GoogleCloudStorageBuilder::from_env()
                 .with_url(spec)
-                .with_client_options(client_options())
+                .with_client_options(
+                    client_options().with_allow_http(allow_http("GOOGLE", &["GOOGLE_BASE_URL"])),
+                )
                 .build()
                 .map_err(fail)?,
         ),
         object_store::ObjectStoreScheme::MicrosoftAzure => Arc::new(
             object_store::azure::MicrosoftAzureBuilder::from_env()
                 .with_url(spec)
-                .with_client_options(client_options())
+                .with_client_options(client_options().with_allow_http(allow_http(
+                    "AZURE",
+                    &[
+                        "AZURE_STORAGE_ENDPOINT",
+                        "AZURE_ENDPOINT",
+                        "AZURE_STORAGE_EMULATOR_HOST",
+                    ],
+                )))
                 .build()
                 .map_err(fail)?,
         ),
@@ -699,43 +1076,6 @@ fn ini_section(text: &str, name: &str) -> Vec<(String, String)> {
         }
     }
     out
-}
-
-#[cfg(unix)]
-fn write_at(file: &File, buf: &[u8], at: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.write_all_at(buf, at)
-}
-
-#[cfg(windows)]
-fn write_at(file: &File, mut buf: &[u8], mut at: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !buf.is_empty() {
-        let n = file.seek_write(buf, at)?;
-        buf = &buf[n..];
-        at += n as u64;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn read_at(file: &File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(buf, at)
-}
-
-#[cfg(windows)]
-fn read_at(file: &File, mut buf: &mut [u8], mut at: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !buf.is_empty() {
-        let n = file.seek_read(buf, at)?;
-        if n == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        buf = &mut buf[n..];
-        at += n as u64;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

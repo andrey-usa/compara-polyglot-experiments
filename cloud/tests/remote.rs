@@ -515,3 +515,111 @@ fn transient_failures_are_retried_and_an_overwrite_is_caught() {
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("changed while it was being read"), "{err}");
 }
+
+/// A prefix, a glob, or a name that is a prefix rather than an object reads
+/// every part under it as one table, the local directory's answer; Parquet
+/// parts only as far as the comparison reads them, gzip parts expanded.
+#[test]
+fn parts_under_a_prefix_are_one_table() {
+    let dir = std::env::temp_dir().join(format!(
+        "compara-remote-many-{}-{}",
+        std::process::id(),
+        id()
+    ));
+    let d = Dir(dir.clone());
+    let gen_dir = d.0.join("gen");
+    for (p, rows, seed) in [("p", "30k", "1"), ("q", "10k", "2")] {
+        for extra in [
+            &[][..],
+            // Uncompressed, so a column's chunk is worth not fetching.
+            &["--format", "parquet", "--compression", "none"][..],
+        ] {
+            let out = Command::new(env!("CARGO_BIN_EXE_compara-gen-data"))
+                .args(["--rows", rows, "--seed", seed, "--prefix", p, "--out-dir"])
+                .arg(&gen_dir)
+                .args(extra)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+    }
+    let bucket = d.0.join("bkt");
+    for side in ["a", "b"] {
+        for fmt in ["csv", "parquet"] {
+            for (n, p) in [(1, "p"), (2, "q")] {
+                let to = bucket.join(format!("{fmt}-{side}/date=2026-10-0{n}/part-0.{fmt}"));
+                std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+                std::fs::copy(gen_dir.join(format!("{p}_{side}.{fmt}")), &to).unwrap();
+            }
+            std::fs::write(bucket.join(format!("{fmt}-{side}/_SUCCESS")), "").unwrap();
+        }
+        // The CSV parts again, gzipped.
+        for (n, p) in [(1, "p"), (2, "q")] {
+            let to = bucket.join(format!("gz-{side}/part-{n}.csv.gz"));
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            gz.write_all(&std::fs::read(gen_dir.join(format!("{p}_{side}.csv"))).unwrap())
+                .unwrap();
+            std::fs::write(&to, gz.finish().unwrap()).unwrap();
+        }
+    }
+    let local = |p: &str| bucket.join(p).to_string_lossy().into_owned();
+    let want = compare(&local("csv-a"), &local("csv-b"), &KEY, &[], None);
+    assert_eq!(want.0, 1, "{}", want.1);
+    let Some(server) = Server::start(&d.0, &[]) else {
+        return;
+    };
+    let env = s3_env(&server.url);
+    let env = borrowed(&env);
+    for (a, b) in [
+        ("s3://bkt/csv-a/", "s3://bkt/csv-b/"),
+        ("s3://bkt/parquet-a", "s3://bkt/parquet-b"),
+        (
+            "s3://bkt/parquet-a/date=*/*.parquet",
+            "s3://bkt/csv-b/**/part-?.csv",
+        ),
+        ("s3://bkt/gz-a/", "s3://bkt/gz-b/*.csv.gz"),
+    ] {
+        let got = compare(a, b, &KEY, &env, None);
+        assert_eq!(
+            (got.0, &got.2, &got.3),
+            (want.0, &want.2, &want.3),
+            "{a} {b}: {}",
+            got.1
+        );
+    }
+    // One compared column, far from the key, of the Parquet parts: their footers and three
+    // columns' chunks, not the parts.
+    let total: u64 = ["a", "b"]
+        .iter()
+        .flat_map(|s| (1..=2).map(move |n| format!("parquet-{s}/date=2026-10-0{n}/part-0.parquet")))
+        .map(|p| std::fs::metadata(bucket.join(p)).unwrap().len())
+        .sum();
+    let before = server.sent();
+    let narrow = [&KEY[..], &["-c", "risk_flag"]].concat();
+    let got = compare(
+        "s3://bkt/parquet-a/",
+        "s3://bkt/parquet-b/",
+        &narrow,
+        &env,
+        None,
+    );
+    let local_narrow = compare(&local("parquet-a"), &local("parquet-b"), &narrow, &[], None);
+    assert_eq!(
+        (got.0, &got.2),
+        (local_narrow.0, &local_narrow.2),
+        "{}",
+        got.1
+    );
+    let sent = server.sent() - before;
+    assert!(sent < total / 2, "sent {sent} of {total}: {}", got.1);
+    for (spec, says) in [
+        ("s3://bkt/nothing/", "no objects under"),
+        ("s3://bkt/csv-a/*.parquet", "no objects match"),
+        ("s3://bkt/nothing", "not found"),
+    ] {
+        let got = compare(spec, &local("csv-b"), &KEY, &env, None);
+        assert_eq!(got.0, 2, "{spec}: {}", got.1);
+        assert!(got.1.contains(says), "{spec}: {}", got.1);
+    }
+}

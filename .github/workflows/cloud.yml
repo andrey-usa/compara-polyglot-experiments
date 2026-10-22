@@ -157,10 +157,23 @@ jobs:
           AZ="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
           az storage container create -n cont --connection-string "$AZ" -o none
           curl -sf -X POST http://localhost:4443/storage/v1/b -H 'content-type: application/json' -d '{"name":"bkt"}'
-          for f in t_a.csv t_b.csv t_a.csv.gz t_a.parquet t_b.parquet t_a.ndjson t_b.ndjson; do
+          # A table of parts, the way Spark writes one, per format and side.
+          for fmt in csv parquet; do
+            extra=""; [ $fmt = parquet ] && extra="--format parquet"
+            $gen --rows 60k --seed 1 --out-dir gen --prefix p $extra
+            $gen --rows 20k --seed 2 --out-dir gen --prefix q $extra
+            for side in a b; do
+              mkdir -p parts/$fmt-$side/date=1 parts/$fmt-$side/date=2
+              cp gen/p_$side.$fmt parts/$fmt-$side/date=1/part-0.$fmt
+              cp gen/q_$side.$fmt parts/$fmt-$side/date=2/part-0.$fmt
+              : > parts/$fmt-$side/_SUCCESS
+            done
+          done
+          for f in t_a.csv t_b.csv t_a.csv.gz t_a.parquet t_b.parquet t_a.ndjson t_b.ndjson $(find parts -type f | sort); do
             aws --endpoint-url http://localhost:8333 s3 cp "$f" "s3://bkt/$f" --only-show-errors
             az storage blob upload -c cont -f "$f" -n "$f" --connection-string "$AZ" -o none --only-show-errors
-            curl -sf -X POST "http://localhost:4443/upload/storage/v1/b/bkt/o?uploadType=media&name=$f" \
+            name=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$f")
+            curl -sf -X POST "http://localhost:4443/upload/storage/v1/b/bkt/o?uploadType=media&name=$name" \
               --data-binary @"$f" -o /dev/null
           done
       - name: Compare from each store against the local answer
@@ -193,8 +206,15 @@ jobs:
               http://localhost:4443/storage/v1/b/bkt/o/t_b.$fmt?alt=media X=1 >> report.txt
           done
           run "s3-gz" s3://bkt/t_a.csv.gz s3://bkt/t_b.csv $S3 >> report.txt
+          # Prefixes and globs: every store's listing, each part fetched.
+          for fmt in csv parquet; do
+            run "local-parts-$fmt" parts/$fmt-a parts/$fmt-b X=1 >> report.txt
+            run "s3-parts-$fmt" s3://bkt/parts/$fmt-a/ s3://bkt/parts/$fmt-b $S3 >> report.txt
+            run "az-parts-$fmt" az://cont/parts/$fmt-a/ "az://cont/parts/$fmt-b/date=*/*.$fmt" $AZ >> report.txt
+            run "gs-parts-$fmt" "gs://bkt/parts/$fmt-a/**/part-0.$fmt" gs://bkt/parts/$fmt-b/ $GS >> report.txt
+          done
           ok=0; bad=0
-          for fmt in csv parquet ndjson gz; do
+          for fmt in csv parquet ndjson gz parts-csv parts-parquet; do
             ref=local-${fmt/gz/csv}
             for store in s3 az gs http; do
               d=out-$store-$fmt; [ -d "$d" ] || continue

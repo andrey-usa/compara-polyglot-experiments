@@ -18,7 +18,12 @@ Parquet a warehouse emits, a migration's source against its target.
   Parquet**, and the two sides need not be in the same format.
 - Ten million rows × 20 columns in about a second on four cores
   ([numbers below](#speed)).
-- One static binary; the report is a single HTML file with nothing to host.
+- Reads and writes **object storage and the web** directly -- `s3://`,
+  `gs://`, `az://`, `https://` -- with each cloud's own credentials, and
+  fetches only the Parquet columns it compares
+  ([cloud and containers](#cloud-and-containers)).
+- One static binary, and a distroless container image; the report is a
+  single HTML file with nothing to host.
 - Exit codes made for pipelines: `0` identical, `1` differences, `2` error,
   `3` duplicate keys (with `--fail-on-dups`).
 
@@ -35,6 +40,7 @@ and the same binaries through package managers:
 | pip / uv | `pip install compara` · `uv tool install compara` |
 | Homebrew | `brew install andrey-usa/tap/compara` |
 | Scoop | `scoop bucket add andrey-usa https://github.com/andrey-usa/scoop-bucket` then `scoop install compara` |
+| Docker | `docker run --rm -v "$PWD:/data" ghcr.io/andrey-usa/compara compare a.csv b.csv -k id` |
 
 ## Use
 
@@ -85,6 +91,111 @@ key takes part in the join.
 comparisons: key, compared and ignored columns, normalisation, engine. See
 [`compara.example.toml`](compara.example.toml). The command line overrides the
 profile.
+
+## Cloud and containers
+
+Any file argument can be a URL, and so can `-o`, `--json` and
+`--export-dir`:
+
+```sh
+compara compare s3://lake/orders/2026-09.parquet s3://lake/orders/2026-10.parquet -k order_id \
+  --json s3://reports/orders/summary.json --export-dir s3://reports/orders/diff/
+compara compare gs://bucket/export.csv.gz az://container/warehouse.parquet -k id
+compara compare s3://lake/orders/run=41/ 's3://lake/orders/run=42/date=2026-10-*/*.parquet' -k order_id
+compara compare "https://bucket.s3.amazonaws.com/a.csv?X-Amz-Signature=..." b.csv -k id
+aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
+```
+
+| Scheme | Credentials, as that cloud's own tools find them |
+|---|---|
+| `s3://`, `s3a://` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, a `~/.aws` profile (`AWS_PROFILE`), web identity (EKS), the ECS task role, instance metadata. `AWS_ENDPOINT_URL` for MinIO, R2, Ceph and the like; `AWS_SKIP_SIGNATURE=true` for a public bucket. The bucket's region is looked up when none is set. |
+| `gs://` | `GOOGLE_APPLICATION_CREDENTIALS`, application default credentials, the metadata server (GKE, Cloud Run). |
+| `az://`, `abfs(s)://`, `azure://`, `adl://` | `AZURE_STORAGE_ACCOUNT_NAME` with a key (`AZURE_STORAGE_ACCOUNT_KEY`), a SAS token (`AZURE_STORAGE_SAS_KEY`), a service principal, or managed or workload identity. |
+| `http://`, `https://` | none: the URL is fetched as given, so a presigned S3 URL or an Azure SAS URL works as it is. A refused one that names a bucket or a storage account is retried signed. |
+
+- **Parquet is read as far as the comparison reads it**: the footer, then
+  only the column chunks of the key and compared columns. `--compare` on two
+  columns of a 200-column table fetches those two; `compara columns` fetches
+  the last 64 KB.
+- **Everything else is read in parallel ranges** (8 MB, sixteen at a time,
+  `COMPARA_FETCH_CONCURRENCY`) into a temporary file in `TMPDIR`. Gzip and
+  zstd files, local or remote, are read as what they hold.
+- **A table of many files is one side**: a directory, a quoted glob, or an
+  object storage prefix is its files read as one table, in path order --
+  Spark and Hive output (`date=2026-10-01/part-00000.snappy.parquet`), a
+  warehouse unload (`unload/0000_part_00.csv.gz`). CSV parts must share a
+  header and Parquet parts a schema, and the error names the part that does
+  not. From object storage the parts are fetched together, sixteen ranges in
+  flight across all of them, and Parquet parts only as far as the comparison
+  reads them. Names starting with `.` or `_` (`_SUCCESS`, `.crc`) are passed
+  over; a Delta or Iceberg table is refused rather than read as every file of
+  every version.
+- **Every range is read from one version of the object** (`If-Match` on its
+  ETag): an object overwritten mid-read is an error, not a file stitched
+  from two versions. Throttled and dropped ranges are retried.
+- **Outputs go up** in one request, or as a multipart upload for a large
+  export. `--json -` prints the summary on stdout and the counts on stderr.
+
+In a container:
+
+- `ghcr.io/andrey-usa/compara` is the release binary on
+  `gcr.io/distroless/cc` for `linux/amd64` and `linux/arm64`, running as a
+  non-root user with `WORKDIR /data`. Nothing else is in the image.
+- It reads the container's limits: threads from the CPU quota, memory from
+  the cgroup. **Out of memory is a message, not an OOM kill**: the heap is held
+  a margin under the limit, so a pair that does not fit is refused with what
+  needed how much (exit 2), and under `--engine auto` a CSV pair is compared
+  by the engine that spills to disk instead, with the same answer.
+- A read-only root filesystem works; standard input, compressed and remote
+  inputs and the spilling engine need a writable `TMPDIR` -- in Kubernetes an
+  `emptyDir` (disk-backed: a `medium: Memory` one counts against the memory
+  limit).
+- `compara env` prints what the process sees: CPUs, memory, the container's
+  limit, the heap limit it set, and whether the temporary directory is
+  writable.
+
+In GitHub Actions, the action installs the release binary, writes the
+counts and the most-changed columns to the job summary, and fails the step
+when the tables differ (`fail-on-differences: false` to only report):
+
+```yaml
+- uses: aws-actions/configure-aws-credentials@v5   # or any other credentials
+  with: {role-to-assume: arn:aws:iam::123456789012:role/ci, aws-region: us-east-1}
+- uses: andrey-usa/compara@v0
+  with:
+    a: s3://lake/orders/baseline.parquet
+    b: out/orders.parquet
+    key: order_id,line_no
+    args: -i updated_at --tolerance 0.01
+    report: out/orders-diff.html
+```
+
+Its outputs are `identical`, `changed`, `added`, `removed` and `summary`
+(the JSON summary's path).
+
+A Kubernetes Job comparing two Parquet snapshots with the pod's IAM role
+(IRSA) and failing when they differ:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata: {name: orders-diff}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: lake-reader          # annotated with the IAM role
+      restartPolicy: Never
+      containers:
+        - name: compara
+          image: ghcr.io/andrey-usa/compara:latest
+          args: [compare, s3://lake/orders/v1.parquet, s3://lake/orders/v2.parquet,
+                 -k, order_id, --json, s3://reports/orders/summary.json]
+          resources: {limits: {memory: 2Gi, cpu: "4"}}
+          securityContext: {readOnlyRootFilesystem: true, runAsNonRoot: true}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {}}]
+```
 
 ## Speed
 

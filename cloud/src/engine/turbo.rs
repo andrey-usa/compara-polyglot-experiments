@@ -3987,6 +3987,18 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
             let mut fields = vec![ABSENT; width];
             let mut out = Vec::with_capacity(want);
             while at < end && out.len() < want {
+                // A line with nothing on it is not a row, here as in a comparison.
+                match data[at] {
+                    b'\n' => {
+                        at += 1;
+                        continue;
+                    }
+                    b'\r' if at + 1 < end && data[at + 1] == b'\n' => {
+                        at += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
                 at = parser.parse(data, at, end, &mut fields);
                 out.push(render_row(&slab, &fields));
                 fields.iter_mut().for_each(|f| *f = ABSENT);

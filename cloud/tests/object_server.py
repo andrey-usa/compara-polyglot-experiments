@@ -35,12 +35,13 @@ def main() -> None:
     ap.add_argument("--no-ranges", action="store_true")
     ap.add_argument("--private", action="store_true")
     ap.add_argument("--flaky", type=int, default=0,
-                    help="answer every N-th ranged GET after the first with a 503")
+                    help="answer every N-th ranged GET after the first with a 503, once per range")
     ap.add_argument("--overwrite-after", type=int, default=0,
                     help="after N GETs, serve every object as a new version (a new ETag)")
     args = ap.parse_args()
     lock = threading.Lock()
     gets = [0]
+    failed = set()
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -72,10 +73,45 @@ def main() -> None:
                 self.wfile.write(body)
             self.record(self.headers.get("Range"), 0)
 
+        def etag_of(self, full, version=1):
+            st = os.stat(full)
+            return '"' + hashlib.md5(f"{full}:{st.st_mtime_ns}:{st.st_size}:{version}".encode()).hexdigest() + '"'
+
+        def list_bucket(self, bucket, query):
+            """S3 ListObjectsV2, every key at once."""
+            from urllib.parse import parse_qs
+            from xml.sax.saxutils import escape
+            q = {k: v[0] for k, v in parse_qs(query, keep_blank_values=True).items()}
+            prefix = q.get("prefix", "")
+            root = os.path.join(args.root, bucket)
+            keys = []
+            for d, dirs, files in os.walk(root):
+                dirs[:] = [x for x in dirs if x != ".uploads"]
+                for f in files:
+                    full = os.path.join(d, f)
+                    key = os.path.relpath(full, root).replace(os.sep, "/")
+                    if key.startswith(prefix):
+                        keys.append((key, full))
+            keys.sort()
+            items = "".join(
+                f"<Contents><Key>{escape(k)}</Key><LastModified>"
+                f"{__import__('datetime').datetime.fromtimestamp(os.stat(full).st_mtime, __import__('datetime').timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+                f"</LastModified><ETag>{escape(self.etag_of(full))}</ETag><Size>{os.path.getsize(full)}</Size>"
+                f"<StorageClass>STANDARD</StorageClass></Contents>"
+                for k, full in keys)
+            xml = (f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>"
+                   f"<Name>{escape(bucket)}</Name><Prefix>{escape(prefix)}</Prefix><KeyCount>{len(keys)}</KeyCount>"
+                   f"<MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{items}</ListBucketResult>").encode()
+            self.reply(200, xml)
+            self.record("LIST", len(xml))
+
         def serve(self, head):
             full, parts = self.target()
             if args.private and not self.headers.get("Authorization") and not parts.query:
                 return self.refuse(403)
+            bucket_only = unquote(parts.path).strip("/")
+            if "list-type=2" in parts.query and "/" not in bucket_only:
+                return self.list_bucket(bucket_only, parts.query)
             if full is None:
                 return self.refuse(404)
             size = os.path.getsize(full)
@@ -84,10 +120,15 @@ def main() -> None:
                 gets[0] += 1
                 n = gets[0]
             version = 2 if args.overwrite_after and n > args.overwrite_after else 1
-            etag = '"' + hashlib.md5(f"{full}:{st.st_mtime_ns}:{size}:{version}".encode()).hexdigest() + '"'
+            etag = self.etag_of(full, version)
             asked = self.headers.get("Range")
             if args.flaky and asked and n > 1 and n % args.flaky == 0:
-                return self.refuse(503)
+                # Once per range: a retry of it gets through.
+                with lock:
+                    first = (full, asked) not in failed
+                    failed.add((full, asked))
+                if first:
+                    return self.refuse(503)
             wanted = self.headers.get("If-Match")
             if wanted and wanted != etag:
                 return self.refuse(412)

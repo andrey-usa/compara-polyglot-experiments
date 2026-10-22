@@ -1,0 +1,264 @@
+//! A side made of several files -- a directory, or a glob -- is read as the
+//! files one after another: the answer is the one the concatenated file gives,
+//! in every format, and the files that cannot be one table are refused with
+//! the file and the difference named.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use compara::gendata::parquet::{Compression, Writer};
+
+struct Dir(PathBuf);
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(tag: &str) -> Dir {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "compara-many-{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    Dir(dir)
+}
+
+fn generate(dir: &Path, prefix: &str, rows: &str, seed: &str, extra: &[&str]) {
+    let out = Command::new(env!("CARGO_BIN_EXE_compara-gen-data"))
+        .args([
+            "--rows",
+            rows,
+            "--seed",
+            seed,
+            "--prefix",
+            prefix,
+            "--out-dir",
+        ])
+        .arg(dir)
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// Exit code, stderr, and the summary without its run facts.
+fn compare(a: &str, b: &str, args: &[&str]) -> (i32, String, String) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let json = std::env::temp_dir().join(format!(
+        "compara-many-summary-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&json);
+    let out = Command::new(env!("CARGO_BIN_EXE_compara"))
+        .args(["compare", a, b])
+        .args(args)
+        .arg("--json")
+        .arg(&json)
+        .output()
+        .unwrap();
+    let summary = std::fs::read_to_string(&json)
+        .ok()
+        .map(|t| {
+            let mut v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            v.as_object_mut().unwrap().remove("meta");
+            v.to_string()
+        })
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&json);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        summary,
+    )
+}
+
+const KEY: [&str; 4] = ["-k", "account_id,txn_id", "-i", "updated_at"];
+
+/// The text of `files` as one CSV: the first header, every row.
+fn concatenated(files: &[PathBuf], to: &Path) {
+    let mut out = String::new();
+    for (i, f) in files.iter().enumerate() {
+        let text = std::fs::read_to_string(f).unwrap();
+        let body = if i == 0 {
+            &text[..]
+        } else {
+            &text[text.find('\n').unwrap() + 1..]
+        };
+        out.push_str(body);
+    }
+    std::fs::write(to, out).unwrap();
+}
+
+/// Two seeds, so the parts repeat keys across files: which occurrence comes
+/// first depends on the order the parts are read in, and is checked here.
+#[test]
+fn a_directory_or_a_glob_is_its_files_in_path_order() {
+    let d = scratch("order");
+    let gen_dir = d.0.join("gen");
+    for (p, rows, seed) in [("p", "20k", "1"), ("q", "7k", "2"), ("r", "3k", "3")] {
+        for fmt in ["csv", "parquet", "ndjson"] {
+            let extra: &[&str] = match fmt {
+                "parquet" => &[
+                    "--format",
+                    "parquet",
+                    "--compression",
+                    "zstd",
+                    "--row-group-size",
+                    "1000",
+                ],
+                "ndjson" => &["--format", "ndjson"],
+                _ => &[],
+            };
+            generate(&gen_dir, p, rows, seed, extra);
+        }
+    }
+    // A/date=.../part-N.<fmt>, the parts out of name order on disk, a Spark
+    // marker and a checksum file beside them.
+    for side in ["a", "b"] {
+        for fmt in ["csv", "parquet", "ndjson"] {
+            let root = d.0.join(format!("{fmt}-{side}"));
+            for (dir, p) in [
+                ("date=2026-10-02", "q"),
+                ("date=2026-10-01", "p"),
+                ("date=2026-10-03", "r"),
+            ] {
+                std::fs::create_dir_all(root.join(dir)).unwrap();
+                std::fs::copy(
+                    gen_dir.join(format!("{p}_{side}.{fmt}")),
+                    root.join(dir).join(format!("part-0.{fmt}")),
+                )
+                .unwrap();
+            }
+            std::fs::write(root.join("_SUCCESS"), "").unwrap();
+            std::fs::write(root.join("date=2026-10-01").join(".part-0.crc"), "junk").unwrap();
+        }
+        let parts: Vec<PathBuf> = ["p", "q", "r"]
+            .iter()
+            .map(|p| gen_dir.join(format!("{p}_{side}.csv")))
+            .collect();
+        concatenated(&parts, &d.0.join(format!("all_{side}.csv")));
+    }
+    let path = |s: String| d.0.join(s).to_string_lossy().into_owned();
+    let want = compare(&path("all_a.csv".into()), &path("all_b.csv".into()), &KEY);
+    assert_eq!(want.0, 1, "{}", want.1);
+    for fmt in ["csv", "parquet", "ndjson"] {
+        let got = compare(&path(format!("{fmt}-a")), &path(format!("{fmt}-b")), &KEY);
+        assert_eq!((got.0, &got.2), (want.0, &want.2), "{fmt}: {}", got.1);
+        assert!(got.1.contains("3 "), "{fmt}: {}", got.1);
+    }
+    // Globs, a different format on each side, `**` and a class.
+    let got = compare(
+        &path("parquet-a/date=2026-10-0[1-3]/*.parquet".into()),
+        &path("ndjson-b/**/part-?.ndjson".into()),
+        &KEY,
+    );
+    assert_eq!((got.0, &got.2), (want.0, &want.2), "glob: {}", got.1);
+    // The parquet engine and turbo read the joined Parquet file alike.
+    let got = compare(
+        &path("parquet-a".into()),
+        &path("parquet-b".into()),
+        &[&KEY[..], &["--engine", "turbo"]].concat(),
+    );
+    assert_eq!((got.0, &got.2), (want.0, &want.2), "turbo: {}", got.1);
+    // `columns` and `head` read a directory too.
+    let out = Command::new(env!("CARGO_BIN_EXE_compara"))
+        .args(["columns", &path("parquet-a".into())])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && text.contains("account_id"),
+        "{out:?}"
+    );
+}
+
+/// Compressed parts, parts without a last newline, CRLF and a byte-order
+/// mark: one table all the same.
+#[test]
+fn compressed_and_untidy_parts_join_cleanly() {
+    let d = scratch("untidy");
+    let side = d.0.join("a");
+    std::fs::create_dir_all(&side).unwrap();
+    std::fs::write(side.join("1.csv"), "id,v\r\n1,a\r\n2,b").unwrap();
+    std::fs::write(side.join("2.csv"), "\u{feff}id,v\n3,c").unwrap();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gz, b"id,v\n4,d\n5,e\n").unwrap();
+    std::fs::write(side.join("3.csv.gz"), gz.finish().unwrap()).unwrap();
+    std::fs::write(
+        side.join("4.csv.zst"),
+        zstd::encode_all(&b"id,v\n6,f\n"[..], 3).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(side.join("5.csv"), "id,v\n").unwrap(); // a header and nothing else
+    std::fs::write(d.0.join("b.csv"), "id,v\n1,a\n2,b\n3,c\n4,d\n5,e\n6,f\n").unwrap();
+    let got = compare(
+        &side.to_string_lossy(),
+        &d.0.join("b.csv").to_string_lossy(),
+        &["-k", "id"],
+    );
+    assert_eq!(got.0, 0, "{}", got.1);
+    assert!(got.2.contains("\"a_rows\":6"), "{}", got.2);
+}
+
+#[test]
+fn parts_that_are_not_one_table_are_refused_by_name() {
+    let d = scratch("refused");
+    let w = |p: &str, text: &str| {
+        let path = d.0.join(p);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    w("one.csv", "id,v\n1,a\n");
+    w("header/1.csv", "id,v\n1,a\n");
+    w("header/2.csv", "id,w\n2,b\n");
+    w("mixed/1.csv", "id,v\n1,a\n");
+    w("mixed/2.ndjson", "{\"id\":2,\"v\":\"b\"}\n");
+    w("delta/part-0.parquet", "x");
+    w("delta/_delta_log/00000000000000000000.json", "{}");
+    w("iceberg/data/0.parquet", "x");
+    w("iceberg/metadata/v1.metadata.json", "{}");
+    std::fs::create_dir_all(d.0.join("empty")).unwrap();
+    w("empty/_SUCCESS", "");
+    let one = d.0.join("one.csv").to_string_lossy().into_owned();
+    for (side, says) in [
+        ("header", "has the header `id,w` where"),
+        ("mixed", "must be of one format"),
+        ("delta", "is a Delta table"),
+        ("iceberg", "is an Iceberg table"),
+        ("empty", "no files in"),
+        ("nothing/*.csv", "no files match"),
+    ] {
+        let got = compare(&d.0.join(side).to_string_lossy(), &one, &["-k", "id"]);
+        assert_eq!(got.0, 2, "{side}: {}", got.1);
+        assert!(got.1.contains(says), "{side}: {}", got.1);
+    }
+
+    // Parquet parts must agree on their columns, nullability and types; the
+    // error names the column.
+    let pq = |p: &str, names: &[&str], rows: &[&[&str]]| {
+        let path = d.0.join(p);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut w = Writer::create(&path, names, Compression::None, 100).unwrap();
+        for r in rows {
+            w.write_row(r.iter().copied()).unwrap();
+        }
+        w.finish().unwrap();
+    };
+    pq("pq/1.parquet", &["id", "v"], &[&["1", "a"]]);
+    pq("pq/2.parquet", &["id", "w"], &[&["2", "b"]]);
+    let got = compare(&d.0.join("pq").to_string_lossy(), &one, &["-k", "id"]);
+    assert_eq!(got.0, 2, "{}", got.1);
+    assert!(got.1.contains("has w instead of v"), "{}", got.1);
+    pq("same/1.parquet", &["id", "v"], &[&["1", "a"], &["2", "b"]]);
+    pq("same/2.parquet", &["id", "v"], &[&["3", "c"]]);
+    let got = compare(&d.0.join("same").to_string_lossy(), &one, &["-k", "id"]);
+    assert_eq!(got.0, 1, "{}", got.1);
+    assert!(got.2.contains("\"a_rows\":3"), "{}", got.2);
+}

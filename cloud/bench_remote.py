@@ -47,6 +47,10 @@ con.execute(f"""CREATE SECRET s (TYPE s3, KEY_ID '{__import__('os').environ['AWS
     URL_STYLE 'path', USE_SSL false, REGION 'us-east-1')""")
 def src(name):
     url = f"s3://{bucket}/{name}"
+    if name.endswith("/"):
+        # A directory of parts: read in name order, as compara reads them.
+        return (f"read_parquet('{url}*.parquet', filename = true, file_row_number = true)",
+                "filename, file_row_number")
     if fmt == "parquet":
         return f"read_parquet('{url}', file_row_number = true)", "file_row_number"
     return f"read_csv('{url}', all_varchar = true)", "rowid"
@@ -77,8 +81,9 @@ def main():
     ap.add_argument("--compare", default="", help="only these columns (default: all but the key and updated_at)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--label", default="")
+    ap.add_argument("--format", default="", help="parquet or csv (default: from the name)")
     args = ap.parse_args()
-    fmt = "parquet" if args.a.endswith(".parquet") else "csv"
+    fmt = args.format or ("parquet" if args.a.endswith(".parquet") else "csv")
     everything = [c for c in args.columns.split(",") if c]
     cols = [c for c in (args.compare.split(",") if args.compare else everything)
             if c and c not in KEY and c != IGNORE]

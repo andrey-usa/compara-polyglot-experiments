@@ -572,6 +572,289 @@ pub(crate) fn chunk_ranges(
 // Pages
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
+// Several files as one
+// ---------------------------------------------------------------------------
+
+/// Thrift compact encoding, for the parts of a footer `merge_footers` writes
+/// itself rather than copies.
+struct Out {
+    b: Vec<u8>,
+}
+
+impl Out {
+    fn varint(&mut self, mut v: u64) {
+        while v >= 0x80 {
+            self.b.push(v as u8 | 0x80);
+            v >>= 7;
+        }
+        self.b.push(v as u8);
+    }
+
+    fn zigzag(&mut self, v: i64) {
+        self.varint(((v << 1) ^ (v >> 63)) as u64);
+    }
+
+    fn field(&mut self, id: i16, last: &mut i16, ty: u8) {
+        let delta = id.wrapping_sub(*last);
+        if (1..=15).contains(&delta) {
+            self.b.push(((delta as u8) << 4) | ty);
+        } else {
+            self.b.push(ty);
+            self.zigzag(id as i64);
+        }
+        *last = id;
+    }
+
+    fn list(&mut self, elem: u8, n: usize) {
+        if n < 15 {
+            self.b.push(((n as u8) << 4) | elem);
+        } else {
+            self.b.push(0xF0 | elem);
+            self.varint(n as u64);
+        }
+    }
+
+    /// A field whose value is copied as it was: the header written here, the
+    /// value's bytes from `t` (none for a bool, which lives in the header).
+    fn copy(&mut self, t: &mut Thrift, id: i16, last: &mut i16, ty: u8) -> Result<()> {
+        self.field(id, last, ty);
+        let from = t.at;
+        t.skip(ty)?;
+        self.b.extend_from_slice(&t.d[from..t.at]);
+        Ok(())
+    }
+
+    /// An i64 offset field, moved by `base`. Zero and below mean "none" to
+    /// every writer that writes them, and stay as they are.
+    fn offset(&mut self, t: &mut Thrift, id: i16, last: &mut i16, ty: u8, base: u64) -> Result<()> {
+        if ty != T_I64 {
+            return self.copy(t, id, last, ty);
+        }
+        let v = t.zigzag()?;
+        self.field(id, last, T_I64);
+        self.zigzag(if v > 0 {
+            v.saturating_add(base as i64)
+        } else {
+            v
+        });
+        Ok(())
+    }
+}
+
+/// The schema of one part, for saying how two parts differ: per column its
+/// name, whether it may be null, its fixed width and its physical type.
+fn part_schema(fm: &FileMeta) -> Vec<(String, bool, usize, i64)> {
+    let first = fm.groups.first();
+    (0..fm.names.len())
+        .map(|i| {
+            let ty = first.and_then(|g| g.columns.get(i)).map_or(-1, |c| c.ty);
+            (fm.names[i].clone(), fm.optional[i], fm.type_length[i], ty)
+        })
+        .collect()
+}
+
+/// The footer of the file made by writing several Parquet files one after
+/// another: the first file's schema and key-value metadata, every file's row
+/// groups in order with each offset moved by where its file starts, and the
+/// rows of all of them. `parts` holds, per file, where it starts in the whole
+/// and its metadata (the bytes before the metadata's length and the closing
+/// magic); `names` names each file for an error.
+///
+/// The files must have the same columns, in the same order, of the same types
+/// and nullability -- the pages of one are decoded with the schema of the
+/// first -- and each error says which file and which column differ.
+pub(crate) fn merge_footers(parts: &[(u64, &[u8])], names: &[&str]) -> Result<Vec<u8>> {
+    let Some(&(_, first)) = parts.first() else {
+        return fail("no parquet files to read", "");
+    };
+    let with_magic = |meta: &[u8]| {
+        let mut whole = Vec::with_capacity(meta.len() + 12);
+        whole.extend_from_slice(b"PAR1");
+        whole.extend_from_slice(meta);
+        whole.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        whole.extend_from_slice(b"PAR1");
+        whole
+    };
+    let schema0 = part_schema(&read_file_meta(&with_magic(first), names[0])?);
+    let mut rows = 0i64;
+    let mut groups = Out { b: Vec::new() };
+    let mut group_count = 0usize;
+    // The first file's fields other than the rows and row groups, as written.
+    let mut kept: Vec<(i16, u8, Vec<u8>)> = Vec::new();
+    for (p, &(base, meta)) in parts.iter().enumerate() {
+        let name = names[p];
+        if p > 0 {
+            let schema = part_schema(&read_file_meta(&with_magic(meta), name)?);
+            if schema != schema0 {
+                return Err(schema_difference(&schema0, &schema, names[0], name));
+            }
+        }
+        let mut t = Thrift::new(meta, name);
+        let (mut id, mut last) = (0i16, 0i16);
+        loop {
+            let ty = t.field(&mut id, &mut last)?;
+            if ty == T_STOP {
+                break;
+            }
+            match id {
+                3 => rows = rows.saturating_add(t.zigzag()?),
+                4 => {
+                    let (_, n) = t.list()?;
+                    for _ in 0..n {
+                        merge_row_group(&mut t, &mut groups, base, name)?;
+                    }
+                    group_count += n;
+                }
+                8 | 9 => return unsupported("encrypted parquet files are not read here", name),
+                _ if p == 0 => {
+                    let from = t.at;
+                    t.skip(ty)?;
+                    kept.push((id, ty, t.d[from..t.at].to_vec()));
+                }
+                _ => t.skip(ty)?,
+            }
+        }
+    }
+    let mut out = Out {
+        b: Vec::with_capacity(groups.b.len() + 4096),
+    };
+    let mut last = 0i16;
+    let mut wrote_groups = false;
+    let groups_now = |out: &mut Out, last: &mut i16| {
+        out.field(3, last, T_I64);
+        out.zigzag(rows);
+        out.field(4, last, T_LIST);
+        out.list(T_STRUCT, group_count);
+        out.b.extend_from_slice(&groups.b);
+    };
+    kept.sort_by_key(|k| k.0);
+    for (id, ty, value) in &kept {
+        if *id > 4 && !wrote_groups {
+            groups_now(&mut out, &mut last);
+            wrote_groups = true;
+        }
+        out.field(*id, &mut last, *ty);
+        out.b.extend_from_slice(value);
+    }
+    if !wrote_groups {
+        groups_now(&mut out, &mut last);
+    }
+    out.b.push(T_STOP);
+    Ok(out.b)
+}
+
+fn merge_row_group(t: &mut Thrift, out: &mut Out, base: u64, name: &str) -> Result<()> {
+    let (mut id, mut last, mut olast) = (0i16, 0i16, 0i16);
+    loop {
+        let ty = t.field(&mut id, &mut last)?;
+        if ty == T_STOP {
+            out.b.push(T_STOP);
+            return Ok(());
+        }
+        match id {
+            1 if ty == T_LIST => {
+                let (elem, n) = t.list()?;
+                out.field(1, &mut olast, T_LIST);
+                out.list(elem, n);
+                for _ in 0..n {
+                    merge_chunk(t, out, base, name)?;
+                }
+            }
+            5 => out.offset(t, id, &mut olast, ty, base)?,
+            // The ordinal numbers a row group within its file, for decryption;
+            // it would be wrong in the whole, and nothing here needs it.
+            7 => t.skip(ty)?,
+            _ => out.copy(t, id, &mut olast, ty)?,
+        }
+    }
+}
+
+fn merge_chunk(t: &mut Thrift, out: &mut Out, base: u64, name: &str) -> Result<()> {
+    let (mut id, mut last, mut olast) = (0i16, 0i16, 0i16);
+    loop {
+        let ty = t.field(&mut id, &mut last)?;
+        if ty == T_STOP {
+            out.b.push(T_STOP);
+            return Ok(());
+        }
+        match id {
+            1 => {
+                return unsupported(
+                    "a parquet file whose column data lives in another file is not read here",
+                    name,
+                );
+            }
+            2 | 4 | 6 => out.offset(t, id, &mut olast, ty, base)?,
+            3 if ty == T_STRUCT => {
+                out.field(3, &mut olast, T_STRUCT);
+                let (mut mid, mut mlast, mut molast) = (0i16, 0i16, 0i16);
+                loop {
+                    let mty = t.field(&mut mid, &mut mlast)?;
+                    if mty == T_STOP {
+                        out.b.push(T_STOP);
+                        break;
+                    }
+                    match mid {
+                        9 | 10 | 11 | 14 => out.offset(t, mid, &mut molast, mty, base)?,
+                        _ => out.copy(t, mid, &mut molast, mty)?,
+                    }
+                }
+            }
+            8 | 9 => return unsupported("encrypted parquet files are not read here", name),
+            _ => out.copy(t, id, &mut olast, ty)?,
+        }
+    }
+}
+
+/// What tells two parts' schemas apart, as an error naming both files.
+fn schema_difference(
+    a: &[(String, bool, usize, i64)],
+    b: &[(String, bool, usize, i64)],
+    a_name: &str,
+    b_name: &str,
+) -> Error {
+    let names =
+        |s: &[(String, bool, usize, i64)]| s.iter().map(|c| c.0.clone()).collect::<Vec<_>>();
+    let (an, bn) = (names(a), names(b));
+    let only = |x: &[String], y: &[String]| {
+        x.iter()
+            .filter(|n| !y.contains(n))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let what = if an != bn {
+        let (missing, extra) = (only(&an, &bn), only(&bn, &an));
+        match (missing.is_empty(), extra.is_empty()) {
+            (true, true) => "the same columns in a different order".to_string(),
+            (false, true) => format!("no {missing}"),
+            (true, false) => format!("{extra} as well"),
+            (false, false) => format!("{extra} instead of {missing}"),
+        }
+    } else {
+        let (x, y) = a
+            .iter()
+            .zip(b)
+            .find(|(x, y)| x != y)
+            .expect("schemas differ");
+        if x.1 != y.1 {
+            format!(
+                "{} {} where {a_name} has it {}",
+                x.0,
+                if y.1 { "nullable" } else { "required" },
+                if x.1 { "nullable" } else { "required" }
+            )
+        } else {
+            format!("{} stored as another type", x.0)
+        }
+    };
+    Error::new(format!(
+        "{b_name} has {what}; the files of one side are read as one table and must have the \
+         columns of the first ({a_name}), in its order and of its types"
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Pages
 // ---------------------------------------------------------------------------
 

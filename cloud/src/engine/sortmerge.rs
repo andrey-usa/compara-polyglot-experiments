@@ -248,6 +248,8 @@ fn stream_into(
                     write_row(&mut w, &batch, row as usize)?;
                 }
                 w.flush()?;
+                let file = w.into_inner().map_err(|e| Error::new(e.to_string()))?;
+                crate::memory::write_out(&file);
                 spilled.push(path);
             }
             Ok(spilled)

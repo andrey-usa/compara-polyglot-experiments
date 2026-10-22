@@ -177,6 +177,7 @@ engine, which reads more of the format, failed too: {turbo_err}"
                  engine, which spills to disk ({})",
                 std::env::temp_dir().display()
             );
+            crate::memory::release_free();
             sortmerge::compare(a, b, opt)
                 .map(|r| (r, Engine::SortMerge.label().to_string()))
                 .map_err(|e| e.context("the sortmerge engine failed: "))

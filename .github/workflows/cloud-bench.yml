@@ -81,6 +81,20 @@ jobs:
             aws --endpoint-url http://localhost:8333 s3 cp "$f" "s3://bkt/$f" --only-show-errors
           done
           rm -f t_a.csv t_b.csv
+          # The same tables as a directory of parts each, written by DuckDB in
+          # row order, about 64 MB a part: what a data lake holds.
+          pip install --upgrade duckdb >/dev/null
+          python3 - <<'PY'
+          import duckdb
+          con = duckdb.connect()
+          con.execute("SET threads = 1")
+          for side in "ab":
+              con.execute(f"COPY (SELECT * FROM 't_{side}.parquet') TO 'parts_{side}' (FORMAT parquet, FILE_SIZE_BYTES '64MB')")
+          PY
+          ls -la parts_a parts_b
+          for side in a b; do
+            aws --endpoint-url http://localhost:8333 s3 cp --recursive parts_$side "s3://bkt/parts_$side/" --only-show-errors
+          done
           $GITHUB_WORKSPACE/cloud/target/release/compara columns t_a.parquet 2>/dev/null | paste -sd, > columns.txt
           cat columns.txt
       - name: DuckDB
@@ -90,12 +104,17 @@ jobs:
           set -o pipefail
           cols=$(cat /mnt/fx/columns.txt)
           bin=$GITHUB_WORKSPACE/cloud/target/release/compara
-          b() { python3 cloud/bench_remote.py --compara "$bin" --endpoint http://localhost:8333 --bucket bkt \
-                  --columns "$cols" --label "$ROWS rows, S3 (SeaweedFS)" "$@" | tee -a /tmp/bench.log; }
+          b() {
+            python3 cloud/bench_remote.py --compara "$bin" --endpoint http://localhost:8333 --bucket bkt \
+              --columns "$cols" --label "$ROWS rows, S3 (SeaweedFS)" "$@" 2> /tmp/bench.err | tee -a /tmp/bench.log \
+              || { echo "::error title=cloud bench $*::$(tail -c 1500 /tmp/bench.err | tr '\n' ' ')"; return 1; }
+          }
           : > /tmp/bench.log
-          b --a t_a.parquet --b t_b.parquet
-          b --a t_a.parquet --b t_b.parquet --compare amount
-          b --a t_a.csv --b t_b.csv
+          status=0
+          b --a t_a.parquet --b t_b.parquet || status=1
+          b --a t_a.parquet --b t_b.parquet --compare amount || status=1
+          b --a t_a.csv --b t_b.csv || status=1
+          b --a parts_a/ --b parts_b/ --format parquet --label "$ROWS rows in parts, S3 (SeaweedFS)" || status=1
           python3 - <<'EOF'
           import re
           text = open("/tmp/bench.log").read()
@@ -104,3 +123,4 @@ jobs:
               title = "cloud bench " + str(i + 1)
               print(f"::notice title={title}::" + block.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
           EOF
+          exit $status

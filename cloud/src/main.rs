@@ -34,6 +34,9 @@ commands:
 
 A, B and FILE are paths, `-` for standard input, or with cloud support s3://,
 gs://, az:// and https:// URLs. Gzip and zstd files are read as what they hold.
+A directory, a quoted glob ('out/date=*/*.parquet', `**` for any depth) or an
+object storage prefix (s3://bucket/orders/) is its files read as one table, in
+path order; names starting with `.` or `_` in a directory are passed over.
 
 columns and head read CSV, newline-delimited JSON and Parquet, and neither reads
 more of the file than it has to: `columns` on Parquet reads the footer, and
@@ -277,6 +280,14 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         return Err(Error::new(
             "compare needs two files: compara compare A.csv B.csv --key ...",
         ));
+    }
+    if args.positional.len() > 2 {
+        return Err(Error::new(format!(
+            "compare takes two inputs, A and B, and was given {}; a glob the shell expanded \
+             gives one per file -- quote it ('data/*.parquet') and compara reads its files as \
+             one table, or name the directory",
+            args.positional.len()
+        )));
     }
     let (a_spec, b_spec) = (args.positional[0].as_str(), args.positional[1].as_str());
     if a_spec == "-" && b_spec == "-" {

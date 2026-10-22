@@ -28,6 +28,7 @@ use std::time::Instant;
 use crate::error::{Error, Result};
 use crate::options::Options;
 
+mod many;
 #[cfg(feature = "cloud")]
 mod remote;
 
@@ -125,6 +126,8 @@ impl Source {
             Source::stdin()?
         } else if is_remote(spec) {
             Source::remote(spec, want)?
+        } else if let Some(files) = many::local_files(spec)? {
+            Source::local_many(spec, files)?
         } else {
             let path = PathBuf::from(spec);
             let meta = std::fs::metadata(&path)
@@ -179,6 +182,30 @@ impl Source {
             .to_string()
     }
 
+    /// The files of a local directory or glob, in path order, as one.
+    fn local_many(spec: &str, files: Vec<PathBuf>) -> Result<Source> {
+        let started = Instant::now();
+        let mut combined = many::Combined::new()?;
+        let mut source = Source {
+            spec: spec.to_string(),
+            path: combined.path.clone(),
+            stored: 0,
+            temps: vec![combined.path.clone()],
+            steps: Vec::new(),
+        };
+        for file in &files {
+            source.stored += std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+            combined.append_file(&file.display().to_string(), file)?;
+        }
+        combined.finish()?;
+        source.steps.push(format!(
+            "{} in {:.1}s",
+            combined.note(),
+            started.elapsed().as_secs_f64()
+        ));
+        Ok(source)
+    }
+
     fn stdin() -> Result<Source> {
         let started = Instant::now();
         let (path, file) = temp_file("stdin")?;
@@ -189,7 +216,7 @@ impl Source {
             temps: vec![path],
             steps: Vec::new(),
         };
-        let mut out = BufWriter::with_capacity(1 << 20, file);
+        let mut out = BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::new(file));
         let n = std::io::copy(&mut std::io::stdin().lock(), &mut out)
             .and_then(|n| out.flush().map(|_| n))
             .map_err(|e| Error::new(format!("cannot read standard input: {e}")))?;
@@ -257,7 +284,7 @@ impl Source {
             File::open(&self.path)
                 .map_err(|e| Error::new(format!("cannot read {}: {e}", self.spec)))?,
         );
-        let mut out = BufWriter::with_capacity(1 << 20, file);
+        let mut out = BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::new(file));
         let written = match kind {
             "gzip" => std::io::copy(&mut flate2::read::MultiGzDecoder::new(input), &mut out),
             _ => zstd::stream::read::Decoder::with_buffer(input)
