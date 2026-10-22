@@ -130,6 +130,12 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
         ("Rust", [str(RUST)], report + thread_flag, ALL),
         ("Zig", [str(ZIG)], thread_flag, ALL),
     ]
+    # `BENCH_RUST_VARIANT_ENV="NAME=value"`: the Rust port again, beside
+    # itself, with that variable set -- an A/B of an opt-in switch on the
+    # same runner and the same data.
+    variant = os.environ.get("BENCH_RUST_VARIANT_ENV", "").strip()
+    if variant:
+        rows.append(("Rust*", ["/usr/bin/env", variant, str(RUST)], report + thread_flag, ALL))
     if not matrix:
         return rows
     for label, path, flags, formats in [

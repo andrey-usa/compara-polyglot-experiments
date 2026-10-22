@@ -45,6 +45,7 @@ jobs:
       rows: ${{ steps.p.outputs.rows }}
       threads: ${{ steps.p.outputs.threads }}
       repeats: ${{ steps.p.outputs.repeats }}
+      variant: ${{ steps.p.outputs.variant }}
     steps:
       - uses: actions/checkout@v7
       - id: p
@@ -61,6 +62,7 @@ jobs:
           print("formats=" + json.dumps([f.strip() for f in get("formats").split(",") if f.strip()]))
           for k in ("rows", "threads", "repeats"):
               print(f"{k}={get(k)}")
+          print("variant=" + str(cfg.get("rust_variant_env", "")))
           EOF
 
   bench:
@@ -104,6 +106,7 @@ jobs:
           ROWS: ${{ needs.plan.outputs.rows }}
           THREADS: ${{ needs.plan.outputs.threads }}
           REPEATS: ${{ needs.plan.outputs.repeats }}
+          BENCH_RUST_VARIANT_ENV: ${{ needs.plan.outputs.variant }}
         run: |
           host="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs), $(nproc) cores"
           echo "host: $host"

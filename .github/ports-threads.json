@@ -1,6 +1,7 @@
 {
   "rows": "10m",
-  "formats": "ndjson",
-  "threads": "1,4",
-  "repeats": 5
+  "formats": "csv,tsv",
+  "threads": "2,4",
+  "repeats": 5,
+  "rust_variant_env": "COMPARA_PARALLEL_INSERT=1"
 }
