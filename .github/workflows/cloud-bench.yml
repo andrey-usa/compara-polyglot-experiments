@@ -1,0 +1,90 @@
+name: Cloud benchmark
+
+# compara against DuckDB (latest, httpfs) on one keyed comparison of a pair
+# read from S3 -- MinIO on the same runner, so this measures the tools and
+# not the internet. Parquet with every column, Parquet with one compared
+# column (where reading only what is compared pays), and CSV. Counts must
+# agree or the run fails. Tables are annotations: `cloud bench ...`.
+
+on:
+  push:
+    branches: [experiment-15]
+    paths:
+      - "cloud/bench_remote.py"
+      - ".github/workflows/cloud-bench.yml"
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Rows a side (10m, 5m, ...)"
+        default: "10m"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      ROWS: ${{ inputs.rows || '10m' }}
+      AWS_ACCESS_KEY_ID: minio
+      AWS_SECRET_ACCESS_KEY: minio12345
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Build compara
+        working-directory: cloud
+        run: cargo build --release --locked --bin compara --bin compara-gen-data
+      - name: MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio12345 \
+            -v /mnt/minio:/data quay.io/minio/minio:latest server /data
+          docker ps -a --format '{{.Names}} {{.Status}}'
+          for i in $(seq 60); do curl -sf http://localhost:9000/minio/health/live && break; sleep 1; done
+          aws --endpoint-url http://localhost:9000 s3 mb s3://bkt
+          aws configure set default.s3.max_concurrent_requests 32
+      - name: Data
+        run: |
+          set -eux
+          sudo mkdir -p /mnt/fx && sudo chown "$USER" /mnt/fx && cd /mnt/fx
+          gen=$GITHUB_WORKSPACE/cloud/target/release/compara-gen-data
+          $gen --rows "$ROWS" --out-dir . --prefix t --format parquet
+          $gen --rows "$ROWS" --out-dir . --prefix t
+          ls -la
+          for f in t_a.parquet t_b.parquet t_a.csv t_b.csv; do
+            aws --endpoint-url http://localhost:9000 s3 cp "$f" "s3://bkt/$f" --only-show-errors
+          done
+          rm -f t_a.csv t_b.csv
+          $GITHUB_WORKSPACE/cloud/target/release/compara columns t_a.parquet 2>/dev/null | paste -sd, > columns.txt
+          cat columns.txt
+      - name: DuckDB
+        run: pip install --upgrade duckdb
+      - name: Benchmark
+        run: |
+          set -o pipefail
+          cols=$(cat /mnt/fx/columns.txt)
+          bin=$GITHUB_WORKSPACE/cloud/target/release/compara
+          b() { python3 cloud/bench_remote.py --compara "$bin" --endpoint http://localhost:9000 --bucket bkt \
+                  --columns "$cols" --label "$ROWS rows, S3 (MinIO)" "$@" | tee -a /tmp/bench.log; }
+          : > /tmp/bench.log
+          b --a t_a.parquet --b t_b.parquet
+          b --a t_a.parquet --b t_b.parquet --compare amount
+          b --a t_a.csv --b t_b.csv
+          python3 - <<'EOF'
+          import re
+          text = open("/tmp/bench.log").read()
+          for i, block in enumerate(re.findall(r"(####.*?)(?=\n####|\Z)", text, re.S)):
+              block = block.strip()[:3800]
+              title = "cloud bench " + str(i + 1)
+              print(f"::notice title={title}::" + block.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          EOF
