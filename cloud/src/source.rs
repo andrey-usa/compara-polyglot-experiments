@@ -28,6 +28,7 @@ use std::time::Instant;
 use crate::error::{Error, Result};
 use crate::options::Options;
 
+mod delta;
 mod many;
 #[cfg(feature = "cloud")]
 mod remote;
@@ -126,8 +127,8 @@ impl Source {
             Source::stdin()?
         } else if is_remote(spec) {
             Source::remote(spec, want)?
-        } else if let Some(files) = many::local_files(spec)? {
-            Source::local_many(spec, files)?
+        } else if let Some((files, note)) = many::local_files(spec)? {
+            Source::local_many(spec, files, &note)?
         } else {
             let path = PathBuf::from(spec);
             let meta = std::fs::metadata(&path)
@@ -183,7 +184,7 @@ impl Source {
     }
 
     /// The files of a local directory or glob, in path order, as one.
-    fn local_many(spec: &str, files: Vec<(String, PathBuf)>) -> Result<Source> {
+    fn local_many(spec: &str, files: Vec<(String, PathBuf)>, note: &str) -> Result<Source> {
         let started = Instant::now();
         let mut combined = many::Combined::new()?;
         let relative: Vec<String> = files.iter().map(|f| f.0.clone()).collect();
@@ -210,7 +211,7 @@ impl Source {
         }
         combined.finish()?;
         source.steps.push(format!(
-            "{} in {:.1}s",
+            "{}{note} in {:.1}s",
             combined.note(),
             started.elapsed().as_secs_f64()
         ));
@@ -358,6 +359,19 @@ pub(crate) fn temp_file(tag: &str) -> Result<(PathBuf, File)> {
         }
     }
     Err(Error::new("cannot find a free temporary file name"))
+}
+
+/// Where each cloud's credentials would come from here (scheme, source), by
+/// what is set and on disk; empty without the `cloud` feature.
+pub fn credential_sources() -> Vec<(&'static str, String)> {
+    #[cfg(feature = "cloud")]
+    {
+        remote::credential_sources()
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        Vec::new()
+    }
 }
 
 /// Writes the local file `from` to `dest`, an object storage or HTTP URL;

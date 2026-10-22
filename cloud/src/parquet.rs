@@ -2617,6 +2617,373 @@ fn word(ty: i64, v: &[u8]) -> [u8; 8] {
     w.to_le_bytes()
 }
 
+// ---------------------------------------------------------------------------
+// Nested string leaves, for a Delta Lake checkpoint
+// ---------------------------------------------------------------------------
+
+/// A leaf of a nested schema: its path of names from the root, its physical
+/// type, and the definition and repetition levels it can reach.
+struct NestedLeaf {
+    path: Vec<String>,
+    max_def: u32,
+    max_rep: u32,
+}
+
+/// Walks a schema list in its depth-first order, giving each leaf its path
+/// and levels. `at` is the next element; `parents` the path so far.
+fn nested_leaves(
+    elements: &[(String, i64, i64)],
+    at: &mut usize,
+    parents: &mut Vec<String>,
+    def: u32,
+    rep: u32,
+    out: &mut Vec<NestedLeaf>,
+) {
+    let Some((name, repetition, children)) = elements.get(*at).cloned() else {
+        return;
+    };
+    *at += 1;
+    let def = def + u32::from(repetition == 1 || repetition == 2);
+    let rep = rep + u32::from(repetition == 2);
+    parents.push(name);
+    if children > 0 {
+        for _ in 0..children {
+            nested_leaves(elements, at, parents, def, rep, out);
+        }
+    } else {
+        out.push(NestedLeaf {
+            path: parents.clone(),
+            max_def: def,
+            max_rep: rep,
+        });
+    }
+    parents.pop();
+}
+
+/// A column chunk as the nested reader needs it: codec, values, dictionary
+/// offset, data offset, stored size.
+type NestedChunk = (i64, i64, i64, i64, i64);
+
+/// The bits a level up to `max` takes.
+fn level_width(max: u32) -> u32 {
+    32 - max.leading_zeros()
+}
+
+/// The values of the string leaves at `paths` -- each a path of names from
+/// the root, `["add", "path"]` -- in a Parquet file with nested columns, as a
+/// Delta Lake checkpoint is: one per row, `None` where the leaf or a struct
+/// above it is null. A leaf under a repeated field (a list, a map) is
+/// refused; a path that names no leaf is all `None`.
+pub(crate) fn nested_strings(
+    data: &[u8],
+    paths: &[&[&str]],
+    name: &str,
+) -> Result<Vec<Vec<Option<String>>>> {
+    if data.len() < 12 || &data[..4] != b"PAR1" || &data[data.len() - 4..] != b"PAR1" {
+        return fail("not a parquet file", name);
+    }
+    let meta_len =
+        u32::from_le_bytes(data[data.len() - 8..data.len() - 4].try_into().unwrap()) as usize;
+    if meta_len + 12 > data.len() {
+        return fail("the parquet footer is longer than the file", name);
+    }
+    let meta = &data[data.len() - 8 - meta_len..data.len() - 8];
+    let mut t = Thrift::new(meta, name);
+    // (name, repetition, children) per schema element; per row group, per
+    // leaf: codec, values, dictionary offset, data offset, stored size.
+    let mut elements: Vec<(String, i64, i64)> = Vec::new();
+    let mut groups: Vec<Vec<NestedChunk>> = Vec::new();
+    let (mut id, mut last) = (0i16, 0i16);
+    loop {
+        let ty = t.field(&mut id, &mut last)?;
+        if ty == T_STOP {
+            break;
+        }
+        match id {
+            2 => {
+                let (_, n) = t.list()?;
+                for _ in 0..n {
+                    let (mut sid, mut slast) = (0i16, 0i16);
+                    let (mut nm, mut repetition, mut children) = (String::new(), 0i64, 0i64);
+                    loop {
+                        let st = t.field(&mut sid, &mut slast)?;
+                        if st == T_STOP {
+                            break;
+                        }
+                        match sid {
+                            3 => repetition = t.zigzag()?,
+                            4 => nm = String::from_utf8_lossy(t.binary()?).into_owned(),
+                            5 => children = t.zigzag()?,
+                            _ => t.skip(st)?,
+                        }
+                    }
+                    elements.push((nm, repetition, children));
+                }
+            }
+            4 => {
+                let (_, n) = t.list()?;
+                for _ in 0..n {
+                    let mut chunks = Vec::new();
+                    let (mut gid, mut glast) = (0i16, 0i16);
+                    loop {
+                        let gt = t.field(&mut gid, &mut glast)?;
+                        if gt == T_STOP {
+                            break;
+                        }
+                        if gid != 1 {
+                            t.skip(gt)?;
+                            continue;
+                        }
+                        let (_, m) = t.list()?;
+                        for _ in 0..m {
+                            let mut c = ChunkMeta::default();
+                            read_chunk(&mut t, &mut c)?;
+                            chunks.push((
+                                c.codec,
+                                c.num_values,
+                                c.dictionary_page_offset,
+                                c.data_page_offset,
+                                c.total_compressed_size,
+                            ));
+                        }
+                    }
+                    groups.push(chunks);
+                }
+            }
+            _ => t.skip(ty)?,
+        }
+    }
+    let mut leaves = Vec::new();
+    let (mut at, mut parents) = (1usize, Vec::new());
+    let root_children = elements.first().map_or(0, |e| e.2);
+    for _ in 0..root_children {
+        nested_leaves(&elements, &mut at, &mut parents, 0, 0, &mut leaves);
+    }
+    let rows: usize = groups
+        .iter()
+        .map(|g| g.first().map_or(0, |c| c.1.max(0) as usize))
+        .sum();
+    let mut out = Vec::with_capacity(paths.len());
+    for want in paths {
+        let Some((index, leaf)) = leaves
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.path.iter().map(String::as_str).eq(want.iter().copied()))
+        else {
+            out.push(vec![None; rows]);
+            continue;
+        };
+        if leaf.max_rep > 0 {
+            return unsupported("a repeated nested column is not read here", name);
+        }
+        let mut values = Vec::with_capacity(rows);
+        for g in &groups {
+            let Some(&(codec, count, dict_at, data_at, size)) = g.get(index) else {
+                return fail("a row group is missing a column", name);
+            };
+            nested_chunk(
+                data,
+                codec_of(codec, name)?,
+                count.max(0) as usize,
+                if dict_at > 0 {
+                    dict_at.min(data_at)
+                } else {
+                    data_at
+                } as usize,
+                size.max(0) as usize,
+                leaf.max_def,
+                name,
+                &mut values,
+            )?;
+        }
+        out.push(values);
+    }
+    Ok(out)
+}
+
+/// One column chunk of a nested string leaf, its values appended to `out`.
+#[allow(clippy::too_many_arguments)]
+fn nested_chunk(
+    data: &[u8],
+    codec: Codec,
+    count: usize,
+    start: usize,
+    size: usize,
+    max_def: u32,
+    name: &str,
+    out: &mut Vec<Option<String>>,
+) -> Result<()> {
+    let end = start.saturating_add(size).min(data.len());
+    let mut at = start;
+    let mut dictionary: Vec<String> = Vec::new();
+    let mut done = 0usize;
+    let width = level_width(max_def);
+    while done < count && at < end {
+        // PageHeader: type 1, uncompressed 2, compressed 3, data page 5,
+        // dictionary page 7, data page v2 8.
+        let mut t = Thrift::new(&data[..end], name);
+        t.at = at;
+        let (mut kind, mut raw, mut stored) = (0i64, 0i64, 0i64);
+        let (mut n, mut encoding, mut def_len, mut rep_len, mut compressed) =
+            (0i64, 0i64, 0i64, 0i64, true);
+        let (mut id, mut last) = (0i16, 0i16);
+        loop {
+            let ty = t.field(&mut id, &mut last)?;
+            if ty == T_STOP {
+                break;
+            }
+            match id {
+                1 => kind = t.zigzag()?,
+                2 => raw = t.zigzag()?,
+                3 => stored = t.zigzag()?,
+                5 | 7 | 8 => {
+                    let (mut hid, mut hlast) = (0i16, 0i16);
+                    loop {
+                        let ht = t.field(&mut hid, &mut hlast)?;
+                        if ht == T_STOP {
+                            break;
+                        }
+                        match (id, hid) {
+                            (_, 1) => n = t.zigzag()?,
+                            (5 | 7, 2) | (8, 4) => encoding = t.zigzag()?,
+                            (8, 5) => def_len = t.zigzag()?,
+                            (8, 6) => rep_len = t.zigzag()?,
+                            (8, 7) => compressed = ht == T_TRUE,
+                            _ => t.skip(ht)?,
+                        }
+                    }
+                }
+                _ => t.skip(ty)?,
+            }
+        }
+        let body_at = t.at;
+        let body_end = body_at.saturating_add(stored.max(0) as usize);
+        if body_end > end {
+            return fail("a parquet page runs past its column chunk", name);
+        }
+        let body = &data[body_at..body_end];
+        at = body_end;
+        match kind {
+            2 => {
+                let mut page = Vec::new();
+                expand_append(codec, body, raw, &mut page, name)?;
+                let mut p = 0usize;
+                for _ in 0..n.max(0) {
+                    let Some(len) = page.get(p..p + 4) else {
+                        return fail("a dictionary page ends early", name);
+                    };
+                    let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+                    let Some(v) = page.get(p + 4..p + 4 + len) else {
+                        return fail("a dictionary page ends early", name);
+                    };
+                    dictionary.push(String::from_utf8_lossy(v).into_owned());
+                    p += 4 + len;
+                }
+            }
+            0 | 3 => {
+                let values = n.max(0) as usize;
+                // The levels, then the values: v1 has all of it compressed and
+                // the levels length-prefixed; v2 has the levels first,
+                // uncompressed, with their lengths in the header.
+                let (levels, rest): (Vec<i32>, Vec<u8>) = if kind == 0 {
+                    let mut page = Vec::new();
+                    expand_append(codec, body, raw, &mut page, name)?;
+                    let mut levels = vec![max_def as i32; values];
+                    let mut p = 0usize;
+                    if max_def > 0 {
+                        let Some(len) = page.get(0..4) else {
+                            return fail("a data page ends early", name);
+                        };
+                        let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+                        let Some(run) = page.get(4..4 + len) else {
+                            return fail("a data page ends early", name);
+                        };
+                        if !RleReader::new(run, width).fill(&mut levels) {
+                            return fail("the definition levels of a page will not decode", name);
+                        }
+                        p = 4 + len;
+                    }
+                    (levels, page[p..].to_vec())
+                } else {
+                    let (rep_len, def_len) = (rep_len.max(0) as usize, def_len.max(0) as usize);
+                    let Some(defs) = body.get(rep_len..rep_len + def_len) else {
+                        return fail("a data page ends early", name);
+                    };
+                    let mut levels = vec![max_def as i32; values];
+                    if max_def > 0 && !RleReader::new(defs, width).fill(&mut levels) {
+                        return fail("the definition levels of a page will not decode", name);
+                    }
+                    let tail = &body[rep_len + def_len..];
+                    let rest = if compressed {
+                        let mut page = Vec::new();
+                        expand_append(
+                            codec,
+                            tail,
+                            raw - (rep_len + def_len) as i64,
+                            &mut page,
+                            name,
+                        )?;
+                        page
+                    } else {
+                        tail.to_vec()
+                    };
+                    (levels, rest)
+                };
+                let present = levels.iter().filter(|&&l| l == max_def as i32).count();
+                let mut strings: Vec<Option<String>> = Vec::with_capacity(present);
+                match encoding {
+                    ENC_PLAIN => {
+                        let mut p = 0usize;
+                        for _ in 0..present {
+                            let Some(len) = rest.get(p..p + 4) else {
+                                return fail("a data page ends early", name);
+                            };
+                            let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+                            let Some(v) = rest.get(p + 4..p + 4 + len) else {
+                                return fail("a data page ends early", name);
+                            };
+                            strings.push(Some(String::from_utf8_lossy(v).into_owned()));
+                            p += 4 + len;
+                        }
+                    }
+                    ENC_PLAIN_DICTIONARY | ENC_RLE_DICTIONARY => {
+                        if present > 0 {
+                            let Some(&w) = rest.first() else {
+                                return fail("a data page ends early", name);
+                            };
+                            let mut index = vec![0i32; present];
+                            if !RleReader::new(&rest[1..], u32::from(w)).fill(&mut index) {
+                                return fail(
+                                    "the dictionary indices of a page will not decode",
+                                    name,
+                                );
+                            }
+                            for i in index {
+                                let Some(v) = dictionary.get(i.max(0) as usize) else {
+                                    return fail("a dictionary index past the dictionary", name);
+                                };
+                                strings.push(Some(v.clone()));
+                            }
+                        }
+                    }
+                    _ => return unsupported("this parquet string encoding is not read here", name),
+                }
+                let mut next = strings.into_iter();
+                for l in levels {
+                    out.push(if l == max_def as i32 {
+                        next.next().flatten()
+                    } else {
+                        None
+                    });
+                }
+                done += values;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// True when the file begins with Parquet's `PAR1` magic. Cheap: four bytes.
 pub fn is_parquet(path: &std::path::Path) -> bool {
     use std::io::Read;

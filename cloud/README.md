@@ -134,14 +134,35 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
   `date=2026-10-01/region=eu/` carry `date` and `region` (as text), so
   `-k date,order_id` keys a table whose ids repeat from day to day, and a
   partitioned table compares with a flat export that has those columns.
-  Names starting with `.` or `_` (`_SUCCESS`, `.crc`) are passed over; a
-  Delta or Iceberg table is refused rather than read as every file of every
-  version.
+  Names starting with `.` or `_` (`_SUCCESS`, `.crc`) are passed over.
+- **A Delta table is read at a version**: `s3://lake/orders/` is its latest
+  version, `s3://lake/orders@v41` the forty-first -- the files its log
+  (`_delta_log/`, checkpoint and commits) says make that version, and no
+  others -- so two versions compare like two tables:
+  `compara compare s3://lake/orders@v41 s3://lake/orders -k order_id`.
+  Deletion vectors and column mapping are refused rather than read wrong; an
+  Iceberg table is refused.
 - **Every range is read from one version of the object** (`If-Match` on its
   ETag): an object overwritten mid-read is an error, not a file stitched
   from two versions. Throttled and dropped ranges are retried.
 - **Outputs go up** in one request, or as a multipart upload for a large
   export. `--json -` prints the summary on stdout and the counts on stderr.
+
+Against DuckDB 2.0.0 reading the same objects over S3 (`httpfs`), on one
+keyed comparison of 10M rows a side, both tools giving the same four counts
+-- an S3 server (SeaweedFS) on the same 4-core runner, best of three (CI run
+39793328982):
+
+| input on S3 | compara | DuckDB | peak RSS, compara / DuckDB |
+|---|---:|---:|---:|
+| Parquet, every column | 9.5 s | 25.3 s | 2.7 / 9.7 GB |
+| Parquet, one compared column | 6.7 s | 10.3 s | 2.0 / 3.9 GB |
+| Parquet, 9 parts under a prefix | 3.5 s | 20.8 s | 3.8 / 9.1 GB |
+| CSV, 1.7 GB a side | 21.5 s | 60.2 s | 4.1 / 13.8 GB |
+
+The single objects come off this server at about 90 MB/s each however many
+ranges are in flight, which is most of compara's time on them; the parts,
+fetched together, come at 340 MB/s.
 
 In a container:
 

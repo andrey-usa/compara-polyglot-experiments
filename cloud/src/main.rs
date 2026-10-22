@@ -37,7 +37,8 @@ gs://, az:// and https:// URLs. Gzip and zstd files are read as what they hold.
 A directory, a quoted glob ('out/date=*/*.parquet', `**` for any depth) or an
 object storage prefix (s3://bucket/orders/) is its files read as one table, in
 path order; names starting with `.` or `_` in a directory are passed over, and
-Hive partition directories (date=2026-10-01/) are columns.
+Hive partition directories (date=2026-10-01/) are columns. A Delta table is read
+at its latest version, or at TABLE@vN (s3://lake/orders@v41).
 
 columns and head read CSV, newline-delimited JSON and Parquet, and neither reads
 more of the file than it has to: `columns` on Parquet reads the footer, and
@@ -138,7 +139,26 @@ fn quiet_panics() {
     }));
 }
 
+/// A closed pipe ends the process quietly, as it ends `cat`: `compara head
+/// big.csv | head -1` is not an error. Rust ignores SIGPIPE, so a write to a
+/// closed pipe would fail -- and `println!` would panic -- instead.
+fn default_sigpipe() {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
+        }
+        const SIGPIPE: std::ffi::c_int = 13;
+        const SIG_DFL: usize = 0;
+        // SAFETY: restores the default disposition of one signal.
+        unsafe {
+            signal(SIGPIPE, SIG_DFL);
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    default_sigpipe();
     quiet_panics();
     compara::alloc::hold_reserve();
     // Inside a container, out of memory is a refusal, not an OOM kill.
@@ -523,6 +543,9 @@ fn print_env() {
             "no (built without the `cloud` feature)"
         }
     );
+    for (scheme, source) in compara::source::credential_sources() {
+        println!("  {scheme}:// credentials: {source}");
+    }
     println!(
         "cpus: {}",
         std::thread::available_parallelism().map_or(1, |n| n.get())

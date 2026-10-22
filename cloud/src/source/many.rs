@@ -121,29 +121,46 @@ pub(crate) fn hidden(relative: &str) -> bool {
 
 /// A table format whose directory is not the table: what to say instead of
 /// reading every file in it. `names` are the paths under the root.
-pub(crate) fn table_format<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
+/// A table format whose directory is not the table, found under the root:
+/// the format and where the table is (relative to the root, empty for the
+/// root itself). `names` are the paths under the root.
+pub(crate) fn table_format<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Option<(&'static str, String)> {
     for n in names {
-        if n.starts_with("_delta_log/") || n.contains("/_delta_log/") {
-            return Some("Delta");
-        }
-        if (n.starts_with("metadata/") || n.contains("/metadata/")) && n.ends_with(".metadata.json")
+        if let Some(at) = n
+            .find("_delta_log/")
+            .filter(|&at| at == 0 || n[..at].ends_with('/'))
         {
-            return Some("Iceberg");
+            return Some(("Delta", n[..at].trim_end_matches('/').to_string()));
+        }
+        if n.ends_with(".metadata.json")
+            && let Some(at) = n
+                .find("metadata/")
+                .filter(|&at| at == 0 || n[..at].ends_with('/'))
+        {
+            return Some(("Iceberg", n[..at].trim_end_matches('/').to_string()));
         }
     }
     None
 }
 
-pub(crate) fn refuse_table(spec: &str, format: &str) -> Error {
-    let a = if format.starts_with(['A', 'E', 'I', 'O', 'U']) {
-        "an"
-    } else {
-        "a"
-    };
+/// The error for a table format found under a directory or prefix: a Delta
+/// table further down is read by naming it; an Iceberg table is not read.
+pub(crate) fn refuse_table(spec: &str, found: &(&str, String)) -> Error {
+    let (format, at) = (found.0, &found.1);
+    let sep = if spec.ends_with('/') { "" } else { "/" };
+    if format == "Delta" {
+        return Error::new(format!(
+            "{spec} holds a Delta table at {at}/, whose directory has the files of earlier \
+             versions as well as the current one; name the table to read a version of it \
+             ({spec}{sep}{at}, or {spec}{sep}{at}@v3)"
+        ));
+    }
     Error::new(format!(
-        "{spec} is {a} {format} table: its directory holds the files of earlier versions as \
-         well as the current one, so reading every file would not read the table. Compare \
-         the files of one version (a glob of them, or a copy), or export the table"
+        "{spec} is an Iceberg table (or holds one), which is not read here: its directory \
+         holds the files of earlier snapshots as well as the current one. Compare the files \
+         of one snapshot (a glob of them, or a copy), or export the table"
     ))
 }
 
@@ -210,7 +227,22 @@ pub(crate) fn table_partitions(relative: &[String]) -> Option<(Vec<String>, Vec<
 
 /// The files a local directory or glob names, in path order; `None` for a
 /// spec that is neither, read as one file.
-pub(super) fn local_files(spec: &str) -> Result<Option<Vec<(String, PathBuf)>>> {
+/// Local parts with what to say about them: the Delta version they are, or
+/// nothing.
+pub(super) type LocalParts = (Vec<(String, PathBuf)>, String);
+
+pub(super) fn local_files(spec: &str) -> Result<Option<LocalParts>> {
+    let (table, version) = super::delta::split_version(spec);
+    let log = Path::new(table).join("_delta_log");
+    if log.is_dir() {
+        return delta_files(spec, Path::new(table), &log, version).map(Some);
+    }
+    if version.is_some() {
+        return Err(Error::new(format!(
+            "{spec}: @v{} names a version of a Delta table, and {table} is not one",
+            version.unwrap_or_default()
+        )));
+    }
     let path = Path::new(spec);
     let (root, pattern) = if path.is_dir() {
         (path.to_path_buf(), None)
@@ -227,9 +259,9 @@ pub(super) fn local_files(spec: &str) -> Result<Option<Vec<(String, PathBuf)>>> 
     let mut found: Vec<(String, PathBuf)> = Vec::new();
     walk(&root, "", &mut found)?;
     if pattern.is_none()
-        && let Some(format) = table_format(found.iter().map(|f| f.0.as_str()))
+        && let Some(found) = table_format(found.iter().map(|f| f.0.as_str()))
     {
-        return Err(refuse_table(spec, format));
+        return Err(refuse_table(spec, &found));
     }
     let base = if pattern.is_some() {
         literal_prefix(spec)
@@ -255,7 +287,35 @@ pub(super) fn local_files(spec: &str) -> Result<Option<Vec<(String, PathBuf)>>> 
         }));
     }
     files.sort();
-    Ok(Some(files))
+    Ok(Some((files, String::new())))
+}
+
+/// The files of one version of a local Delta table, in path order.
+fn delta_files(spec: &str, table: &Path, log: &Path, version: Option<u64>) -> Result<LocalParts> {
+    let names: Vec<String> = std::fs::read_dir(log)
+        .map_err(|e| Error::new(format!("cannot list {}: {e}", log.display())))?
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    let plan = super::delta::plan(&names, version, spec)?;
+    let mut read = |name: &str| -> Result<Vec<u8>> {
+        std::fs::read(log.join(name))
+            .map_err(|e| Error::new(format!("{spec}: cannot read the log ({name}): {e}")))
+    };
+    let files = super::delta::replay(&plan, &mut read, spec)?;
+    let files: Result<Vec<(String, PathBuf)>> = files
+        .into_iter()
+        .map(|relative| {
+            let full = table.join(&relative);
+            if !full.is_file() {
+                return Err(Error::new(format!(
+                    "{spec}: version {} names {relative}, which is no longer there (vacuumed?)",
+                    plan.version
+                )));
+            }
+            Ok((relative, full))
+        })
+        .collect();
+    Ok((files?, format!(", Delta version {}", plan.version)))
 }
 
 /// Every file under `dir`, with its path relative to the walk's root.
@@ -847,11 +907,11 @@ mod tests {
         assert!(hidden("_temporary/0/part-1"));
         assert!(!hidden("date=1/part-0.parquet"));
         assert_eq!(
-            table_format(["part-0.parquet", "_delta_log/00000.json"]),
+            table_format(["part-0.parquet", "_delta_log/00000.json"]).map(|f| f.0),
             Some("Delta")
         );
         assert_eq!(
-            table_format(["data/a.parquet", "metadata/v1.metadata.json"]),
+            table_format(["data/a.parquet", "metadata/v1.metadata.json"]).map(|f| f.0),
             Some("Iceberg")
         );
         assert_eq!(table_format(["a/part-0.parquet"]), None);

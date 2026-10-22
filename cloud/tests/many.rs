@@ -221,8 +221,9 @@ fn parts_that_are_not_one_table_are_refused_by_name() {
     w("header/2.csv", "id,w\n2,b\n");
     w("mixed/1.csv", "id,v\n1,a\n");
     w("mixed/2.ndjson", "{\"id\":2,\"v\":\"b\"}\n");
-    w("delta/part-0.parquet", "x");
-    w("delta/_delta_log/00000000000000000000.json", "{}");
+    // A Delta table inside the directory named, not the directory itself.
+    w("lake/orders/part-0.parquet", "x");
+    w("lake/orders/_delta_log/00000000000000000000.json", "{}");
     w("iceberg/data/0.parquet", "x");
     w("iceberg/metadata/v1.metadata.json", "{}");
     std::fs::create_dir_all(d.0.join("empty")).unwrap();
@@ -231,7 +232,7 @@ fn parts_that_are_not_one_table_are_refused_by_name() {
     for (side, says) in [
         ("header", "has the header `id,w` where"),
         ("mixed", "must be of one format"),
-        ("delta", "is a Delta table"),
+        ("lake", "holds a Delta table at orders/"),
         ("iceberg", "is an Iceberg table"),
         ("empty", "no files in"),
         ("nothing/*.csv", "no files match"),
@@ -354,4 +355,94 @@ fn exit_zero_reports_differences_without_failing() {
     assert!(got.2.contains("\"changed\":1"), "{}", got.2);
     let got = compare(&a, &b, &["-k", "nope", "--exit-zero"]);
     assert_eq!(got.0, 2, "{}", got.1);
+}
+
+/// A Delta table is the files its log says, at the latest version or at
+/// `@vN`: a version compares like the directory of just its files, and what
+/// the log cannot vouch for is refused.
+#[test]
+fn delta_tables_are_read_at_a_version() {
+    let d = scratch("delta");
+    let gen_dir = d.0.join("gen");
+    for (p, rows, seed) in [("p", "20k", "1"), ("q", "8k", "2"), ("r", "5k", "3")] {
+        generate(&gen_dir, p, rows, seed, &["--format", "parquet"]);
+    }
+    let t = d.0.join("t");
+    let place = |root: &Path, date: &str, file: &str, p: &str| {
+        let dir = root.join(format!("date={date}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(gen_dir.join(format!("{p}_a.parquet")), dir.join(file)).unwrap();
+    };
+    place(&t, "2026-10-01", "part-0.parquet", "p");
+    place(&t, "2026-10-02", "part-0.parquet", "q");
+    place(&t, "2026-10-03", "part 0.parquet", "r");
+    // Version 0 adds days 1 and 2; version 1 removes day 2 and adds day 3.
+    let log = t.join("_delta_log");
+    std::fs::create_dir_all(&log).unwrap();
+    std::fs::write(
+        log.join("00000000000000000000.json"),
+        concat!(
+            "{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n",
+            "{\"metaData\":{\"id\":\"t\",\"partitionColumns\":[\"date\"],\"configuration\":{}}}\n",
+            "{\"add\":{\"path\":\"date=2026-10-01/part-0.parquet\",\"size\":1,\"dataChange\":true}}\n",
+            "{\"add\":{\"path\":\"date=2026-10-02/part-0.parquet\",\"size\":1,\"dataChange\":true}}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        log.join("00000000000000000001.json"),
+        concat!(
+            "{\"remove\":{\"path\":\"date=2026-10-02/part-0.parquet\",\"dataChange\":true}}\n",
+            "{\"add\":{\"path\":\"date=2026-10-03/part%200.parquet\",\"size\":1,\"dataChange\":true}}\n",
+        ),
+    )
+    .unwrap();
+    // The same versions as plain directories.
+    let v0 = d.0.join("v0");
+    place(&v0, "2026-10-01", "part-0.parquet", "p");
+    place(&v0, "2026-10-02", "part-0.parquet", "q");
+    let v1 = d.0.join("v1");
+    place(&v1, "2026-10-01", "part-0.parquet", "p");
+    place(&v1, "2026-10-03", "part 0.parquet", "r");
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let key = ["-k", "date,account_id,txn_id"];
+    let t_s = path(&t);
+    for (a, b) in [
+        (format!("{t_s}@v0"), path(&v0)),
+        (t_s.clone(), path(&v1)),
+        (format!("{t_s}@v1"), path(&v1)),
+    ] {
+        let got = compare(&a, &b, &key);
+        assert_eq!(got.0, 0, "{a} vs {b}: {}", got.1);
+    }
+    let got = compare(&format!("{t_s}@v0"), &t_s, &key);
+    assert_eq!(got.0, 1, "{}", got.1);
+    assert!(
+        got.2.contains("\"added\":5000") && got.2.contains("\"removed\":8000"),
+        "{}",
+        got.2
+    );
+    assert!(
+        got.1.contains("Delta version 0") && got.1.contains("Delta version 1"),
+        "{}",
+        got.1
+    );
+    // A version that is not there, and a file the log names that is gone.
+    let got = compare(&format!("{t_s}@v7"), &t_s, &key);
+    assert!(got.0 == 2 && got.1.contains("latest is 1"), "{}", got.1);
+    std::fs::remove_file(t.join("date=2026-10-02/part-0.parquet")).unwrap();
+    let got = compare(&format!("{t_s}@v0"), &t_s, &key);
+    assert!(got.0 == 2 && got.1.contains("no longer there"), "{}", got.1);
+    // Deletion vectors are refused, not read as if the rows were there.
+    std::fs::write(
+        log.join("00000000000000000002.json"),
+        "{\"add\":{\"path\":\"date=2026-10-01/part-0.parquet\",\"deletionVector\":{\"storageType\":\"u\",\"pathOrInlineDv\":\"x\",\"sizeInBytes\":1,\"cardinality\":1}}}\n",
+    )
+    .unwrap();
+    let got = compare(&t_s, &path(&v1), &key);
+    assert!(
+        got.0 == 2 && got.1.contains("deletion vectors"),
+        "{}",
+        got.1
+    );
 }

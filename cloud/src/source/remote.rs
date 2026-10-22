@@ -30,9 +30,11 @@ use std::time::Instant;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 
+use super::delta;
 use super::many::{self, Combined, read_at, write_at};
 use super::{Source, Want, human, room_for, temp_file};
 use crate::error::{Error, Result};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Bytes per ranged request.
 const PART: u64 = 8 << 20;
@@ -65,7 +67,10 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
     let store_scheme = scheme != "http" && scheme != "https";
     if store_scheme
         && let Some((_, key)) = split_key(spec)
-        && (key.is_empty() || key.ends_with('/') || many::is_pattern(key))
+        && (key.is_empty()
+            || key.ends_with('/')
+            || many::is_pattern(key)
+            || delta::split_version(spec).1.is_some())
     {
         return fetch_many(spec, want).await;
     }
@@ -211,8 +216,19 @@ struct Part {
 /// comparison reads it, as for one object.
 async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
     let started = Instant::now();
-    let (root, key) =
-        split_key(spec).ok_or_else(|| Error::new(format!("{spec}: no bucket in the URL")))?;
+    // `table@v12`: a version of a Delta table, listed as its directory.
+    let (table, version) = delta::split_version(spec);
+    let as_dir;
+    let (root, key) = {
+        let (root, key) =
+            split_key(table).ok_or_else(|| Error::new(format!("{spec}: no bucket in the URL")))?;
+        if version.is_some() && !key.is_empty() && !key.ends_with('/') {
+            as_dir = format!("{key}/");
+            (root, as_dir.as_str())
+        } else {
+            (root, key)
+        }
+    };
     let pattern = many::is_pattern(key).then_some(key);
     let prefix = match pattern {
         Some(p) => many::literal_prefix(p),
@@ -262,19 +278,78 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
             .trim_start_matches('/')
             .to_string()
     };
+    let mut delta_note = String::new();
+    let mut delta_files: Option<BTreeSet<String>> = None;
     if pattern.is_none() {
         let names: Vec<String> = listed.iter().map(relative).collect();
-        if let Some(format) = many::table_format(names.iter().map(String::as_str)) {
-            return Err(many::refuse_table(spec, format));
+        if delta::is_delta(names.iter().map(String::as_str)) {
+            // A Delta table: its log says which files are this version.
+            let log: Vec<String> = names
+                .iter()
+                .filter_map(|n| n.strip_prefix("_delta_log/"))
+                .filter(|n| !n.contains('/'))
+                .map(str::to_string)
+                .collect();
+            let plan = delta::plan(&log, version, spec)?;
+            let wanted: Vec<String> = plan
+                .checkpoint
+                .iter()
+                .chain(&plan.commits)
+                .cloned()
+                .collect();
+            let fetched: Vec<(String, Vec<u8>)> =
+                futures::stream::iter(wanted.into_iter().map(|n| {
+                    let store = store.clone();
+                    let path = ObjectPath::from(
+                        format!("{trimmed}/_delta_log/{n}").trim_start_matches('/'),
+                    );
+                    async move {
+                        let fail = |e: object_store::Error| {
+                            Error::new(format!("{spec}: cannot read the log ({n}): {e}"))
+                        };
+                        let got = store.get(&path).await.map_err(fail)?;
+                        let bytes = got.bytes().await.map_err(fail)?;
+                        Ok::<_, Error>((n, bytes.to_vec()))
+                    }
+                }))
+                .buffered(concurrency())
+                .try_collect()
+                .await?;
+            let files: BTreeMap<String, Vec<u8>> = fetched.into_iter().collect();
+            let mut read = |n: &str| -> Result<Vec<u8>> {
+                files
+                    .get(n)
+                    .cloned()
+                    .ok_or_else(|| Error::new(format!("{spec}: {n} was not read")))
+            };
+            let set: BTreeSet<String> =
+                delta::replay(&plan, &mut read, spec)?.into_iter().collect();
+            let present: BTreeSet<String> = names.iter().cloned().collect();
+            if let Some(gone) = set.iter().find(|f| !present.contains(*f)) {
+                return Err(Error::new(format!(
+                    "{spec}: version {} names {gone}, which is no longer there (vacuumed?)",
+                    plan.version
+                )));
+            }
+            delta_note = format!(", Delta version {}", plan.version);
+            delta_files = Some(set);
+        } else if version.is_some() {
+            return Err(Error::new(format!(
+                "{spec}: @v{} names a version of a Delta table, and {table} is not one",
+                version.unwrap_or_default()
+            )));
+        } else if let Some(found) = many::table_format(names.iter().map(String::as_str)) {
+            return Err(many::refuse_table(spec, &found));
         }
     }
     let mut objects: Vec<object_store::ObjectMeta> = listed
         .into_iter()
         .filter(|m| {
             m.size > 0
-                && match pattern {
-                    Some(p) => many::glob_matches(p, m.location.as_ref()),
-                    None => !many::hidden(&relative(m)),
+                && match (&delta_files, pattern) {
+                    (Some(set), _) => set.contains(&relative(m)),
+                    (None, Some(p)) => many::glob_matches(p, m.location.as_ref()),
+                    (None, None) => !many::hidden(&relative(m)),
                 }
         })
         .collect();
@@ -351,7 +426,9 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
                 whole.len(),
                 started.elapsed().as_secs_f64()
             ));
-            source.steps.push(combined.note());
+            source
+                .steps
+                .push(format!("{}{delta_note}", combined.note()));
             return Ok(source);
         }
         if let Some(odd) = parts
@@ -473,7 +550,9 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
     }
     let size = combined.finish()?;
     let _ = size;
-    source.steps.push(combined.note());
+    source
+        .steps
+        .push(format!("{}{delta_note}", combined.note()));
     Ok(source)
 }
 
@@ -649,8 +728,33 @@ fn explain(e: &str) -> String {
     }
 }
 
-/// The object's size and its last [`TAIL`] bytes (all of it, if smaller).
+/// The object's size and its last [`TAIL`] bytes (all of it, if smaller). A
+/// plain HTTP server that answers 5xx or 429, or drops the connection, is
+/// asked again, three times, a little later each time, as a range is.
 async fn tail(
+    reader: &Reader,
+    spec: &str,
+) -> std::result::Result<(u64, Vec<u8>, Option<String>), FetchError> {
+    let mut attempt = 0u32;
+    loop {
+        let result = tail_once(reader, spec).await;
+        let retryable = match &result {
+            Err(FetchError::Transient(_)) => true,
+            Err(Refused(status)) => *status >= 500 || *status == 429,
+            _ => false,
+        };
+        if !retryable || attempt >= 3 || !matches!(reader, Reader::Http(..)) {
+            return result.map_err(|e| match e {
+                FetchError::Transient(m) => FetchError::Other(m),
+                e => e,
+            });
+        }
+        attempt += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
+    }
+}
+
+async fn tail_once(
     reader: &Reader,
     spec: &str,
 ) -> std::result::Result<(u64, Vec<u8>, Option<String>), FetchError> {
@@ -705,7 +809,13 @@ async fn tail(
                 .header(reqwest::header::RANGE, format!("bytes=-{TAIL}"))
                 .send()
                 .await
-                .map_err(|e| FetchError::Other(e.to_string()))?;
+                .map_err(|e| {
+                    if e.is_timeout() {
+                        FetchError::Transient(e.to_string())
+                    } else {
+                        FetchError::Other(e.to_string())
+                    }
+                })?;
             let status = response.status();
             if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
                 // An empty body: nothing to take the end of.
@@ -1151,6 +1261,65 @@ async fn store_signed(spec: &str, url: &url::Url, signed: bool) -> Result<Reader
         }
     };
     Ok(Reader::Store(store, path))
+}
+
+/// Where each cloud's credentials would come from here, by what is set and
+/// on disk -- nothing is fetched or run, and no secret is shown: for `compara
+/// env`, to say why a pod can or cannot read a bucket.
+pub(super) fn credential_sources() -> Vec<(&'static str, String)> {
+    let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let aws = if set("AWS_ACCESS_KEY_ID") {
+        "keys in the environment".to_string()
+    } else if set("AWS_WEB_IDENTITY_TOKEN_FILE") {
+        "web identity (an EKS service account's role)".to_string()
+    } else if set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+        || set("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+    {
+        "the container's role (ECS, EKS Pod Identity)".to_string()
+    } else {
+        let profile = aws_profile_name();
+        let files = ["credentials", "config"].iter().any(|f| {
+            home.as_ref()
+                .is_some_and(|h| h.join(".aws").join(f).is_file())
+        }) || set("AWS_SHARED_CREDENTIALS_FILE")
+            || set("AWS_CONFIG_FILE");
+        if files {
+            format!("the profile `{profile}` in ~/.aws, or instance metadata")
+        } else {
+            "instance metadata, if this is an EC2 instance; else none (public buckets \
+             are read unsigned)"
+                .to_string()
+        }
+    };
+    let gcs = if set("GOOGLE_APPLICATION_CREDENTIALS") || set("GOOGLE_SERVICE_ACCOUNT") {
+        "a service account file".to_string()
+    } else if home.as_ref().is_some_and(|h| {
+        h.join(".config/gcloud/application_default_credentials.json")
+            .is_file()
+    }) {
+        "application default credentials (gcloud auth application-default login)".to_string()
+    } else {
+        "the metadata server, if this runs on Google Cloud; else none".to_string()
+    };
+    let azure = if set("AZURE_STORAGE_ACCOUNT_KEY") || set("AZURE_STORAGE_ACCESS_KEY") {
+        "an account key".to_string()
+    } else if set("AZURE_STORAGE_SAS_KEY") || set("AZURE_STORAGE_SAS_TOKEN") {
+        "a SAS token".to_string()
+    } else if set("AZURE_CLIENT_SECRET") {
+        "a service principal's secret".to_string()
+    } else if set("AZURE_FEDERATED_TOKEN_FILE") {
+        "workload identity".to_string()
+    } else if set("AZURE_STORAGE_USE_EMULATOR") {
+        "the emulator (Azurite)".to_string()
+    } else if azure_cli_only() {
+        "the Azure CLI's sign-in (az login)".to_string()
+    } else {
+        "managed identity, if this runs on Azure; else none".to_string()
+    };
+    vec![("s3", aws), ("gs", gcs), ("az", azure)]
 }
 
 /// Whether the only Azure credentials here are an Azure CLI sign-in: no key,
