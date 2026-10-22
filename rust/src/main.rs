@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use compara::error::{Error, Result};
+
+#[global_allocator]
+static ALLOCATOR: compara::hugepages::HugePages = compara::hugepages::HugePages;
 use compara::{Options, compare, parse_list, profiles, render};
 
 const USAGE: &str = "\
