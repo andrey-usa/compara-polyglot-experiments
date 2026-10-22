@@ -34,8 +34,13 @@ def main() -> None:
     ap.add_argument("--log")
     ap.add_argument("--no-ranges", action="store_true")
     ap.add_argument("--private", action="store_true")
+    ap.add_argument("--flaky", type=int, default=0,
+                    help="answer every N-th ranged GET after the first with a 503")
+    ap.add_argument("--overwrite-after", type=int, default=0,
+                    help="after N GETs, serve every object as a new version (a new ETag)")
     args = ap.parse_args()
     lock = threading.Lock()
+    gets = [0]
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -75,8 +80,17 @@ def main() -> None:
                 return self.refuse(404)
             size = os.path.getsize(full)
             st = os.stat(full)
-            etag = '"' + hashlib.md5(f"{full}:{st.st_mtime_ns}:{size}".encode()).hexdigest() + '"'
+            with lock:
+                gets[0] += 1
+                n = gets[0]
+            version = 2 if args.overwrite_after and n > args.overwrite_after else 1
+            etag = '"' + hashlib.md5(f"{full}:{st.st_mtime_ns}:{size}:{version}".encode()).hexdigest() + '"'
             asked = self.headers.get("Range")
+            if args.flaky and asked and n > 1 and n % args.flaky == 0:
+                return self.refuse(503)
+            wanted = self.headers.get("If-Match")
+            if wanted and wanted != etag:
+                return self.refuse(412)
             start, end, partial = 0, size, False
             if asked and not args.no_ranges and not head:
                 m = re.fullmatch(r"bytes=(\d*)-(\d*)", asked.strip())

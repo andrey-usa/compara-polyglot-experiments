@@ -69,7 +69,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
 
     // The end of the object first: its size comes with it, and for Parquet
     // the footer.
-    let (size, tail) = match tail(&reader, spec).await {
+    let (size, tail, etag) = match tail(&reader, spec).await {
         Ok(found) => found,
         Err(Refused(status)) if signable(&url) && matches!(reader, Reader::Http(..)) => {
             // A plain GET of a private object: sign it as its cloud would.
@@ -111,6 +111,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
                 &reader,
                 &file,
                 std::iter::once(footer_at..tail_at).collect(),
+                etag.as_deref(),
                 spec,
             )
             .await?;
@@ -128,7 +129,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
     }
     let ranges = coalesce(ranges, tail_at);
     let fetched: u64 = ranges.iter().map(|r| r.end - r.start).sum::<u64>() + tail.len() as u64;
-    fetch_ranges(&reader, &file, ranges, spec).await?;
+    fetch_ranges(&reader, &file, ranges, etag.as_deref(), spec).await?;
     file.sync_data().ok();
     let secs = started.elapsed().as_secs_f64();
     source.steps.push(format!(
@@ -217,6 +218,8 @@ async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
 /// Why a request failed, kept apart so a refused unsigned GET can be retried.
 enum FetchError {
     Refused(u16),
+    /// Worth another try: a dropped connection, a 5xx, a 429.
+    Transient(String),
     Other(String),
 }
 use FetchError::Refused;
@@ -226,7 +229,7 @@ impl FetchError {
         match self {
             Refused(404) => Error::new(format!("not found: {spec}")),
             Refused(status) => Error::new(format!("{spec}: HTTP {status}")),
-            FetchError::Other(e) => Error::new(format!("{spec}: {e}")),
+            FetchError::Transient(e) | FetchError::Other(e) => Error::new(format!("{spec}: {e}")),
         }
     }
 }
@@ -235,6 +238,7 @@ impl From<object_store::Error> for FetchError {
     fn from(e: object_store::Error) -> Self {
         match e {
             object_store::Error::NotFound { .. } => Refused(404),
+            object_store::Error::Precondition { .. } => FetchError::Other(changed()),
             e => FetchError::Other(explain(&e.to_string())),
         }
     }
@@ -256,7 +260,10 @@ fn explain(e: &str) -> String {
 }
 
 /// The object's size and its last [`TAIL`] bytes (all of it, if smaller).
-async fn tail(reader: &Reader, spec: &str) -> std::result::Result<(u64, Vec<u8>), FetchError> {
+async fn tail(
+    reader: &Reader,
+    spec: &str,
+) -> std::result::Result<(u64, Vec<u8>, Option<String>), FetchError> {
     match reader {
         Reader::Store(store, path) => {
             let got = store
@@ -274,14 +281,15 @@ async fn tail(reader: &Reader, spec: &str) -> std::result::Result<(u64, Vec<u8>)
                 Err(e) => {
                     let meta = store.head(path).await;
                     match meta {
-                        Ok(m) if m.size == 0 => return Ok((0, Vec::new())),
+                        Ok(m) if m.size == 0 => return Ok((0, Vec::new(), m.e_tag)),
                         _ => return Err(e.into()),
                     }
                 }
             };
             let size = got.meta.size;
+            let etag = got.meta.e_tag.clone();
             let bytes = got.bytes().await?;
-            Ok((size, bytes.to_vec()))
+            Ok((size, bytes.to_vec(), etag))
         }
         Reader::Http(client, url) => {
             let response = client
@@ -293,8 +301,15 @@ async fn tail(reader: &Reader, spec: &str) -> std::result::Result<(u64, Vec<u8>)
             let status = response.status();
             if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
                 // An empty body: nothing to take the end of.
-                return Ok((0, Vec::new()));
+                return Ok((0, Vec::new(), None));
             }
+            // A strong validator only: a weak one does not promise the bytes.
+            let etag = response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .filter(|v| !v.starts_with("W/"))
+                .map(str::to_string);
             if !status.is_success() {
                 return Err(Refused(status.as_u16()));
             }
@@ -314,7 +329,7 @@ async fn tail(reader: &Reader, spec: &str) -> std::result::Result<(u64, Vec<u8>)
                     .bytes()
                     .await
                     .map_err(|e| FetchError::Other(e.to_string()))?;
-                return Ok((total, bytes.to_vec()));
+                return Ok((total, bytes.to_vec(), etag));
             }
             // The server sent the whole object: it does not do ranges, so this
             // response is the download.
@@ -322,7 +337,7 @@ async fn tail(reader: &Reader, spec: &str) -> std::result::Result<(u64, Vec<u8>)
                 .bytes()
                 .await
                 .map_err(|e| FetchError::Other(e.to_string()))?;
-            Ok((bytes.len() as u64, bytes.to_vec()))
+            Ok((bytes.len() as u64, bytes.to_vec(), etag))
         }
     }
 }
@@ -332,6 +347,7 @@ async fn fetch_ranges(
     reader: &Reader,
     file: &File,
     ranges: Vec<Range<u64>>,
+    etag: Option<&str>,
     spec: &str,
 ) -> Result<()> {
     let parts: Vec<Range<u64>> = ranges
@@ -353,7 +369,7 @@ async fn fetch_ranges(
         .filter(|&n| n > 0)
         .unwrap_or(CONCURRENCY);
     futures::stream::iter(parts)
-        .map(|part| fetch_part(reader, file, part))
+        .map(|part| fetch_part(reader, file, part, etag))
         .buffer_unordered(concurrency)
         .try_collect::<Vec<()>>()
         .await
@@ -361,10 +377,40 @@ async fn fetch_ranges(
     Ok(())
 }
 
+/// One part, pinned to the version of the object the first request saw: a
+/// part of a later version fails rather than lands beside parts of the
+/// earlier one. A plain HTTP part that fails in transit or with a 5xx or 429
+/// is tried again, three times, a little later each time; object_store does
+/// that for its own.
 async fn fetch_part(
     reader: &Reader,
     file: &File,
     part: Range<u64>,
+    etag: Option<&str>,
+) -> std::result::Result<(), FetchError> {
+    let mut attempt = 0u32;
+    loop {
+        let result = fetch_part_once(reader, file, part.clone(), etag).await;
+        let retryable = match &result {
+            Err(FetchError::Transient(_)) => matches!(reader, Reader::Http(..)),
+            _ => false,
+        };
+        if !retryable || attempt >= 3 {
+            return result.map_err(|e| match e {
+                FetchError::Transient(m) => FetchError::Other(m),
+                e => e,
+            });
+        }
+        attempt += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
+    }
+}
+
+async fn fetch_part_once(
+    reader: &Reader,
+    file: &File,
+    part: Range<u64>,
+    etag: Option<&str>,
 ) -> std::result::Result<(), FetchError> {
     let mut at = part.start;
     match reader {
@@ -374,6 +420,7 @@ async fn fetch_part(
                     path,
                     GetOptions {
                         range: Some(GetRange::Bounded(part.clone())),
+                        if_match: etag.map(str::to_string),
                         ..Default::default()
                     },
                 )
@@ -386,16 +433,24 @@ async fn fetch_part(
             }
         }
         Reader::Http(client, url) => {
-            let response = client
-                .get(url)
-                .header(
-                    reqwest::header::RANGE,
-                    format!("bytes={}-{}", part.start, part.end - 1),
-                )
+            let mut request = client.get(url).header(
+                reqwest::header::RANGE,
+                format!("bytes={}-{}", part.start, part.end - 1),
+            );
+            if let Some(tag) = etag {
+                request = request.header(reqwest::header::IF_MATCH, tag);
+            }
+            let response = request
                 .send()
                 .await
-                .map_err(|e| FetchError::Other(e.to_string()))?;
+                .map_err(|e| FetchError::Transient(e.to_string()))?;
             let status = response.status();
+            if status == reqwest::StatusCode::PRECONDITION_FAILED {
+                return Err(FetchError::Other(changed()));
+            }
+            if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(FetchError::Transient(format!("HTTP {status}")));
+            }
             if status != reqwest::StatusCode::PARTIAL_CONTENT {
                 return Err(if status.is_success() {
                     FetchError::Other(format!(
@@ -407,20 +462,24 @@ async fn fetch_part(
             }
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| FetchError::Other(e.to_string()))?;
+                let chunk = chunk.map_err(|e| FetchError::Transient(e.to_string()))?;
                 write_at(file, &chunk, at).map_err(|e| FetchError::Other(e.to_string()))?;
                 at += chunk.len() as u64;
             }
         }
     }
     if at != part.end {
-        return Err(FetchError::Other(format!(
+        return Err(FetchError::Transient(format!(
             "a range ended early: {} of {} bytes",
             at - part.start,
             part.end - part.start
         )));
     }
     Ok(())
+}
+
+fn changed() -> String {
+    "the object changed while it was being read; run the comparison again".to_string()
 }
 
 /// Sorted, merged where they touch or nearly do, and cut at `limit` (what is

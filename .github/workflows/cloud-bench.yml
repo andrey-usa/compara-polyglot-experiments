@@ -1,7 +1,7 @@
 name: Cloud benchmark
 
 # compara against DuckDB (latest, httpfs) on one keyed comparison of a pair
-# read from S3 -- MinIO on the same runner, so this measures the tools and
+# read from S3 -- SeaweedFS on the same runner, so this measures the tools and
 # not the internet. Parquet with every column, Parquet with one compared
 # column (where reading only what is compared pays), and CSV. Counts must
 # agree or the run fails. Tables are annotations: `cloud bench ...`.
@@ -23,15 +23,15 @@ permissions:
 
 jobs:
   bench:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     defaults:
       run:
         shell: bash
     env:
       ROWS: ${{ inputs.rows || '10m' }}
-      AWS_ACCESS_KEY_ID: minio
-      AWS_SECRET_ACCESS_KEY: minio12345
+      AWS_ACCESS_KEY_ID: compara
+      AWS_SECRET_ACCESS_KEY: secret12345
       AWS_DEFAULT_REGION: us-east-1
     steps:
       - uses: actions/checkout@v7
@@ -45,13 +45,29 @@ jobs:
       - name: Build compara
         working-directory: cloud
         run: cargo build --release --locked --bin compara --bin compara-gen-data
-      - name: MinIO
+      - name: SeaweedFS
         run: |
-          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio12345 \
-            -v /mnt/minio:/data quay.io/minio/minio:latest server /data
-          docker ps -a --format '{{.Names}} {{.Status}}'
-          for i in $(seq 60); do curl -sf http://localhost:9000/minio/health/live && break; sleep 1; done
-          aws --endpoint-url http://localhost:9000 s3 mb s3://bkt
+          start() { # name, docker run arguments...
+            local name=$1; shift
+            if ! out=$(docker run -d --name "$name" "$@" 2>&1); then
+              echo "::warning title=cloud bench $name::$(echo "$out" | tail -c 600 | tr '\n' ' ')"
+              return 1
+            fi
+          }
+          sudo mkdir -p /mnt/sw-data && sudo chmod 777 /mnt/sw-data
+          mkdir -p /tmp/sw && cat > /tmp/sw/s3.json <<'JSON'
+          {"identities": [{"name": "compara", "credentials": [{"accessKey": "compara", "secretKey": "secret12345"}],
+            "actions": ["Admin", "Read", "List", "Tagging", "Write"]}]}
+          JSON
+          # MinIO no longer publishes images that pull anonymously; SeaweedFS
+          # is the S3 server here (signed requests, ranges, multipart).
+          for img in chrislusf/seaweedfs:4.47 chrislusf/seaweedfs:latest; do
+            docker rm -f s3 >/dev/null 2>&1
+            start s3 -p 8333:8333 -v /tmp/sw:/etc/sw:ro -v /mnt/sw-data:/data "$img" server -s3 -s3.config=/etc/sw/s3.json -dir=/data -ip=127.0.0.1 -ip.bind=0.0.0.0 && break
+          done
+          for i in $(seq 60); do aws --endpoint-url http://localhost:8333 s3 mb s3://bkt 2>/dev/null && break; sleep 1; done
+          docker ps -a --format '{{.Names}} {{.Image}} {{.Status}}'
+          aws --endpoint-url http://localhost:8333 s3 ls
           aws configure set default.s3.max_concurrent_requests 32
       - name: Data
         run: |
@@ -62,7 +78,7 @@ jobs:
           $gen --rows "$ROWS" --out-dir . --prefix t
           ls -la
           for f in t_a.parquet t_b.parquet t_a.csv t_b.csv; do
-            aws --endpoint-url http://localhost:9000 s3 cp "$f" "s3://bkt/$f" --only-show-errors
+            aws --endpoint-url http://localhost:8333 s3 cp "$f" "s3://bkt/$f" --only-show-errors
           done
           rm -f t_a.csv t_b.csv
           $GITHUB_WORKSPACE/cloud/target/release/compara columns t_a.parquet 2>/dev/null | paste -sd, > columns.txt
@@ -74,8 +90,8 @@ jobs:
           set -o pipefail
           cols=$(cat /mnt/fx/columns.txt)
           bin=$GITHUB_WORKSPACE/cloud/target/release/compara
-          b() { python3 cloud/bench_remote.py --compara "$bin" --endpoint http://localhost:9000 --bucket bkt \
-                  --columns "$cols" --label "$ROWS rows, S3 (MinIO)" "$@" | tee -a /tmp/bench.log; }
+          b() { python3 cloud/bench_remote.py --compara "$bin" --endpoint http://localhost:8333 --bucket bkt \
+                  --columns "$cols" --label "$ROWS rows, S3 (SeaweedFS)" "$@" | tee -a /tmp/bench.log; }
           : > /tmp/bench.log
           b --a t_a.parquet --b t_b.parquet
           b --a t_a.parquet --b t_b.parquet --compare amount

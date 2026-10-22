@@ -471,3 +471,47 @@ fn outputs_reach_object_storage_and_stdout() {
     assert_eq!(v.to_string(), want.2);
     assert!(String::from_utf8_lossy(&out.stderr).contains("matched"));
 }
+
+/// A server that drops some ranged requests is retried through; an object
+/// overwritten part-way through the download is an error, not a file stitched
+/// together from two versions.
+#[test]
+fn transient_failures_are_retried_and_an_overwrite_is_caught() {
+    let f = fixture("200k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    let Some(flaky) = Server::start(&f.0, &["--flaky", "3"]) else {
+        return;
+    };
+    let u = &flaky.url;
+    // Small parts, so there are enough requests for some to fail.
+    let env = [("COMPARA_FETCH_CONCURRENCY", "2")];
+    let got = compare(
+        &format!("{u}/bkt/t_a.csv"),
+        &format!("{u}/bkt/t_b.csv"),
+        &KEY,
+        &env,
+        None,
+    );
+    assert_eq!(
+        (want.0, &want.2, &want.3),
+        (got.0, &got.2, &got.3),
+        "flaky: {}",
+        got.1
+    );
+    drop(flaky);
+    let Some(changing) = Server::start(&f.0, &["--overwrite-after", "2"]) else {
+        return;
+    };
+    let u = &changing.url;
+    let (code, err, ..) = compare(
+        &format!("{u}/bkt/t_a.csv"),
+        &local("t_b.csv"),
+        &KEY,
+        &[],
+        None,
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("changed while it was being read"), "{err}");
+}

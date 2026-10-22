@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """compara against DuckDB on one keyed comparison, both reading from S3.
 
-The pair is uploaded to an S3 endpoint (MinIO on the runner) and each tool
+The pair is uploaded to an S3 endpoint (SeaweedFS on the runner) and each tool
 reads it from there: compara with `s3://` URLs, DuckDB with httpfs and an S3
 secret. The task is compara's: rows matched on (account_id, txn_id), first
 occurrence of a repeated key, every other column compared but `updated_at`;
 the answer is four counts -- unchanged, changed, added, removed -- and the
 run fails unless both tools give the same four.
 
-    bench_remote.py --compara BIN --endpoint http://localhost:9000 \
+    bench_remote.py --compara BIN --endpoint http://localhost:8333 \
         --bucket bkt --a t_a.parquet --b t_b.parquet [--compare amount,note]
 
 Prints one JSON line per run and a markdown table at the end.

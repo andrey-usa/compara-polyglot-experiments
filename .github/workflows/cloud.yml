@@ -5,7 +5,7 @@ name: Cloud and containers
 #
 # - build: every release target, the way release.yml builds it (glibc 2.28
 #   through zigbuild on Linux), the test suite on Linux, and a smoke test;
-# - emulators: S3 (MinIO), Azure (Azurite) and GCS (fake-gcs-server), each
+# - emulators: S3 (SeaweedFS), Azure (Azurite) and GCS (fake-gcs-server), each
 #   compared against the local answer, inputs and outputs both;
 # - container: the image from the Dockerfile, run read-only, non-root, and
 #   under memory limits that turbo cannot meet.
@@ -30,7 +30,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, glibc: "2.28", test: true }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, glibc: "2.28", test: true }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, glibc: "2.28" }
           - { os: macos-14, target: aarch64-apple-darwin }
           - { os: macos-14, target: x86_64-apple-darwin }
@@ -95,7 +95,7 @@ jobs:
           EOF
 
   emulators:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         shell: bash
@@ -105,24 +105,32 @@ jobs:
         with:
           toolchain: stable
           cache: false
-      - name: Start MinIO, Azurite and fake-gcs-server
+      - name: Start SeaweedFS (S3), Azurite and fake-gcs-server
         run: |
           start() { # name, docker run arguments...
             local name=$1; shift
             if ! out=$(docker run -d --name "$name" "$@" 2>&1); then
-              echo "::error title=cloud emulator $name::$(echo "$out" | tail -c 600 | tr '\n' ' ')"
+              echo "::warning title=cloud emulator $name::$(echo "$out" | tail -c 600 | tr '\n' ' ')"
               return 1
             fi
           }
-          start minio -p 9000:9000 -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio12345 \
-            quay.io/minio/minio:latest server /data
+          mkdir -p /tmp/sw && cat > /tmp/sw/s3.json <<'JSON'
+          {"identities": [{"name": "compara", "credentials": [{"accessKey": "compara", "secretKey": "secret12345"}],
+            "actions": ["Admin", "Read", "List", "Tagging", "Write"]}]}
+          JSON
+          # MinIO no longer publishes images that pull anonymously; SeaweedFS
+          # is the S3 server here (signed requests, ranges, multipart).
+          for img in chrislusf/seaweedfs:4.47 chrislusf/seaweedfs:latest; do
+            docker rm -f s3 >/dev/null 2>&1
+            start s3 -p 8333:8333 -v /tmp/sw:/etc/sw:ro "$img" server -s3 -s3.config=/etc/sw/s3.json -dir=/data -ip=127.0.0.1 -ip.bind=0.0.0.0 && break
+          done
           start azurite -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:latest \
             azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
           start gcs -p 4443:4443 fsouza/fake-gcs-server:latest -scheme http -port 4443 \
             -public-host localhost:4443
           sleep 5
           docker ps -a --format '{{.Names}} {{.Status}}'
-          for n in minio azurite gcs; do
+          for n in s3 azurite gcs; do
             if [ "$(docker inspect -f '{{.State.Running}}' $n)" != true ]; then
               echo "::error title=cloud emulator $n::not running: $(docker logs $n 2>&1 | tail -c 600 | tr '\n' ' ')"
             fi
@@ -132,8 +140,8 @@ jobs:
         run: cargo build --release --locked --bin compara --bin compara-gen-data
       - name: Fixtures, uploaded to each
         env:
-          AWS_ACCESS_KEY_ID: minio
-          AWS_SECRET_ACCESS_KEY: minio12345
+          AWS_ACCESS_KEY_ID: compara
+          AWS_SECRET_ACCESS_KEY: secret12345
           AWS_DEFAULT_REGION: us-east-1
         run: |
           set -eux
@@ -144,20 +152,20 @@ jobs:
           $gen --rows 200k --out-dir . --prefix t --format ndjson
           gzip -k t_a.csv
           ls -la
-          for i in $(seq 30); do curl -sf http://localhost:9000/minio/health/live && break; sleep 1; done
-          aws --endpoint-url http://localhost:9000 s3 mb s3://bkt
+          for i in $(seq 60); do aws --endpoint-url http://localhost:8333 s3 mb s3://bkt 2>/dev/null && break; sleep 1; done
+          aws --endpoint-url http://localhost:8333 s3 ls
           AZ="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
           az storage container create -n cont --connection-string "$AZ" -o none
           curl -sf -X POST http://localhost:4443/storage/v1/b -H 'content-type: application/json' -d '{"name":"bkt"}'
           for f in t_a.csv t_b.csv t_a.csv.gz t_a.parquet t_b.parquet t_a.ndjson t_b.ndjson; do
-            aws --endpoint-url http://localhost:9000 s3 cp "$f" "s3://bkt/$f" --only-show-errors
+            aws --endpoint-url http://localhost:8333 s3 cp "$f" "s3://bkt/$f" --only-show-errors
             az storage blob upload -c cont -f "$f" -n "$f" --connection-string "$AZ" -o none --only-show-errors
             curl -sf -X POST "http://localhost:4443/upload/storage/v1/b/bkt/o?uploadType=media&name=$f" \
               --data-binary @"$f" -o /dev/null
           done
       - name: Compare from each store against the local answer
         run: |
-          set -u
+          set -u +e +o pipefail
           cd /tmp/fx
           bin=$GITHUB_WORKSPACE/cloud/target/release/compara
           K="-k account_id,txn_id -i updated_at"
@@ -172,7 +180,7 @@ jobs:
             echo "$code" > "out-$name/code"
             echo "$name exit $code ${secs}s: $(tr '\n' ' ' < out-$name/err | cut -c1-300)"
           }
-          S3="AWS_ENDPOINT_URL=http://localhost:9000 AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio12345 AWS_REGION=us-east-1"
+          S3="AWS_ENDPOINT_URL=http://localhost:8333 AWS_ACCESS_KEY_ID=compara AWS_SECRET_ACCESS_KEY=secret12345 AWS_REGION=us-east-1"
           AZ="AZURE_STORAGE_USE_EMULATOR=true"
           GS="GOOGLE_BASE_URL=http://localhost:4443 GOOGLE_SKIP_SIGNATURE=true GOOGLE_ALLOW_HTTP=true"
           : > report.txt
@@ -211,12 +219,12 @@ jobs:
           cd /tmp/fx
           bin=$GITHUB_WORKSPACE/cloud/target/release/compara
           K="-k account_id,txn_id -i updated_at"
-          export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio12345 AWS_DEFAULT_REGION=us-east-1
+          export AWS_ACCESS_KEY_ID=compara AWS_SECRET_ACCESS_KEY=secret12345 AWS_DEFAULT_REGION=us-east-1
           AZ="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
           : > out.txt
-          env AWS_ENDPOINT_URL=http://localhost:9000 AWS_REGION=us-east-1 COMPARA_UPLOAD_ONE_SHOT=1000000 COMPARA_UPLOAD_PART=5242880 \
+          env AWS_ENDPOINT_URL=http://localhost:8333 AWS_REGION=us-east-1 COMPARA_UPLOAD_ONE_SHOT=1000000 COMPARA_UPLOAD_PART=5242880 \
             $bin compare t_a.csv t_b.csv $K -o s3://bkt/out/report.html --json s3://bkt/out/s.json --export-dir s3://bkt/out/x/ || true
-          aws --endpoint-url http://localhost:9000 s3 ls --recursive s3://bkt/out/ >> out.txt
+          aws --endpoint-url http://localhost:8333 s3 ls --recursive s3://bkt/out/ >> out.txt
           env AZURE_STORAGE_USE_EMULATOR=true $bin compare t_a.csv t_b.csv $K -o az://cont/out/report.html --export-dir az://cont/out/x/ || true
           az storage blob list -c cont --prefix out/ --connection-string "$AZ" --query "[].{n:name,s:properties.contentLength}" -o tsv >> out.txt
           env GOOGLE_BASE_URL=http://localhost:4443 GOOGLE_SKIP_SIGNATURE=true GOOGLE_ALLOW_HTTP=true \
@@ -230,7 +238,7 @@ jobs:
           EOF
 
   container:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         shell: bash
@@ -254,7 +262,7 @@ jobs:
           cp examples/*.csv /tmp/data/
       - name: Run it the ways a cluster does
         run: |
-          set -u
+          set -u +e +o pipefail
           K="-k account_id,txn_id -i updated_at"
           : > c.txt
           note() { echo "$*" | tee -a c.txt; }
