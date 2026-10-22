@@ -40,6 +40,7 @@ import duckdb, json, sys
 endpoint, bucket, a, b, cols, fmt = sys.argv[1:7]
 cols = json.loads(cols)
 con = duckdb.connect()
+con.execute("SET enable_progress_bar = false")
 con.execute("INSTALL httpfs; LOAD httpfs;")
 host = endpoint.split("://", 1)[1]
 con.execute(f"""CREATE SECRET s (TYPE s3, KEY_ID '{__import__('os').environ['AWS_ACCESS_KEY_ID']}',
@@ -57,6 +58,11 @@ def src(name):
 want = ", ".join(["account_id", "txn_id"] + cols)
 for side, name in (("a", a), ("b", b)):
     table, order = src(name)
+    if order == "rowid":
+        # A CSV has no row number to read; a table loaded from it in order
+        # has one, its rowid.
+        con.execute(f"CREATE TABLE raw_{side} AS SELECT {want} FROM {table}")
+        table = f"raw_{side}"
     con.execute(f"""CREATE TABLE {side} AS SELECT {want} FROM {table}
         QUALIFY row_number() OVER (PARTITION BY account_id, txn_id ORDER BY {order}) = 1""")
 eq = " AND ".join(f"a.{c} IS NOT DISTINCT FROM b.{c}" for c in cols) or "true"
@@ -109,7 +115,7 @@ def main():
             else:
                 if code != 0:
                     sys.exit(f"duckdb failed ({code}): {err[-2000:]}")
-                got = json.loads(out.strip().splitlines()[-1])
+                got = json.loads([l for l in out.splitlines() if l.startswith("{")][-1])
                 note = "duckdb " + got.pop("duckdb")
                 counts = got
             runs.append({"wall": wall, "cpu": cpu, "rss_mb": rss, "counts": counts, "note": note})
