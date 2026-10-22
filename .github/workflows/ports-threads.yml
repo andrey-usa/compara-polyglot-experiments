@@ -88,6 +88,17 @@ jobs:
       - name: Build every port
         run: scripts/build_ports.sh c rust zig cpp cpp-gen
 
+      # The 10M NDJSON pair is 17 GB, more than the root disk has free; the
+      # runner's second disk has room.
+      - name: Data directory
+        run: |
+          if sudo mkdir -p /mnt/bench-data && sudo chown "$USER" /mnt/bench-data; then
+            echo "DATA=/mnt/bench-data" >> "$GITHUB_ENV"
+          else
+            echo "DATA=/tmp/bench-data" >> "$GITHUB_ENV"
+          fi
+          df -h / /mnt || true
+
       - name: Run the tables
         env:
           ROWS: ${{ needs.plan.outputs.rows }}
@@ -102,7 +113,7 @@ jobs:
           for t in ${THREADS//,/ }; do
             python3 scripts/bench_formats_ports.py \
               --rows "$ROWS" --formats "${{ matrix.format }}" --repeats "$REPEATS" \
-              --threads "$t" --memory-cap "$cap" --keep --data-dir /tmp/bench-data \
+              --threads "$t" --memory-cap "$cap" --keep --data-dir "$DATA" \
               --md-out "/tmp/tables/t$t.md" --json-out "/tmp/tables/t$t.json" \
               | tee -a /tmp/tables/log.txt
             {
@@ -124,7 +135,7 @@ jobs:
           THREADS: ${{ needs.plan.outputs.threads }}
         run: |
           f="${{ matrix.format }}"
-          a=/tmp/bench-data/bench_a.$f; b=/tmp/bench-data/bench_b.$f
+          a=$DATA/bench_a.$f; b=$DATA/bench_b.$f
           [ -f "$a" ] || exit 0
           for t in ${THREADS//,/ }; do
             for i in 1 2 3; do

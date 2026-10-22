@@ -1,6 +1,6 @@
 {
   "rows": "10m",
-  "formats": "csv,tsv,ndjson,parquet",
+  "formats": "ndjson",
   "threads": "1,4",
   "repeats": 5
 }
