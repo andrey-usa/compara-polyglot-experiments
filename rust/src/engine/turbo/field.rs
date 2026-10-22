@@ -78,6 +78,9 @@ pub(super) trait Scan: Copy {
     /// One bit per byte of the register at `at` that is `a` or `b`. Only asked
     /// of `Wide`, and only where `at + STEP <= data.len()`.
     fn hits(self, data: &[u8], at: usize, a: u8, b: u8) -> u64;
+    /// One bit per byte where `x` at `xi` and `y` at `yi` hold the same byte.
+    /// Only asked of `Wide`, and only where a whole register fits in each.
+    fn same(self, x: &[u8], xi: usize, y: &[u8], yi: usize) -> u64;
 }
 
 /// Eight bytes at a time, on any CPU.
@@ -88,6 +91,10 @@ impl Scan for Swar {
     const WIDE: bool = false;
     #[inline(always)]
     fn hits(self, _: &[u8], _: usize, _: u8, _: u8) -> u64 {
+        0
+    }
+    #[inline(always)]
+    fn same(self, _: &[u8], _: usize, _: &[u8], _: usize) -> u64 {
         0
     }
 }
@@ -164,6 +171,49 @@ impl Scan for Wide {
             unreachable!("no Wide scan off x86-64")
         }
     }
+
+    #[inline(always)]
+    fn same(self, x: &[u8], xi: usize, y: &[u8], yi: usize) -> u64 {
+        debug_assert!(xi + STEP <= x.len() && yi + STEP <= y.len());
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+        // Safety: the caller has checked both bounds, and this build targets a
+        // CPU with AVX-512BW.
+        return unsafe {
+            use std::arch::x86_64::*;
+            let a = _mm512_loadu_si512(x.as_ptr().add(xi) as *const _);
+            let b = _mm512_loadu_si512(y.as_ptr().add(yi) as *const _);
+            _mm512_cmpeq_epi8_mask(a, b)
+        };
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
+        // Safety: `self` exists, so the CPU has AVX2, and the caller has
+        // checked both bounds.
+        return unsafe { avx2_same(x, xi, y, yi) };
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (x, xi, y, yi);
+            unreachable!("no Wide scan off x86-64")
+        }
+    }
+}
+
+/// The AVX2 byte-for-byte compare of two registers' worth.
+///
+/// # Safety
+/// The CPU has AVX2, `xi + 32 <= x.len()` and `yi + 32 <= y.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(dead_code)] // unused in an AVX-512 build
+unsafe fn avx2_same(x: &[u8], xi: usize, y: &[u8], yi: usize) -> u64 {
+    use std::arch::x86_64::*;
+    // Safety: the bounds are the caller's promise.
+    let (a, b) = unsafe {
+        (
+            _mm256_loadu_si256(x.as_ptr().add(xi) as *const _),
+            _mm256_loadu_si256(y.as_ptr().add(yi) as *const _),
+        )
+    };
+    _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32 as u64
 }
 
 /// The AVX2 compare.

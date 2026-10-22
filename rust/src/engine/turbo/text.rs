@@ -1325,10 +1325,24 @@ fn json_tail_is_clean_with<S: Scan>(
 /// same bytes; the tail check covers what follows. The C and C++ ports have the
 /// same proof (#234, #235).
 pub(super) fn json_rows_match(p: &RowParser, a: &[u8], b: &[u8], b_lo: usize, b_hi: usize) -> bool {
+    json_rows_match_at(p, a, 0, a.len(), b, b_lo, b_hi)
+}
+
+/// [`json_rows_match`] over A's bytes `a[a_lo..a_hi]` in place, so the scans
+/// may read whole registers past the row's end.
+pub(super) fn json_rows_match_at(
+    p: &RowParser,
+    a: &[u8],
+    a_lo: usize,
+    a_hi: usize,
+    b: &[u8],
+    b_lo: usize,
+    b_hi: usize,
+) -> bool {
     match Wide::detect() {
         // Safety: `w` proves the CPU has AVX2.
-        Some(w) => unsafe { json_rows_match_wide(w, p, a, b, b_lo, b_hi) },
-        None => json_rows_match_with(Swar, p, a, b, b_lo, b_hi),
+        Some(w) => unsafe { json_rows_match_wide(w, p, a, a_lo, a_hi, b, b_lo, b_hi) },
+        None => json_rows_match_with(Swar, p, a, a_lo, a_hi, b, b_lo, b_hi),
     }
 }
 
@@ -1343,34 +1357,43 @@ pub(super) fn json_rows_match(p: &RowParser, a: &[u8], b: &[u8], b_lo: usize, b_
     ),
     target_feature(enable = "avx2,popcnt,bmi1")
 )]
+#[allow(clippy::too_many_arguments)]
 unsafe fn json_rows_match_wide(
     w: Wide,
     p: &RowParser,
     a: &[u8],
+    a_lo: usize,
+    a_hi: usize,
     b: &[u8],
     b_lo: usize,
     b_hi: usize,
 ) -> bool {
-    json_rows_match_with(w, p, a, b, b_lo, b_hi)
+    json_rows_match_with(w, p, a, a_lo, a_hi, b, b_lo, b_hi)
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn json_rows_match_with<S: Scan>(
     scan: S,
     p: &RowParser,
     a: &[u8],
+    a_lo: usize,
+    a_hi: usize,
     b: &[u8],
     b_lo: usize,
     b_hi: usize,
 ) -> bool {
-    let (mut ai, mut bi) = (0usize, b_lo);
+    if let Some(answer) = json_rows_match_counted(scan, p, a, a_lo, a_hi, b, b_lo, b_hi) {
+        return answer;
+    }
+    let (mut ai, mut bi) = (a_lo, b_lo);
     let mut after_value = false;
     for _ in 0..64 {
-        let left = a.len() - ai;
+        let left = a_hi - ai;
         let m = left.min(b_hi - bi);
         // The whole run first: equal slices are one memcmp, and they are the
         // common case -- every row whose ignored values do not differ.
-        if m == left && a[ai..] == b[bi..bi + left] {
+        if m == left && a[ai..a_hi] == b[bi..bi + left] {
             return json_tail_is_clean_with(scan, p, b, bi + left, b_hi);
         }
         let same = common_prefix(&a[ai..ai + m], &b[bi..bi + m]);
@@ -1380,7 +1403,7 @@ fn json_rows_match_with<S: Scan>(
         if same == m {
             return false; // B ends first
         }
-        let Some((vs, ve)) = json_member_at(scan, p, a, ai, ai + same, after_value) else {
+        let Some((vs, ve)) = json_member_at(scan, p, a, a_hi, ai, ai + same, after_value) else {
             return false;
         };
         let b_vs = bi + (vs - ai);
@@ -1447,11 +1470,11 @@ fn json_member_at<S: Scan>(
     scan: S,
     p: &RowParser,
     d: &[u8],
+    end: usize,
     mut at: usize,
     diff: usize,
     mut after_value: bool,
 ) -> Option<(usize, usize)> {
-    let end = d.len();
     loop {
         while at < end && json_gap(d[at]) {
             at += 1;
@@ -1498,6 +1521,204 @@ fn json_member_at<S: Scan>(
         at = v_end;
         after_value = true;
     }
+}
+
+/// [`json_rows_match_with`] a register at a time, for rows with no backslash,
+/// brace or bracket where they differ: one pass compares the two rows, counts
+/// A's quotes and looks for those bytes, and the member a difference falls in
+/// is read backwards from it instead of walked to. With no backslash every
+/// quote opens or closes a string, so the count says whether the difference is
+/// inside one, and the bytes just before it say whose value that is. A row of
+/// twenty members differing in its last took a walk over nineteen of them for
+/// every row of A the join proved: most of an NDJSON comparison's
+/// instructions.
+///
+/// `None` hands the rows to the walk: a backslash, brace or bracket before a
+/// difference (an escape or a nested value, which the count cannot read), a
+/// register past the end of either slab, or a shape the backward read does not
+/// follow. Otherwise the answer is the walk's.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn json_rows_match_counted<S: Scan>(
+    scan: S,
+    p: &RowParser,
+    a: &[u8],
+    a_lo: usize,
+    a_hi: usize,
+    b: &[u8],
+    b_lo: usize,
+    b_hi: usize,
+) -> Option<bool> {
+    if !S::WIDE {
+        return None;
+    }
+    // Past the object's opening brace, which is the same in both rows or the
+    // rows differ there and the walk says so.
+    let mut s = a_lo;
+    while s < a_hi && json_gap(a[s]) {
+        s += 1;
+    }
+    if s >= a_hi || a[s] != b'{' {
+        return None;
+    }
+    s += 1;
+    let lead = s - a_lo;
+    if b_hi - b_lo < lead || a[a_lo..s] != b[b_lo..b_lo + lead] {
+        return None;
+    }
+    let (mut ai, mut bi) = (s, b_lo + lead);
+    // The lowest byte the backward read may look at: the brace, and later the
+    // byte after the last value skipped.
+    let mut floor = s - 1;
+    for _ in 0..64 {
+        let left = a_hi - ai;
+        let m = left.min(b_hi - bi);
+        let mut i = 0usize;
+        let mut quotes = 0u32;
+        let mut odd = false;
+        let same = loop {
+            if i >= m {
+                break m;
+            }
+            if ai + i + STEP > a.len() || bi + i + STEP > b.len() {
+                return None;
+            }
+            let room = m - i;
+            // One bit per byte of the register, or of the bytes left: an
+            // equality mask has its unused high bits clear, and inverted they
+            // would read as differences.
+            let valid = if room >= STEP {
+                u64::MAX >> (64 - STEP)
+            } else {
+                (1u64 << room) - 1
+            };
+            let differ = !scan.same(a, ai + i, b, bi + i) & valid;
+            let q = scan.hits(a, ai + i, b'"', b'"');
+            let o = scan.hits(a, ai + i, b'\\', b'{') | scan.hits(a, ai + i, b'[', b'[');
+            let before = if differ == 0 {
+                valid
+            } else {
+                (1u64 << differ.trailing_zeros()) - 1
+            };
+            quotes += (q & before).count_ones();
+            odd |= o & before != 0;
+            if differ != 0 {
+                break i + differ.trailing_zeros() as usize;
+            }
+            i += STEP;
+        };
+        if same == left {
+            return Some(json_tail_is_clean_with(scan, p, b, bi + left, b_hi));
+        }
+        if same == m {
+            return Some(false); // B ends first
+        }
+        if odd {
+            return None;
+        }
+        let diff = ai + same;
+        let (vs, ve) = match json_member_back(scan, p, a, a_hi, floor, diff, quotes & 1 == 1) {
+            Some(Some(found)) => found,
+            Some(None) => return Some(false),
+            None => return None,
+        };
+        let b_vs = bi + (vs - ai);
+        let b_ve = json_value_end(scan, b, b_vs, b.len());
+        if b_ve >= b_hi || b_ve <= b_vs {
+            return Some(false);
+        }
+        ai = ve;
+        bi = b_ve;
+        floor = ve;
+    }
+    Some(false)
+}
+
+/// The value of the member `diff` is in, read backwards from `diff`: from it
+/// to the colon, then the name before that, which must be one nobody tracks.
+/// `inside` says `diff` is inside a string. `floor` is the lowest byte the read
+/// may look at.
+///
+/// `None` is a shape this does not follow; `Some(None)` a member the walk would
+/// not skip either: a tracked name, or a difference in a name or between
+/// members.
+#[inline(always)]
+fn json_member_back<S: Scan>(
+    scan: S,
+    p: &RowParser,
+    d: &[u8],
+    end: usize,
+    floor: usize,
+    diff: usize,
+    inside: bool,
+) -> Option<Option<(usize, usize)>> {
+    let mut k = diff;
+    let back = |k: &mut usize| -> Option<u8> {
+        if *k <= floor {
+            return None;
+        }
+        *k -= 1;
+        Some(d[*k])
+    };
+    if inside {
+        // The string's opening quote, then what comes before it.
+        while back(&mut k)? != b'"' {}
+        let mut c = back(&mut k)?;
+        while json_gap(c) {
+            c = back(&mut k)?;
+        }
+        if c != b':' {
+            return Some(None); // a name differs
+        }
+    } else {
+        // Only a scalar's own bytes, or space, may stand between the colon
+        // and `diff`.
+        loop {
+            let c = back(&mut k)?;
+            if c == b':' {
+                break;
+            }
+            if !(json_gap(c) || c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'+')) {
+                return Some(None);
+            }
+        }
+    }
+    let colon = k;
+    let mut c = back(&mut k)?;
+    while json_gap(c) {
+        c = back(&mut k)?;
+    }
+    if c != b'"' {
+        return None;
+    }
+    let name_end = k;
+    while back(&mut k)? != b'"' {}
+    let name_start = k + 1;
+    let mut c = back(&mut k)?;
+    while json_gap(c) {
+        c = back(&mut k)?;
+    }
+    if c != b',' && c != b'{' {
+        return None;
+    }
+    if p.slot_for(&d[name_start..name_end]).is_some() {
+        return Some(None);
+    }
+    let mut vs = colon + 1;
+    while vs < end && json_gap(d[vs]) {
+        vs += 1;
+    }
+    if vs > diff {
+        return None;
+    }
+    // Scanned against the whole slab rather than the row, so the scan keeps
+    // its registers up to the row's last bytes; a value that does not close
+    // inside the row fails the check after it either way.
+    let ve = json_value_end(scan, d, vs, d.len());
+    if ve >= end || ve <= vs || diff >= ve {
+        return Some(None);
+    }
+    Some(Some((vs, ve)))
 }
 
 /// The end of a row, which for newline-delimited JSON is the next newline byte
@@ -1598,6 +1819,106 @@ fn end_of_array_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize, open:
 mod tests {
     use super::super::slab::Slab;
     use super::*;
+
+    /// The counted JSON proof agrees with the member walk: rows that differ in
+    /// a tracked or untracked value, a name, a member added or dropped, with
+    /// spaces, escapes, nested values and numbers.
+    #[test]
+    fn json_rows_match_counted_agrees_with_the_walk() {
+        let Some(w) = Wide::detect() else {
+            return;
+        };
+        let p = RowParser::json(
+            vec![
+                Some("id".into()),
+                Some("amount".into()),
+                Some("note".into()),
+            ],
+            1,
+            false,
+        );
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let names = ["id", "amount", "note", "updated_at", "extra", "x"];
+        let values = [
+            "\"a\"",
+            "\"b c\"",
+            "12",
+            "12.5",
+            "-3",
+            "true",
+            "null",
+            "\"q\\\"r\"",
+            "{\"k\":1}",
+            "[1,2]",
+            "\"\"",
+            "\"{x}\"",
+        ];
+        let gaps = ["", "", "", " ", "  "];
+        let mut agreed = 0;
+        for _ in 0..30_000 {
+            let row = |n: usize, mutate: Option<(usize, u64)>| -> String {
+                let mut out = String::from("{");
+                for i in 0..n {
+                    let mut name = names[(i + 3 * (n % 2)) % names.len()].to_string();
+                    let mut value = values[(i * 7 + n) % values.len()].to_string();
+                    if let Some((at, how)) = mutate
+                        && at == i
+                    {
+                        match how % 4 {
+                            0 => value = values[(how / 4) as usize % values.len()].to_string(),
+                            1 => name = format!("{name}z"),
+                            2 => {
+                                value = format!("{value}{}", gaps[(how / 4) as usize % gaps.len()])
+                            }
+                            _ => {
+                                if i > 0 {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    let g = gaps[(i + n) % gaps.len()];
+                    out.push_str(&format!("{g}\"{name}\"{g}:{g}{value}"));
+                }
+                out.push_str("}\n");
+                out
+            };
+            let n = (next() % 8) as usize + 1;
+            let a_row = row(n, None);
+            let b_row = if next() % 5 == 0 {
+                row(n + (next() % 2) as usize, None)
+            } else {
+                row(n, Some(((next() % n as u64) as usize, next())))
+            };
+            // Slabs with room for whole registers past the rows.
+            let mut a = a_row.clone().into_bytes();
+            a.extend_from_slice(&[b' '; 80]);
+            let mut b = b"{\"pad\":0}\n".to_vec();
+            let b_lo = b.len();
+            b.extend_from_slice(b_row.as_bytes());
+            let b_hi = b.len();
+            b.extend_from_slice(&[b' '; 80]);
+            let walk = json_rows_match_with(Swar, &p, &a, 0, a_row.len(), &b, b_lo, b_hi);
+            // Safety: `w` proves AVX2.
+            let counted =
+                unsafe { json_rows_match_wide(w, &p, &a, 0, a_row.len(), &b, b_lo, b_hi) };
+            assert_eq!(counted, walk, "A {a_row:?} B {b_row:?}");
+            agreed += usize::from(walk);
+        }
+        assert!(
+            agreed > 1000,
+            "too few rows proved equal to test anything: {agreed}"
+        );
+    }
 
     /// The register count agrees with the field walk on rows of every shape:
     /// quoted fields, stray quotes, CRLF, short rows, and an end inside a row.

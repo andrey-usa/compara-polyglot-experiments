@@ -49,7 +49,8 @@ use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
     RowParser, Runs, csv_header, detect_delimiter, guard_span, json_array_row_starts, json_header,
-    json_is_array, json_row_indent, json_rows_match, shared_tail, sniff_dialect,
+    json_is_array, json_row_indent, json_rows_match, json_rows_match_at, shared_tail,
+    sniff_dialect,
 };
 
 use crate::alloc;
@@ -2240,7 +2241,10 @@ impl Part {
 /// rows the counted sweep marks again.
 fn mark_seen(seen: &[AtomicU64], row: i32) {
     let bit = row as usize;
-    seen[bit >> 6].fetch_or(1 << (bit & 63), Ordering::Relaxed);
+    // An empty bitmap is a join that keeps no rows: see `join`.
+    if let Some(word) = seen.get(bit >> 6) {
+        word.fetch_or(1 << (bit & 63), Ordering::Relaxed);
+    }
 }
 
 /// Joins one row of A's against B's index: the join's inner loop as a function,
@@ -2306,6 +2310,42 @@ fn join_row(
             }
         } else {
             Fast::Skipped
+        }
+    } else if ctx.json_proof {
+        // JSON: the proof over A's whole row, before A is parsed at all. The
+        // row through its last wanted value is what the parse below would
+        // offer, and finding that end is a parse of every member; the whole
+        // row holds the same values and the walk skips the untracked ones that
+        // differ -- the `updated_at` that differs on every row -- the same
+        // way. The candidate is the first row of B whose hash matches; a
+        // different key under the same hash fails on the key's bytes.
+        let data = ctx.a.slab.data();
+        let (Some(pa), Some(_)) = (ctx.a.parser(), ctx.b.parser()) else {
+            unreachable!("a JSON pair has two text parsers")
+        };
+        match ctx.bi.lookup(
+            ctx.b,
+            &ctx.a.slab,
+            None,
+            hash,
+            ctx.key_size,
+            ctx.opt,
+            None,
+            &mut scratch.fb,
+        ) {
+            Some((mate, _)) => {
+                let bd = ctx.b.slab.data();
+                let b_lo = ctx.bi.row_at[mate as usize] as usize;
+                let b_hi = row_end(ctx.bi, mate, bd.len());
+                if json_rows_match_at(pa, data, from, end, bd, b_lo, b_hi) {
+                    Fast::Proved(mate)
+                } else {
+                    // Not proved is not disproved: the parse below decides,
+                    // with the narrower proof it can offer.
+                    Fast::Skipped
+                }
+            }
+            None => Fast::Missed,
         }
     } else if let Some((delimiter, commas)) = ctx.guard {
         let data = ctx.a.slab.data();
@@ -2676,6 +2716,13 @@ fn join(
     threads: usize,
 ) -> Result<Joined> {
     let (ctx, seen) = join_setup(a, b, bi, opt, compared.len(), exporting);
+    // With no rows to list, the bitmap only counts B's unmatched keys, and
+    // that count is B's keys less the matched ones: a key of A matches at most
+    // one key of B, and no two keys of A the same one. So nothing is marked.
+    // Marking was a locked read-modify-write per matched row into lines every
+    // thread shares, and the join stopped scaling on it: 0.92 s at one thread,
+    // 0.41 s at four, on a 2M-row NDJSON pair.
+    let seen = if ctx.keep_picks { seen } else { Vec::new() };
 
     let a_keys = ai.first_row.len();
     let a_ways = ways_for(a_keys);
@@ -2759,7 +2806,7 @@ fn join_tail(
     };
 
     let b_keys = bi.first_row.len();
-    let b_ways = ways_for(b_keys);
+    let b_ways = if seen.is_empty() { 0 } else { ways_for(b_keys) };
 
     let b_range = |p: usize| -> Capped {
         let mut added = Capped::new(cap, exporting, keep_picks);
@@ -2798,6 +2845,9 @@ fn join_tail(
             added.push(*pick);
         }
         added.total += chunk.total - chunk.held.len() as i64;
+    }
+    if seen.is_empty() {
+        added.total = b_keys as i64 - parts.iter().map(|p| p.matched).sum::<i64>();
     }
 
     phases.mark("  join chunks (par)");
