@@ -382,8 +382,28 @@ def generate(rows: str, fmt: str, data: Path) -> tuple[Path, Path, float]:
     if done.returncode != 0:
         raise SystemExit(f"the generator failed: {done.stderr.strip()[:400]}")
     extension = {"csv": "csv", "tsv": "tsv", "ndjson": "ndjson", "parquet": "parquet"}[fmt]
-    return (data / f"bench_a.{extension}", data / f"bench_b.{extension}",
-            time.monotonic() - started)
+    a, b = data / f"bench_a.{extension}", data / f"bench_b.{extension}"
+    # `BENCH_QUOTE_CSV=1`: the same rows with every field that is not a number
+    # quoted, the way a spreadsheet or a database export writes them. The
+    # generator writes none, and a quoted field is a different path through
+    # every port's scanner.
+    if fmt == "csv" and os.environ.get("BENCH_QUOTE_CSV") == "1":
+        for path in (a, b):
+            quote_in_place(path)
+    return a, b, time.monotonic() - started
+
+
+def quote_in_place(path: Path) -> None:
+    import csv
+    import re
+    number = re.compile(r"-?\d+(\.\d+)?")
+    tmp = path.with_suffix(".quoting")
+    with path.open(newline="") as src, tmp.open("w", newline="") as out:
+        for row in csv.reader(src):
+            out.write(",".join(
+                f if f == "" or number.fullmatch(f) else '"' + f.replace('"', '""') + '"'
+                for f in row) + "\n")
+    tmp.replace(path)
 
 
 # Where the input stops being a benchmark and starts being a page-cache test.

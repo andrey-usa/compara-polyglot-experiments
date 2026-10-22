@@ -1,7 +1,6 @@
 {
-  "rows": "10m",
-  "formats": "csv,tsv",
-  "threads": "2,4",
-  "repeats": 5,
-  "rust_variant_env": "COMPARA_PARALLEL_INSERT=1"
+  "rows": "2m",
+  "formats": "csv-quoted",
+  "threads": "1,2,4",
+  "repeats": 5
 }

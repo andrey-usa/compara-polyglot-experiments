@@ -113,9 +113,12 @@ jobs:
           total_mb=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo)
           cap=$(( total_mb - 2048 ))
           mkdir -p /tmp/tables
+          # `csv-quoted` is the CSV rows with their text fields quoted.
+          fmt="${{ matrix.format }}"
+          if [ "$fmt" = "csv-quoted" ]; then fmt=csv; export BENCH_QUOTE_CSV=1; fi
           for t in ${THREADS//,/ }; do
             python3 scripts/bench_formats_ports.py \
-              --rows "$ROWS" --formats "${{ matrix.format }}" --repeats "$REPEATS" \
+              --rows "$ROWS" --formats "$fmt" --repeats "$REPEATS" \
               --threads "$t" --memory-cap "$cap" --keep --data-dir "$DATA" \
               --md-out "/tmp/tables/t$t.md" --json-out "/tmp/tables/t$t.json" \
               | tee -a /tmp/tables/log.txt
@@ -137,7 +140,7 @@ jobs:
         env:
           THREADS: ${{ needs.plan.outputs.threads }}
         run: |
-          f="${{ matrix.format }}"
+          f="${{ matrix.format }}"; f="${f%-quoted}"
           a=$DATA/bench_a.$f; b=$DATA/bench_b.$f
           [ -f "$a" ] || exit 0
           for t in ${THREADS//,/ }; do
