@@ -3,7 +3,7 @@ name: Cloud A/B
 # Did the cloud work slow compara down on local files? The `cloud/` copy
 # (head, with and without the `cloud` feature) against `base/` (the branch it
 # started from), on one runner per format, interleaved runs, counts checked
-# equal. Tables are annotations: `cloud ab ...`.
+# equal. Tables are annotations: `cloud ab ...` (one per format and size).
 
 on:
   push:
