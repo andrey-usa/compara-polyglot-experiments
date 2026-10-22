@@ -449,6 +449,16 @@ fn hash_rows(as_id: &[bool], s: &KeySide<'_>, from: usize, out: &mut [u64], opt:
             }
             continue;
         }
+        if !needs_normalising(opt) {
+            let read = KeyRead::of(false, s, j);
+            for (h, r) in out.iter_mut().zip(rows.clone()) {
+                *h = match read.bytes(r) {
+                    None => fold_absent(*h),
+                    Some(v) => fold_bytes(*h, v),
+                };
+            }
+            continue;
+        }
         for (h, r) in out.iter_mut().zip(rows.clone()) {
             let c = s.col[j].at(r);
             *h = if absent(c, opt) {
@@ -488,6 +498,182 @@ fn row_eq(
         }
     }
     true
+}
+
+/// One side's key column as the hot loops read it, settled once rather than
+/// asked per cell: which form it is held in, and the buffers that form reads.
+/// `row_eq` and `Col::at` asked both on every cell -- whether the column was
+/// coded, held as words, a dictionary, which buffer its slices point into --
+/// and on the 200k-row Parquet pair that was about 450 instructions per key
+/// comparison, most of the join.
+#[derive(Clone, Copy)]
+enum KeyRead<'a> {
+    Id(&'a [i32]),
+    Word(&'a parquet::Words),
+    Dict {
+        base: &'a [u8],
+        dict: &'a [parquet::Slice],
+        index: &'a [i32],
+    },
+    Plain {
+        base: &'a [u8],
+        values: &'a [parquet::Slice],
+    },
+}
+
+impl<'a> KeyRead<'a> {
+    fn of(coded: bool, s: &'a KeySide<'_>, j: usize) -> Self {
+        if coded {
+            return KeyRead::Id(&s.id[j]);
+        }
+        let col = &s.col[j];
+        if let Some(w) = &col.c.words {
+            return KeyRead::Word(w);
+        }
+        if col.c.dictionary {
+            KeyRead::Dict {
+                base: col.base(),
+                dict: &col.c.dict,
+                index: &col.c.index,
+            }
+        } else {
+            KeyRead::Plain {
+                base: col.base(),
+                values: &col.c.values,
+            }
+        }
+    }
+
+    /// A byte column's cell, or `None` where it is absent -- null or empty, as
+    /// [`absent`] reads a cell when nothing normalises.
+    #[inline(always)]
+    fn bytes(self, row: usize) -> Option<&'a [u8]> {
+        let (base, s) = match self {
+            KeyRead::Dict { base, dict, index } => {
+                let k = index[row];
+                if k < 0 {
+                    return None;
+                }
+                (base, dict[k as usize])
+            }
+            KeyRead::Plain { base, values } => (base, values[row]),
+            KeyRead::Id(_) | KeyRead::Word(_) => unreachable!("not a byte column"),
+        };
+        if s.is_null() || s.length() == 0 {
+            return None;
+        }
+        Some(&base[s.offset()..s.offset() + s.length()])
+    }
+
+    /// Starts the fetch of what [`KeyRead::bytes`] and its kin read first
+    /// of `row`: the id, word or slice handle.
+    #[inline(always)]
+    fn prefetch(self, row: usize) {
+        let p: *const u8 = match self {
+            KeyRead::Id(v) => v.as_ptr().wrapping_add(row).cast(),
+            KeyRead::Word(w) => w.values.as_ptr().wrapping_add(row).cast(),
+            KeyRead::Dict { index, .. } => index.as_ptr().wrapping_add(row).cast(),
+            KeyRead::Plain { values, .. } => values.as_ptr().wrapping_add(row).cast(),
+        };
+        prefetch_at(p);
+    }
+
+    fn is_bytes(self) -> bool {
+        matches!(self, KeyRead::Dict { .. } | KeyRead::Plain { .. })
+    }
+}
+
+/// Two byte strings equal, short ones by a load or two rather than a call to
+/// `memcmp`: a key cell is typically an id of a dozen bytes.
+#[inline(always)]
+fn bytes_eq(p: &[u8], q: &[u8]) -> bool {
+    let n = p.len();
+    if n != q.len() {
+        return false;
+    }
+    if n > 16 {
+        return p == q;
+    }
+    if n >= 8 {
+        let word = |v: &[u8], at: usize| u64::from_le_bytes(v[at..at + 8].try_into().unwrap());
+        return word(p, 0) == word(q, 0) && word(p, n - 8) == word(q, n - 8);
+    }
+    n == 0 || tail_word(p, n) == tail_word(q, n)
+}
+
+/// [`row_eq`] between two sides, with each key column read through a
+/// [`KeyRead`] decided once. Normalising options, and a column held in
+/// different forms on the two sides, keep `row_eq`.
+struct KeyEq<'a> {
+    cols: Vec<(KeyRead<'a>, KeyRead<'a>)>,
+    general: bool,
+    as_id: &'a [bool],
+    x: &'a KeySide<'a>,
+    y: &'a KeySide<'a>,
+    opt: &'a Options,
+}
+
+impl<'a> KeyEq<'a> {
+    fn new(as_id: &'a [bool], x: &'a KeySide<'a>, y: &'a KeySide<'a>, opt: &'a Options) -> Self {
+        let cols: Vec<_> = as_id
+            .iter()
+            .enumerate()
+            .map(|(j, &coded)| (KeyRead::of(coded, x, j), KeyRead::of(coded, y, j)))
+            .collect();
+        let general = needs_normalising(opt)
+            || !cols.iter().all(|&(a, b)| match (a, b) {
+                (KeyRead::Id(_), KeyRead::Id(_)) | (KeyRead::Word(_), KeyRead::Word(_)) => true,
+                _ => a.is_bytes() && b.is_bytes(),
+            });
+        KeyEq {
+            cols,
+            general,
+            as_id,
+            x,
+            y,
+            opt,
+        }
+    }
+
+    /// The second stage of the sweep's prefetch: the slot `h` lands in,
+    /// fetched [`PREFETCH_AHEAD`] / 2 probes ago, names the first side's row a
+    /// hit will compare.
+    #[inline(always)]
+    fn prefetch_mate(&self, into: &Index, h: u64) {
+        let word = into.slots[(h & into.mask) as usize];
+        if word != 0 && into.tag_is(word, h) {
+            let row = into.row_of(word);
+            for &(a, _) in &self.cols {
+                a.prefetch(row);
+            }
+        }
+    }
+
+    /// Whether row `rx` of the first side has the key of row `ry` of the second.
+    #[inline(always)]
+    fn eq(&self, rx: usize, ry: usize) -> bool {
+        if self.general {
+            return row_eq(self.as_id, self.x, rx, self.y, ry, self.opt);
+        }
+        for &(a, b) in &self.cols {
+            let same = match (a, b) {
+                (KeyRead::Id(x), KeyRead::Id(y)) => x[rx] == y[ry],
+                (KeyRead::Word(x), KeyRead::Word(y)) => {
+                    let null = x.is_null(rx);
+                    null == y.is_null(ry) && (null || x.values[rx] == y.values[ry])
+                }
+                _ => match (a.bytes(rx), b.bytes(ry)) {
+                    (None, None) => true,
+                    (Some(p), Some(q)) => bytes_eq(p, q),
+                    _ => false,
+                },
+            };
+            if !same {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// An open-addressed table over one file's distinct keys, first occurrence wins.
@@ -618,54 +804,6 @@ fn prefetch_at(p: *const u8) {
     }
 }
 
-/// Starts the fetch of what [`row_eq`] reads of `row` in `s`: each key column's
-/// id, word or slice handle there.
-///
-/// The sweep's probes land on rows of the other file in no order, so after
-/// the slot the next miss is these, one per key column, and their address is
-/// known as soon as the slot is: a stage behind the slot's own prefetch, the
-/// slot is in cache and names the row.
-#[inline]
-fn prefetch_row(as_id: &[bool], s: &KeySide<'_>, row: usize) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-        let fetch = |p: *const i8| {
-            // Safety: a prefetch has no architectural effect, and the address
-            // is computed without dereferencing anything.
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(p) }
-        };
-        for (j, &coded) in as_id.iter().enumerate() {
-            if coded {
-                fetch(s.id[j].as_ptr().wrapping_add(row).cast());
-                continue;
-            }
-            let c = &s.col[j].c;
-            if let Some(w) = &c.words {
-                fetch(w.values.as_ptr().wrapping_add(row).cast());
-            } else if c.dictionary {
-                fetch(c.index.as_ptr().wrapping_add(row).cast());
-            } else {
-                fetch(c.values.as_ptr().wrapping_add(row).cast());
-            }
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (as_id, s, row);
-    }
-}
-
-/// The second stage of the sweep's prefetch: the slot `h` lands in, fetched
-/// [`PREFETCH_AHEAD`] / 2 probes ago, names the row a hit will compare.
-#[inline]
-fn prefetch_mate(as_id: &[bool], into: &Index, there: &KeySide<'_>, h: u64) {
-    let word = into.slots[(h & into.mask) as usize];
-    if word != 0 && into.tag_is(word, h) {
-        prefetch_row(as_id, there, into.row_of(word));
-    }
-}
-
 fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -> Result<Index> {
     let n = s.rows;
     let mut hs = alloc::filled(0u64, n, "one hash per row")?;
@@ -714,6 +852,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
     alloc::grow(&mut ix.firsts, n, "one row per distinct key")?;
     alloc::grow(&mut ix.hashes, n, "one hash per distinct key")?;
 
+    let eq = KeyEq::new(as_id, s, s, opt);
     for (r, &h) in hs.iter().enumerate() {
         if let Some(&soon) = hs.get(r + PREFETCH_AHEAD) {
             prefetch_slot(&ix.slots, ix.mask, soon);
@@ -729,7 +868,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
             }
             if ix.tag_is(slot, h) {
                 let first = ix.row_of(slot);
-                if row_eq(as_id, s, first, s, r, opt) {
+                if eq.eq(first, r) {
                     if ix.extra.is_empty() {
                         ix.extra = alloc::filled(0u32, n, "a repeat count per row")?;
                     }
@@ -749,15 +888,10 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
 }
 
 /// Looks one side's row up in the other side's table.
-fn lookup(
-    as_id: &[bool],
-    into: &Index,
-    there: &KeySide<'_>,
-    here: &KeySide<'_>,
-    row: usize,
-    h: u64,
-    opt: &Options,
-) -> i32 {
+/// `eq` compares a row of the table's side (first) with one of the probing
+/// side (second).
+#[inline(always)]
+fn lookup(into: &Index, eq: &KeyEq<'_>, row: usize, h: u64) -> i32 {
     let mut at = (h & into.mask) as usize;
     loop {
         let slot = into.slots[at];
@@ -766,7 +900,7 @@ fn lookup(
         }
         if into.tag_is(slot, h) {
             let first = into.row_of(slot);
-            if row_eq(as_id, there, first, here, row, opt) {
+            if eq.eq(first, row) {
                 return first as i32;
             }
         }
@@ -1444,6 +1578,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         (a, budget - a)
     };
 
+    // B's rows against A's, and A's against B's: the table's side first.
+    let a_probes_b = KeyEq::new(&as_id, &b_keys, &a_keys, opt);
+    let b_probes_a = KeyEq::new(&as_id, &a_keys, &b_keys, opt);
     let a_range = |p: usize| -> Result<Part> {
         let mut out = Part::default();
         let lo = ai.firsts.len() * p / a_ways;
@@ -1455,18 +1592,10 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 prefetch_slot(&bi.slots, bi.mask, soon);
             }
             if let Some(&near) = ai.hashes.get(at + PREFETCH_AHEAD / 2) {
-                prefetch_mate(&as_id, &bi, &b_keys, near);
+                a_probes_b.prefetch_mate(&bi, near);
             }
             let row = ai.firsts[at];
-            let mate = lookup(
-                &as_id,
-                &bi,
-                &b_keys,
-                &a_keys,
-                row as usize,
-                ai.hashes[at],
-                opt,
-            );
+            let mate = lookup(&bi, &a_probes_b, row as usize, ai.hashes[at]);
             if mate < 0 {
                 out.total += 1;
                 if out.held.len() <= cap {
@@ -1491,19 +1620,10 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 prefetch_slot(&ai.slots, ai.mask, soon);
             }
             if let Some(&near) = bi.hashes.get(at + PREFETCH_AHEAD / 2) {
-                prefetch_mate(&as_id, &ai, &a_keys, near);
+                b_probes_a.prefetch_mate(&ai, near);
             }
             let row = bi.firsts[at];
-            if lookup(
-                &as_id,
-                &ai,
-                &a_keys,
-                &b_keys,
-                row as usize,
-                bi.hashes[at],
-                opt,
-            ) >= 0
-            {
+            if lookup(&ai, &b_probes_a, row as usize, bi.hashes[at]) >= 0 {
                 continue;
             }
             out.total += 1;
@@ -2280,6 +2400,33 @@ mod tests {
             let mut padded = [0u8; 8];
             padded[..rem].copy_from_slice(&v[n - rem..]);
             assert_eq!(tail_word(v, rem), u64::from_le_bytes(padded), "length {n}");
+        }
+    }
+
+    /// The word-at-a-time key compare agrees with slice equality at every
+    /// length, for equal pairs and pairs differing in any one byte.
+    #[test]
+    fn bytes_eq_is_slice_equality() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for n in 0..40usize {
+            for _ in 0..200 {
+                let p: Vec<u8> = (0..n).map(|_| (next() % 4) as u8 + b'a').collect();
+                let mut q = p.clone();
+                assert!(bytes_eq(&p, &q), "{p:?}");
+                if n > 0 {
+                    let at = (next() % n as u64) as usize;
+                    q[at] = (next() % 4) as u8 + b'a';
+                    assert_eq!(bytes_eq(&p, &q), p == q, "{p:?} {q:?}");
+                }
+                let longer = [p.as_slice(), b"a"].concat();
+                assert!(!bytes_eq(&p, &longer));
+            }
         }
     }
 }
