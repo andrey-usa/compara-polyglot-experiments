@@ -257,6 +257,89 @@ jobs:
           print(f"::notice title={sys.argv[2]}::" + text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
           EOF
 
+  action:
+    # The composite action in cloud/action.yml, run the way a workflow runs
+    # it, on a binary built here (`binary:`), since there is no release of
+    # this code to download: its outputs, its job summary, and the exit it
+    # gives for identical tables, differing ones and a failure.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - name: Build
+        working-directory: cloud
+        run: cargo build --release --locked --bin compara --bin compara-gen-data
+      - name: Fixtures
+        run: |
+          mkdir -p /tmp/ax && cd /tmp/ax
+          $GITHUB_WORKSPACE/cloud/target/release/compara-gen-data --rows 50k --out-dir . --prefix t
+          cp t_a.csv same.csv
+      - name: Differences, reported only
+        id: differ
+        uses: ./cloud
+        with:
+          a: /tmp/ax/t_a.csv
+          b: /tmp/ax/t_b.csv
+          key: account_id,txn_id
+          args: -i updated_at
+          report: /tmp/ax/report.html
+          fail-on-differences: "false"
+          binary: ${{ github.workspace }}/cloud/target/release/compara
+      - name: Identical
+        id: same
+        uses: ./cloud
+        with:
+          a: /tmp/ax/t_a.csv
+          b: /tmp/ax/same.csv
+          key: account_id,txn_id
+          binary: ${{ github.workspace }}/cloud/target/release/compara
+      - name: Differences, failing the step
+        id: fail
+        continue-on-error: true
+        uses: ./cloud
+        with:
+          a: /tmp/ax/t_a.csv
+          b: /tmp/ax/t_b.csv
+          key: account_id,txn_id
+          binary: ${{ github.workspace }}/cloud/target/release/compara
+      - name: A missing file
+        id: missing
+        continue-on-error: true
+        uses: ./cloud
+        with:
+          a: /tmp/ax/nope.csv
+          b: /tmp/ax/t_b.csv
+          key: account_id,txn_id
+          binary: ${{ github.workspace }}/cloud/target/release/compara
+      - name: Check what the action gave
+        env:
+          D_IDENTICAL: ${{ steps.differ.outputs.identical }}
+          D_CHANGED: ${{ steps.differ.outputs.changed }}
+          D_ADDED: ${{ steps.differ.outputs.added }}
+          D_SUMMARY: ${{ steps.differ.outputs.summary }}
+          S_IDENTICAL: ${{ steps.same.outputs.identical }}
+          F_OUTCOME: ${{ steps.fail.outcome }}
+          M_OUTCOME: ${{ steps.missing.outcome }}
+        run: |
+          set -u
+          ok=true
+          check() { if [ "$2" = "$3" ]; then echo "ok   $1 = $2"; else echo "FAIL $1 = $2, wanted $3"; ok=false; fi; }
+          check "differ.identical" "$D_IDENTICAL" false
+          check "differ.added" "$D_ADDED" "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['counts']['added'])" "$D_SUMMARY")"
+          check "same.identical" "$S_IDENTICAL" true
+          check "fail.outcome" "$F_OUTCOME" failure
+          check "missing.outcome" "$M_OUTCOME" failure
+          check "report written" "$(test -s /tmp/ax/report.html && echo yes)" yes
+          echo "changed=$D_CHANGED"
+          echo "::notice title=cloud action::$($ok && echo all checks pass || echo a check failed): differ.changed=$D_CHANGED differ.identical=$D_IDENTICAL same.identical=$S_IDENTICAL fail=$F_OUTCOME missing=$M_OUTCOME"
+          $ok
+
   container:
     runs-on: ubuntu-24.04
     defaults:
