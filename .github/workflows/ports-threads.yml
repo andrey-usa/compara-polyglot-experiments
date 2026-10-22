@@ -16,6 +16,7 @@ on:
     paths:
       - "rust/**"
       - "c/**"
+      - "scripts/bench_formats_ports.py"
       - ".github/ports-threads.json"
       - ".github/workflows/ports-threads.yml"
   workflow_dispatch:

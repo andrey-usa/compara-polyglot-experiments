@@ -277,23 +277,38 @@ def run(argv: list[str], timeout: float,
         except OSError:
             pass
         os._exit(127)
-    deadline = started + timeout
-    peak_data = 0.0
+    # The wall time comes from a blocking wait, not from the 50 ms poll that
+    # samples memory: polled, every time was a multiple of 50 ms, which at two
+    # million rows is a sixth of a run and turned 0.31 s against 0.34 s into
+    # a tie or a 17% gap depending on where the polls fell.
+    import threading
     status_path = f"/proc/{pid}/status"
-    while True:
-        # Before the wait, so the last sample is as late as the poll allows.
-        peak_data = max(peak_data, vm_data_mb(status_path))
-        done, status, usage = os.wait4(pid, os.WNOHANG)
-        if done:
-            return (time.monotonic() - started, usage.ru_maxrss / 1024,
-                    usage.ru_utime + usage.ru_stime,
-                    os.waitstatus_to_exitcode(status), last_line(errors), peak_data)
-        if time.monotonic() > deadline:
-            os.kill(pid, 9)
-            _, _, usage = os.wait4(pid, 0)
-            return (time.monotonic() - started, 0.0,
-                    usage.ru_utime + usage.ru_stime, -1, last_line(errors), peak_data)
-        time.sleep(0.05)
+    peak = [0.0]
+    finished = threading.Event()
+    killed = [False]
+
+    def sample() -> None:
+        deadline = started + timeout
+        while not finished.wait(0.05):
+            peak[0] = max(peak[0], vm_data_mb(status_path))
+            if time.monotonic() > deadline:
+                killed[0] = True
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+                return
+
+    sampler = threading.Thread(target=sample, daemon=True)
+    sampler.start()
+    _, status, usage = os.wait4(pid, 0)
+    wall = time.monotonic() - started
+    finished.set()
+    sampler.join()
+    if killed[0]:
+        return (wall, 0.0, usage.ru_utime + usage.ru_stime, -1, last_line(errors), peak[0])
+    return (wall, usage.ru_maxrss / 1024, usage.ru_utime + usage.ru_stime,
+            os.waitstatus_to_exitcode(status), last_line(errors), peak[0])
 
 
 def vm_data_mb(status_path: str) -> float:
@@ -391,7 +406,7 @@ def table_of(results: list[dict]) -> str:
             continue
         rate = row["rows"] / row["seconds"] if row["seconds"] else 0
         data = row.get("data") or 0
-        grid.append([row["port"], row["format"], f"{row['seconds']:.2f}s", f"{rate:,.0f}",
+        grid.append([row["port"], row["format"], f"{row['seconds']:.3f}s", f"{rate:,.0f}",
                      f"{row['cpu']:.1f}s", f"{row['cores']:.2f}x",
                      f"{row['rss']:,.0f} MB", f"{row['above']:,.0f} MB",
                      f"{data:,.0f} MB" if data else "-"])
