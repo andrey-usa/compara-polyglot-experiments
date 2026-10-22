@@ -119,6 +119,31 @@ jobs:
           EOF
           done
 
+      - name: Phases, C and Rust
+        env:
+          THREADS: ${{ needs.plan.outputs.threads }}
+        run: |
+          f="${{ matrix.format }}"
+          a=/tmp/bench-data/bench_a.$f; b=/tmp/bench-data/bench_b.$f
+          [ -f "$a" ] || exit 0
+          for t in ${THREADS//,/ }; do
+            for i in 1 2 3; do
+              CSVDIFF_PHASES=1 c/csvdiff compare "$a" "$b" -k account_id,txn_id -i updated_at --threads "$t" > /tmp/c.out 2> /tmp/c.err || true
+              COMPARA_PHASES=1 rust/target/release/compara compare "$a" "$b" -k account_id,txn_id -i updated_at --threads "$t" --summary > /tmp/r.out 2> /tmp/r.err || true
+            done
+            {
+              echo "### phases $f t=$t (third run)"
+              echo; echo "C:"; echo '```'; cat /tmp/c.err; echo '```'
+              echo "Rust:"; echo '```'; cat /tmp/r.err; echo '```'
+            } > "/tmp/tables/phases-t$t.md"
+            python3 - "/tmp/tables/phases-t$t.md" "phases $f t=$t" <<'EOF'
+          import sys
+          text = open(sys.argv[1]).read()[:3800]
+          esc = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::notice title={sys.argv[2]}::{esc}")
+          EOF
+          done
+
       - uses: actions/upload-artifact@v7
         if: always()
         with:

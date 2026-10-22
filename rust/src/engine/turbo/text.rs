@@ -11,8 +11,8 @@
 //! differ, because the JSON reader joins by name.
 
 use super::field::{
-    ABSENT, Delims, Field, Scan, Swar, Wide, next_of1_with, next_of2, next_of2_with, next_of3_with,
-    pack, skip_quoted, skip_quoted_with,
+    ABSENT, Delims, Field, STEP, Scan, Swar, Wide, next_of1_with, next_of2, next_of2_with,
+    next_of3_with, pack, skip_quoted, skip_quoted_with,
 };
 use super::slab::{Dialect, Slab, text_of};
 use crate::error::{Error, Result};
@@ -308,6 +308,73 @@ fn skip_json_nested<S: Scan>(scan: S, data: &[u8], mut pos: usize, end: usize) -
     end
 }
 
+/// [`guard_span_with`] a register at a time, for a row with no quote before
+/// the answer: the delimiters in each register are counted rather than visited,
+/// and the one wanted is picked out of the last register's mask. On a twenty-
+/// column row that is six registers where the field walk took nineteen steps
+/// of a few dozen instructions each, and the walk ran once for every row of A
+/// the join proves -- a quarter of the whole comparison's instructions.
+///
+/// `None` hands the row to the field walk: a quote, which may open a quoted
+/// field whose delimiters do not count, or too few bytes left for a register.
+/// The answer is otherwise the walk's: the `commas`-th delimiter, or the
+/// newline where the last field ends the row, and `Some(None)` where the row
+/// ends early or runs past `hi`.
+#[inline(always)]
+fn guard_span_counted<S: Scan>(
+    scan: S,
+    data: &[u8],
+    lo: usize,
+    hi: usize,
+    delimiter: u8,
+    commas: usize,
+) -> Option<Option<usize>> {
+    if !S::WIDE || commas == 0 {
+        return None;
+    }
+    let mut need = commas;
+    let mut at = lo;
+    while at < hi {
+        if at + STEP > data.len() {
+            return None;
+        }
+        let room = hi - at;
+        let valid = if room >= STEP {
+            u64::MAX
+        } else {
+            (1u64 << room) - 1
+        };
+        let delims = scan.hits(data, at, delimiter, delimiter) & valid;
+        // A newline ends the row and a quote ends what can be counted.
+        let stops = scan.hits(data, at, b'\n', b'"') & valid;
+        let before = if stops == 0 {
+            u64::MAX
+        } else {
+            (1u64 << stops.trailing_zeros()) - 1
+        };
+        let counted = delims & before;
+        let seen = counted.count_ones() as usize;
+        if seen >= need {
+            let mut m = counted;
+            for _ in 1..need {
+                m &= m - 1;
+            }
+            return Some(Some(at + m.trailing_zeros() as usize - lo));
+        }
+        if stops != 0 {
+            let stop = at + stops.trailing_zeros() as usize;
+            if data[stop] == b'"' {
+                return None;
+            }
+            // The newline: it ends the last field, or the row was too short.
+            return Some((need - seen == 1).then_some(stop - lo));
+        }
+        need -= seen;
+        at += STEP;
+    }
+    Some(None)
+}
+
 /// A quoted CSV field, flagged when it holds a doubled quote. A quote inside the
 /// body can only be half of such a pair, which is what makes the test a single
 /// scan and lets the unescaping wait until the bytes are actually read.
@@ -503,7 +570,7 @@ pub(super) fn guard_span(
         target_arch = "x86_64",
         not(any(target_feature = "avx2", target_feature = "avx512bw"))
     ),
-    target_feature(enable = "avx2")
+    target_feature(enable = "avx2,popcnt,bmi1")
 )]
 unsafe fn guard_span_wide(
     w: Wide,
@@ -525,6 +592,9 @@ fn guard_span_with<S: Scan>(
     delimiter: u8,
     commas: usize,
 ) -> Option<usize> {
+    if let Some(answer) = guard_span_counted(scan, data, lo, hi, delimiter, commas) {
+        return answer;
+    }
     let mut at = lo;
     let mut delims = Delims::new(scan, data, lo, hi, delimiter, b'\n');
     for i in 0..commas {
@@ -628,7 +698,7 @@ impl Runs {
             target_arch = "x86_64",
             not(any(target_feature = "avx2", target_feature = "avx512bw"))
         ),
-        target_feature(enable = "avx2")
+        target_feature(enable = "avx2,popcnt,bmi1")
     )]
     unsafe fn of_row_wide(
         &self,
@@ -711,7 +781,7 @@ impl Runs {
             target_arch = "x86_64",
             not(any(target_feature = "avx2", target_feature = "avx512bw"))
         ),
-        target_feature(enable = "avx2")
+        target_feature(enable = "avx2,popcnt,bmi1")
     )]
     unsafe fn matches_wide(
         &self,
@@ -884,7 +954,7 @@ impl RowParser {
             target_arch = "x86_64",
             not(any(target_feature = "avx2", target_feature = "avx512bw"))
         ),
-        target_feature(enable = "avx2")
+        target_feature(enable = "avx2,popcnt,bmi1")
     )]
     unsafe fn parse_wide(
         &self,
@@ -1271,7 +1341,7 @@ pub(super) fn json_rows_match(p: &RowParser, a: &[u8], b: &[u8], b_lo: usize, b_
         target_arch = "x86_64",
         not(any(target_feature = "avx2", target_feature = "avx512bw"))
     ),
-    target_feature(enable = "avx2")
+    target_feature(enable = "avx2,popcnt,bmi1")
 )]
 unsafe fn json_rows_match_wide(
     w: Wide,
@@ -1528,6 +1598,53 @@ fn end_of_array_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize, open:
 mod tests {
     use super::super::slab::Slab;
     use super::*;
+
+    /// The register count agrees with the field walk on rows of every shape:
+    /// quoted fields, stray quotes, CRLF, short rows, and an end inside a row.
+    #[test]
+    fn guard_span_counted_agrees_with_the_field_walk() {
+        let Some(w) = Wide::detect() else {
+            return;
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet = b"abc,,,\"\n\r xyz0123";
+        for _ in 0..20_000 {
+            let len = (next() % 300) as usize + 1;
+            let mut data: Vec<u8> = (0..len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            // Most rows plain, as files are: quotes and newlines thinned out.
+            if next() % 3 != 0 {
+                for b in data.iter_mut() {
+                    if (*b == b'"' || *b == b'\n') && next() % 8 != 0 {
+                        *b = b'q';
+                    }
+                }
+            }
+            data.extend_from_slice(&[b'\n'; 70]);
+            let lo = (next() % len as u64) as usize;
+            let hi = lo + (next() % (len - lo + 40) as u64) as usize;
+            let hi = hi.min(data.len());
+            let commas = (next() % 25) as usize;
+            for delimiter in [b',', b'\t'] {
+                let walk = guard_span_with(Swar, &data, lo, hi, delimiter, commas);
+                // Safety: `w` proves AVX2.
+                let counted = unsafe { guard_span_wide(w, &data, lo, hi, delimiter, commas) };
+                assert_eq!(
+                    counted,
+                    walk,
+                    "{:?} lo {lo} hi {hi} commas {commas}",
+                    String::from_utf8_lossy(&data)
+                );
+            }
+        }
+    }
 
     fn json_slab(text: &str) -> Slab {
         let mut s = Slab::owned(text.as_bytes().to_vec(), Dialect::Json);

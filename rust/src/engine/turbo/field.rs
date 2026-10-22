@@ -112,7 +112,12 @@ impl Wide {
             target_arch = "x86_64",
             not(any(target_feature = "avx2", target_feature = "avx512bw"))
         ))]
-        return std::arch::is_x86_feature_detected!("avx2").then_some(Wide(()));
+        // POPCNT and BMI1 ride along: every CPU with AVX2 has them, and the
+        // wide functions count and find bits with them.
+        return (std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("popcnt")
+            && std::arch::is_x86_feature_detected!("bmi1"))
+        .then_some(Wide(()));
         #[cfg(not(target_arch = "x86_64"))]
         return None;
     }
@@ -166,7 +171,7 @@ impl Scan for Wide {
 /// # Safety
 /// The CPU has AVX2, and `at + 32 <= data.len()`.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,popcnt,bmi1")]
 #[inline]
 #[allow(dead_code)] // unused in an AVX-512 build
 unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
