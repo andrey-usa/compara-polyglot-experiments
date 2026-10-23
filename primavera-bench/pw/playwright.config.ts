@@ -4,7 +4,8 @@ import { defineConfig } from '@playwright/test';
 // own Chrome (no browser download), one browser context per test.
 export default defineConfig({
   testDir: './tests',
-  fullyParallel: false,
+  // Tests of one file run in parallel too, as a speed-minded setup would.
+  fullyParallel: true,
   retries: 0,
   reporter: 'line',
   use: {

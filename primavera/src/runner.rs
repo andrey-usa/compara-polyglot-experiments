@@ -49,6 +49,9 @@ pub struct Failure {
     /// Something earlier that likely explains it (a click that changed nothing).
     pub hint: Option<String>,
     pub screenshot: Option<PathBuf>,
+    /// When the element wasn't there: what on the page comes closest,
+    /// (`role "name"`, a locator for it, how close).
+    pub nearest: Vec<(String, String, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,23 +59,63 @@ pub struct ScenarioResult {
     pub file: PathBuf,
     pub name: String,
     pub line: usize,
+    pub tags: Vec<String>,
     pub ms: f64,
     #[allow(dead_code)]
     pub steps: Vec<StepResult>,
     pub failure: Option<Failure>,
+    /// 1 for the first try; more when `--retries` ran it again.
+    pub attempt: u32,
+    /// How the earlier tries failed (a scenario that passed after one is
+    /// flaky).
+    pub retried: Vec<Failure>,
+    /// What it saved, for `--json`.
+    pub saved: BTreeMap<String, String>,
+    /// Optional steps that didn't happen.
+    pub notes: Vec<String>,
+    /// Which worker ran it.
+    pub worker: usize,
 }
 
 impl ScenarioResult {
     pub fn passed(&self) -> bool {
         self.failure.is_none()
     }
+
+    pub fn flaky(&self) -> bool {
+        self.passed() && !self.retried.is_empty()
+    }
+
+    /// `file::name`, the key of `.primavera/timings.json`.
+    pub fn key(&self) -> String {
+        format!("{}::{}", self.file.display(), self.name)
+    }
 }
 
-/// Which scenarios a run takes, after `--grep` and `--tag`.
-pub fn selected<'a>(suites: &'a [Suite], opts: &Options) -> Vec<(&'a Suite, &'a Scenario)> {
+/// A scenario to run: indexes into the run's suites.
+#[derive(Debug, Clone, Copy)]
+pub struct Job {
+    pub suite: usize,
+    pub scenario: usize,
+}
+
+impl Job {
+    pub fn get<'a>(&self, suites: &'a [Suite]) -> (&'a Suite, &'a Scenario) {
+        let s = &suites[self.suite];
+        (s, &s.scenarios[self.scenario])
+    }
+
+    pub fn key(&self, suites: &[Suite]) -> String {
+        let (s, sc) = self.get(suites);
+        format!("{}::{}", s.file.display(), sc.name)
+    }
+}
+
+/// Which scenarios a run takes, after `--grep` and `--tag`, in file order.
+pub fn jobs(suites: &[Suite], opts: &Options) -> Vec<Job> {
     let mut out = Vec::new();
-    for suite in suites {
-        for sc in &suite.scenarios {
+    for (si, suite) in suites.iter().enumerate() {
+        for (ci, sc) in suite.scenarios.iter().enumerate() {
             if let Some(g) = &opts.grep {
                 if !sc.name.to_lowercase().contains(&g.to_lowercase()) {
                     continue;
@@ -81,7 +124,7 @@ pub fn selected<'a>(suites: &'a [Suite], opts: &Options) -> Vec<(&'a Suite, &'a 
             if !opts.tags.is_empty() && !opts.tags.iter().any(|t| sc.tags.contains(t)) {
                 continue;
             }
-            out.push((suite, sc));
+            out.push(Job { suite: si, scenario: ci });
         }
     }
     out
@@ -91,6 +134,7 @@ pub struct Runner {
     driver: Driver,
     opts: Options,
     fresh: bool,
+    attempt: u32,
 }
 
 impl Runner {
@@ -103,12 +147,13 @@ impl Runner {
             ..SessionConfig::default()
         };
         let driver = Driver::launch(&config)?;
-        Ok(Runner { driver, opts, fresh: true })
+        Ok(Runner { driver, opts, fresh: true, attempt: 1 })
     }
 
-    pub fn run(&mut self, suite: &Suite, scenario: &Scenario) -> ScenarioResult {
+    pub fn run(&mut self, suite: &Suite, scenario: &Scenario, attempt: u32) -> ScenarioResult {
+        self.attempt = attempt;
         let started = Instant::now();
-        let mut scope = Scope::new(suite, &self.opts);
+        let mut scope = Scope::new(suite, scenario, &self.opts);
         let mut steps = Vec::new();
         let mut failure = None;
         // A clean browser context for every scenario but the first one of
@@ -122,6 +167,7 @@ impl Runner {
                     at: None,
                     hint: None,
                     screenshot: None,
+                    nearest: Vec::new(),
                 });
             }
         }
@@ -130,7 +176,7 @@ impl Runner {
         if failure.is_none() {
             for step in all {
                 let t = Instant::now();
-                let res = self.step(step, &mut scope);
+                let res = self.step(step, &mut scope, suite);
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 steps.push(StepResult { line: step.line, text: step.text.clone(), ms, ok: res.is_ok() });
                 if let Err(message) = res {
@@ -142,7 +188,7 @@ impl Runner {
         // `after each` runs whatever happened; its own failures count only
         // when the scenario had passed.
         for step in &suite.after_each {
-            if let Err(message) = self.step(step, &mut scope) {
+            if let Err(message) = self.step(step, &mut scope, suite) {
                 if failure.is_none() {
                     failure = Some(self.failure(step, message, &scope, suite, scenario));
                 }
@@ -152,9 +198,15 @@ impl Runner {
             file: suite.file.clone(),
             name: scenario.name.clone(),
             line: scenario.line,
+            tags: scenario.tags.clone(),
             ms: started.elapsed().as_secs_f64() * 1000.0,
             steps,
             failure,
+            attempt,
+            retried: Vec::new(),
+            saved: scope.saved,
+            notes: scope.notes,
+            worker: 0,
         }
     }
 
@@ -165,7 +217,11 @@ impl Runner {
                 v.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
             )
         });
-        let shot = self.opts.evidence.join(evidence_name(&suite.file, &sc.name)).join("screenshot.png");
+        let mut dir = evidence_name(&suite.file, &sc.name);
+        if self.attempt > 1 {
+            dir.push_str(&format!("-try{}", self.attempt));
+        }
+        let shot = self.opts.evidence.join(dir).join("screenshot.png");
         let screenshot = std::fs::create_dir_all(shot.parent().unwrap_or(Path::new(".")))
             .ok()
             .and_then(|_| {
@@ -173,11 +229,39 @@ impl Runner {
                 self.driver.run(&cmd).ok()
             })
             .map(|_| shot);
-        Failure { line: step.line, text: step.text.clone(), message, at, hint: scope.noop.clone(), screenshot }
+        let nearest = if message.contains("no element") { self.nearest(&step.action, scope) } else { Vec::new() };
+        Failure { line: step.line, text: step.text.clone(), message, at, hint: scope.noop.clone(), screenshot, nearest }
     }
 
-    fn step(&mut self, step: &Step, scope: &mut Scope) -> Result<(), String> {
-        match &step.action {
+    /// What on the page comes closest to the element a step asked for.
+    fn nearest(&mut self, action: &Action, scope: &Scope) -> Vec<(String, String, f64)> {
+        let words = match action {
+            Action::Command(w) | Action::Save { command: w, .. } => w.clone(),
+            Action::Expect(Expect { subject: Subject::Target { flags, .. }, .. }) => flags.clone(),
+            Action::Optional(inner) => return self.nearest(inner, scope),
+            _ => return Vec::new(),
+        };
+        let words = scope.words(&words).unwrap_or(words);
+        let Some(want) = crate::nearest::wanted(&words) else { return Vec::new() };
+        match self.command(&["ax".into(), "--format".into(), "json".into()]) {
+            Ok(ax) => crate::nearest::rank(&ax, &want, 3),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn step(&mut self, step: &Step, scope: &mut Scope, suite: &Suite) -> Result<(), String> {
+        self.action(&step.action, step, scope, suite, 0)
+    }
+
+    fn action(
+        &mut self,
+        action: &Action,
+        step: &Step,
+        scope: &mut Scope,
+        suite: &Suite,
+        depth: usize,
+    ) -> Result<(), String> {
+        match action {
             Action::Command(words) => {
                 let words = scope.words(words)?;
                 let outcome = self.command(&words)?;
@@ -198,6 +282,30 @@ impl Runner {
                 Ok(())
             }
             Action::Expect(e) => self.expect(e, scope),
+            Action::Optional(inner) => {
+                if let Err(e) = self.action(inner, step, scope, suite, depth) {
+                    scope.notes.push(format!("optional step at line {} didn't happen: {e}", step.line));
+                }
+                Ok(())
+            }
+            Action::Run { flow, args } => {
+                if depth >= 16 {
+                    return Err(format!("flows nest more than 16 deep at {flow} (a flow that runs itself?)"));
+                }
+                let f = suite.flows.get(flow).ok_or_else(|| format!("no flow named {flow:?}"))?;
+                let values = scope.words(args)?;
+                scope.layers.push(f.params.iter().cloned().zip(values).collect());
+                let mut result = Ok(());
+                for st in &f.steps {
+                    if let Err(e) = self.action(&st.action, st, scope, suite, depth + 1) {
+                        let file = f.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        result = Err(format!("in flow {flow}, {file}:{} `{}`: {e}", st.line, st.text));
+                        break;
+                    }
+                }
+                scope.layers.pop();
+                result
+            }
         }
     }
 
@@ -282,6 +390,75 @@ impl Runner {
             Subject::Var(raw) => {
                 let actual = scope.word(raw)?;
                 (compare(&actual, e.matcher, value), actual)
+            }
+            Subject::Js(code) => {
+                let code = scope.word(code)?;
+                match self.command(&["eval".into(), code]) {
+                    Ok(v) => {
+                        let actual = match &v {
+                            Value::String(s) => s.clone(),
+                            Value::Null => "null".into(),
+                            other => other.to_string(),
+                        };
+                        let holds = if e.matcher == Matcher::Holds {
+                            !matches!(&v, Value::Null | Value::Bool(false))
+                                && v != serde_json::json!(0)
+                                && v != serde_json::json!("")
+                        } else {
+                            compare(&actual, e.matcher, value)
+                        };
+                        (holds, actual)
+                    }
+                    Err(err) => (false, err),
+                }
+            }
+            Subject::Request { method, url, status } => {
+                let url = scope.word(url)?;
+                let v = self.command(&["network".into(), "--limit".into(), "1000".into()])?;
+                // `#3 POST 200 Fetch /api/cart 196 B 3 ms`; another origin's
+                // URL in full, matched by its path too.
+                let mut seen = Vec::new();
+                let mut hit = false;
+                for l in v.as_str().unwrap_or("").lines() {
+                    let w: Vec<&str> = l.split_whitespace().collect();
+                    if w.len() < 5 {
+                        continue;
+                    }
+                    let (m, st, u) = (w[1], w[2], w[4]);
+                    let path = u.split_once("://").and_then(|(_, r)| r.find('/').map(|i| &r[i..])).unwrap_or(u);
+                    if crate::expect::glob(&url, u) || crate::expect::glob(&url, path) {
+                        seen.push(format!("{m} {u} {st}"));
+                        if (method == "*" || m.eq_ignore_ascii_case(method))
+                            && status.as_deref().is_none_or(|s| s == st)
+                        {
+                            hit = true;
+                        }
+                    }
+                }
+                let actual = if seen.is_empty() { format!("no request to {url}") } else { seen.join(", ") };
+                (hit, actual)
+            }
+            Subject::Cookie(name) => {
+                let name = scope.word(name)?;
+                let v = self.command(&["cookies".into(), "--all".into(), "--json".into()])?;
+                let found = v.as_array().and_then(|a| {
+                    a.iter().find(|c| c.get("name").and_then(Value::as_str) == Some(name.as_str())).cloned()
+                });
+                match found {
+                    Some(c) => {
+                        let val = c.get("value").and_then(Value::as_str).unwrap_or("").to_string();
+                        (compare(&val, e.matcher, value), val)
+                    }
+                    None => (false, "no such cookie".into()),
+                }
+            }
+            Subject::Storage { area, key } => {
+                let key = scope.word(key)?;
+                match self.command(&["storage".into(), area.clone(), "get".into(), key]) {
+                    Ok(Value::String(val)) => (compare(&val, e.matcher, value), val),
+                    Ok(_) => (false, "no such key".into()),
+                    Err(err) => (false, err),
+                }
             }
             Subject::Errors => {
                 let v = self.command(&["errors".into(), "--json".into()])?;
@@ -368,6 +545,12 @@ fn describe(e: &Expect, value: &str, actual: &str, limit: Duration) -> String {
         Subject::Text(t) => format!("text {t:?}"),
         Subject::Var(v) => v.clone(),
         Subject::Errors => "no page errors".to_string(),
+        Subject::Js(c) => format!("js {c:?}"),
+        Subject::Request { method, url, status } => {
+            format!("request {method} {url}{}", status.as_ref().map(|s| format!(" status {s}")).unwrap_or_default())
+        }
+        Subject::Cookie(c) => format!("cookie {c}"),
+        Subject::Storage { area, key } => format!("storage {area} {key}"),
         Subject::Target { flags, prop } => {
             let p = match prop {
                 Prop::State(s) => s.clone(),
@@ -404,20 +587,39 @@ fn evidence_name(file: &Path, scenario: &str) -> String {
 /// Variables a scenario sees: what it saved, the run's `--var`s, the
 /// file's `set`s, then the environment.
 struct Scope {
+    /// Flow arguments, innermost last.
+    layers: Vec<BTreeMap<String, String>>,
     saved: BTreeMap<String, String>,
+    /// The scenario's data row.
+    row: BTreeMap<String, String>,
     run: BTreeMap<String, String>,
     file: BTreeMap<String, String>,
     noop: Option<String>,
+    /// Optional steps that didn't happen.
+    notes: Vec<String>,
 }
 
 impl Scope {
-    fn new(suite: &Suite, opts: &Options) -> Self {
-        Scope { saved: BTreeMap::new(), run: opts.vars.clone(), file: suite.vars.clone(), noop: None }
+    fn new(suite: &Suite, scenario: &Scenario, opts: &Options) -> Self {
+        Scope {
+            layers: Vec::new(),
+            saved: BTreeMap::new(),
+            row: scenario.vars.clone(),
+            run: opts.vars.clone(),
+            file: suite.vars.clone(),
+            noop: None,
+            notes: Vec::new(),
+        }
     }
 
+    /// A flow's arguments, then what was saved, the data row, `--var`,
+    /// the file's `set`s, the environment.
     fn lookup(&self, name: &str) -> Option<String> {
-        self.saved
-            .get(name)
+        self.layers
+            .last()
+            .and_then(|l| l.get(name))
+            .or_else(|| self.saved.get(name))
+            .or_else(|| self.row.get(name))
             .or_else(|| self.run.get(name))
             .or_else(|| self.file.get(name))
             .cloned()

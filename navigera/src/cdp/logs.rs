@@ -216,10 +216,24 @@ const REPORT_SEGMENTS: &[&str] = &[
 
 fn report_kind(kind: &str, host: &str, path: &str) -> Report {
     let host = host.rsplit('@').next().unwrap_or(host).split(':').next().unwrap_or(host).to_ascii_lowercase();
-    if kind == "Ping" || REPORT_HOSTS.iter().any(|h| host == *h || host.ends_with(&format!(".{h}"))) {
+    let path_l = path.to_ascii_lowercase();
+    // Beacons, analytics services, and what the browser or the page loads
+    // on its own while a click is watched (the tab's icon, lazy images,
+    // fonts): none of it is the click doing something. A click that shows
+    // an image changes the DOM, and that is seen.
+    if kind == "Ping"
+        || matches!(kind, "Image" | "Media" | "Font" | "Manifest" | "TextTrack" | "CSPViolationReport" | "Prefetch")
+        || path_l.ends_with("/favicon.ico")
+        || path_l.contains("apple-touch-icon")
+        || REPORT_HOSTS.iter().any(|h| host == *h || host.ends_with(&format!(".{h}")))
+    {
         return Report::Surely;
     }
-    if path.split('/').any(|seg| REPORT_SEGMENTS.contains(&seg.to_ascii_lowercase().as_str())) {
+    // Reporting-like paths, and code a click may load before it renders
+    // (a lazily imported chunk): judged by what follows.
+    if matches!(kind, "Script" | "Stylesheet")
+        || path.split('/').any(|seg| REPORT_SEGMENTS.contains(&seg.to_ascii_lowercase().as_str()))
+    {
         return Report::Maybe;
     }
     Report::No
@@ -633,6 +647,10 @@ mod tests {
         assert_eq!(report_kind("XHR", "shop.test:8080", "/api/v1/Events"), Report::Maybe);
         assert_eq!(report_kind("Fetch", "shop.test", "/api/cart"), Report::No);
         assert_eq!(report_kind("Fetch", "notfacebook.com", "/x"), Report::No);
+        assert_eq!(report_kind("Other", "shop.test", "/favicon.ico"), Report::Surely);
+        assert_eq!(report_kind("Image", "shop.test", "/img/lazy.jpg"), Report::Surely);
+        assert_eq!(report_kind("Script", "shop.test", "/chunks/editor.js"), Report::Maybe);
+        assert_eq!(report_kind("Document", "shop.test", "/next"), Report::No);
     }
     use super::*;
 

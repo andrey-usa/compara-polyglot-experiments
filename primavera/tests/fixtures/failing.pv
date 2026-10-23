@@ -9,3 +9,15 @@ scenario "A click that does nothing, then an expect"
   goto /docs
   click --selector "h1"
   expect text "Something that never shows" --timeout-ms 400
+
+flow open-docs
+  goto /docs
+  expect title contains "Nope" --timeout-ms 300
+
+scenario "A flow's failure says where in the flow"
+  optional click --selector "#not-here" --timeout-ms 200
+  run open-docs
+
+scenario "A missing button names the closest ones"
+  goto /shop
+  click --role button --name "Accept everything" --timeout-ms 300

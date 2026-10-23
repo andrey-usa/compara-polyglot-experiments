@@ -32,6 +32,22 @@ pub enum Subject {
     },
     /// Page exceptions and console errors.
     Errors,
+    /// A JavaScript expression in the page: truthy, or compared.
+    Js(String),
+    /// A request the page made (since the scenario started): method (or
+    /// `*`), URL glob, and an optional status.
+    Request {
+        method: String,
+        url: String,
+        status: Option<String>,
+    },
+    /// A cookie of the browser context: present, or its value compared.
+    Cookie(String),
+    /// `storage local|session <key>`: present, or its value compared.
+    Storage {
+        area: String,
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,11 +156,65 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
                 value: String::new(),
                 timeout_ms,
             }),
-            _ => Err("after `no`: `errors`, or `text \"<text>\"`".into()),
+            Some("cookie") if words.len() == 2 => Ok(Expect {
+                negate,
+                subject: Subject::Cookie(words[1].clone()),
+                matcher: Matcher::Holds,
+                value: String::new(),
+                timeout_ms,
+            }),
+            Some("request") if words.len() == 3 => Ok(Expect {
+                negate,
+                subject: Subject::Request { method: words[1].to_uppercase(), url: words[2].clone(), status: None },
+                matcher: Matcher::Holds,
+                value: String::new(),
+                timeout_ms,
+            }),
+            _ => Err("after `no`: `errors`, `text \"<text>\"`, `cookie <name>` or `request <METHOD> <url>`".into()),
         };
     }
-    let first = words.first().cloned().ok_or("expect what? (url, title, text, a target, ${var}, no errors)")?;
+    let first = words
+        .first()
+        .cloned()
+        .ok_or("expect what? (url, title, text, a target, ${var}, js, request, cookie, storage, no errors)")?;
+    // A subject with an optional comparison after it: present/truthy without one.
+    let optional_tail = |rest: &[String], what: &str| -> Result<(Matcher, String), String> {
+        if rest.is_empty() {
+            Ok((Matcher::Holds, String::new()))
+        } else {
+            tail(rest, what)
+        }
+    };
     let (subject, matcher, value) = match first.as_str() {
+        "js" => {
+            let code = words.get(1).ok_or("expect js \"<expression>\"")?.clone();
+            let (m, v) = optional_tail(&words[2..], "js")?;
+            (Subject::Js(code), m, v)
+        }
+        "request" => {
+            // request <METHOD> <url glob> [status <n>]
+            let usage = "expect request <METHOD> <url glob> [status <n>]";
+            let method = words.get(1).ok_or(usage)?.to_uppercase();
+            let url = words.get(2).ok_or(usage)?.clone();
+            let status = match &words[3..] {
+                [] => None,
+                [s, n] if s == "status" => Some(n.clone()),
+                other => return Err(format!("after the request: `status <n>` or nothing (got {other:?})")),
+            };
+            (Subject::Request { method, url, status }, Matcher::Holds, String::new())
+        }
+        "cookie" => {
+            let name = words.get(1).ok_or("expect cookie <name> [<comparison> <value>]")?.clone();
+            let (m, v) = optional_tail(&words[2..], "cookie")?;
+            (Subject::Cookie(name), m, v)
+        }
+        "storage" => {
+            let usage = "expect storage local|session <key> [<comparison> <value>]";
+            let area = words.get(1).filter(|a| *a == "local" || *a == "session").ok_or(usage)?.clone();
+            let key = words.get(2).ok_or(usage)?.clone();
+            let (m, v) = optional_tail(&words[3..], "storage")?;
+            (Subject::Storage { area, key }, m, v)
+        }
         "url" => {
             let (m, v) = tail(&words[1..], "url")?;
             (Subject::Url, m, v)
@@ -213,6 +283,32 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
         }
     };
     Ok(Expect { negate, subject, matcher, value, timeout_ms })
+}
+
+/// `*` matches any run of characters (`/api/orders/*`); everything else is
+/// literal.
+pub fn glob(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let mut rest = text;
+    for (i, part) in parts.iter().enumerate() {
+        if i == 0 {
+            match rest.strip_prefix(part) {
+                Some(r) => rest = r,
+                None => return false,
+            }
+        } else if i == parts.len() - 1 {
+            return rest.ends_with(part);
+        } else {
+            match rest.find(part) {
+                Some(k) => rest = &rest[k + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 /// Does `actual` satisfy `m` against `expected`?
@@ -299,6 +395,33 @@ mod tests {
         assert!(p("--role button count is 2").unwrap_err().contains("--selector"));
         assert!(p("url matches \"(\"").unwrap_err().contains("regular expression"));
         assert!(p("text a b").is_err());
+    }
+
+    #[test]
+    fn page_state_subjects() {
+        let e = p("js \"document.forms.length\" >= 1").unwrap();
+        assert_eq!((e.subject, e.matcher), (Subject::Js("document.forms.length".into()), Matcher::Ge));
+        let e = p("js \"window.ready === true\"").unwrap();
+        assert_eq!(e.matcher, Matcher::Holds);
+        let e = p("request post /api/orders status 201").unwrap();
+        assert_eq!(
+            e.subject,
+            Subject::Request { method: "POST".into(), url: "/api/orders".into(), status: Some("201".into()) }
+        );
+        let e = p("no request GET /api/tracking*").unwrap();
+        assert!(e.negate);
+        let e = p("cookie session").unwrap();
+        assert_eq!((e.subject, e.matcher), (Subject::Cookie("session".into()), Matcher::Holds));
+        let e = p("no cookie session").unwrap();
+        assert!(e.negate);
+        let e = p("storage local cart contains sku-1").unwrap();
+        assert_eq!(e.subject, Subject::Storage { area: "local".into(), key: "cart".into() });
+        assert!(p("storage disk x").is_err());
+        assert!(p("request POST /x status").is_err());
+        assert!(glob("/api/orders/*", "/api/orders/12"));
+        assert!(glob("*/cart", "http://x/cart"));
+        assert!(glob("/a*c*e", "/abcde"));
+        assert!(!glob("/api/orders", "/api/orders/12"));
     }
 
     #[test]

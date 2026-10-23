@@ -87,7 +87,7 @@ def run(cmd, cwd, env):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--primavera", required=True)
-    ap.add_argument("--scenarios", required=True, help="primavera scenarios directory")
+    ap.add_argument("--scenarios", required=True, nargs="+", help="primavera scenario files or directories")
     ap.add_argument("--pw", required=True, help="Playwright Test project directory")
     ap.add_argument("--site", required=True)
     ap.add_argument("--rounds", type=int, default=15)
@@ -97,16 +97,17 @@ def main():
 
     env = dict(os.environ, BASE_URL=a.site, CI="1")
     pv = os.path.abspath(a.primavera)
-    scen = os.path.abspath(a.scenarios)
+    scen = [os.path.abspath(x) for x in a.scenarios]
     npx = shutil.which("npx") or "npx"
     extra = ["--chromium", a.chromium] if a.chromium else []
     tools = {
-        "primavera": ([pv, "run", scen, "--base-url", a.site] + extra, None),
+        "primavera (1 worker)": ([pv, "run", *scen, "--base-url", a.site] + extra, None),
+        "primavera (4 workers)": ([pv, "run", *scen, "--base-url", a.site, "--workers", "4"] + extra, None),
         "playwright test (1 worker)": ([npx, "playwright", "test", "--workers=1"], a.pw),
         "playwright test (4 workers)": ([npx, "playwright", "test", "--workers=4"], a.pw),
     }
     one = {
-        "primavera": ([pv, "run", scen, "--base-url", a.site, "--grep", a.grep] + extra, None),
+        "primavera (1 worker)": ([pv, "run", *scen, "--base-url", a.site, "--grep", a.grep] + extra, None),
         "playwright test (1 worker)": ([npx, "playwright", "test", "--workers=1", "-g", a.grep], a.pw),
     }
     suite = {k: [] for k in tools}
@@ -134,11 +135,11 @@ def main():
     def med(xs):
         return statistics.median(xs) if xs else float("nan")
 
-    base = med(suite["primavera"][1:])
+    base = med(suite["primavera (1 worker)"][1:])
     lines = [
         f"#### primavera vs Playwright Test: 7 scenarios, {a.rounds} interleaved rounds",
         "",
-        "| | suite, first round (ms) | suite, median of the rest (ms) | vs primavera | one scenario, median (ms) | runner peak RSS (MB) | total peak RSS incl. Chrome (MB) |",
+        "| | suite, first round (ms) | suite, median of the rest (ms) | vs primavera, 1 worker | one scenario, median (ms) | runner peak RSS (MB) | total peak RSS incl. Chrome (MB) |",
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for name in tools:

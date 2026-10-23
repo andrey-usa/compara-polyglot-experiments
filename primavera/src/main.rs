@@ -2,6 +2,7 @@
 //! through navigera. See README.md.
 
 mod expect;
+mod nearest;
 mod report;
 mod runner;
 mod suite;
@@ -10,6 +11,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
 const USAGE: &str = "\
@@ -26,7 +28,14 @@ run options:
   --var <name=value>    a variable for ${name} (repeatable)
   --grep <text>         only scenarios whose name contains it
   --tag <tag>           only scenarios with this @tag (repeatable: any of them)
+  --workers <n|auto>    scenarios at once, a browser each (default 1; auto: half the CPUs, at most 8)
+  --retries <n>         run a failing scenario again, up to n times; one that then passes is flaky
+  --fail-on-flaky       a flaky scenario fails the run
+  --shard <i/n>         run the i-th of n slices (for CI matrix jobs)
+  --reporter <name>     console (default), jsonl (one JSON object per scenario on stdout), github
+                        (workflow annotations; on by itself under GitHub Actions); repeatable
   --junit <file>        also write JUnit XML
+  --json                print what the scenarios saved, as one JSON object, at the end
   --timeout-ms <ms>     how long an expect retries (default 5000)
   --wait-ms <ms>        how long a step waits for its element (navigera's default 5000)
   --headed              show the browser
@@ -41,6 +50,12 @@ struct Args {
     paths: Vec<PathBuf>,
     opts: runner::Options,
     junit: Option<PathBuf>,
+    workers: usize,
+    retries: u32,
+    fail_on_flaky: bool,
+    shard: Option<(usize, usize)>,
+    reporters: Vec<String>,
+    json: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -62,6 +77,12 @@ fn parse_args() -> Result<Args, String> {
     };
     let mut junit = None;
     let mut base_flag = None;
+    let mut workers = 1usize;
+    let mut retries = 0u32;
+    let mut fail_on_flaky = false;
+    let mut shard = None;
+    let mut reporters: Vec<String> = Vec::new();
+    let mut json = false;
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
@@ -85,6 +106,41 @@ fn parse_args() -> Result<Args, String> {
             "--headed" => opts.headed = true,
             "--chromium" => opts.chromium = Some(val("--chromium")?),
             "--evidence" => opts.evidence = PathBuf::from(val("--evidence")?),
+            "--workers" | "-j" => {
+                let v = val("--workers")?;
+                workers = if v == "auto" {
+                    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+                    (cpus / 2).clamp(1, 8)
+                } else {
+                    v.parse::<usize>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| format!("--workers takes a number or auto, not {v:?}"))?
+                };
+            }
+            "--retries" => {
+                let v = val("--retries")?;
+                retries = v.parse().map_err(|_| format!("--retries takes a number, not {v:?}"))?;
+            }
+            "--fail-on-flaky" => fail_on_flaky = true,
+            "--shard" => {
+                let v = val("--shard")?;
+                let parsed = v
+                    .split_once('/')
+                    .and_then(|(i, n)| Some((i.parse::<usize>().ok()?, n.parse::<usize>().ok()?)))
+                    .filter(|(i, n)| *n > 0 && *i >= 1 && i <= n);
+                shard = Some(parsed.ok_or_else(|| format!("--shard takes i/n with 1 <= i <= n, not {v:?}"))?);
+            }
+            "--reporter" => {
+                let v = val("--reporter")?;
+                for r in v.split(',') {
+                    if !matches!(r, "console" | "jsonl" | "github") {
+                        return Err(format!("unknown reporter {r:?} (console, jsonl, github)"));
+                    }
+                    reporters.push(r.to_string());
+                }
+            }
+            "--json" => json = true,
             "-h" | "--help" => return Err(USAGE.to_string()),
             f if f.starts_with('-') => return Err(format!("unknown option {f}\n\n{USAGE}")),
             p => paths.push(PathBuf::from(p)),
@@ -96,7 +152,13 @@ fn parse_args() -> Result<Args, String> {
     if paths.is_empty() {
         paths.push(PathBuf::from("."));
     }
-    Ok(Args { cmd, paths, opts, junit })
+    if reporters.is_empty() {
+        reporters.push("console".into());
+    }
+    if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") && !reporters.iter().any(|r| r == "github") {
+        reporters.push("github".into());
+    }
+    Ok(Args { cmd, paths, opts, junit, workers, retries, fail_on_flaky, shard, reporters, json })
 }
 
 fn load(paths: &[PathBuf]) -> Result<Vec<suite::Suite>, String> {
@@ -115,11 +177,11 @@ fn load(paths: &[PathBuf]) -> Result<Vec<suite::Suite>, String> {
             Err(e) => errors.push(format!("{}: {e}", f.display())),
         }
     }
-    if errors.is_empty() {
-        Ok(suites)
-    } else {
-        Err(errors.join("\n"))
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
     }
+    suite::resolve(&mut suites).map_err(|e| e.to_string())?;
+    Ok(suites)
 }
 
 fn main() -> ExitCode {
@@ -152,7 +214,8 @@ fn main() -> ExitCode {
         },
         "list" => match load(&args.paths) {
             Ok(suites) => {
-                for (suite, sc) in runner::selected(&suites, &args.opts) {
+                for job in planned(&suites, &args) {
+                    let (suite, sc) = job.get(&suites);
                     let tags: String = sc.tags.iter().map(|t| format!(" @{t}")).collect();
                     println!("{}:{}  {}{tags}", suite.file.display(), sc.line, sc.name);
                 }
@@ -181,33 +244,92 @@ fn run(args: Args) -> ExitCode {
         }
     };
     let mut opts = args.opts.clone();
-    let picked = runner::selected(&suites, &opts);
-    if picked.is_empty() {
-        eprintln!("no scenario matches");
-        return ExitCode::from(2);
-    }
     // The first file's `base` serves when the run names none.
     if opts.base.is_none() {
         opts.base = suites.iter().find_map(|s| s.base.clone());
     }
-    let mut runner = match runner::Runner::launch(opts) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("the browser didn't start: {e:#}");
+    let mut jobs = planned(&suites, &args);
+    if jobs.is_empty() {
+        eprintln!("no scenario matches");
+        return ExitCode::from(2);
+    }
+    // Longest first (from the last runs), so the slowest one doesn't start
+    // last; ones never timed go first, as they may be long.
+    let timings = Timings::load();
+    jobs.sort_by(|a, b| {
+        let t = |j: &runner::Job| timings.get(&j.key(&suites)).copied().unwrap_or(f64::INFINITY);
+        t(b).partial_cmp(&t(a)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let jsonl = args.reporters.iter().any(|r| r == "jsonl");
+    let console = args.reporters.iter().any(|r| r == "console");
+    let github = args.reporters.iter().any(|r| r == "github");
+    let workers = args.workers.min(jobs.len()).max(1);
+    let queue = Mutex::new(std::collections::VecDeque::from(jobs));
+    let (tx, rx) = mpsc::channel::<Event>();
+    let mut results: Vec<runner::ScenarioResult> = Vec::new();
+    let mut launch_errors = Vec::new();
+    std::thread::scope(|scope| {
+        for w in 0..workers {
+            let tx = tx.clone();
+            let (queue, suites, opts) = (&queue, &suites, &opts);
+            let retries = args.retries;
+            scope.spawn(move || worker(w, queue, suites, opts, retries, tx));
+        }
+        drop(tx);
+        let mut out = std::io::stdout();
+        for ev in rx {
+            match ev {
+                Event::Done(r) => {
+                    let mut text = String::new();
+                    if github {
+                        text.push_str(&report::github(&r));
+                    }
+                    if jsonl {
+                        text.push_str(&report::jsonl(&r));
+                    }
+                    if console {
+                        // With jsonl on stdout, the console goes to stderr.
+                        if jsonl {
+                            eprint!("{}", report::console_line(&r));
+                        } else {
+                            text.push_str(&report::console_line(&r));
+                        }
+                    }
+                    let _ = out.write_all(text.as_bytes());
+                    let _ = out.flush();
+                    results.push(*r);
+                }
+                Event::LaunchFailed(e) => launch_errors.push(e),
+            }
+        }
+    });
+    let left = queue.lock().map(|q| q.len()).unwrap_or(0);
+    if left > 0 {
+        eprintln!("the browser didn't start: {}", launch_errors.first().map(String::as_str).unwrap_or("?"));
+        eprintln!("{left} scenario(s) not run");
+        if results.is_empty() {
             return ExitCode::from(3);
         }
-    };
-    let mut results = Vec::new();
-    let mut out = std::io::stdout();
-    for (suite, sc) in picked {
-        let r = runner.run(suite, sc);
-        let _ = out.write_all(report::console_line(&r).as_bytes());
-        let _ = out.flush();
-        results.push(r);
     }
-    drop(runner);
     let ms = started.elapsed().as_secs_f64() * 1000.0;
-    println!("{}", report::summary(&results, ms));
+    if console {
+        let line = report::summary(&results, ms);
+        if jsonl {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+    if jsonl {
+        print!("{}", report::jsonl_summary(&results, ms));
+    }
+    if args.json {
+        let saved: serde_json::Map<String, serde_json::Value> =
+            results.iter().map(|r| (r.name.clone(), serde_json::json!(r.saved))).collect();
+        println!("{}", serde_json::Value::Object(saved));
+    }
+    Timings::save(&results);
     if let Some(path) = &args.junit {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             let _ = std::fs::create_dir_all(dir);
@@ -216,9 +338,90 @@ fn run(args: Args) -> ExitCode {
             eprintln!("could not write {}: {e}", path.display());
         }
     }
-    if results.iter().all(|r| r.passed()) {
-        ExitCode::SUCCESS
-    } else {
+    let failed = results.iter().any(|r| !r.passed()) || (args.fail_on_flaky && results.iter().any(|r| r.flaky()));
+    if failed || left > 0 {
         ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// The scenarios this run takes: `--grep`, `--tag`, then `--shard` (every
+/// n-th, in file order, so the slices are the same on every machine).
+fn planned(suites: &[suite::Suite], args: &Args) -> Vec<runner::Job> {
+    let jobs = runner::jobs(suites, &args.opts);
+    match args.shard {
+        Some((i, n)) => jobs.into_iter().enumerate().filter(|(k, _)| k % n == i - 1).map(|(_, j)| j).collect(),
+        None => jobs,
+    }
+}
+
+enum Event {
+    Done(Box<runner::ScenarioResult>),
+    LaunchFailed(String),
+}
+
+/// One worker: its own browser, started when it takes its first scenario,
+/// then scenarios from the shared queue until it is empty.
+fn worker(
+    id: usize,
+    queue: &Mutex<std::collections::VecDeque<runner::Job>>,
+    suites: &[suite::Suite],
+    opts: &runner::Options,
+    retries: u32,
+    tx: mpsc::Sender<Event>,
+) {
+    let mut browser: Option<runner::Runner> = None;
+    loop {
+        let Some(job) = queue.lock().ok().and_then(|mut q| q.pop_front()) else { return };
+        if browser.is_none() {
+            match runner::Runner::launch(opts.clone()) {
+                Ok(r) => browser = Some(r),
+                Err(e) => {
+                    // Give the scenario back to a worker whose browser runs.
+                    if let Ok(mut q) = queue.lock() {
+                        q.push_front(job);
+                    }
+                    let _ = tx.send(Event::LaunchFailed(format!("{e:#}")));
+                    return;
+                }
+            }
+        }
+        let Some(r) = browser.as_mut() else { return };
+        let (suite, sc) = job.get(suites);
+        let mut result = r.run(suite, sc, 1);
+        let mut earlier = Vec::new();
+        while !result.passed() && result.attempt <= retries {
+            earlier.extend(result.failure.take());
+            let next = result.attempt + 1;
+            result = r.run(suite, sc, next);
+        }
+        result.retried = earlier;
+        result.worker = id;
+        if tx.send(Event::Done(Box::new(result))).is_err() {
+            return;
+        }
+    }
+}
+
+/// How long each scenario took last time (`.primavera/timings.json`), to
+/// start the slow ones first.
+struct Timings;
+
+impl Timings {
+    const PATH: &'static str = ".primavera/timings.json";
+
+    fn load() -> BTreeMap<String, f64> {
+        std::fs::read_to_string(Self::PATH).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    fn save(results: &[runner::ScenarioResult]) {
+        let mut all = Self::load();
+        for r in results {
+            all.insert(r.key(), (r.ms * 10.0).round() / 10.0);
+        }
+        if std::fs::create_dir_all(".primavera").is_ok() {
+            let _ = std::fs::write(Self::PATH, serde_json::to_string_pretty(&all).unwrap_or_default());
+        }
     }
 }

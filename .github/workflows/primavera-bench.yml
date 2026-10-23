@@ -65,7 +65,7 @@ jobs:
           python3 primavera-bench/bench.py \
             --primavera primavera/target/release/primavera \
             --chromium "$(command -v google-chrome)" \
-            --scenarios primavera/examples/bench-site \
+            --scenarios primavera/examples/bench-site/shop.pv primavera/examples/bench-site/account.pv \
             --pw primavera-bench/pw --site "$url" --rounds 15 2>&1 | tee bench.md
           code=${PIPESTATUS[0]}
           bin_kb=$(du -k primavera/target/release/primavera | cut -f1)

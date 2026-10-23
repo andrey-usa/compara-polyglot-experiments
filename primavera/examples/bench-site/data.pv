@@ -1,0 +1,24 @@
+# Data rows, flows from another file, optional steps, page-state checks.
+use flows/account.pv
+
+scenario "Searching for ${term} shows only ${what}" @search
+  examples
+    | term  | what   |
+    | valve | Valve  |
+    | hinge | Hinge  |
+  goto /shop
+  run accept-cookies
+  fill --label "Search products" ${term}
+  press Enter
+  expect --role status text contains "Showing"
+  expect js "[...document.querySelectorAll('.card h3')].every((h) => h.textContent.includes('${what}'))"
+
+scenario "A signed-in cart is kept by the server"
+  run sign-in demo@acme.test ${PASSWORD:-hunter2}
+  expect cookie sid
+  goto /shop
+  run accept-cookies
+  click --text "Add to cart"
+  expect request POST /api/cart status 200
+  expect --selector "#cart-count" text is 1
+  expect no request GET /api/tracking*

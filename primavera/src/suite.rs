@@ -31,6 +31,14 @@ pub enum Action {
         name: String,
         command: Vec<String>,
     },
+    /// `run <flow> <args…>`.
+    Run {
+        flow: String,
+        args: Vec<String>,
+    },
+    /// `optional <step>`: a failure is noted, not fatal (a banner that may
+    /// or may not show).
+    Optional(Box<Action>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +55,18 @@ pub struct Scenario {
     pub tags: Vec<String>,
     pub line: usize,
     pub steps: Vec<Step>,
+    /// A data row's values (`examples`, `for each <file.csv>`).
+    pub vars: BTreeMap<String, String>,
+}
+
+/// `flow name(a, b)`: steps a scenario runs with `run name x y`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Flow {
+    pub name: String,
+    pub params: Vec<String>,
+    pub file: PathBuf,
+    pub line: usize,
+    pub steps: Vec<Step>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -57,6 +77,9 @@ pub struct Suite {
     pub before_each: Vec<Step>,
     pub after_each: Vec<Step>,
     pub scenarios: Vec<Scenario>,
+    pub flows: BTreeMap<String, Flow>,
+    /// `use <file.pv>`: files whose flows and `set`s this one takes.
+    pub uses: Vec<(usize, PathBuf)>,
 }
 
 /// A problem in a file, with where it is.
@@ -178,6 +201,69 @@ fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
+/// Replace the `${NAME}`s that `vars` has, leave the others as written.
+fn interpolate_known(word: &str, vars: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    let mut rest = word;
+    while let Some(i) = rest.find("${") {
+        out.push_str(&rest[..i]);
+        let body = &rest[i + 2..];
+        match body.find('}') {
+            Some(end) if vars.contains_key(&body[..end]) => {
+                out.push_str(&vars[&body[..end]]);
+                rest = &body[end + 1..];
+            }
+            _ => {
+                out.push_str("${");
+                rest = body;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A table row: `| a | b |` -> ["a", "b"].
+fn table_row(line: &str) -> Vec<String> {
+    let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
+    inner.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// Rows of a CSV file (first line: the column names). Double quotes around
+/// a field allow commas in it (`""` for a quote).
+pub fn csv_rows(text: &str) -> Result<Vec<BTreeMap<String, String>>, String> {
+    let split = |line: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut quoted = false;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    cur.push('"');
+                    chars.next();
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => out.push(std::mem::take(&mut cur).trim().to_string()),
+                c => cur.push(c),
+            }
+        }
+        out.push(cur.trim().to_string());
+        out
+    };
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let header = split(lines.next().ok_or("the file is empty")?);
+    let mut rows = Vec::new();
+    for (i, l) in lines.enumerate() {
+        let cells = split(l);
+        if cells.len() != header.len() {
+            return Err(format!("row {} has {} fields, the header {}", i + 2, cells.len(), header.len()));
+        }
+        rows.push(header.iter().cloned().zip(cells).collect());
+    }
+    Ok(rows)
+}
+
 /// Parse one file's text.
 pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
     let err = |line: usize, message: String| ParseError { file: file.to_path_buf(), line, message };
@@ -187,8 +273,12 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
         BeforeEach,
         AfterEach,
         Scenario,
+        Flow(String),
     }
     let mut block = Block::None;
+    // Data rows of the scenario being read: (line of `examples`, header, rows).
+    let mut rows: BTreeMap<usize, Vec<BTreeMap<String, String>>> = BTreeMap::new();
+    let mut table: Option<(usize, Option<Vec<String>>)> = None;
     for (i, raw) in text.lines().enumerate() {
         let line_no = i + 1;
         let trimmed = raw.trim();
@@ -196,16 +286,49 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
             continue;
         }
         if indent_of(raw) > 0 {
+            // `examples` and the table under it.
+            if let Some((si, header)) = table.as_mut() {
+                if trimmed.starts_with('|') {
+                    let cells = table_row(trimmed);
+                    match header {
+                        None => *header = Some(cells),
+                        Some(h) if h.len() == cells.len() => {
+                            rows.entry(*si).or_default().push(h.iter().cloned().zip(cells).collect())
+                        }
+                        Some(h) => {
+                            return Err(err(
+                                line_no,
+                                format!("{} cells in this row, {} in the header", cells.len(), h.len()),
+                            ))
+                        }
+                    }
+                    continue;
+                }
+                table = None;
+            }
+            if trimmed == "examples" {
+                match block {
+                    Block::Scenario => {
+                        table = Some((suite.scenarios.len() - 1, None));
+                        continue;
+                    }
+                    _ => return Err(err(line_no, "`examples` belongs under a scenario".into())),
+                }
+            }
             let step = parse_step(trimmed).map_err(|m| err(line_no, m))?;
             let step = Step { line: line_no, text: trimmed.to_string(), action: step };
-            match block {
-                Block::None => return Err(err(line_no, "a step outside any `scenario` or `before each` block".into())),
+            match &block {
+                Block::None => {
+                    return Err(err(line_no, "a step outside any `scenario`, `flow` or `before each` block".into()))
+                }
                 Block::BeforeEach => suite.before_each.push(step),
                 Block::AfterEach => suite.after_each.push(step),
                 Block::Scenario => suite.scenarios.last_mut().expect("a scenario is open").steps.push(step),
+                Block::Flow(name) => suite.flows.get_mut(name).expect("the flow is open").steps.push(step),
             }
             continue;
         }
+        table = None;
         let words = tokenize(trimmed).map_err(|m| err(line_no, m))?;
         match words.first().map(String::as_str) {
             Some("set") => {
@@ -227,27 +350,69 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
                 suite.base = Some(url.clone());
                 block = Block::None;
             }
+            Some("use") => {
+                let path = words.get(1).ok_or_else(|| err(line_no, "expected `use <file.pv>`".into()))?;
+                let dir = file.parent().unwrap_or(Path::new("."));
+                suite.uses.push((line_no, dir.join(path)));
+                block = Block::None;
+            }
             Some("before") if words.get(1).map(String::as_str) == Some("each") => block = Block::BeforeEach,
             Some("after") if words.get(1).map(String::as_str) == Some("each") => block = Block::AfterEach,
+            Some("flow") => {
+                // flow name(a, b)   or   flow name
+                let rest = trimmed["flow".len()..].trim();
+                let (name, params) = match rest.split_once('(') {
+                    Some((n, p)) => {
+                        let p = p.strip_suffix(')').ok_or_else(|| err(line_no, "expected `flow name(a, b)`".into()))?;
+                        (n.trim(), p.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+                    }
+                    None => (rest, Vec::new()),
+                };
+                let ok = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                if !ok(name) || !params.iter().all(|p: &String| ok(p)) {
+                    return Err(err(line_no, format!("bad flow header {rest:?} (expected `flow name(a, b)`)")));
+                }
+                if suite.flows.contains_key(name) {
+                    return Err(err(line_no, format!("a second flow named {name:?}")));
+                }
+                suite.flows.insert(
+                    name.to_string(),
+                    Flow { name: name.to_string(), params, file: file.to_path_buf(), line: line_no, steps: Vec::new() },
+                );
+                block = Block::Flow(name.to_string());
+            }
             Some("scenario") => {
                 let name = words.get(1).ok_or_else(|| err(line_no, "expected `scenario \"name\"`".into()))?.clone();
                 let mut tags = Vec::new();
-                for w in &words[2..] {
+                let mut k = 2;
+                while k < words.len() {
+                    let w = &words[k];
+                    if w == "for" && words.get(k + 1).map(String::as_str) == Some("each") {
+                        let csv = words.get(k + 2).ok_or_else(|| err(line_no, "expected `for each <file.csv>`".into()))?;
+                        let path = file.parent().unwrap_or(Path::new(".")).join(csv);
+                        let text = std::fs::read_to_string(&path)
+                            .map_err(|e| err(line_no, format!("reading {}: {e}", path.display())))?;
+                        let data = csv_rows(&text).map_err(|m| err(line_no, format!("{}: {m}", path.display())))?;
+                        rows.entry(suite.scenarios.len()).or_default().extend(data);
+                        k += 3;
+                        continue;
+                    }
                     match w.strip_prefix('@') {
                         Some(t) if !t.is_empty() => tags.push(t.to_string()),
-                        _ => return Err(err(line_no, format!("after the name, only @tags: {w:?}"))),
+                        _ => return Err(err(line_no, format!("after the name, only @tags or `for each <file.csv>`: {w:?}"))),
                     }
+                    k += 1;
                 }
                 if suite.scenarios.iter().any(|s| s.name == name) {
                     return Err(err(line_no, format!("a second scenario named {name:?}")));
                 }
-                suite.scenarios.push(Scenario { name, tags, line: line_no, steps: Vec::new() });
+                suite.scenarios.push(Scenario { name, tags, line: line_no, steps: Vec::new(), vars: BTreeMap::new() });
                 block = Block::Scenario;
             }
             Some(other) => {
                 return Err(err(
                     line_no,
-                    format!("unknown line {other:?} (top level: set, base, before each, after each, scenario; steps are indented)"),
+                    format!("unknown line {other:?} (top level: set, base, use, flow, before each, after each, scenario; steps are indented)"),
                 ))
             }
             None => {}
@@ -258,11 +423,109 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
             return Err(err(s.line, format!("scenario {:?} has no steps", s.name)));
         }
     }
+    for f in suite.flows.values() {
+        if f.steps.is_empty() {
+            return Err(err(f.line, format!("flow {:?} has no steps", f.name)));
+        }
+    }
+    // One scenario per data row, named from the row.
+    if !rows.is_empty() {
+        let mut out = Vec::new();
+        for (i, sc) in suite.scenarios.drain(..).enumerate() {
+            let Some(data) = rows.get(&i) else {
+                out.push(sc);
+                continue;
+            };
+            if data.is_empty() {
+                return Err(err(sc.line, format!("scenario {:?}: its data has no rows", sc.name)));
+            }
+            for (k, row) in data.iter().enumerate() {
+                let mut name = interpolate_known(&sc.name, row);
+                if name == sc.name {
+                    name = format!("{} [{}]", sc.name, k + 1);
+                }
+                out.push(Scenario { name, vars: row.clone(), ..sc.clone() });
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for sc in &out {
+            if !seen.insert(sc.name.clone()) {
+                return Err(err(
+                    sc.line,
+                    format!("two data rows name the scenario {:?}: put a column in its name", sc.name),
+                ));
+            }
+        }
+        suite.scenarios = out;
+    }
     Ok(suite)
+}
+
+/// `use` files merged in: their flows and `set`s, then this file's own on
+/// top. Checks that every `run` names a flow with the right arguments.
+pub fn resolve(suites: &mut [Suite]) -> Result<(), ParseError> {
+    for suite in suites.iter_mut() {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo: Vec<(usize, PathBuf)> = suite.uses.clone();
+        while let Some((line, path)) = todo.pop() {
+            let key = std::fs::canonicalize(&path).unwrap_or(path.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            let err = |m: String| ParseError { file: suite.file.clone(), line, message: m };
+            let text = std::fs::read_to_string(&path).map_err(|e| err(format!("use {}: {e}", path.display())))?;
+            let used = parse(&path, &text)?;
+            for (name, flow) in used.flows {
+                suite.flows.entry(name).or_insert(flow);
+            }
+            for (k, v) in used.vars {
+                suite.vars.entry(k).or_insert(v);
+            }
+            todo.extend(used.uses);
+        }
+        // Every `run`, wherever it is, names a known flow.
+        let check = |steps: &[Step], file: &Path, flows: &BTreeMap<String, Flow>| -> Result<(), ParseError> {
+            for st in steps {
+                let action = match &st.action {
+                    Action::Optional(a) => a.as_ref(),
+                    a => a,
+                };
+                if let Action::Run { flow, args } = action {
+                    let err = |m: String| ParseError { file: file.to_path_buf(), line: st.line, message: m };
+                    let f = flows.get(flow).ok_or_else(|| {
+                        err(format!("no flow named {flow:?} (define it with `flow {flow}(…)` or `use` its file)"))
+                    })?;
+                    if f.params.len() != args.len() {
+                        return Err(err(format!(
+                            "flow {flow} takes {} argument(s) ({}), not {}",
+                            f.params.len(),
+                            f.params.join(", "),
+                            args.len()
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        };
+        let file = suite.file.clone();
+        check(&suite.before_each, &file, &suite.flows)?;
+        check(&suite.after_each, &file, &suite.flows)?;
+        for sc in &suite.scenarios {
+            check(&sc.steps, &file, &suite.flows)?;
+        }
+        for f in suite.flows.values() {
+            check(&f.steps, &f.file, &suite.flows)?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_step(line: &str) -> Result<Action, String> {
     let words = tokenize(line)?;
+    parse_words(&words)
+}
+
+fn parse_words(words: &[String]) -> Result<Action, String> {
     match words.first().map(String::as_str) {
         Some("expect") => Ok(Action::Expect(crate::expect::parse(&words[1..])?)),
         Some("save") => {
@@ -271,6 +534,19 @@ fn parse_step(line: &str) -> Result<Action, String> {
                 return Err("expected `save NAME = <command>`".into());
             }
             Ok(Action::Save { name: words[1].clone(), command: words[3..].to_vec() })
+        }
+        Some("run") => {
+            let flow = words.get(1).ok_or("expected `run <flow> <args…>`")?.clone();
+            Ok(Action::Run { flow, args: words[2..].to_vec() })
+        }
+        Some("optional") => {
+            if words.len() < 2 {
+                return Err("expected `optional <step>`".into());
+            }
+            match parse_words(&words[1..])? {
+                Action::Optional(_) => Err("`optional optional`".into()),
+                a => Ok(Action::Optional(Box::new(a))),
+            }
         }
         Some(op) => {
             const TAKES_A_REF: &[&str] =
@@ -284,7 +560,7 @@ fn parse_step(line: &str) -> Result<Action, String> {
                     words[1]
                 ));
             }
-            Ok(Action::Command(words))
+            Ok(Action::Command(words.to_vec()))
         }
         None => Err("empty step".into()),
     }
@@ -379,5 +655,62 @@ mod tests {
         assert!(e.message.contains("no steps"), "{e}");
         let e = parse(Path::new("t.pv"), "scenario \"A\"\n  expect url sounds-like x\n").unwrap_err();
         assert_eq!(e.line, 2);
+    }
+
+    #[test]
+    fn flows_rows_and_optional_steps() {
+        let text = "flow sign-in(email, password)\n  goto /login\n  fill --label Email ${email}\n\nscenario \"Ship to ${country}\"\n  examples\n    | country | fee |\n    | Canada  | $9  |\n    | Mexico  | $12 |\n  run sign-in a@b.c pw\n  optional click --selector #banner\n  expect text ${fee}\n";
+        let mut s = parse(Path::new("t.pv"), text).unwrap();
+        assert_eq!(s.flows["sign-in"].params, ["email", "password"]);
+        assert_eq!(
+            s.scenarios.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["Ship to Canada", "Ship to Mexico"]
+        );
+        assert_eq!(s.scenarios[1].vars["fee"], "$12");
+        assert!(
+            matches!(&s.scenarios[0].steps[0].action, Action::Run { flow, args } if flow == "sign-in" && args.len() == 2)
+        );
+        assert!(matches!(&s.scenarios[0].steps[1].action, Action::Optional(_)));
+        resolve(std::slice::from_mut(&mut s)).unwrap();
+        // A wrong flow call is a file error, with its line.
+        let mut bad = parse(Path::new("t.pv"), "flow f(a)\n  goto /\nscenario \"x\"\n  run f\n").unwrap();
+        let e = resolve(std::slice::from_mut(&mut bad)).unwrap_err();
+        assert_eq!(e.line, 4);
+        assert!(e.message.contains("takes 1 argument"), "{e}");
+        let mut bad = parse(Path::new("t.pv"), "scenario \"x\"\n  run nowhere\n").unwrap();
+        assert!(resolve(std::slice::from_mut(&mut bad)).unwrap_err().message.contains("no flow named"));
+        // Rows that would give two scenarios one name.
+        let e = parse(
+            Path::new("t.pv"),
+            "scenario \"Same ${a}\"\n  examples\n    | a | b |\n    | 1 | x |\n    | 1 | y |\n  goto /\n",
+        )
+        .unwrap_err();
+        assert!(e.message.contains("two data rows"), "{e}");
+        // A name without a column gets the row's number.
+        let s =
+            parse(Path::new("t.pv"), "scenario \"Plain\"\n  examples\n    | a |\n    | 1 |\n    | 2 |\n  goto /${a}\n")
+                .unwrap();
+        assert_eq!(s.scenarios[1].name, "Plain [2]");
+    }
+
+    #[test]
+    fn csv_and_use_files() {
+        let rows = csv_rows("email,password\nada@x.io,\"p,w\"\n\"bo \"\"b\"\"\",z\n").unwrap();
+        assert_eq!(rows[0]["password"], "p,w");
+        assert_eq!(rows[1]["email"], "bo \"b\"");
+        assert!(csv_rows("a,b\n1\n").is_err());
+        let dir = std::env::temp_dir().join(format!("pv-use-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("flows")).unwrap();
+        std::fs::write(dir.join("flows/auth.pv"), "set who = ada\nflow hello\n  goto /\n").unwrap();
+        std::fs::write(dir.join("logins.csv"), "user\nada\nbo\n").unwrap();
+        let main = dir.join("main.pv");
+        std::fs::write(&main, "use flows/auth.pv\nscenario \"Hi ${user}\" for each logins.csv @data\n  run hello\n")
+            .unwrap();
+        let mut s = parse(&main, &std::fs::read_to_string(&main).unwrap()).unwrap();
+        resolve(std::slice::from_mut(&mut s)).unwrap();
+        assert_eq!(s.scenarios.len(), 2);
+        assert_eq!(s.scenarios[0].tags, ["data"]);
+        assert_eq!(s.vars["who"], "ada");
+        assert!(s.flows.contains_key("hello"));
     }
 }
