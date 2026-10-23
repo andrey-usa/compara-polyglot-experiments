@@ -150,6 +150,12 @@ impl Runner {
         Ok(Runner { driver, opts, fresh: true, attempt: 1 })
     }
 
+    /// Another runner on this one's browser, in a browser context of its
+    /// own: a worker without a browser of its own.
+    pub fn fork(&self) -> anyhow::Result<Self> {
+        Ok(Runner { driver: self.driver.fork()?, opts: self.opts.clone(), fresh: true, attempt: 1 })
+    }
+
     pub fn run(&mut self, suite: &Suite, scenario: &Scenario, attempt: u32) -> ScenarioResult {
         self.attempt = attempt;
         let started = Instant::now();

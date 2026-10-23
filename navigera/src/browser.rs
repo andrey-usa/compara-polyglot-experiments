@@ -516,7 +516,7 @@ const NAV_GRACE: Duration = Duration::from_millis(150);
 
 /// One browser + tab list, driven by the from-scratch CDP engine.
 pub struct BrowserSession {
-    browser: Browser,
+    browser: std::sync::Arc<Browser>,
     pages: Vec<Page>,
     active: usize,
     /// Executable that was launched (browser binary or `lightpanda`); kept so
@@ -550,9 +550,12 @@ pub struct BrowserSession {
     held: std::sync::Mutex<Vec<String>>,
     /// The browser context `reset` made (its tabs are the session's).
     context: Option<String>,
+    /// False for a session `fork` made: closing it closes its context, not
+    /// the browser.
+    owner: bool,
     /// Owns the tokio runtime; declared LAST so it drops last, after the
     /// browser/client/pages that use it.
-    _runtime: tokio::runtime::Runtime,
+    _runtime: std::sync::Arc<tokio::runtime::Runtime>,
 }
 
 impl BrowserSession {
@@ -675,7 +678,7 @@ impl BrowserSession {
         }
         crate::timing::record("launch_total", launch_started);
         Ok(Self {
-            browser,
+            browser: std::sync::Arc::new(browser),
             pages: vec![page],
             active: 0,
             exe,
@@ -683,6 +686,7 @@ impl BrowserSession {
             timeout_ms: nav_timeout_ms,
             abandoned: std::sync::Mutex::new(None),
             context: None,
+            owner: true,
             attached: false,
             profile_dir: None,
             profile_exe: None,
@@ -690,7 +694,7 @@ impl BrowserSession {
             init_scripts: Vec::new(),
             init_ids: Default::default(),
             held: Default::default(),
-            _runtime: runtime,
+            _runtime: std::sync::Arc::new(runtime),
         })
     }
 
@@ -739,7 +743,7 @@ impl BrowserSession {
         let _ = browser.enable_downloads(dir.as_deref());
         crate::timing::record("launch_total", started);
         Ok(Self {
-            browser,
+            browser: std::sync::Arc::new(browser),
             pages: vec![page],
             active: 0,
             exe: what,
@@ -747,6 +751,7 @@ impl BrowserSession {
             timeout_ms: nav_timeout_ms,
             abandoned: std::sync::Mutex::new(None),
             context: None,
+            owner: true,
             attached: true,
             profile_dir,
             profile_exe,
@@ -754,7 +759,7 @@ impl BrowserSession {
             init_scripts: Vec::new(),
             init_ids: Default::default(),
             held: Default::default(),
-            _runtime: runtime,
+            _runtime: std::sync::Arc::new(runtime),
         })
     }
 
@@ -900,6 +905,42 @@ impl BrowserSession {
         self.bring_to_front()
     }
 
+    /// Another session on the same browser, in a browser context of its
+    /// own (cookies, storage, cache and tabs apart), for running several
+    /// sessions at once without a browser each. The process-wide settings
+    /// (element wait, download directory, natural mode) are shared; so is the
+    /// dialog policy. Closing a fork closes its context; the browser closes
+    /// with the session it was forked from.
+    pub fn fork(&self) -> Result<BrowserSession> {
+        if self.lightpanda {
+            bail!("the lightpanda engine has one context per process: start another session instead");
+        }
+        self.browser.shared().forked.store(true, std::sync::atomic::Ordering::Relaxed);
+        let context = self.browser.create_context()?;
+        let dir = if self.attached && self.profile_dir.is_none() { None } else { download_dir().ok() };
+        let _ = self.browser.enable_downloads_in(dir.as_deref(), Some(&context));
+        let page = self.browser.new_page_with(Some("about:blank"), false, Some(&context))?;
+        Ok(BrowserSession {
+            browser: std::sync::Arc::clone(&self.browser),
+            pages: vec![page],
+            active: 0,
+            exe: self.exe.clone(),
+            lightpanda: false,
+            timeout_ms: self.timeout_ms,
+            abandoned: std::sync::Mutex::new(None),
+            attached: self.attached,
+            profile_dir: None,
+            profile_exe: None,
+            overrides: Default::default(),
+            init_scripts: Vec::new(),
+            init_ids: Default::default(),
+            held: std::sync::Mutex::new(Vec::new()),
+            context: Some(context),
+            owner: false,
+            _runtime: std::sync::Arc::clone(&self._runtime),
+        })
+    }
+
     /// Switch the active tab by zero-based index.
     pub fn select_page(&mut self, index: usize) -> Result<()> {
         if index >= self.pages.len() {
@@ -946,7 +987,14 @@ impl BrowserSession {
         self.browser.caught_up();
         let shared = std::sync::Arc::clone(self.browser.shared());
         let mut adopted = Vec::new();
-        for (target_id, opener) in shared.take_opened() {
+        let forked = shared.forked.load(std::sync::atomic::Ordering::Relaxed);
+        let mine: Vec<String> = self.pages.iter().map(|p| p.target_id().to_string()).collect();
+        let opened = if forked {
+            shared.take_opened_by(|opener| mine.iter().any(|t| t == opener))
+        } else {
+            shared.take_opened()
+        };
+        for (target_id, opener) in opened {
             if self.pages.iter().any(|p| p.target_id() == target_id) {
                 continue;
             }
@@ -966,7 +1014,10 @@ impl BrowserSession {
                 Err(e) => eprintln!("[browser] could not adopt new tab {target_id}: {e:#}"),
             }
         }
-        for target_id in shared.take_destroyed() {
+        let mine: Vec<String> = self.pages.iter().map(|p| p.target_id().to_string()).collect();
+        let destroyed =
+            if forked { shared.take_destroyed_by(|t| mine.iter().any(|m| m == t)) } else { shared.take_destroyed() };
+        for target_id in destroyed {
             if self.pages.len() <= 1 {
                 break;
             }
@@ -1392,13 +1443,12 @@ impl BrowserSession {
     pub fn cookies(&self, all: bool, url: Option<&str>) -> Result<serde_json::Value> {
         let tab = self.active_tab();
         let r = if all {
-            // After `reset` the tabs live in a context of their own: its
-            // cookies, not the default context's.
-            let params = match &self.context {
-                Some(c) => serde_json::json!({ "browserContextId": c }),
-                None => serde_json::json!({}),
-            };
-            tab.send_cdp("Storage.getCookies", params, self.timeout(None))?
+            // After `reset` (or in a fork) the tabs live in a context of
+            // their own: its cookies, not the default context's.
+            match &self.context {
+                Some(c) => self.browser.context_cookies(Some(c))?,
+                None => tab.send_cdp("Storage.getCookies", serde_json::json!({}), self.timeout(None))?,
+            }
         } else {
             let urls = vec![url.map(str::to_string).unwrap_or_else(|| self.url())];
             tab.send_cdp("Network.getCookies", serde_json::json!({ "urls": urls }), self.timeout(None))?
@@ -1904,11 +1954,14 @@ impl BrowserSession {
         // session into a failed process exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // A browser navigera doesn't own keeps running: take the
-            // context `reset` opened in it away first.
-            if let (true, Some(context)) = (self.attached, self.context.as_deref()) {
+            // context `reset` opened in it away first. A fork only closes
+            // its own context.
+            if let (true, Some(context)) = (self.attached || !self.owner, self.context.as_deref()) {
                 let _ = self.browser.dispose_context(context);
             }
-            self.browser.close();
+            if self.owner {
+                self.browser.close();
+            }
         }));
     }
 

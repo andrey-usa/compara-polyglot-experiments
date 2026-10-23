@@ -32,7 +32,8 @@ run options:
   --var <name=value>    a variable for ${name} (repeatable)
   --grep <text>         only scenarios whose name contains it
   --tag <tag>           only scenarios with this @tag (repeatable: any of them)
-  --workers <n|auto>    scenarios at once, a browser each (default 1; auto: half the CPUs, at most 8)
+  --workers <n|auto>    scenarios at once (default 1; auto: half the CPUs, at most 8)
+  --isolation <how>     context (default): one browser, a browser context per worker; browser: a browser each
   --retries <n>         run a failing scenario again, up to n times; one that then passes is flaky
   --fail-on-flaky       a flaky scenario fails the run
   --shard <i/n>         run the i-th of n slices (for CI matrix jobs)
@@ -60,6 +61,8 @@ struct Args {
     shard: Option<(usize, usize)>,
     reporters: Vec<String>,
     json: bool,
+    /// `context` (one browser, a context per worker) or `browser`.
+    isolation: String,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -87,6 +90,7 @@ fn parse_args() -> Result<Args, String> {
     let mut shard = None;
     let mut reporters: Vec<String> = Vec::new();
     let mut json = false;
+    let mut isolation = "context".to_string();
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
@@ -145,6 +149,12 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--json" => json = true,
+            "--isolation" => {
+                isolation = val("--isolation")?;
+                if isolation != "context" && isolation != "browser" {
+                    return Err(format!("--isolation takes context or browser, not {isolation:?}"));
+                }
+            }
             "-h" | "--help" => return Err(USAGE.to_string()),
             f if f.starts_with('-') => return Err(format!("unknown option {f}\n\n{USAGE}")),
             p => paths.push(PathBuf::from(p)),
@@ -162,7 +172,7 @@ fn parse_args() -> Result<Args, String> {
     if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") && !reporters.iter().any(|r| r == "github") {
         reporters.push("github".into());
     }
-    Ok(Args { cmd, paths, opts, junit, workers, retries, fail_on_flaky, shard, reporters, json })
+    Ok(Args { cmd, paths, opts, junit, workers, retries, fail_on_flaky, shard, reporters, json, isolation })
 }
 
 fn load(paths: &[PathBuf]) -> Result<Vec<suite::Suite>, String> {
@@ -273,16 +283,36 @@ fn run(args: Args) -> ExitCode {
     let console = args.reporters.iter().any(|r| r == "console");
     let github = args.reporters.iter().any(|r| r == "github");
     let workers = args.workers.min(jobs.len()).max(1);
+    // One browser, a context per worker (`--isolation context`, the
+    // default), or a browser per worker. The first browser is kept here
+    // and closes last.
+    let mut owner = None;
+    let mut forks: Vec<Option<runner::Runner>> = (0..workers).map(|_| None).collect();
+    // (One worker needs no sharing: its own browser is the one browser.)
+    if args.isolation == "context" && workers > 1 {
+        match runner::Runner::launch(opts.clone()) {
+            Ok(r) => {
+                for slot in forks.iter_mut() {
+                    *slot = r.fork().ok();
+                }
+                owner = Some(r);
+            }
+            Err(e) => {
+                eprintln!("the browser didn't start: {e:#}");
+                return ExitCode::from(3);
+            }
+        }
+    }
     let queue = Mutex::new(std::collections::VecDeque::from(jobs));
     let (tx, rx) = mpsc::channel::<Event>();
     let mut results: Vec<runner::ScenarioResult> = Vec::new();
     let mut launch_errors = Vec::new();
     std::thread::scope(|scope| {
-        for w in 0..workers {
+        for (w, fork) in forks.into_iter().enumerate() {
             let tx = tx.clone();
             let (queue, suites, opts) = (&queue, &suites, &opts);
             let retries = args.retries;
-            scope.spawn(move || worker(w, queue, suites, opts, retries, tx));
+            scope.spawn(move || worker(w, fork, queue, suites, opts, retries, tx));
         }
         drop(tx);
         let mut out = std::io::stdout();
@@ -312,6 +342,7 @@ fn run(args: Args) -> ExitCode {
             }
         }
     });
+    drop(owner);
     let left = queue.lock().map(|q| q.len()).unwrap_or(0);
     if left > 0 {
         eprintln!("the browser didn't start: {}", launch_errors.first().map(String::as_str).unwrap_or("?"));
@@ -373,13 +404,15 @@ enum Event {
 /// then scenarios from the shared queue until it is empty.
 fn worker(
     id: usize,
+    fork: Option<runner::Runner>,
     queue: &Mutex<std::collections::VecDeque<runner::Job>>,
     suites: &[suite::Suite],
     opts: &runner::Options,
     retries: u32,
     tx: mpsc::Sender<Event>,
 ) {
-    let mut browser: Option<runner::Runner> = None;
+    // A context on the shared browser, else a browser of its own.
+    let mut browser: Option<runner::Runner> = fork;
     loop {
         let Some(job) = queue.lock().ok().and_then(|mut q| q.pop_front()) else { return };
         if browser.is_none() {

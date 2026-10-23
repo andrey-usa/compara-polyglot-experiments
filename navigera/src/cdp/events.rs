@@ -112,6 +112,9 @@ pub struct Shared {
     pub routes: Mutex<Vec<Route>>,
     /// `set credentials`: answers HTTP auth challenges.
     pub credentials: Mutex<Option<(String, String)>>,
+    /// Several sessions share this browser (`BrowserSession::fork`): each
+    /// takes only the tabs its own tabs opened or closed.
+    pub forked: std::sync::atomic::AtomicBool,
 }
 
 /// What a `route` does with the requests its pattern matches.
@@ -262,8 +265,25 @@ impl Shared {
         std::mem::take(&mut *self.opened.lock().unwrap())
     }
 
+    /// The opened tabs whose opener `mine` claims; the others stay for the
+    /// session they belong to.
+    pub fn take_opened_by(&self, mine: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+        let mut all = self.opened.lock().unwrap();
+        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *all).into_iter().partition(|(_, o)| mine(o));
+        *all = kept;
+        taken
+    }
+
     pub fn take_destroyed(&self) -> Vec<String> {
         std::mem::take(&mut *self.destroyed.lock().unwrap())
+    }
+
+    /// The closed tabs `mine` claims; the others stay.
+    pub fn take_destroyed_by(&self, mine: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut all = self.destroyed.lock().unwrap();
+        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *all).into_iter().partition(|t| mine(t));
+        *all = kept;
+        taken
     }
 
     /// URLs of the popups opened since the last call.
