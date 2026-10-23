@@ -1703,6 +1703,30 @@ impl BrowserSession {
         Ok(point)
     }
 
+    /// Raw mouse input (see [`cdp::Page::mouse`]); a click waits for any
+    /// navigation it starts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mouse(
+        &self,
+        action: &str,
+        at: Option<(f64, f64)>,
+        button: &str,
+        count: u32,
+        steps: u32,
+        delta: (f64, f64),
+        timeout_ms: Option<f64>,
+    ) -> Result<serde_json::Value> {
+        let (_, timeout) = self.element_budget(timeout_ms);
+        let page = self.active_tab();
+        let generation = page.nav_generation();
+        let r = page.mouse(action, at, button, count, steps, delta, timeout)?;
+        if action == "click" {
+            page.navigation_started(generation, NAV_GRACE);
+            self.settle_for(timeout_ms);
+        }
+        Ok(r)
+    }
+
     pub fn hover(&self, target: &Target, timeout_ms: Option<f64>) -> Result<serde_json::Value> {
         let (wait, timeout) = self.element_budget(timeout_ms);
         self.active_tab().hover(target, wait, timeout)

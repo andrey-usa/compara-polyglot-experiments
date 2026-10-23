@@ -484,3 +484,45 @@ fn reset_starts_clean_in_the_same_browser() {
     s.ok(&["reset"]);
     assert_eq!(s.ok(&["tab-list"])["tabs"].as_array().map(Vec::len), Some(1));
 }
+
+#[test]
+fn the_mouse_goes_where_it_is_told_on_a_canvas() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("mouse", &[]);
+    s.ok(&["goto", &format!("{}/canvas", site.url)]);
+    let log = |s: &Session| -> Vec<String> {
+        let v = s.ok(&["eval", "log.splice(0)"]);
+        v.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+    };
+    // From the canvas's corner: a press, a path, a release draws a line.
+    let r = s.ok(&["mouse", "move", "10", "20", "--selector", "canvas"]);
+    assert_eq!((r["mouse"]["x"].as_f64(), r["mouse"]["y"].as_f64()), (Some(60.0), Some(60.0)), "{r}");
+    s.ok(&["mouse", "down"]);
+    s.ok(&["mouse", "move", "110", "20", "--selector", "canvas", "--steps", "10"]);
+    let r = s.ok(&["mouse", "up"]);
+    assert_eq!(r["mouse"]["held"], serde_json::json!([]), "{r}");
+    let events = log(&s);
+    assert_eq!(events.first().map(String::as_str), Some("move 10 20 0"), "{events:?}");
+    assert!(events.contains(&"mousedown 10 20 0 1".to_string()), "{events:?}");
+    assert!(events.contains(&"move 60 20 1".to_string()), "{events:?}");
+    assert_eq!(events.last().map(String::as_str), Some("click 110 20 0 0"), "{events:?}");
+    assert!(events.contains(&"mouseup 110 20 0 0".to_string()), "{events:?}");
+    assert!(s.ok(&["eval", "ink(60, 20)"]).as_u64().unwrap_or(0) > 0, "the line is drawn");
+    assert_eq!(s.ok(&["eval", "ink(60, 120)"]), 0, "nothing drawn off the path");
+    // Viewport coordinates, a double click, the right button, the wheel.
+    s.ok(&["mouse", "click", "250", "140", "--count", "2"]);
+    let events = log(&s);
+    assert!(events.contains(&"dblclick 200 100 0 0".to_string()), "{events:?}");
+    s.ok(&["mouse", "click", "30", "30", "--selector", "canvas", "--button", "right"]);
+    assert!(log(&s).contains(&"contextmenu 30 30 2 2".to_string()));
+    s.ok(&["mouse", "wheel", "0", "-120"]);
+    assert_eq!(log(&s), ["wheel 0 -120"]);
+    // Mistakes are argument errors, said before anything runs.
+    let says = |args: &[&str]| {
+        let out = Command::new(tool_exe()).arg("--session").arg(&s.name).args(args).output().unwrap();
+        assert!(!out.status.success());
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    assert!(says(&["mouse", "jump", "1", "2"]).contains("move, down, up, click or wheel"));
+    assert!(says(&["mouse", "move", "5"]).contains("no y"));
+}
