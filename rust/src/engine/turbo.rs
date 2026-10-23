@@ -1383,6 +1383,314 @@ impl RowIndex {
 }
 
 // ---------------------------------------------------------------------------
+// The partitioned probe: the same index, sliced by hash so a probe walks
+// arrays that fit the cache
+// ---------------------------------------------------------------------------
+
+/// The last-level cache of the machine, in bytes: the largest unified cache
+/// sysfs reports, or 32 MB where it cannot be read. The partitioned probe
+/// sizes its slices from this and nothing else, so the same binary adapts to
+/// the box it runs on rather than carrying a tuned constant.
+fn llc_bytes() -> u64 {
+    static LLC: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LLC.get_or_init(|| {
+        let mut level = 0u32;
+        let mut size = 0u64;
+        for i in 0..8 {
+            let base = format!("/sys/devices/system/cpu/cpu0/cache/index{i}");
+            let read = |name: &str| std::fs::read_to_string(format!("{base}/{name}")).ok();
+            let Some(l) = read("level").and_then(|s| s.trim().parse::<u32>().ok()) else {
+                continue;
+            };
+            if read("type").map(|s| s.trim() != "Unified").unwrap_or(true) || l <= level {
+                continue;
+            }
+            if let Some(s) = read("size").and_then(|s| parse_cache_size(s.trim())) {
+                level = l;
+                size = s;
+            }
+        }
+        if size == 0 { 32 << 20 } else { size }
+    })
+}
+
+/// A sysfs cache size: a count with a `K` or `M` suffix, or bare bytes.
+fn parse_cache_size(s: &str) -> Option<u64> {
+    let (num, mult) = match s.as_bytes().last() {
+        Some(b'K') => (&s[..s.len() - 1], 1u64 << 10),
+        Some(b'M') => (&s[..s.len() - 1], 1u64 << 20),
+        _ => (s, 1),
+    };
+    num.parse::<u64>().ok().map(|n| n * mult)
+}
+
+/// Packs a slice slot the way `RowIndex::slot_for` packs a table slot -- the
+/// top bits of a tag source above the position plus one -- with the slice's
+/// own tag source: the hash shifted past the bits that chose the slice, which
+/// are constant inside it and would waste the tag.
+fn pack_slot(pos_bits: u32, tag_src: u64, pos: usize) -> u32 {
+    let pos = pos as u32 + 1;
+    let tag_bits = 32 - pos_bits;
+    if tag_bits == 0 {
+        pos
+    } else {
+        (((tag_src >> (64 - tag_bits)) as u32) << pos_bits) | pos
+    }
+}
+
+/// Whether a slice slot's tag matches the tag source's top bits.
+fn slot_tag_is(pos_bits: u32, word: u32, tag_src: u64) -> bool {
+    let tag_bits = 32 - pos_bits;
+    if tag_bits == 0 {
+        return true;
+    }
+    (word >> pos_bits) == (tag_src >> (64 - tag_bits)) as u32
+}
+
+/// One hash slice of the partitioned probe: its own dense slot table over a
+/// fraction of B's keys, with the `first_row` and `row_hash` entries of just
+/// those keys laid beside it, in the same order.
+struct ProbeSlice {
+    table: Vec<u32>,
+    pos_bits: u32,
+    pos_mask: u32,
+    mask: usize,
+    first_row: Vec<i32>,
+    row_hash: Vec<u64>,
+    /// The bits that chose this slice, counted from the top of the hash:
+    /// the tag source of a key here is its hash shifted left by this much.
+    tag_shift: u32,
+}
+
+impl ProbeSlice {
+    /// The slot a probe of `hash` starts from in this slice: the same fold
+    /// `RowIndex::slot` uses, over this slice's own table.
+    #[inline]
+    fn home(&self, hash: u64) -> usize {
+        ((hash ^ (hash >> 32)) as usize) & self.mask
+    }
+
+    /// Starts the fetch of the slot `hash` will land in, without waiting.
+    #[inline]
+    fn prefetch(&self, hash: u64) {
+        #[cfg(target_arch = "x86_64")]
+        // Safety: `home` masks into the table's length, and a prefetch has
+        // no architectural effect in any case.
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch::<_MM_HINT_T0>(self.table.as_ptr().add(self.home(hash)) as *const i8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = hash;
+    }
+
+    /// The `first_row` position a non-empty slot holds.
+    #[inline]
+    fn pos_of(&self, word: u32) -> usize {
+        ((word & self.pos_mask) - 1) as usize
+    }
+
+    /// The mate `RowIndex::lookup` would return, walked in this slice
+    /// instead: step for step the same walk, with the candidate taken from
+    /// the slice's own arrays rather than the index's.
+    #[allow(clippy::too_many_arguments)]
+    fn lookup(
+        &self,
+        bi: &RowIndex,
+        side: &Side,
+        other: &Slab,
+        fields: Option<&[Field]>,
+        hash: u64,
+        key_size: usize,
+        opt: &Options,
+        span: Option<Proof<'_>>,
+        probe: &mut [Field],
+    ) -> Option<(i32, bool)> {
+        let tag_src = hash << self.tag_shift;
+        let mut slot = self.home(hash);
+        loop {
+            let word = self.table[slot];
+            if word == EMPTY_SLOT {
+                return None;
+            }
+            if slot_tag_is(self.pos_bits, word, tag_src) {
+                let local = self.pos_of(word);
+                let candidate = self.first_row[local];
+                if self.row_hash[local] == hash {
+                    let proved = match span {
+                        Some(Proof::Csv { bytes, delimiter }) => {
+                            bi.row_matches(side, candidate, bytes, delimiter)
+                        }
+                        Some(Proof::Json { bytes }) => bi.json_matches(side, candidate, bytes),
+                        None => false,
+                    };
+                    if proved {
+                        return Some((candidate, true));
+                    }
+                    let fields = match fields {
+                        Some(f) => f,
+                        None => return Some((candidate, false)),
+                    };
+                    bi.fields_of(side, candidate, probe);
+                    if (0..key_size).all(|i| same(&side.slab, probe[i], other, fields[i], opt)) {
+                        return Some((candidate, false));
+                    }
+                }
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+}
+
+/// B's index sliced by the top bits of the key hash, so the join can work
+/// through one slice at a time and probe a table slice that fits the
+/// last-level cache instead of the whole index.
+///
+/// A probe walks three arrays at random -- the slot table, `first_row`,
+/// `row_hash` -- and between them they outgrow the cache long before the
+/// files do: at five million keys the walk touches some ninety megabytes,
+/// every probe a miss to memory. Sliced, the same walk touches a
+/// cache-sized share of each, and the lines a slice's probes load are
+/// still there for the next one.
+///
+/// Only the counts path uses this. A run keeping row lists or exporting
+/// selects its capped picks by the order A's keys are visited, and slicing
+/// would change which rows those are; those runs keep the plain index and
+/// its range order, exactly as one thread would visit them.
+struct ProbeIndex {
+    slices: Vec<ProbeSlice>,
+    /// `hash >> shift` is the slice a key belongs to.
+    shift: u32,
+}
+
+impl ProbeIndex {
+    /// Which slice a hash belongs to.
+    #[inline]
+    fn of(&self, hash: u64) -> usize {
+        (hash >> self.shift) as usize
+    }
+
+    /// The slice holding `hash`.
+    #[inline]
+    fn slice(&self, hash: u64) -> &ProbeSlice {
+        &self.slices[self.of(hash)]
+    }
+
+    /// The mate for `hash`, through the slice that holds it.
+    #[allow(clippy::too_many_arguments)]
+    fn lookup(
+        &self,
+        bi: &RowIndex,
+        side: &Side,
+        other: &Slab,
+        fields: Option<&[Field]>,
+        hash: u64,
+        key_size: usize,
+        opt: &Options,
+        span: Option<Proof<'_>>,
+        probe: &mut [Field],
+    ) -> Option<(i32, bool)> {
+        self.slice(hash)
+            .lookup(bi, side, other, fields, hash, key_size, opt, span, probe)
+    }
+
+    /// Slices `bi` for a join on `threads` threads, or `None` where the
+    /// probe's working set already fits the share of the cache one thread
+    /// can count on -- there slicing would only add its build to the run.
+    ///
+    /// The share is the cache divided by the threads, less a quarter for
+    /// the rows themselves and the other side's streams: up to `threads`
+    /// slices are being probed at once, and together they must fit.
+    fn build(bi: &RowIndex, threads: usize) -> Result<Option<ProbeIndex>> {
+        let keys = bi.first_row.len();
+        if keys == 0 {
+            return Ok(None);
+        }
+        // What one probe walks, in bytes: the slot table, plus a first_row
+        // and a row_hash entry for each distinct key.
+        let walking = (bi.table.len() * 4 + keys * (4 + 8)) as u64;
+        let share = llc_bytes() / threads.max(1) as u64 * 3 / 4;
+        if walking <= share {
+            return Ok(None);
+        }
+        let mut parts = 2usize;
+        while parts < 256 && walking / parts as u64 > share {
+            parts <<= 1;
+        }
+        let part_bits = parts.trailing_zeros();
+        let shift = 64 - part_bits;
+
+        // Each slice's keys in the order the index met them, gathered a
+        // chunk of the index per thread -- the gather reads a hash per key
+        // at random, and in serial it would cost what the slicing saves --
+        // then laid beside the slice's table.
+        let ways = threads.max(1);
+        let gathered = in_parallel(ways, |t| {
+            let lo = keys * t / ways;
+            let hi = keys * (t + 1) / ways;
+            let mut rows: Vec<Vec<i32>> = (0..parts).map(|_| Vec::new()).collect();
+            let mut hashes: Vec<Vec<u64>> = (0..parts).map(|_| Vec::new()).collect();
+            for &row in &bi.first_row[lo..hi] {
+                let hash = bi.row_hash[row as usize];
+                let slice = (hash >> shift) as usize;
+                rows[slice].push(row);
+                hashes[slice].push(hash);
+            }
+            Ok((rows, hashes))
+        });
+        let mut rows: Vec<Vec<i32>> = (0..parts).map(|_| Vec::new()).collect();
+        let mut hashes: Vec<Vec<u64>> = (0..parts).map(|_| Vec::new()).collect();
+        for part in gathered {
+            let (rs, hs) = part?;
+            for (slice, part_rows) in rs.into_iter().enumerate() {
+                rows[slice].extend(part_rows);
+            }
+            for (slice, part_hashes) in hs.into_iter().enumerate() {
+                hashes[slice].extend(part_hashes);
+            }
+        }
+        let mut slices: Vec<ProbeSlice> = Vec::with_capacity(parts);
+        for (first_row, row_hash) in rows.into_iter().zip(hashes) {
+            let count = first_row.len();
+            // The table build's own sizing: the next power of two past a
+            // two-thirds load, and the narrowest position width that holds
+            // every key in the slice.
+            let mut cap = 1usize << 10;
+            while cap * 2 < count * 3 + 16 {
+                cap <<= 1;
+            }
+            let mut pos_bits: u32 = 1;
+            while pos_bits < 32 && (1u64 << pos_bits) < count as u64 + 2 {
+                pos_bits += 1;
+            }
+            let pos_mask = if pos_bits >= 32 {
+                u32::MAX
+            } else {
+                (1u32 << pos_bits) - 1
+            };
+            let mut slice = ProbeSlice {
+                table: empty_table(cap)?,
+                pos_bits,
+                pos_mask,
+                mask: cap - 1,
+                first_row,
+                row_hash,
+                tag_shift: part_bits,
+            };
+            for (pos, &hash) in slice.row_hash.iter().enumerate() {
+                let mut slot = slice.home(hash);
+                while slice.table[slot] != EMPTY_SLOT {
+                    slot = (slot + 1) & slice.mask;
+                }
+                slice.table[slot] = pack_slot(slice.pos_bits, hash << slice.tag_shift, pos);
+            }
+            slices.push(slice);
+        }
+        Ok(Some(ProbeIndex { slices, shift }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The sweep: finding and hashing every row, in parallel
 // ---------------------------------------------------------------------------
 
@@ -2038,6 +2346,9 @@ struct JoinCtx<'a> {
     a: &'a Side,
     b: &'a Side,
     bi: &'a RowIndex,
+    /// B's index sliced for the probe (`ProbeIndex`), where the join built
+    /// one; `lookup` goes through it and falls back to the plain index.
+    probe: Option<&'a ProbeIndex>,
     opt: &'a Options,
     key_size: usize,
     nc: usize,
@@ -2133,6 +2444,33 @@ fn mark_seen(seen: &[AtomicU64], row: i32) {
     seen[bit >> 6].fetch_or(1 << (bit & 63), Ordering::Relaxed);
 }
 
+impl JoinCtx<'_> {
+    /// The mate for `hash` in B: through the partitioned probe where the
+    /// join built one, the plain index otherwise. The two walks answer the
+    /// same question the same way; only the arrays they walk differ.
+    #[allow(clippy::too_many_arguments)]
+    fn lookup(
+        &self,
+        side: &Side,
+        other: &Slab,
+        fields: Option<&[Field]>,
+        hash: u64,
+        key_size: usize,
+        opt: &Options,
+        span: Option<Proof<'_>>,
+        probe: &mut [Field],
+    ) -> Option<(i32, bool)> {
+        match self.probe {
+            Some(sliced) => sliced.lookup(
+                self.bi, side, other, fields, hash, key_size, opt, span, probe,
+            ),
+            None => self
+                .bi
+                .lookup(side, other, fields, hash, key_size, opt, span, probe),
+        }
+    }
+}
+
 /// Joins one row of A's against B's index: the join's inner loop as a function,
 /// shared by the normal join (over each key's first row) and the fused join
 /// (over every row as the sweep finds it, then again over the repeated keys,
@@ -2172,7 +2510,7 @@ fn join_row(
         if runs.of_row(data, from, end, delimiter, &mut scratch.spans) {
             // No fields and no span: the first candidate whose whole
             // hash matches, unproven, which the runs then settle.
-            match ctx.bi.lookup(
+            match ctx.lookup(
                 ctx.b,
                 &ctx.a.slab,
                 None,
@@ -2205,7 +2543,7 @@ fn join_row(
                     bytes: &data[from..from + len],
                     delimiter,
                 });
-                match ctx.bi.lookup(
+                match ctx.lookup(
                     ctx.b,
                     &ctx.a.slab,
                     None,
@@ -2311,7 +2649,7 @@ fn join_row(
             bytes: &data[from..t + 1],
         })
     });
-    let Some((mate, same_bytes)) = ctx.bi.lookup(
+    let Some((mate, same_bytes)) = ctx.lookup(
         ctx.b,
         &ctx.a.slab,
         Some(&scratch.fa),
@@ -2474,6 +2812,7 @@ fn join_setup<'a>(
     a: &'a Side,
     b: &'a Side,
     bi: &'a RowIndex,
+    probe: Option<&'a ProbeIndex>,
     opt: &'a Options,
     nc: usize,
     exporting: bool,
@@ -2537,6 +2876,7 @@ fn join_setup<'a>(
         a,
         b,
         bi,
+        probe,
         opt,
         key_size,
         nc,
@@ -2565,36 +2905,119 @@ fn join(
     exporting: bool,
     threads: usize,
 ) -> Result<Joined> {
-    let (ctx, seen) = join_setup(a, b, bi, opt, compared.len(), exporting);
+    // The partitioned probe, for the counts path only: a run keeping row
+    // lists or exporting selects its capped picks by the order A's keys are
+    // visited, and slicing changes that order, so those runs keep the plain
+    // index. A build the budget cannot hold falls back the same way -- the
+    // slices are an optimisation, never a requirement.
+    let sliced = if opt.row_lists || exporting {
+        None
+    } else {
+        ProbeIndex::build(bi, threads).ok().flatten()
+    };
+    let (ctx, seen) = join_setup(a, b, bi, sliced.as_ref(), opt, compared.len(), exporting);
 
     let a_keys = ai.first_row.len();
-    let a_ways = ways_for(a_keys);
 
     let nc = ctx.nc;
     let width = ctx.width;
     let data_len = a.slab.data().len();
 
+    // The work, as ranges of A's key positions for the threads to pull from
+    // one queue. For the plain index the ranges run over `first_row` in its
+    // own order; sliced, A's keys are first grouped by the slice their hash
+    // belongs to (`order` holds the positions, slice by slice) and the
+    // ranges walk one slice's keys at a time, so a thread's probes keep
+    // landing in the slice it has already loaded. The ranges are chunked
+    // the same way in both walks.
+    let (order, ranges): (Vec<i32>, Vec<(usize, usize)>) = match &sliced {
+        Some(probe) => {
+            // A's key positions grouped by slice -- a chunk of the keys per
+            // thread, the chunks laid end to end so a slice's positions
+            // stay in file order -- then cut into ranges of one slice each.
+            let gathered = in_parallel(threads.max(1), |t| {
+                let ways = threads.max(1);
+                let lo = a_keys * t / ways;
+                let hi = a_keys * (t + 1) / ways;
+                let mut buckets: Vec<Vec<i32>> =
+                    (0..probe.slices.len()).map(|_| Vec::new()).collect();
+                for (pos, &row) in ai.first_row[lo..hi].iter().enumerate() {
+                    buckets[probe.of(ai.row_hash[row as usize])].push((lo + pos) as i32);
+                }
+                Ok(buckets)
+            });
+            let mut order: Vec<i32> = Vec::with_capacity(a_keys);
+            let mut ranges = Vec::new();
+            for part in gathered {
+                for bucket in part?.iter() {
+                    let lo = order.len();
+                    order.extend_from_slice(bucket);
+                    let hi = order.len();
+                    let mut at = lo;
+                    while at < hi {
+                        let end = (at + JOIN_CHUNK).min(hi);
+                        ranges.push((at, end));
+                        at = end;
+                    }
+                }
+            }
+            (order, ranges)
+        }
+        None => {
+            let ways = ways_for(a_keys);
+            let ranges = (0..ways)
+                .map(|p| (a_keys * p / ways, a_keys * (p + 1) / ways))
+                .collect();
+            (Vec::new(), ranges)
+        }
+    };
+    let ways = ranges.len();
+
     let a_range = |p: usize| -> Part {
         let mut out = Part::blank(nc);
         let mut scratch = RowScratch::new(width, ctx.runs.as_ref().map_or(0, Runs::len));
-        let lo = a_keys * p / a_ways;
-        let hi = a_keys * (p + 1) / a_ways;
-        let keys = &ai.first_row[lo..hi];
-        for (i, &row) in keys.iter().enumerate() {
-            if let Some(&soon) = keys.get(i + PREFETCH_AHEAD) {
-                bi.prefetch(ai.row_hash[soon as usize]);
-            }
+        let (lo, hi) = ranges[p];
+        for (i, pos) in (lo..hi).enumerate() {
+            let row = match &sliced {
+                Some(_) => ai.first_row[order[pos] as usize],
+                None => ai.first_row[pos],
+            };
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             let hash = ai.row_hash[row as usize];
-            // The home slot was prefetched 32 probes ago, so this read is
-            // cheap; the first_row entry behind it is the probe's first
-            // unprefetched random access. Fetch it now, while join_row parses
-            // A's row, rather than serially inside the probe.
-            let word = bi.table[bi.slot(hash)];
-            if word != EMPTY_SLOT {
-                prefetch_first_row(&bi.first_row, bi.pos_of(word));
+            // The probe 32 keys ahead starts now, so its misses overlap the
+            // work between here and there; in the sliced walk the key ahead
+            // is in the same slice, and its slot is what will be wanted.
+            if pos + PREFETCH_AHEAD < hi {
+                let ahead = match &sliced {
+                    Some(_) => ai.first_row[order[pos + PREFETCH_AHEAD] as usize],
+                    None => ai.first_row[pos + PREFETCH_AHEAD],
+                };
+                let ahead_hash = ai.row_hash[ahead as usize];
+                match ctx.probe {
+                    Some(probe) => probe.slice(ahead_hash).prefetch(ahead_hash),
+                    None => bi.prefetch(ahead_hash),
+                }
+            }
+            // The home slot's fetch was started 32 probes ago, so reading
+            // its word here is cheap; the first_row entry behind it is the
+            // probe's first unprefetched random access. Fetch it now, while
+            // join_row parses A's row, rather than serially inside the probe.
+            match ctx.probe {
+                Some(probe) => {
+                    let slice = probe.slice(hash);
+                    let word = slice.table[slice.home(hash)];
+                    if word != EMPTY_SLOT {
+                        prefetch_first_row(&slice.first_row, slice.pos_of(word));
+                    }
+                }
+                None => {
+                    let word = bi.table[bi.slot(hash)];
+                    if word != EMPTY_SLOT {
+                        prefetch_first_row(&bi.first_row, bi.pos_of(word));
+                    }
+                }
             }
             join_row(
                 &ctx,
@@ -2616,7 +3039,7 @@ fn join(
         let mut mine = Vec::new();
         loop {
             let t = next.fetch_add(1, Ordering::Relaxed);
-            if t >= a_ways {
+            if t >= ways {
                 return mine;
             }
             mine.push((t, a_range(t)));
@@ -2967,7 +3390,7 @@ fn fused_join<'x>(
     threads: usize,
 ) -> Result<FusedJoin<'x>> {
     let key_size = opt.key.len();
-    let (ctx, seen) = join_setup(a, b, bi, opt, nc, false);
+    let (ctx, seen) = join_setup(a, b, bi, None, opt, nc, false);
     let width = ctx.width;
     let runs_len = ctx.runs.as_ref().map_or(0, Runs::len);
 
