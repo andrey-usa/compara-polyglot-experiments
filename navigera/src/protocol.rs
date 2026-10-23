@@ -2423,6 +2423,15 @@ impl Driver {
                         "element has no visible box; dispatched DOM events instead".to_string()
                     });
                 }
+                if let Some(ms) = point.get("no_effect").and_then(Value::as_u64) {
+                    // Clicked, but the page did nothing: often a control
+                    // the page hasn't wired up yet.
+                    state["no_effect"] = json!(format!(
+                        "the click reached the element, but nothing on the page changed within {ms} ms \
+                         (no DOM change, focus, form value, URL, scroll, request, dialog, tab or download). \
+                         The page may not have wired it up yet: wait until it is ready and click again"
+                    ));
+                }
                 Ok(state)
             }
             Command::Hover { target, timeout_ms } => {

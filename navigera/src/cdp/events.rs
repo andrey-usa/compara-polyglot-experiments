@@ -231,6 +231,20 @@ impl Shared {
         self.nav.lock().unwrap().get(session_id).cloned().unwrap_or_default()
     }
 
+    /// What a page did that its own scripts can't watch from the inside,
+    /// as counters: requests, navigations, dialogs, tabs and popups it
+    /// opened, downloads. A click compares them before and after.
+    pub fn activity(&self, session_id: &str) -> [u64; 6] {
+        [
+            self.logs.lock().unwrap().requests_started(),
+            self.nav_state(session_id).generation,
+            self.dialogs.lock().unwrap().len() as u64,
+            self.opened.lock().unwrap().len() as u64,
+            self.popups.lock().unwrap().len() as u64,
+            self.downloads.lock().unwrap().items.len() as u64,
+        ]
+    }
+
     /// Mark a navigation we started ourselves as in flight, so ops issued
     /// right after a `goto --wait commit` don't race it.
     pub fn mark_loading(&self, session_id: &str) {

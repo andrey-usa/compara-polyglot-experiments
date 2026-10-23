@@ -131,6 +131,11 @@ fn location(url: Option<&str>, line: Option<u64>) -> String {
 }
 
 impl Logs {
+    /// Requests seen so far, all tabs.
+    pub fn requests_started(&self) -> u64 {
+        self.next_request
+    }
+
     fn tab(&mut self, session: &str) -> &mut TabLogs {
         self.tabs.entry(session.to_string()).or_default()
     }

@@ -387,3 +387,44 @@ fn forms_inside_cross_origin_frames() {
     let err = s.fails(&["click", "--text", "No such button", "--timeout-ms", "400"]);
     assert!(err.contains("cross-origin frame"), "{err}");
 }
+
+#[test]
+fn a_click_that_changes_nothing_says_so() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("effects", &[]);
+    s.ok(&["goto", &format!("{}/effects", site.url)]);
+    // Close is wired 1.5 s after load: clicked at once, nothing happens, and
+    // the click says so instead of a plain success.
+    let r = s.ok(&["click", "--selector", "#late"]);
+    let note = r["no_effect"].as_str().unwrap_or_default();
+    assert!(note.contains("nothing on the page changed"), "{r}");
+    assert_eq!(s.text(&["get", "text", "--selector", "#out"]), "none");
+    let r = s.ok(&["click", "--selector", "#noop"]);
+    assert!(r.get("no_effect").is_some(), "{r}");
+    // Once wired, the same click works and claims nothing extra.
+    std::thread::sleep(std::time::Duration::from_millis(1600));
+    let r = s.ok(&["click", "--selector", "#late"]);
+    assert!(r.get("no_effect").is_none(), "{r}");
+    assert_eq!(s.text(&["get", "text", "--selector", "#out"]), "closed");
+    // Effects a DOM observer alone would miss: a checkbox's state, a value
+    // set from script, a request, a change a moment later, a scrolled strip,
+    // a change inside another component's shadow root.
+    for (target, what) in [
+        ("#agree", "checkbox"),
+        ("#clear", "field cleared from script"),
+        ("#send", "request"),
+        ("#later", "change 80 ms later"),
+        ("#next", "scrolled strip"),
+    ] {
+        let r = s.ok(&["click", "--selector", target]);
+        assert!(r.get("no_effect").is_none(), "{what}: {r}");
+    }
+    assert_eq!(s.ok(&["get", "checked", "--selector", "#agree"]), true);
+    assert_eq!(s.text(&["get", "value", "--selector", "#q"]), "");
+    assert_eq!(s.text(&["get", "text", "--selector", "#out"]), "later");
+    let r = s.ok(&["click", "--role", "button", "--name", "Bump"]);
+    assert!(r.get("no_effect").is_none(), "shadow root: {r}");
+    // Typing into a field or opening a <select> isn't judged.
+    let r = s.ok(&["click", "--selector", "#q"]);
+    assert!(r.get("no_effect").is_none(), "field: {r}");
+}

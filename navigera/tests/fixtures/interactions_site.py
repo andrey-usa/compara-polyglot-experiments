@@ -315,6 +315,39 @@ setTimeout(() => { document.getElementById('unlock-later').disabled = false; }, 
 </script>""")
 
 
+PAGES["/effects"] = ("effects", "#strip{width:200px;overflow-x:auto;white-space:nowrap}#strip span{display:inline-block;width:150px}", """
+<button id=late>Close</button>
+<button id=noop>Does nothing</button>
+<label><input type=checkbox id=agree> Agree</label>
+<input id=q value=typed> <button id=clear>Clear</button>
+<button id=send>Send</button>
+<button id=later>Later</button>
+<div id=strip><span>a</span><span>b</span><span>c</span></div> <button id=next>Next</button>
+<a id=self href="#">Top</a>
+<x-panel id=panel></x-panel> <x-badge id=badge></x-badge>
+<p id=out>none</p>
+<script>
+const out = (t) => { document.getElementById('out').textContent = t; };
+// Close is wired only once the page has "loaded its scripts".
+setTimeout(() => { document.getElementById('late').onclick = () => out('closed'); }, 1500);
+// Clear sets the field from script: no DOM change, no event.
+document.getElementById('clear').onclick = () => { document.getElementById('q').value = ''; };
+// Send only starts a request.
+document.getElementById('send').onclick = () => { fetch('/slow-echo?ms=400'); };
+document.getElementById('later').onclick = () => setTimeout(() => out('later'), 80);
+document.getElementById('next').onclick = () => { document.getElementById('strip').scrollLeft += 150; };
+// A button in one shadow root changes text in another one.
+customElements.define('x-badge', class extends HTMLElement {
+  constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<b>0</b>'; }
+  set count(n) { this.shadowRoot.querySelector('b').textContent = n; }
+});
+customElements.define('x-panel', class extends HTMLElement {
+  constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<button id=bump>Bump</button>'; let n = 0;
+    this.shadowRoot.querySelector('button').onclick = () => { document.getElementById('badge').count = ++n; }; }
+});
+</script>""")
+
+
 def xo_parent(port, child_host):
     return ("xo parent", "iframe{width:420px;height:170px;border:1px solid #888}", f"""
 <h1>Checkout</h1>

@@ -171,7 +171,10 @@ pub const DEEP: &str = r#"(() => {
 /// it either. Without `strict` (`--force`, or an engine with no layout) the
 /// element gets DOM-dispatched events, reported as `synthetic`. An element
 /// with no box at all always gets those.
-const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button) {
+///
+/// With `effects`, it also starts watching what the click will change (see
+/// [`Page::click_effect`]).
+const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button, effects) {
     const deadline = Date.now() + (force ? 0 : settleMs);
     // The element's ancestors through shadow hosts: what can move it.
     const chain = new Set();
@@ -226,6 +229,106 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button)
     ];
     // A disabled control can't be clicked by a user; wait for it to be
     // enabled (a form that unlocks Submit once valid), else say so.
+    // What the click changes, to tell a click that did nothing (a control
+    // the page hasn't wired up yet) from one that did something: changes to
+    // the DOM of the page, of the element's document and of the shadow roots
+    // around the element; events a DOM observer can't see (input, change,
+    // submit, toggle, invalid, a scroll, a navigation starting); focus moving
+    // elsewhere; form values, the URL or the scroll position a script set.
+    // A field, a <select> and a right or middle click are left out: what
+    // they open isn't in the DOM. `Page::click_effect` reads it, removes it.
+    const armEffects = (w) => {
+        const top = w.top, doc = el.ownerDocument, ctl = el.control || el;
+        const tag = ctl.tagName, type = (ctl.type || '').toLowerCase();
+        const skip = button === 'right' || button === 'middle' || tag === 'SELECT' || tag === 'TEXTAREA'
+            || !!ctl.isContentEditable
+            || (tag === 'INPUT' && !['checkbox', 'radio', 'button', 'submit', 'reset', 'image'].includes(type));
+        const docs = doc === top.document ? [top.document] : [top.document, doc];
+        const fx = { m: 0, e: 0, obs: [], offs: [] };
+        // Every open shadow root too (a button in one component often
+        // changes another): about 0.1 ms per thousand elements.
+        const roots = [...docs], seen = new Set(roots);
+        const add = (r) => { if (r && !seen.has(r)) { seen.add(r); roots.push(r); return true; } return false; };
+        const walk = (scope) => {
+            const all = scope.getElementsByTagName ? scope.getElementsByTagName('*') : scope.querySelectorAll('*');
+            for (let i = 0; i < all.length && roots.length < 1000; i++) {
+                const r = all[i].shadowRoot;
+                if (add(r)) walk(r);
+            }
+        };
+        if (!skip) {
+            for (let r = el.getRootNode(); r && r.host; r = r.host.getRootNode()) add(r);
+            for (const d of docs) walk(d);
+        }
+        const partial = roots.length >= 1000;
+        if (!skip) {
+            for (const r of roots) {
+                const o = new MutationObserver((recs) => { fx.m += recs.length; });
+                o.observe(r, { subtree: true, childList: true, attributes: true, characterData: true });
+                fx.obs.push(o);
+            }
+            const onEvent = (e) => {
+                // Scrolling the element into view lands as a scroll event of
+                // the document or an ancestor a frame later: not the click's.
+                const t = e.target;
+                if (e.type === 'scroll' && (t.nodeType === 9 || (t.contains && t.contains(el)))) return;
+                fx.e++;
+            };
+            const wins = w === top ? [top] : [top, w];
+            for (const v of wins) {
+                for (const t of ['input', 'change', 'submit', 'reset', 'toggle', 'scroll', 'select', 'invalid', 'hashchange', 'play', 'pause']) {
+                    v.addEventListener(t, onEvent, true);
+                    fx.offs.push(() => v.removeEventListener(t, onEvent, true));
+                }
+            }
+            const nav = top.navigation;
+            if (nav && nav.addEventListener) {
+                nav.addEventListener('navigate', onEvent);
+                fx.offs.push(() => nav.removeEventListener('navigate', onEvent));
+            }
+        }
+        const focused = () => {
+            let a = top.document.activeElement;
+            for (;;) {
+                let n = a && a.shadowRoot && a.shadowRoot.activeElement;
+                if (!n && a && (a.tagName === 'IFRAME' || a.tagName === 'FRAME')) { try { n = a.contentDocument && a.contentDocument.activeElement; } catch (_) { n = null; } }
+                if (!n) return a;
+                a = n;
+            }
+        };
+        const state = () => {
+            let s = top.location.href + ' ' + top.history.length + ' ' + top.scrollX + ',' + top.scrollY + ' ' + ctl.checked + ' ' + ctl.value;
+            for (const d of docs) {
+                const cs = d.querySelectorAll('input, textarea, select');
+                for (let i = 0; i < cs.length && i < 300; i++) s += '\u0001' + cs[i].value + (cs[i].checked ? '+' : '-') + cs[i].selectedIndex;
+            }
+            return s;
+        };
+        const before = skip ? '' : state(), focus = focused();
+        // Same-origin frames nobody watched (or too many shadow roots): a
+        // change there would go unseen, so "nothing changed" can't be said.
+        const unwatched = () => partial || docs.some((d) => [...d.querySelectorAll('iframe, frame')].some((f) => {
+            try { const fd = f.contentDocument; return !!(fd && !seen.has(fd) && fd.body && fd.body.childElementCount); } catch (_) { return false; }
+        }));
+        const done = () => {
+            for (const o of fx.obs) o.disconnect();
+            for (const off of fx.offs) off();
+            try { delete top.__nvFx; delete top.__nvSeen; } catch (_) {}
+        };
+        fx.check = (last) => {
+            for (const o of fx.obs) fx.m += o.takeRecords().length;
+            let what = skip ? '' : fx.m ? 'dom' : fx.e ? 'event' : '';
+            if (!what && !skip) {
+                const f = focused();
+                if (f && f !== focus && f !== top.document.body && !(f.contains(el) || el.contains(f))) what = 'focus';
+            }
+            if (!what && !skip && state() !== before) what = 'state';
+            const unsure = !what && !skip && !!last && unwatched();
+            if (what || skip || last) done();
+            return { what, skip, unsure };
+        };
+        Object.defineProperty(top, '__nvFx', { value: fx, configurable: true, enumerable: false, writable: true });
+    };
     const disabled = () => !!(el.disabled || el.closest('fieldset[disabled]'));
     while (!force && disabled() && Date.now() < deadline) await new Promise((res) => setTimeout(res, 50));
     if (!force && strict && disabled()) return { disabled: true };
@@ -253,7 +356,8 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button)
                 w.top.__nvSeen = 0;
                 for (const t of ['pointerdown', 'mousedown', 'mouseup', 'click'])
                     w.addEventListener(t, () => { w.top.__nvSeen++; }, { capture: true, once: true });
-                return Object.assign(p, { nav: mayNavigate(el), check: true });
+                if (effects) armEffects(w);
+                return Object.assign(p, { nav: mayNavigate(el), check: true, effects: !!effects });
             }
             // Inside a cross-origin frame: our coordinates are frame-local;
             // the caller asks CDP for the box instead.
@@ -309,6 +413,11 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button)
     }
     return { synthetic: true, covered: !!hit && !force, covered_by: hit && hit !== el ? describe(hit) : null, nav: mayNavigate(el) };
 }"#;
+
+/// How long a click that changed nothing yet is watched before `click`
+/// says so (`no_effect`). Effects of a click almost always show within a
+/// frame or two; a request it starts shows at once.
+const EFFECT_WINDOW: Duration = Duration::from_millis(200);
 
 /// The second half of a DOM-event double click (the first click's events
 /// were sent by CLICK_PREP).
@@ -1686,11 +1795,14 @@ impl Page {
         if opts.force {
             return dom(self);
         }
+        // Watch what the click changes (not on Lightpanda: no layout, so its
+        // clicks are DOM events anyway).
+        let effects = !self.shared.is_single_target() && std::env::var_os("NAVIGERA_NO_CLICK_CHECK").is_none();
         let mut point = self.on_element(
             target,
             "click",
             CLICK_PREP,
-            &[json!(false), settle.clone(), strict.clone(), button.clone()],
+            &[json!(false), settle.clone(), strict.clone(), button.clone(), json!(effects)],
             wait,
             timeout,
         )?;
@@ -1741,9 +1853,18 @@ impl Page {
                 _ => return dom(self),
             }
         }
-        if !self.mouse_click(&point, &opts.button, timeout)? {
-            // Engine without the Input domain: DOM events.
-            return dom(self);
+        let armed = point.get("effects").and_then(Value::as_bool) == Some(true);
+        let before = self.shared.activity(&self.session_id);
+        match self.mouse_click(&point, &opts.button, timeout) {
+            Ok(true) => {}
+            other => {
+                if armed {
+                    self.drop_effects(timeout);
+                }
+                // Engine without the Input domain: DOM events.
+                other?;
+                return dom(self);
+            }
         }
         let check = point.get("check").and_then(Value::as_bool) == Some(true)
             && std::env::var_os("NAVIGERA_NO_CLICK_CHECK").is_none(); // diagnostic knob
@@ -1761,13 +1882,66 @@ impl Page {
             self.mouse_click(&point, &opts.button, timeout)?;
             if !self.press_arrived(timeout) {
                 eprintln!("[click] still not delivered; dispatching DOM events");
+                if armed {
+                    self.drop_effects(timeout);
+                }
                 let mut res = dom(self)?;
                 res["dropped"] = json!(true);
                 return Ok(res);
             }
             point["redelivered"] = json!(true);
         }
+        if armed && self.click_effect(&before, timeout) == Some(false) {
+            point["no_effect"] = json!(EFFECT_WINDOW.as_millis() as u64);
+        }
         Ok(point)
+    }
+
+    /// Did a delivered click change anything? Polls, for up to
+    /// [`EFFECT_WINDOW`], what CLICK_PREP set up in the page (DOM changes,
+    /// events, focus, form values, URL, scroll) and what only the browser
+    /// sees (requests, navigations, dialogs, new tabs, downloads). `Some(true)`
+    /// as soon as something changed (the usual case: one round trip);
+    /// `Some(false)` when nothing did; `None` when it can't tell (a field, a
+    /// `<select>`, a right click, shadow roots or frames it didn't watch, the
+    /// page gone).
+    fn click_effect(&self, before: &[u64; 6], timeout: Duration) -> Option<bool> {
+        let end = Instant::now() + EFFECT_WINDOW;
+        loop {
+            let last = Instant::now() >= end;
+            let expr = format!("window.__nvFx ? window.__nvFx.check({last}) : null");
+            let v = self
+                .send("Runtime.evaluate", json!({ "expression": expr, "returnByValue": true }), timeout)
+                .ok()?
+                .pointer("/result/value")
+                .cloned()
+                .filter(|v| v.is_object())?;
+            if v.get("what").and_then(Value::as_str).is_some_and(|w| !w.is_empty()) {
+                return Some(true);
+            }
+            if v.get("skip").and_then(Value::as_bool) == Some(true) {
+                return None;
+            }
+            if self.shared.activity(&self.session_id) != *before {
+                if !last {
+                    self.drop_effects(timeout);
+                }
+                return Some(true);
+            }
+            if last {
+                return (v.get("unsure").and_then(Value::as_bool) != Some(true)).then_some(false);
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    /// Stop watching a click's effects (see [`Page::click_effect`]).
+    fn drop_effects(&self, timeout: Duration) {
+        let _ = self.send(
+            "Runtime.evaluate",
+            json!({ "expression": "window.__nvFx && window.__nvFx.check(true), 0", "returnByValue": true }),
+            timeout,
+        );
     }
 
     /// How long a click waits for its element to stop moving and become
