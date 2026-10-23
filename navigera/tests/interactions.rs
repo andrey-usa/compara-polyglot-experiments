@@ -365,3 +365,25 @@ fn clicks_only_claim_what_a_user_could_do() {
     let err = s.fails(&["fill", "--selector", "#off", "x", "--timeout-ms", "300"]);
     assert!(err.contains("disabled"), "{err}");
 }
+
+#[test]
+fn forms_inside_cross_origin_frames() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("xo", &[]);
+    // Cross-site (localhost in a 127.0.0.1 page), then cross-origin on the
+    // same site (another port).
+    for page in ["/xo-parent", "/xo-parent?same-site"] {
+        s.ok(&["goto", &format!("{}{page}", site.url)]);
+        s.ok(&["fill", "--label", "Card number", "4242424242424242"]);
+        s.ok(&["check", "--label", "Save card"]);
+        s.ok(&["select", "--selector", "#exp", "02/28"]);
+        s.ok(&["click", "--role", "button", "--name", "Pay"]);
+        // Text inside the frame, then the page's own (it hears by postMessage).
+        s.ok(&["wait", "--text", "sent 4242424242424242"]);
+        s.ok(&["wait", "--text", "paid 4242"]);
+        assert_eq!(s.text(&["get", "text", "--selector", "#paid"]), "paid 4242 saved 02/28", "{page}");
+        assert_eq!(s.text(&["get", "text", "--selector", "#status"]), "sent 4242424242424242", "{page}");
+    }
+    let err = s.fails(&["click", "--text", "No such button", "--timeout-ms", "400"]);
+    assert!(err.contains("cross-origin frame"), "{err}");
+}

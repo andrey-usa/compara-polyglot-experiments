@@ -981,6 +981,11 @@ fn finder_expr(target: &Target, wait_ms: u128, what: &str) -> String {
     }
 }
 
+/// A finder's "no element … within" (the element isn't there yet).
+fn not_found(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains(": no element")
+}
+
 /// The page an evaluate ran in was replaced by a navigation before it
 /// answered.
 fn navigated_away(e: &anyhow::Error) -> bool {
@@ -1041,6 +1046,9 @@ pub struct Page {
     session_id: String,
     target_id: String,
     shared: Arc<Shared>,
+    /// Isolated worlds navigera made in cross-origin frames: frame id ->
+    /// (the frame's loader, its execution context).
+    worlds: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>>,
 }
 
 impl Page {
@@ -1051,7 +1059,7 @@ impl Page {
         target_id: String,
         shared: Arc<Shared>,
     ) -> Self {
-        Self { handle, client, session_id, target_id, shared }
+        Self { handle, client, session_id, target_id, shared, worlds: Default::default() }
     }
 
     pub fn target_id(&self) -> &str {
@@ -1443,8 +1451,149 @@ impl Page {
             }
             other => finder_expr(other, wait_ms, what),
         };
-        let expr = format!("(async () => {{ const el = await {finder}; return ({function})(el{extra}); }})()");
-        self.evaluate_raw(&expr, timeout)
+        let _ = finder;
+        let expr = |ms: u128| {
+            format!(
+                "(async () => {{ const el = await {}; return ({function})(el{extra}); }})()",
+                finder_expr(target, ms, what)
+            )
+        };
+        // Most often the element is there: one round trip.
+        match self.evaluate_raw(&expr(0), timeout) {
+            Err(e) if not_found(&e) => {}
+            other => return other,
+        }
+        // Not yet. Frames of another origin are out of a page script's
+        // reach; without any, wait in the page as always.
+        let mut frames = self.foreign_frames(timeout);
+        if frames.is_empty() {
+            return self.evaluate_raw(&expr(wait_ms), timeout);
+        }
+        // With some, look in the page and in each of them until the wait
+        // runs out. A match in a frame says which (`__frame`), for ops that
+        // then need the element's box.
+        let started = Instant::now();
+        let mut polls = 0u32;
+        loop {
+            for &(_, context) in &frames {
+                match self.evaluate_in(context, &expr(0), timeout) {
+                    Ok(mut v) => {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("__frame".into(), json!(context));
+                        }
+                        return Ok(v);
+                    }
+                    Err(e) if not_found(&e) || navigated_away(&e) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let last = match self.evaluate_raw(&expr(0), timeout) {
+                Err(e) if not_found(&e) => e,
+                other => return other,
+            };
+            if started.elapsed() >= wait {
+                let msg = format!("{last:#}").replace("within 0 ms", &format!("within {} ms", wait.as_millis()));
+                bail!("{msg} (looked in the page and {} cross-origin frame(s))", frames.len());
+            }
+            polls += 1;
+            if polls.is_multiple_of(20) {
+                frames = self.foreign_frames(timeout);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Frames of another origin than the page's, and the frames inside
+    /// them: a page script can't reach into those, so navigera looks there
+    /// from an isolated world of its own in each (invisible to the page).
+    /// navigera's own browsers keep cross-site frames in the page's process,
+    /// so this covers them; frames in other processes (a user's browser
+    /// with `--attach`) are not included.
+    fn foreign_frames(&self, timeout: Duration) -> Vec<(String, i64)> {
+        let Ok(tree) = self.send("Page.getFrameTree", json!({}), timeout) else {
+            return Vec::new();
+        };
+        let root = tree.get("frameTree").cloned().unwrap_or(Value::Null);
+        let origin = |n: &Value| n.pointer("/frame/securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
+        let main = origin(&root);
+        let mut found = Vec::new();
+        fn walk(node: &Value, main: &str, foreign_above: bool, out: &mut Vec<(String, String)>) {
+            for child in node.get("childFrames").and_then(Value::as_array).into_iter().flatten() {
+                let o = child.pointer("/frame/securityOrigin").and_then(Value::as_str).unwrap_or("");
+                let foreign = foreign_above || o != main;
+                if foreign {
+                    if let (Some(id), Some(loader)) = (
+                        child.pointer("/frame/id").and_then(Value::as_str),
+                        child.pointer("/frame/loaderId").and_then(Value::as_str),
+                    ) {
+                        out.push((id.to_string(), loader.to_string()));
+                    }
+                }
+                walk(child, main, foreign, out);
+            }
+        }
+        walk(&root, &main, false, &mut found);
+        let mut out = Vec::new();
+        for (id, loader) in found.into_iter().take(20) {
+            let cached = self.worlds.lock().unwrap().get(&id).filter(|(l, _)| *l == loader).map(|(_, c)| *c);
+            let context = match cached {
+                Some(c) => c,
+                None => match self
+                    .send("Page.createIsolatedWorld", json!({ "frameId": id, "worldName": "navigera" }), timeout)
+                    .ok()
+                    .and_then(|r| r.get("executionContextId").and_then(Value::as_i64))
+                {
+                    Some(c) => {
+                        self.worlds.lock().unwrap().insert(id.clone(), (loader, c));
+                        c
+                    }
+                    None => continue,
+                },
+            };
+            out.push((id, context));
+        }
+        out
+    }
+
+    /// Whether `expression` is true in any cross-origin frame (see
+    /// [`Page::foreign_frames`]).
+    pub fn true_in_a_frame(&self, expression: &str, timeout: Duration) -> bool {
+        self.foreign_frames(timeout).iter().any(|&(_, context)| {
+            self.evaluate_in(context, expression, timeout).ok().and_then(|v| v.as_bool()) == Some(true)
+        })
+    }
+
+    /// Evaluate in one execution context (a frame's isolated world).
+    fn evaluate_in(&self, context: i64, expression: &str, timeout: Duration) -> Result<Value> {
+        let res = self.send(
+            "Runtime.evaluate",
+            json!({ "expression": expression, "contextId": context, "returnByValue": true, "awaitPromise": true }),
+            timeout,
+        )?;
+        if let Some(details) = res.get("exceptionDetails") {
+            bail!("{}", exception_message(details));
+        }
+        Ok(res.get("result").and_then(|r| r.get("value")).cloned().unwrap_or(Value::Null))
+    }
+
+    /// The centre, in page coordinates, of the element `target` names inside
+    /// a frame's isolated world.
+    fn center_in_frame(&self, context: i64, target: &Target, timeout: Duration) -> Option<(f64, f64)> {
+        let res = self
+            .send(
+                "Runtime.evaluate",
+                json!({ "expression": finder_expr(target, 0, "click"), "contextId": context,
+                        "awaitPromise": true, "objectGroup": "nv-frame" }),
+                timeout,
+            )
+            .ok()?;
+        let object = res.pointer("/result/objectId").and_then(Value::as_str).map(str::to_string);
+        let quads = object.and_then(|o| self.send("DOM.getContentQuads", json!({ "objectId": o }), timeout).ok());
+        let _ = self.send("Runtime.releaseObjectGroup", json!({ "objectGroup": "nv-frame" }), timeout);
+        let quad: Vec<f64> =
+            quads?.get("quads")?.as_array()?.first()?.as_array()?.iter().filter_map(Value::as_f64).collect();
+        (quad.len() == 8)
+            .then(|| ((quad[0] + quad[2] + quad[4] + quad[6]) / 4.0, (quad[1] + quad[3] + quad[5] + quad[7]) / 4.0))
     }
 
     /// Resolve an `ax` ref (`backendNodeId`) and call `function` on it.
@@ -1573,7 +1722,15 @@ impl Page {
         if point.get("xframe").and_then(Value::as_bool) == Some(true) {
             // Inside a cross-origin iframe the page can't see its frame's
             // offset; CDP reports the box in top-level coordinates.
+            let in_frame = point.get("__frame").and_then(Value::as_i64);
             match target {
+                _ if in_frame.is_some() => match self.center_in_frame(in_frame.unwrap_or_default(), target, timeout) {
+                    Some((x, y)) => {
+                        point["x"] = json!(x);
+                        point["y"] = json!(y);
+                    }
+                    None => return dom(self),
+                },
                 Target::Ref(node) => match self.content_quad_center(*node, timeout) {
                     Some((x, y)) => {
                         point["x"] = json!(x);
@@ -1726,7 +1883,12 @@ impl Page {
             );
         }
         if point.get("xframe").and_then(Value::as_bool) == Some(true) {
+            let in_frame = point.get("__frame").and_then(Value::as_i64);
             match target {
+                _ if in_frame.is_some() => match self.center_in_frame(in_frame.unwrap_or_default(), target, timeout) {
+                    Some((x, y)) => point = json!({ "x": x, "y": y }),
+                    None => bail!("dblclick: element inside a cross-origin iframe has no box"),
+                },
                 Target::Ref(node) => match self.content_quad_center(*node, timeout) {
                     Some((x, y)) => point = json!({ "x": x, "y": y }),
                     None => bail!("dblclick: element is inside a cross-origin iframe without a box"),
@@ -1845,8 +2007,9 @@ impl Page {
         let settle = json!(self.hit_settle_ms(wait));
         let mut point = self.on_element(target, "hover", HOVER_PREP, &[settle], wait, timeout)?;
         if point.get("xframe").and_then(Value::as_bool) == Some(true) {
-            let center = match target {
-                Target::Ref(node) => self.content_quad_center(*node, timeout),
+            let center = match (target, point.get("__frame").and_then(Value::as_i64)) {
+                (_, Some(context)) => self.center_in_frame(context, target, timeout),
+                (Target::Ref(node), None) => self.content_quad_center(*node, timeout),
                 _ => None,
             };
             match center {

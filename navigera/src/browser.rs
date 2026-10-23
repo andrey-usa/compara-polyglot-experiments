@@ -1759,8 +1759,22 @@ impl BrowserSession {
     /// Survives navigations (the predicate is re-evaluated in each new
     /// document); returns the waited milliseconds.
     pub fn wait_until(&self, js_predicate: &str, what: &str, timeout_ms: Option<f64>) -> Result<f64> {
+        self.wait_until_or_in_frames(js_predicate, false, what, timeout_ms)
+    }
+
+    /// [`Self::wait_until`], also satisfied when the predicate holds inside a
+    /// cross-origin frame (`in_frames`: a single `--text`/`--selector` wait,
+    /// for text a payment or login frame shows).
+    pub fn wait_until_or_in_frames(
+        &self,
+        js_predicate: &str,
+        in_frames: bool,
+        what: &str,
+        timeout_ms: Option<f64>,
+    ) -> Result<f64> {
         let (wait, timeout) = self.element_budget(timeout_ms);
         let started = std::time::Instant::now();
+        let mut polls = 0u32;
         loop {
             // A navigation in flight: wait for it, but never past this
             // op's own budget.
@@ -1768,6 +1782,11 @@ impl BrowserSession {
             if let Ok(true) = self.active_tab().check(js_predicate, timeout) {
                 return Ok((started.elapsed().as_secs_f64() * 1000.0).round());
             }
+            // Frames are listed only after a miss, and every few polls.
+            if in_frames && polls.is_multiple_of(3) && self.active_tab().true_in_a_frame(js_predicate, timeout) {
+                return Ok((started.elapsed().as_secs_f64() * 1000.0).round());
+            }
+            polls += 1;
             if started.elapsed() >= wait {
                 bail!("wait: {what} not met within {} ms", wait.as_millis());
             }

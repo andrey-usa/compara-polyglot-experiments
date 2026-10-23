@@ -24,6 +24,8 @@ getting wrong, one page each, built the way those sites behave:
 /typed-only     an input whose app keeps only what was typed
 /lazy-box       a scrollable box that loads more when scrolled to its end
 /honesty        a decoy copy of an id, disabled and read-only controls
+/xo-parent      a card form in a cross-site iframe (localhost in a 127.0.0.1
+                page: its own process); ?same-site: cross-origin, same process
 
 Prints "LISTENING http://127.0.0.1:<port>" and serves until killed."""
 import sys
@@ -313,6 +315,31 @@ setTimeout(() => { document.getElementById('unlock-later').disabled = false; }, 
 </script>""")
 
 
+def xo_parent(port, child_host):
+    return ("xo parent", "iframe{width:420px;height:170px;border:1px solid #888}", f"""
+<h1>Checkout</h1>
+<p id=paid>unpaid</p>
+<iframe id=card title="Secure card input" src="http://{child_host}:{port}/xo-child"></iframe>
+<script>
+addEventListener('message', (e) => {{ if (e.data && e.data.paid) document.getElementById('paid').textContent = 'paid ' + e.data.paid; }});
+</script>""")
+
+
+PAGES["/xo-child"] = ("card frame", "", """
+<label>Card number <input id=cardnumber autocomplete=off></label>
+<label><input type=checkbox id=save> Save card</label>
+<select id=exp><option>01/27</option><option>02/28</option></select>
+<button id=pay type=button>Pay</button>
+<p id=status>idle</p>
+<script>
+document.getElementById('pay').onclick = () => {
+  const n = document.getElementById('cardnumber').value;
+  document.getElementById('status').textContent = 'sent ' + n;
+  parent.postMessage({ paid: n.slice(-4) + (document.getElementById('save').checked ? ' saved' : '') + ' ' + document.getElementById('exp').value }, '*');
+};
+</script>""")
+
+
 def slow_page(ms):
     return ("slow", "", f"""
 <p>Loading…</p>
@@ -343,7 +370,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
-        q = parse_qs(u.query)
+        q = parse_qs(u.query, keep_blank_values=True)
         if u.path == "/frameset":
             return self.send(FRAMESET)
         if u.path == "/frame-top":
@@ -360,6 +387,14 @@ class Handler(BaseHTTPRequestHandler):
                              [("Content-Disposition", 'attachment; filename="report.csv"')])
         if u.path == "/slow":
             page = slow_page(int(q.get("ms", ["2000"])[0]))
+        elif u.path == "/xo-parent":
+            # localhost and 127.0.0.1 are different sites: the frame is
+            # cross-site, so Chrome runs it in a process of its own.
+            # `?same-site` keeps it cross-origin but in the same process.
+            port = self.server.server_address[1]
+            page = xo_parent(port, "127.0.0.1" if "same-site" in q else "localhost")
+            if "same-site" in q:
+                page = (page[0], page[1], page[2].replace(f"http://127.0.0.1:{port}/xo-child", f"http://127.0.0.1:{XO_PORT[0]}/xo-child"))
         elif u.path in PAGES:
             page = PAGES[u.path]
         else:
@@ -370,7 +405,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send(HEAD.format(title=title, style=style) + body + "</body></html>")
 
 
+XO_PORT = [0]
+
 if __name__ == "__main__":
+    # A second port: another origin on the same site (127.0.0.1).
+    xo = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    XO_PORT[0] = xo.server_address[1]
+    import threading
+    threading.Thread(target=xo.serve_forever, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     print(f"LISTENING http://127.0.0.1:{srv.server_address[1]}", flush=True)
     try:

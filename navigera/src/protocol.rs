@@ -2532,7 +2532,11 @@ impl Driver {
                 if checks.is_empty() {
                     return Ok(json!({ "waited_ms": ms.unwrap_or(0.0) }));
                 }
-                let waited = s.wait_until(&checks.join(" && "), &what.join(" and "), *timeout_ms)?;
+                // One --text or --selector wait also looks in cross-origin
+                // frames (text shown by a payment or sign-in frame).
+                let in_frames = checks.len() == 1 && (text.is_some() || selector.is_some());
+                let waited =
+                    s.wait_until_or_in_frames(&checks.join(" && "), in_frames, &what.join(" and "), *timeout_ms)?;
                 let mut state = self.state_json();
                 state["waited_ms"] = json!(waited);
                 Ok(state)

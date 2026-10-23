@@ -221,10 +221,10 @@ app. Besides a ref, `--selector` and
   `click --force` sends DOM events to the element anyway. Styled checkboxes
   and radios are clicked through their label automatically; a hidden input
   with no label fails at once and names what to click instead (the card).
-- **Iframes and shadow DOM:** refs work inside any iframe, cross-origin
-  included. `--selector`, `--text` and the locators also look inside
-  same-origin iframes and open shadow roots when the page itself has no
-  match; inside a cross-origin iframe, act by ref.
+- **Iframes and shadow DOM:** refs work inside any iframe. `--selector`,
+  `--text` and the locators also look inside iframes (cross-origin ones,
+  like a payment form, included) and open shadow roots when the page itself
+  has no match.
 - **Files:** `upload ./doc.txt` and `screenshot shot.png` use paths relative
   to your current directory.
 
