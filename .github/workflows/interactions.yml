@@ -60,7 +60,7 @@ jobs:
             # A display for `show`.
             xvfb-run -a cargo test --locked --no-fail-fast 2>&1 | tee test.log
           else
-            cargo test --locked --no-fail-fast --lib --test interactions --test handoff --test attach --test commands 2>&1 | tee test.log
+            cargo test --locked --no-fail-fast --lib --test interactions --test handoff --test attach --test commands --test fork 2>&1 | tee test.log
           fi
           code=${PIPESTATUS[0]}
           python3 - test.log "interactions $RUNNER_OS" <<'PY'
