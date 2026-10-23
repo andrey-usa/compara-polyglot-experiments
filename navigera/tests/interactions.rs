@@ -336,10 +336,12 @@ fn scroll_to_bottom_scrolls_the_box_itself() {
     let (true, Some(site)) = (chrome(), site()) else { return };
     let s = Session::start("lazybox", &[]);
     s.ok(&["goto", &format!("{}/lazy-box", site.url)]);
-    for _ in 0..3 {
+    // Each scroll to the box's end loads 20 more; wait for them rather than
+    // a fixed pause (scroll events wait for a rendering step).
+    for loaded in [40, 60] {
         let r = s.ok(&["scroll", "--selector", "#list", "--to", "bottom"]);
         assert!(r["scrollTop"].as_u64().unwrap() > 0, "{r}");
-        s.ok(&["wait", "--ms", "250"]);
+        s.ok(&["wait", "--js", &format!("document.querySelectorAll('#list div').length >= {loaded}")]);
     }
     s.ok(&["click", "--text", "Item 55"]);
 }
