@@ -496,10 +496,13 @@ const IDENTITY: &str = "function (el) { return el; }";
 /// Auto-wait: resolve the first match for `sel`, polling every 50 ms for up
 /// to `ms` (SPAs render after load; an agent shouldn't have to poll). The
 /// top document first, then open shadow roots and same-origin frames.
-const WAIT_FOR: &str = r#"async function (sel, ms, what, deep) {
+const WAIT_FOR: &str = r#"async function (sel, ms, what, deepFn) {
     const end = Date.now() + ms;
+    let deep = null;
     for (;;) {
-        const el = deep.first(sel);
+        // The plain query first: the deep search is built (and compiled)
+        // only when the top document has no match.
+        const el = document.querySelector(sel) || (deep = deep || deepFn()).first(sel);
         if (el) return el;
         if (Date.now() >= end) throw new Error(what + ': no element matches selector ' + JSON.stringify(sel) + ' within ' + ms + ' ms (run `ax` to see the page and act by --ref)');
         await new Promise((r) => setTimeout(r, 50));
@@ -863,7 +866,7 @@ fn modifier_bit(name: &str) -> Option<u32> {
 /// which resolve through CDP).
 fn finder_expr(target: &Target, wait_ms: u128, what: &str) -> String {
     match target {
-        Target::Selector(sel) => format!("({WAIT_FOR})({}, {wait_ms}, {}, {DEEP})", json!(sel), json!(what)),
+        Target::Selector(sel) => format!("({WAIT_FOR})({}, {wait_ms}, {}, () => {DEEP})", json!(sel), json!(what)),
         Target::Text(text) => format!("({WAIT_TEXT})({}, {wait_ms}, {}, {DEEP})", json!(text), json!(what)),
         Target::Locator(loc) => format!("({WAIT_LOCATOR})({}, {wait_ms}, {}, {DEEP})", json!(loc), json!(what)),
         Target::Ref(node) => format!("Promise.reject(new Error('{what}: ref {node} must be resolved through CDP'))"),

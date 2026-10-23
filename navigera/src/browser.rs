@@ -163,7 +163,9 @@ pub fn download_dir() -> Result<std::path::PathBuf> {
         .or_else(|| std::env::var_os("NAVIGERA_DOWNLOAD_DIR").filter(|v| !v.is_empty()).map(Into::into))
         .unwrap_or_else(|| std::env::temp_dir().join(format!("navigera-downloads-{}", std::process::id())));
     std::fs::create_dir_all(&dir).with_context(|| format!("download directory {}", dir.display()))?;
-    Ok(std::fs::canonicalize(&dir).unwrap_or(dir))
+    // Not `canonicalize`: on Windows it gives a `\\?\C:\…` path, and Chrome
+    // cancels every download into one of those.
+    Ok(std::path::absolute(&dir).unwrap_or(dir))
 }
 
 /// What a headless Chrome shows a page that a windowed one does not, put
