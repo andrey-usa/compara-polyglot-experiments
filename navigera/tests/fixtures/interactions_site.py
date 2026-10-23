@@ -363,6 +363,7 @@ customElements.define('x-panel', class extends HTMLElement {
 def xo_parent(port, child_host):
     return ("xo parent", "iframe{width:420px;height:170px;border:1px solid #888}", f"""
 <h1>Checkout</h1>
+<h2>Payment details</h2>
 <p id=paid>unpaid</p>
 <iframe id=card title="Secure card input" src="http://{child_host}:{port}/xo-child"></iframe>
 <script>

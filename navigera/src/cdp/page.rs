@@ -861,7 +861,7 @@ const WAIT_LOCATOR: &str = r#"async function (spec, ms, what, deep) {
 /// text or value matches `text` — exact (case-insensitive) beats contains,
 /// actionable elements beat plain ones, visible beats hidden. Walks open
 /// shadow roots.
-const WAIT_TEXT: &str = r#"async function (text, ms, what, deep) {
+const WAIT_TEXT: &str = r#"async function (text, ms, what, deep, mode) {
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const want = norm(text);
     // The longest word is the cheap pre-filter for text nodes.
@@ -913,8 +913,10 @@ const WAIT_TEXT: &str = r#"async function (text, ms, what, deep) {
         for (const el of root.querySelectorAll('*')) if (el.shadowRoot) fromText(el.shadowRoot, needle, out);
         return out;
     };
+    // A frame is where text is, not something to act on by its title.
+    const FRAMES = new Set(['IFRAME', 'FRAME', 'OBJECT', 'EMBED']);
     const fromAttrs = (root, out) => {
-        for (const el of root.querySelectorAll('[aria-label],[placeholder],[title],[alt],input,textarea,select')) out.add(el);
+        for (const el of root.querySelectorAll('[aria-label],[placeholder],[title],[alt],input,textarea,select')) if (!FRAMES.has(el.tagName)) out.add(el);
         for (const el of root.querySelectorAll('*')) if (el.shadowRoot) fromAttrs(el.shadowRoot, out);
         return out;
     };
@@ -928,22 +930,34 @@ const WAIT_TEXT: &str = r#"async function (text, ms, what, deep) {
         if (!(r.width > 0 && r.height > 0)) return false;
         return el.checkVisibility ? el.checkVisibility({ visibilityProperty: true }) : true;
     };
+    // Frames this script can't look into (another origin): an exact match
+    // may be in one of them (a "Pay" button in a payment frame, beside a
+    // "Payment details" heading here).
+    const unreachable = () => deep.docs().some((d) => [...d.querySelectorAll('iframe, frame')].some((f) => {
+        try { return !f.contentDocument; } catch (_) { return true; }
+    }));
+    // mode: 0 = say so (an "inexact" error) when the best match only
+    // contains the text and frames out of reach could hold an exact one;
+    // 1 = exact matches only (looking inside such a frame); 2 = take the
+    // best match.
     const end = Date.now() + ms;
     for (;;) {
-        let best = null, bestScore = -1;
-        // Document by document, the top one first: a match there wins over
-        // one inside a frame.
-        for (const d of deep.docs()) {
+        let best = null, bestScore = -1, bestExact = false;
+        // Every document this script reaches; for the same quality of match,
+        // the top one first.
+        deep.docs().forEach((d, di) => {
             for (const el of candidates(d.body || d.documentElement)) {
-                if (SKIP.has(el.tagName) || el.closest('head')) continue;
+                if (SKIP.has(el.tagName) || FRAMES.has(el.tagName) || el.closest('head')) continue;
                 const m = match(el);
-                if (!m) continue;
+                if (!m || (mode === 1 && !m.exact)) continue;
                 // Visible beats everything: an exact match on a hidden element
                 // must not win over the button the agent can see.
-                const score = (visible(el) ? 8 : 0) + (m.exact ? 4 : 0) + (el.matches(ACTION) ? 2 : 0) - m.l.length / 1000;
-                if (score > bestScore) { best = el; bestScore = score; }
+                const score = (visible(el) ? 8 : 0) + (m.exact ? 4 : 0) + (el.matches(ACTION) ? 2 : 0) - m.l.length / 1000 - di / 100000;
+                if (score > bestScore) { best = el; bestScore = score; bestExact = m.exact; }
             }
-            if (best) break;
+        });
+        if (best && !bestExact && mode === 0 && unreachable()) {
+            throw new Error(what + ': inexact match only for ' + JSON.stringify(text));
         }
         // A <label> stands for its control (fill/select/upload need the input).
         if (best && best.tagName === 'LABEL' && best.control) return best.control;
@@ -1132,10 +1146,26 @@ fn modifier_bit(name: &str) -> Option<u32> {
 /// own "not found" error wins the race against the transport timeout.
 /// A JS expression awaiting the element `target` names (not for refs,
 /// which resolve through CDP).
+/// How a `--text` finder takes a match that only contains the text (see
+/// WAIT_TEXT): flag it when frames out of reach could hold an exact one,
+/// take exact ones only, or take the best.
+#[derive(Clone, Copy, PartialEq)]
+enum TextMode {
+    FlagInexact = 0,
+    ExactOnly = 1,
+    Best = 2,
+}
+
 fn finder_expr(target: &Target, wait_ms: u128, what: &str) -> String {
+    finder_expr_in(target, wait_ms, what, TextMode::Best)
+}
+
+fn finder_expr_in(target: &Target, wait_ms: u128, what: &str, mode: TextMode) -> String {
     match target {
         Target::Selector(sel) => format!("({WAIT_FOR})({}, {wait_ms}, {}, () => {DEEP})", json!(sel), json!(what)),
-        Target::Text(text) => format!("({WAIT_TEXT})({}, {wait_ms}, {}, {DEEP})", json!(text), json!(what)),
+        Target::Text(text) => {
+            format!("({WAIT_TEXT})({}, {wait_ms}, {}, {DEEP}, {})", json!(text), json!(what), mode as u8)
+        }
         Target::Locator(loc) => format!("({WAIT_LOCATOR})({}, {wait_ms}, {}, {DEEP})", json!(loc), json!(what)),
         Target::Ref(node) => format!("Promise.reject(new Error('{what}: ref {node} must be resolved through CDP'))"),
     }
@@ -1144,6 +1174,12 @@ fn finder_expr(target: &Target, wait_ms: u128, what: &str) -> String {
 /// A finder's "no element … within" (the element isn't there yet).
 fn not_found(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains(": no element")
+}
+
+/// A `--text` finder's "only an inexact match here, and frames out of
+/// reach" (see WAIT_TEXT).
+fn inexact(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains(": inexact match only for ")
 }
 
 /// The page an evaluate ran in was replaced by a navigation before it
@@ -1641,43 +1677,61 @@ impl Page {
             other => finder_expr(other, wait_ms, what),
         };
         let _ = finder;
-        let expr = |ms: u128| {
+        let expr_in = |ms: u128, mode: TextMode| {
             format!(
                 "(async () => {{ const el = await {}; return ({function})(el{extra}); }})()",
-                finder_expr(target, ms, what)
+                finder_expr_in(target, ms, what, mode)
             )
         };
+        let expr = |ms: u128| expr_in(ms, TextMode::FlagInexact);
         // Most often the element is there: one round trip.
         match self.evaluate_raw(&expr(0), timeout) {
-            Err(e) if not_found(&e) => {}
+            Err(e) if not_found(&e) || inexact(&e) => {}
             other => return other,
         }
         // Not yet. Frames of another origin are out of a page script's
         // reach; without any, wait in the page as always.
         let mut frames = self.foreign_frames(timeout);
         if frames.is_empty() {
-            return self.evaluate_raw(&expr(wait_ms), timeout);
+            return self.evaluate_raw(&expr_in(wait_ms, TextMode::Best), timeout);
         }
         // With some, look in the page and in each of them until the wait
         // runs out. A match in a frame says which (`__frame`), for ops that
-        // then need the element's box.
+        // then need the element's box. Text there must match exactly to win
+        // over a page element that only contains it.
         let started = Instant::now();
         let mut polls = 0u32;
-        loop {
-            for &(_, context) in &frames {
-                match self.evaluate_in(context, &expr(0), timeout) {
+        let in_frames = |frames: &[(String, i64)], mode: TextMode| -> Option<Result<Value>> {
+            for &(_, context) in frames {
+                match self.evaluate_in(context, &expr_in(0, mode), timeout) {
                     Ok(mut v) => {
                         if let Some(obj) = v.as_object_mut() {
                             obj.insert("__frame".into(), json!(context));
+                            obj.insert("__frame_mode".into(), json!(mode as u8));
                         }
-                        return Ok(v);
+                        return Some(Ok(v));
                     }
                     Err(e) if not_found(&e) || navigated_away(&e) => {}
-                    Err(e) => return Err(e),
+                    Err(e) => return Some(Err(e)),
                 }
             }
+            None
+        };
+        loop {
+            if let Some(found) = in_frames(&frames, TextMode::ExactOnly) {
+                return found;
+            }
             let last = match self.evaluate_raw(&expr(0), timeout) {
-                Err(e) if not_found(&e) => e,
+                // Nothing in the page: a frame's match that only contains
+                // the text will do.
+                Err(e) if not_found(&e) => {
+                    match matches!(target, Target::Text(_)).then(|| in_frames(&frames, TextMode::Best)).flatten() {
+                        Some(found) => return found,
+                        None => e,
+                    }
+                }
+                // No frame has it exactly: the page's own match it is.
+                Err(e) if inexact(&e) => return self.evaluate_raw(&expr_in(0, TextMode::Best), timeout),
                 other => return other,
             };
             if started.elapsed() >= wait {
@@ -1767,11 +1821,18 @@ impl Page {
 
     /// The centre, in page coordinates, of the element `target` names inside
     /// a frame's isolated world.
-    fn center_in_frame(&self, context: i64, target: &Target, timeout: Duration) -> Option<(f64, f64)> {
+    /// `found` is what the frame search returned (its `__frame_mode` says
+    /// how the element was matched, so the same one is measured).
+    fn center_in_frame(&self, context: i64, target: &Target, found: &Value, timeout: Duration) -> Option<(f64, f64)> {
+        let mode = match found.get("__frame_mode").and_then(Value::as_u64) {
+            Some(1) => TextMode::ExactOnly,
+            Some(0) => TextMode::FlagInexact,
+            _ => TextMode::Best,
+        };
         let res = self
             .send(
                 "Runtime.evaluate",
-                json!({ "expression": finder_expr(target, 0, "click"), "contextId": context,
+                json!({ "expression": finder_expr_in(target, 0, "click", mode), "contextId": context,
                         "awaitPromise": true, "objectGroup": "nv-frame" }),
                 timeout,
             )
@@ -1916,13 +1977,15 @@ impl Page {
             // offset; CDP reports the box in top-level coordinates.
             let in_frame = point.get("__frame").and_then(Value::as_i64);
             match target {
-                _ if in_frame.is_some() => match self.center_in_frame(in_frame.unwrap_or_default(), target, timeout) {
-                    Some((x, y)) => {
-                        point["x"] = json!(x);
-                        point["y"] = json!(y);
+                _ if in_frame.is_some() => {
+                    match self.center_in_frame(in_frame.unwrap_or_default(), target, &point, timeout) {
+                        Some((x, y)) => {
+                            point["x"] = json!(x);
+                            point["y"] = json!(y);
+                        }
+                        None => return dom(self),
                     }
-                    None => return dom(self),
-                },
+                }
                 Target::Ref(node) => match self.content_quad_center(*node, timeout) {
                     Some((x, y)) => {
                         point["x"] = json!(x);
@@ -2181,10 +2244,12 @@ impl Page {
         if point.get("xframe").and_then(Value::as_bool) == Some(true) {
             let in_frame = point.get("__frame").and_then(Value::as_i64);
             match target {
-                _ if in_frame.is_some() => match self.center_in_frame(in_frame.unwrap_or_default(), target, timeout) {
-                    Some((x, y)) => point = json!({ "x": x, "y": y }),
-                    None => bail!("dblclick: element inside a cross-origin iframe has no box"),
-                },
+                _ if in_frame.is_some() => {
+                    match self.center_in_frame(in_frame.unwrap_or_default(), target, &point, timeout) {
+                        Some((x, y)) => point = json!({ "x": x, "y": y }),
+                        None => bail!("dblclick: element inside a cross-origin iframe has no box"),
+                    }
+                }
                 Target::Ref(node) => match self.content_quad_center(*node, timeout) {
                     Some((x, y)) => point = json!({ "x": x, "y": y }),
                     None => bail!("dblclick: element is inside a cross-origin iframe without a box"),
@@ -2304,7 +2369,7 @@ impl Page {
         let mut point = self.on_element(target, "hover", HOVER_PREP, &[settle], wait, timeout)?;
         if point.get("xframe").and_then(Value::as_bool) == Some(true) {
             let center = match (target, point.get("__frame").and_then(Value::as_i64)) {
-                (_, Some(context)) => self.center_in_frame(context, target, timeout),
+                (_, Some(context)) => self.center_in_frame(context, target, &point, timeout),
                 (Target::Ref(node), None) => self.content_quad_center(*node, timeout),
                 _ => None,
             };

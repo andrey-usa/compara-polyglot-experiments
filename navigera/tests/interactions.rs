@@ -379,12 +379,19 @@ fn forms_inside_cross_origin_frames() {
     let s = Session::start("xo", &[]);
     // Cross-site (localhost in a 127.0.0.1 page), then cross-origin on the
     // same site (another port).
-    for page in ["/xo-parent", "/xo-parent?same-site"] {
+    // By role, then by text: "Pay" in the frame matches exactly and wins
+    // over the page's own "Payment details" heading and the frame's title.
+    for (page, pay) in
+        [("/xo-parent", ["--role", "button", "--name", "Pay"]), ("/xo-parent?same-site", ["--text", "Pay", "", ""])]
+    {
         s.ok(&["goto", &format!("{}{page}", site.url)]);
         s.ok(&["fill", "--label", "Card number", "4242424242424242"]);
         s.ok(&["check", "--label", "Save card"]);
         s.ok(&["select", "--selector", "#exp", "02/28"]);
-        s.ok(&["click", "--role", "button", "--name", "Pay"]);
+        let mut click = vec!["click"];
+        click.extend(pay.iter().filter(|w| !w.is_empty()));
+        let r = s.ok(&click);
+        assert!(r.get("synthetic_click").is_none(), "{page}: {r}");
         // Text inside the frame, then the page's own (it hears by postMessage).
         s.ok(&["wait", "--text", "sent 4242424242424242"]);
         s.ok(&["wait", "--text", "paid 4242"]);
