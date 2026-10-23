@@ -130,10 +130,127 @@ fn location(url: Option<&str>, line: Option<u64>) -> String {
     }
 }
 
+/// A request a page sent, as a click's effect check sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sent {
+    /// `METHOD /path (status)`.
+    pub label: String,
+    pub done: bool,
+    pub report: Report,
+}
+
+/// Whether a request looks like the page reporting on itself rather than
+/// doing what was asked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Report {
+    /// A beacon, or a well-known analytics or monitoring service.
+    Surely,
+    /// A first-party path that reads like reporting (`/event/…`, `/collect`,
+    /// `/log`): judged by what the page does once it is answered.
+    Maybe,
+    /// Anything else: the page is doing something.
+    No,
+}
+
+const REPORT_HOSTS: &[&str] = &[
+    "google-analytics.com",
+    "analytics.google.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "segment.io",
+    "segment.com",
+    "mixpanel.com",
+    "amplitude.com",
+    "hotjar.com",
+    "hotjar.io",
+    "fullstory.com",
+    "heapanalytics.com",
+    "nr-data.net",
+    "datadoghq.com",
+    "datadoghq.eu",
+    "sentry.io",
+    "bugsnag.com",
+    "clarity.ms",
+    "bat.bing.com",
+    "facebook.com",
+    "facebook.net",
+    "px.ads.linkedin.com",
+    "posthog.com",
+    "plausible.io",
+    "quantserve.com",
+    "scorecardresearch.com",
+    "omtrdc.net",
+    "demdex.net",
+    "adobedc.net",
+    "analytics.tiktok.com",
+    "ct.pinterest.com",
+    "analytics.twitter.com",
+    "mc.yandex.ru",
+    "lr-ingest.io",
+    "cloudflareinsights.com",
+    "logx.optimizely.com",
+    "events.launchdarkly.com",
+    "statsigapi.net",
+    "snowplowanalytics.com",
+];
+
+const REPORT_SEGMENTS: &[&str] = &[
+    "collect",
+    "log",
+    "logs",
+    "event",
+    "events",
+    "analytics",
+    "track",
+    "tracking",
+    "beacon",
+    "telemetry",
+    "rum",
+    "metrics",
+    "pixel",
+    "ping",
+    "stats",
+    "ingest",
+];
+
+fn report_kind(kind: &str, host: &str, path: &str) -> Report {
+    let host = host.rsplit('@').next().unwrap_or(host).split(':').next().unwrap_or(host).to_ascii_lowercase();
+    if kind == "Ping" || REPORT_HOSTS.iter().any(|h| host == *h || host.ends_with(&format!(".{h}"))) {
+        return Report::Surely;
+    }
+    if path.split('/').any(|seg| REPORT_SEGMENTS.contains(&seg.to_ascii_lowercase().as_str())) {
+        return Report::Maybe;
+    }
+    Report::No
+}
+
 impl Logs {
     /// Requests seen so far, all tabs.
     pub fn requests_started(&self) -> u64 {
         self.next_request
+    }
+
+    /// Requests a tab started after request `#after` (a number from
+    /// [`Logs::requests_started`]).
+    pub fn requests_after(&self, session: &str, after: u64) -> Vec<Sent> {
+        let Some(tab) = self.tabs.get(session) else { return Vec::new() };
+        tab.requests
+            .iter()
+            .filter(|r| r.n > after)
+            .map(|r| {
+                // The path, without scheme, host or query.
+                let rest = r.url.split_once("://").map_or(r.url.as_str(), |(_, rest)| rest);
+                let (host, path) = rest.find('/').map_or((rest, "/"), |i| (&rest[..i], &rest[i..]));
+                let path = clip(path.split(['?', '#']).next().unwrap_or("/"), 80);
+                let status = r.status.map(|s| format!(" ({s})")).unwrap_or_default();
+                Sent {
+                    label: format!("{} {path}{status}", r.method),
+                    done: r.ended.is_some() || r.failed.is_some(),
+                    report: report_kind(&r.kind, host, &path),
+                }
+            })
+            .collect()
     }
 
     fn tab(&mut self, session: &str) -> &mut TabLogs {
@@ -506,6 +623,17 @@ fn chrono_like_iso(epoch_s: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reporting_requests_are_told_apart() {
+        assert_eq!(report_kind("Ping", "shop.test", "/cart"), Report::Surely);
+        assert_eq!(report_kind("Fetch", "www.google-analytics.com", "/g/collect"), Report::Surely);
+        assert_eq!(report_kind("Fetch", "region1.google-analytics.com:443", "/x"), Report::Surely);
+        assert_eq!(report_kind("Fetch", "shop.test", "/event/modal"), Report::Maybe);
+        assert_eq!(report_kind("XHR", "shop.test:8080", "/api/v1/Events"), Report::Maybe);
+        assert_eq!(report_kind("Fetch", "shop.test", "/api/cart"), Report::No);
+        assert_eq!(report_kind("Fetch", "notfacebook.com", "/x"), Report::No);
+    }
     use super::*;
 
     #[test]

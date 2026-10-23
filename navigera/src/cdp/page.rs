@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use super::ax;
 use super::client::CdpClient;
 use super::events::Shared;
+use super::logs::Report;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -233,7 +234,8 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button,
     // the page hasn't wired up yet) from one that did something: changes to
     // the DOM of the page, of the element's document and of the shadow roots
     // around the element; events a DOM observer can't see (input, change,
-    // submit, toggle, invalid, copy, a scroll, a navigation starting); focus moving
+    // submit, toggle, invalid, copy, a scroll, a navigation starting, a
+    // clipboard write); focus moving
     // elsewhere; form values, the URL or the scroll position a script set.
     // A field, a <select> and a right or middle click are left out: what
     // they open isn't in the DOM. `Page::click_effect` reads it, removes it.
@@ -286,6 +288,17 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button,
             if (nav && nav.addEventListener) {
                 nav.addEventListener('navigate', onEvent);
                 fx.offs.push(() => nav.removeEventListener('navigate', onEvent));
+            }
+            // A clipboard write ("Copy link") changes nothing a page shows.
+            for (const v of wins) {
+                const C = v.Clipboard && v.Clipboard.prototype;
+                if (!C) continue;
+                for (const k of ['writeText', 'write']) {
+                    const orig = C[k];
+                    if (typeof orig !== 'function') continue;
+                    C[k] = { [k](...a) { fx.e++; return orig.apply(this, a); } }[k];
+                    fx.offs.push(() => { C[k] = orig; });
+                }
             }
         }
         const focused = () => {
@@ -417,8 +430,26 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button,
 
 /// How long a click that changed nothing yet is watched before `click`
 /// says so (`no_effect`). Effects of a click almost always show within a
-/// frame or two; a request it starts shows at once.
+/// frame or two.
 const EFFECT_WINDOW: Duration = Duration::from_millis(200);
+
+/// A click whose only sign is requests that read like reporting
+/// (`/event/…`, `/log`) waits for them to finish, up to this long, then
+/// watches the page for [`AFTER_RESPONSE`] more.
+const REQUEST_WAIT: Duration = Duration::from_millis(1500);
+const AFTER_RESPONSE: Duration = Duration::from_millis(150);
+
+/// What a delivered click did, as far as navigera can see.
+#[derive(Debug, PartialEq)]
+enum Effect {
+    /// Something changed (the usual case, seen in one round trip): what.
+    Changed(String),
+    /// Nothing changed in the page; `requests` it sent, if any (analytics).
+    Nothing { watched_ms: u64, requests: Vec<String> },
+    /// Can't tell: a field, a `<select>`, a right click, frames it didn't
+    /// watch, a request still running, the page gone.
+    Unknown,
+}
 
 /// The second half of a DOM-event double click (the first click's events
 /// were sent by CLICK_PREP).
@@ -1870,7 +1901,7 @@ impl Page {
             }
         }
         let armed = point.get("effects").and_then(Value::as_bool) == Some(true);
-        let before = self.shared.activity(&self.session_id);
+        let before = (self.shared.activity(&self.session_id), self.shared.logs.lock().unwrap().requests_started());
         match self.mouse_click(&point, &opts.button, timeout) {
             Ok(true) => {}
             other => {
@@ -1907,45 +1938,87 @@ impl Page {
             }
             point["redelivered"] = json!(true);
         }
-        if armed && self.click_effect(&before, timeout) == Some(false) {
-            point["no_effect"] = json!(EFFECT_WINDOW.as_millis() as u64);
+        if armed {
+            let effect = self.click_effect(&before, timeout);
+            if std::env::var_os("NAVIGERA_TRACE_EFFECT").is_some() {
+                point["effect_trace"] = json!(format!("{effect:?}")); // diagnostic knob
+            }
+            if let Effect::Nothing { watched_ms, requests } = effect {
+                point["no_effect"] = json!({ "watched_ms": watched_ms, "requests": requests });
+            }
         }
         Ok(point)
     }
 
-    /// Did a delivered click change anything? Polls, for up to
-    /// [`EFFECT_WINDOW`], what CLICK_PREP set up in the page (DOM changes,
-    /// events, focus, form values, URL, scroll) and what only the browser
-    /// sees (requests, navigations, dialogs, new tabs, downloads). `Some(true)`
-    /// as soon as something changed (the usual case: one round trip);
-    /// `Some(false)` when nothing did; `None` when it can't tell (a field, a
-    /// `<select>`, a right click, shadow roots or frames it didn't watch, the
-    /// page gone).
-    fn click_effect(&self, before: &[u64; 6], timeout: Duration) -> Option<bool> {
-        let end = Instant::now() + EFFECT_WINDOW;
+    /// Did a delivered click change anything? Polls what CLICK_PREP set up
+    /// in the page (DOM changes, events, focus, form values, URL, scroll,
+    /// clipboard writes) and what only the browser sees (navigations,
+    /// dialogs, new tabs, downloads, requests) for [`EFFECT_WINDOW`]. Many
+    /// pages report every click: a beacon or an analytics service's request
+    /// isn't an effect, and a first-party one that reads like reporting
+    /// (`/event/…`) is waited for ([`REQUEST_WAIT`]), then judged by what
+    /// the page does with the answer ([`AFTER_RESPONSE`]).
+    fn click_effect(&self, before: &([u64; 5], u64), timeout: Duration) -> Effect {
+        let started = Instant::now();
+        let mut deadline = started + EFFECT_WINDOW;
+        let mut settled: Option<(usize, Instant)> = None; // requests seen, all finished at
         loop {
-            let last = Instant::now() >= end;
+            let now = Instant::now();
+            let requests = self.shared.logs.lock().unwrap().requests_after(&self.session_id, before.1);
+            if requests.iter().any(|r| r.report == Report::No) {
+                self.drop_effects(timeout);
+                return Effect::Changed("request".into());
+            }
+            // Reporting that might also be the action (`/events` can be an
+            // app's own API): wait for the answer and what the page does.
+            let maybe: Vec<_> = requests.iter().filter(|r| r.report == Report::Maybe).collect();
+            let pending = maybe.iter().any(|r| !r.done);
+            if pending {
+                settled = None;
+                deadline = deadline.max(now + Duration::from_millis(30));
+            } else if !maybe.is_empty() {
+                let at = match settled {
+                    Some((n, at)) if n == maybe.len() => at,
+                    _ => now,
+                };
+                settled = Some((maybe.len(), at));
+                deadline = deadline.max(at + AFTER_RESPONSE);
+            }
+            let gave_up = pending && now >= started + REQUEST_WAIT;
+            let last = now >= deadline || gave_up;
             let expr = format!("window.__nvFx ? window.__nvFx.check({last}) : null");
-            let v = self
+            let Some(v) = self
                 .send("Runtime.evaluate", json!({ "expression": expr, "returnByValue": true }), timeout)
-                .ok()?
-                .pointer("/result/value")
-                .cloned()
-                .filter(|v| v.is_object())?;
-            if v.get("what").and_then(Value::as_str).is_some_and(|w| !w.is_empty()) {
-                return Some(true);
+                .ok()
+                .and_then(|r| r.pointer("/result/value").cloned())
+                .filter(Value::is_object)
+            else {
+                return Effect::Unknown;
+            };
+            if let Some(what) = v.get("what").and_then(Value::as_str).filter(|w| !w.is_empty()) {
+                return Effect::Changed(what.to_string());
             }
             if v.get("skip").and_then(Value::as_bool) == Some(true) {
-                return None;
+                return Effect::Unknown;
             }
-            if self.shared.activity(&self.session_id) != *before {
+            if self.shared.activity(&self.session_id) != before.0 {
                 if !last {
                     self.drop_effects(timeout);
                 }
-                return Some(true);
+                return Effect::Changed(format!(
+                    "browser {:?} -> {:?}",
+                    before.0,
+                    self.shared.activity(&self.session_id)
+                ));
             }
             if last {
-                return (v.get("unsure").and_then(Value::as_bool) != Some(true)).then_some(false);
+                if gave_up || v.get("unsure").and_then(Value::as_bool) == Some(true) {
+                    return Effect::Unknown;
+                }
+                return Effect::Nothing {
+                    watched_ms: started.elapsed().as_millis() as u64,
+                    requests: requests.into_iter().map(|r| r.label).collect(),
+                };
             }
             std::thread::sleep(Duration::from_millis(15));
         }

@@ -421,6 +421,7 @@ fn a_click_that_changes_nothing_says_so() {
         ("#later", "change 80 ms later"),
         ("#next", "scrolled strip"),
         ("#copy", "copied to the clipboard"),
+        ("#clip", "clipboard write"),
     ] {
         let r = s.ok(&["click", "--selector", target]);
         assert!(r.get("no_effect").is_none(), "{what}: {r}");
@@ -433,4 +434,18 @@ fn a_click_that_changes_nothing_says_so() {
     // Typing into a field or opening a <select> isn't judged.
     let r = s.ok(&["click", "--selector", "#q"]);
     assert!(r.get("no_effect").is_none(), "field: {r}");
+
+    // A page that reports every click to analytics: the report alone isn't
+    // an effect, and the note says what was sent.
+    s.ok(&["goto", &format!("{}/effects?telemetry", site.url)]);
+    let r = s.ok(&["click", "--selector", "#noop"]);
+    let note = r["no_effect"].as_str().unwrap_or_default();
+    assert!(note.contains("only sent GET /event/click (200)"), "{r}");
+    // Clicks that do something still say nothing extra there: a save whose
+    // result shows when the server answers, a checkbox.
+    let r = s.ok(&["click", "--selector", "#save"]);
+    assert!(r.get("no_effect").is_none(), "slow save: {r}");
+    s.ok(&["wait", "--text", "saved"]);
+    let r = s.ok(&["click", "--selector", "#agree"]);
+    assert!(r.get("no_effect").is_none(), "checkbox: {r}");
 }

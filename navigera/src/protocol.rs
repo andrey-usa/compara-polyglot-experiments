@@ -2423,13 +2423,28 @@ impl Driver {
                         "element has no visible box; dispatched DOM events instead".to_string()
                     });
                 }
-                if let Some(ms) = point.get("no_effect").and_then(Value::as_u64) {
+                if let Some(trace) = point.get("effect_trace") {
+                    state["effect_trace"] = trace.clone();
+                }
+                if let Some(fx) = point.get("no_effect") {
                     // Clicked, but the page did nothing: often a control
                     // the page hasn't wired up yet.
+                    let ms = fx.get("watched_ms").and_then(Value::as_u64).unwrap_or(0);
+                    let sent: Vec<&str> = fx
+                        .get("requests")
+                        .and_then(Value::as_array)
+                        .map(|r| r.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    let only = match sent.len() {
+                        0 => String::new(),
+                        n if n <= 3 => format!("; it only sent {}", sent.join(", ")),
+                        n => format!("; it only sent {} and {} more requests", sent[..2].join(", "), n - 2),
+                    };
                     state["no_effect"] = json!(format!(
-                        "the click reached the element, but nothing on the page changed within {ms} ms \
-                         (no DOM change, focus, form value, URL, scroll, request, dialog, tab or download). \
-                         The page may not have wired it up yet: wait until it is ready and click again"
+                        "the click reached the element, but nothing on the page changed in {ms} ms \
+                         (DOM, focus, form values, URL, scroll, clipboard, dialogs, tabs, downloads){only}. \
+                         The page may not have wired it up yet, or may answer later: check for what the \
+                         click should do (`wait --text ...`) before clicking again"
                     ));
                 }
                 Ok(state)

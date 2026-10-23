@@ -232,11 +232,11 @@ impl Shared {
     }
 
     /// What a page did that its own scripts can't watch from the inside,
-    /// as counters: requests, navigations, dialogs, tabs and popups it
-    /// opened, downloads. A click compares them before and after.
-    pub fn activity(&self, session_id: &str) -> [u64; 6] {
+    /// as counters: navigations, dialogs, tabs and popups it opened,
+    /// downloads. A click compares them before and after (requests are
+    /// judged apart: see `Page::click_effect`).
+    pub fn activity(&self, session_id: &str) -> [u64; 5] {
         [
-            self.logs.lock().unwrap().requests_started(),
             self.nav_state(session_id).generation,
             self.dialogs.lock().unwrap().len() as u64,
             self.opened.lock().unwrap().len() as u64,

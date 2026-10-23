@@ -325,7 +325,8 @@ PAGES["/effects"] = ("effects", "#strip{width:200px;overflow-x:auto;white-space:
 <button id=send>Send</button>
 <button id=later>Later</button>
 <div id=strip><span>a</span><span>b</span><span>c</span></div> <button id=next>Next</button>
-<a id=self href="#">Top</a> <button id=copy>Copy</button>
+<a id=self href="#">Top</a> <button id=copy>Copy</button> <button id=clip>Copy link</button>
+<button id=save>Save</button>
 <x-panel id=panel></x-panel> <x-badge id=badge></x-badge>
 <p id=out>none</p>
 <script>
@@ -340,6 +341,11 @@ document.getElementById('send').onclick = () => { fetch('/slow-echo?ms=400'); };
 // Copy puts text on the clipboard and shows nothing.
 document.addEventListener('copy', (e) => { e.clipboardData.setData('text/plain', 'ref 42'); e.preventDefault(); });
 document.getElementById('copy').onclick = () => { document.execCommand('copy'); };
+document.getElementById('clip').onclick = () => { navigator.clipboard.writeText(location.href).catch(() => {}); };
+// Save shows its result only once the server answers (400 ms).
+document.getElementById('save').onclick = () => fetch('/slow-echo?ms=400').then(() => out('saved'));
+// `?telemetry`: every click is reported, as analytics do.
+if (location.search.includes('telemetry')) document.addEventListener('click', (e) => { fetch('/event/click?on=' + e.target.id); }, true);
 document.getElementById('later').onclick = () => setTimeout(() => out('later'), 80);
 document.getElementById('next').onclick = () => { document.getElementById('strip').scrollLeft += 150; };
 // A button in one shadow root changes text in another one.
@@ -417,6 +423,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/frame-text":
             t = q.get("t", ["?"])[0]
             return self.send(f"<!doctype html><html><body><div id=content>{t}</div></body></html>")
+        if u.path.startswith("/event/"):
+            return self.send("ok", "text/plain")
         if u.path == "/slow-echo":
             import time
             time.sleep(int(q.get("ms", ["100"])[0]) / 1000)

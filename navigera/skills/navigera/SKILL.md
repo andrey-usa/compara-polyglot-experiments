@@ -222,10 +222,11 @@ app. Besides a ref, `--selector` and
   and radios are clicked through their label automatically; a hidden input
   with no label fails at once and names what to click instead (the card).
 - **Clicks that do nothing:** if nothing on the page changed after a click
-  (no DOM change, focus, value, URL, request, dialog, tab), the response
-  carries `"no_effect"`. The page has often not wired the control up yet:
-  `wait` for what shows it is ready, then click again. Don't assume the
-  click worked.
+  (no DOM change, focus, value, URL, request, dialog, tab; analytics
+  requests don't count), the response carries `"no_effect"`. The page has
+  often not wired the control up yet, or answers slowly: `wait` for what
+  the click should show; click again only if it never comes. Don't assume
+  the click worked.
 - **Iframes and shadow DOM:** refs work inside any iframe. `--selector`,
   `--text` and the locators also look inside iframes (cross-origin ones,
   like a payment form, included) and open shadow roots when the page itself
