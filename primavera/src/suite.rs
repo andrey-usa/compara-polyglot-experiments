@@ -264,6 +264,77 @@ pub fn csv_rows(text: &str) -> Result<Vec<BTreeMap<String, String>>, String> {
     Ok(rows)
 }
 
+/// The `${NAME}`s a word uses (not `$${…}`), and whether each has a
+/// default (`${NAME:-x}`).
+pub fn used_vars(word: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = word;
+    while let Some(i) = rest.find('$') {
+        let after = &rest[i + 1..];
+        if let Some(tail) = after.strip_prefix('$') {
+            rest = tail;
+        } else if let Some(body) = after.strip_prefix('{') {
+            let Some(end) = body.find('}') else { break };
+            let inner = &body[..end];
+            match inner.split_once(":-") {
+                Some((n, _)) => out.push((n.to_string(), true)),
+                None => out.push((inner.to_string(), false)),
+            }
+            rest = &body[end + 1..];
+        } else {
+            rest = after;
+        }
+    }
+    out
+}
+
+/// Variables a scenario uses that nothing sets: not the file's `set`s or
+/// its `use`d files', not `--var`, not its data row, not a `save` before
+/// the use, not the environment. (line, name) for each.
+pub fn unset_vars(suite: &Suite, sc: &Scenario, run_vars: &[String]) -> Vec<(usize, String)> {
+    let mut known: std::collections::BTreeSet<String> = suite.vars.keys().cloned().collect();
+    known.extend(run_vars.iter().cloned());
+    known.extend(sc.vars.keys().cloned());
+    let mut out = Vec::new();
+    fn words(a: &Action) -> Vec<String> {
+        match a {
+            Action::Command(w) => w.clone(),
+            Action::Save { command, .. } => command.clone(),
+            Action::Run { args, .. } => args.clone(),
+            Action::Optional(inner) => words(inner),
+            Action::Expect(_) => Vec::new(),
+        }
+    }
+    for st in suite.before_each.iter().chain(&sc.steps) {
+        // An expect's words are in its text.
+        let ws = match &st.action {
+            Action::Expect(_) => tokenize(&st.text).unwrap_or_default(),
+            a => words(a),
+        };
+        for w in &ws {
+            for (name, has_default) in used_vars(w) {
+                if !has_default && !known.contains(&name) && std::env::var_os(&name).is_none() {
+                    out.push((st.line, name));
+                }
+            }
+        }
+        if let Action::Save { name, .. } = &st.action {
+            known.insert(name.clone());
+        }
+        // What a flow saves is known after it runs.
+        if let Action::Run { flow, .. } = &st.action {
+            if let Some(f) = suite.flows.get(flow) {
+                for fs in &f.steps {
+                    if let Action::Save { name, .. } = &fs.action {
+                        known.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Parse one file's text.
 pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
     let err = |line: usize, message: String| ParseError { file: file.to_path_buf(), line, message };
@@ -712,5 +783,15 @@ mod tests {
         assert_eq!(s.scenarios[0].tags, ["data"]);
         assert_eq!(s.vars["who"], "ada");
         assert!(s.flows.contains_key("hello"));
+    }
+
+    #[test]
+    fn lint_finds_variables_nothing_sets() {
+        let text = "set a = 1\nflow f\n  save got = get text --selector h1\nscenario \"x\"\n  goto /${a}\n  goto /${row}\n  run f\n  expect ${got} is ${b:-2}\n  expect ${missing} is 1\n  save later = get title\n  goto /${later}\n";
+        let s = parse(Path::new("t.pv"), text).unwrap();
+        let un = unset_vars(&s, &s.scenarios[0], &[]);
+        assert_eq!(un, [(6, "row".to_string()), (9, "missing".to_string())]);
+        assert_eq!(unset_vars(&s, &s.scenarios[0], &["row".into(), "missing".into()]), []);
+        assert_eq!(used_vars("$${x}-${y}-${z:-1}"), [("y".to_string(), false), ("z".to_string(), true)]);
     }
 }

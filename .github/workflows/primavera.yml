@@ -1,0 +1,63 @@
+name: primavera
+
+# primavera's own tests (parser, reports, and the examples against
+# navigera's bench site and its own fixture site) on Linux, macOS and
+# Windows, with the runner's Chrome. Results are annotations: `primavera <os>`.
+
+on:
+  push:
+    branches: [experiment-18]
+    paths:
+      - "primavera/**"
+      - "navigera/src/**"
+      - ".github/workflows/primavera.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: "primavera ${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: primavera
+    env:
+      PRIMAVERA_REQUIRE_BROWSER: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Tests
+        run: |
+          set +e -o pipefail
+          cargo test --locked --no-fail-fast 2>&1 | tee test.log
+          code=${PIPESTATUS[0]}
+          python3 - test.log "primavera $RUNNER_OS" <<'PY'
+          import re, sys
+          text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          passed = sum(int(m) for m in re.findall(r"test result: \w+\. (\d+) passed", text))
+          failed = re.findall(r"^test (\S+) \.\.\. FAILED", text, re.M)
+          panics = re.findall(r"panicked at .*?\n(.*?)\n", text, re.S)
+          msg = f"{passed} passed, {len(failed)} failed {failed}"
+          if panics:
+              msg += "\n" + "\n".join(p[:900] for p in panics[:4])
+          print(f"::notice title={sys.argv[2]}::" + msg[:3800].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          PY
+          exit $code

@@ -221,8 +221,24 @@ fn main() -> ExitCode {
         }
         "lint" => match load(&args.paths) {
             Ok(suites) => {
+                // Variables nothing sets: warnings, since the environment of
+                // the run (a CI secret) may still set them.
+                let run_vars: Vec<String> = args.opts.vars.keys().cloned().collect();
+                let mut warnings = 0;
+                for s in &suites {
+                    for sc in &s.scenarios {
+                        for (line, name) in suite::unset_vars(s, sc, &run_vars) {
+                            warnings += 1;
+                            println!(
+                                "warning: {}:{line}: ${{{name}}} isn't set by the file, --var, a data row or a save before it, nor in this environment",
+                                s.file.display()
+                            );
+                        }
+                    }
+                }
                 let n: usize = suites.iter().map(|s| s.scenarios.len()).sum();
-                println!("ok: {} file(s), {n} scenario(s)", suites.len());
+                let w = if warnings > 0 { format!(", {warnings} warning(s)") } else { String::new() };
+                println!("ok: {} file(s), {n} scenario(s){w}", suites.len());
                 ExitCode::SUCCESS
             }
             Err(e) => {
