@@ -514,7 +514,10 @@ fn the_mouse_goes_where_it_is_told_on_a_canvas() {
     let events = log(&s);
     assert!(events.contains(&"dblclick 200 100 0 0".to_string()), "{events:?}");
     s.ok(&["mouse", "click", "30", "30", "--selector", "canvas", "--button", "right"]);
-    assert!(log(&s).contains(&"contextmenu 30 30 2 2".to_string()));
+    let events = log(&s);
+    assert!(events.contains(&"mousedown 30 30 2 2".to_string()), "{events:?}");
+    // The menu opens on the press (Linux, macOS) or the release (Windows).
+    assert!(events.iter().any(|e| e.starts_with("contextmenu 30 30 2 ")), "{events:?}");
     s.ok(&["mouse", "wheel", "0", "-120"]);
     assert_eq!(log(&s), ["wheel 0 -120"]);
     // Mistakes are argument errors, said before anything runs.
