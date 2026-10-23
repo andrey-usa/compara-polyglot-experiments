@@ -1392,7 +1392,13 @@ impl BrowserSession {
     pub fn cookies(&self, all: bool, url: Option<&str>) -> Result<serde_json::Value> {
         let tab = self.active_tab();
         let r = if all {
-            tab.send_cdp("Storage.getCookies", serde_json::json!({}), self.timeout(None))?
+            // After `reset` the tabs live in a context of their own: its
+            // cookies, not the default context's.
+            let params = match &self.context {
+                Some(c) => serde_json::json!({ "browserContextId": c }),
+                None => serde_json::json!({}),
+            };
+            tab.send_cdp("Storage.getCookies", params, self.timeout(None))?
         } else {
             let urls = vec![url.map(str::to_string).unwrap_or_else(|| self.url())];
             tab.send_cdp("Network.getCookies", serde_json::json!({ "urls": urls }), self.timeout(None))?

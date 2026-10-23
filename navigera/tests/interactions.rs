@@ -470,6 +470,11 @@ fn reset_starts_clean_in_the_same_browser() {
     assert_eq!(r["tabs"].as_array().map(Vec::len), Some(1), "{r}");
     s.ok(&["goto", &format!("{}/effects", site.url)]);
     assert_eq!(s.ok(&["eval", "[localStorage.getItem('k'), document.cookie]"]), serde_json::json!([null, ""]));
+    // Cookies set in the new context are the ones `cookies --all` lists.
+    s.ok(&["eval", "(document.cookie = 'fresh=1; path=/', 1)"]);
+    let all = s.ok(&["cookies", "--all", "--json"]);
+    let names: Vec<&str> = all.as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+    assert_eq!(names, ["fresh"], "{all}");
     // Downloads still land where they should in the new context.
     s.ok(&["goto", &format!("{}/download", site.url)]);
     s.ok(&["click", "--selector", "#dl"]);
