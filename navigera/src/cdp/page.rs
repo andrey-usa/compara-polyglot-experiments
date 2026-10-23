@@ -1235,6 +1235,16 @@ pub struct AxOptions {
     pub scope: Option<Target>,
 }
 
+/// Where the mouse is and which buttons it holds (bits: 1 left, 2 right,
+/// 4 middle). `mouse` moves from here and keeps buttons held across moves;
+/// element clicks, hovers and drags leave it where they went.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Pointer {
+    pub x: f64,
+    pub y: f64,
+    pub buttons: u8,
+}
+
 #[derive(Clone)]
 pub struct Page {
     handle: tokio::runtime::Handle,
@@ -1245,6 +1255,7 @@ pub struct Page {
     /// Isolated worlds navigera made in cross-origin frames: frame id ->
     /// (the frame's loader, its execution context).
     worlds: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>>,
+    pointer: Arc<std::sync::Mutex<Pointer>>,
 }
 
 impl Page {
@@ -1255,7 +1266,7 @@ impl Page {
         target_id: String,
         shared: Arc<Shared>,
     ) -> Self {
-        Self { handle, client, session_id, target_id, shared, worlds: Default::default() }
+        Self { handle, client, session_id, target_id, shared, worlds: Default::default(), pointer: Default::default() }
     }
 
     pub fn target_id(&self) -> &str {
@@ -2186,6 +2197,7 @@ impl Page {
         else {
             return Ok(true);
         };
+        self.moved_to(x, y);
         let (button, held) = match button {
             "right" => ("right", 2),
             "middle" => ("middle", 4),
@@ -2328,6 +2340,7 @@ impl Page {
             events.push(("mouseMoved", ax + (bx - ax) * t, ay + (by - ay) * t, "left", 1));
         }
         events.push(("mouseReleased", bx, by, "left", 0));
+        self.moved_to(bx, by);
         for (kind, x, y, button, buttons) in events {
             self.send(
                 "Input.dispatchMouseEvent",
@@ -2336,6 +2349,97 @@ impl Page {
             )?;
         }
         Ok(json!({ "from": { "x": ax, "y": ay }, "to": { "x": bx, "y": by } }))
+    }
+
+    fn moved_to(&self, x: f64, y: f64) {
+        if let Ok(mut p) = self.pointer.lock() {
+            p.x = x;
+            p.y = y;
+        }
+    }
+
+    /// Raw mouse input at viewport coordinates (CSS pixels, as in a
+    /// screenshot at scale 1), for what has no element to aim at: a canvas,
+    /// a map, a game. `move` goes from where the pointer is in `steps` events
+    /// (held buttons stay held, so down, moves, up draws); `down`/`up` press
+    /// and release at the pointer; `click` moves there and presses and
+    /// releases `count` times; `wheel` scrolls by `delta` at the pointer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mouse(
+        &self,
+        action: &str,
+        at: Option<(f64, f64)>,
+        button: &str,
+        count: u32,
+        steps: u32,
+        delta: (f64, f64),
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (name, bit) = match button {
+            "right" => ("right", 2u8),
+            "middle" => ("middle", 4u8),
+            "left" | "" => ("left", 1u8),
+            other => bail!("mouse --button takes left, right or middle, not {other:?}"),
+        };
+        let held = |b: u8| match () {
+            _ if b & 1 != 0 => "left",
+            _ if b & 2 != 0 => "right",
+            _ if b & 4 != 0 => "middle",
+            _ => "none",
+        };
+        let send = |kind: &str, x: f64, y: f64, button: &str, buttons: u8, clicks: u32| {
+            self.send(
+                "Input.dispatchMouseEvent",
+                json!({ "type": kind, "x": x, "y": y, "button": button, "buttons": buttons, "clickCount": clicks }),
+                timeout,
+            )
+        };
+        let mut p = self.pointer.lock().map(|p| *p).unwrap_or_default();
+        if matches!(action, "move" | "click") {
+            let (x, y) = at.ok_or_else(|| anyhow::anyhow!("mouse {action} needs x and y"))?;
+            let n = steps.max(1);
+            for i in 1..=n {
+                let t = i as f64 / n as f64;
+                send("mouseMoved", p.x + (x - p.x) * t, p.y + (y - p.y) * t, held(p.buttons), p.buttons, 0)?;
+            }
+            p.x = x;
+            p.y = y;
+        }
+        match action {
+            "move" => {}
+            "down" => {
+                p.buttons |= bit;
+                send("mousePressed", p.x, p.y, name, p.buttons, 1)?;
+            }
+            "up" => {
+                p.buttons &= !bit;
+                send("mouseReleased", p.x, p.y, name, p.buttons, 1)?;
+            }
+            "click" => {
+                for c in 1..=count.max(1) {
+                    send("mousePressed", p.x, p.y, name, p.buttons | bit, c)?;
+                    send("mouseReleased", p.x, p.y, name, p.buttons, c)?;
+                }
+            }
+            "wheel" => {
+                self.send(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseWheel", "x": p.x, "y": p.y, "deltaX": delta.0, "deltaY": delta.1,
+                            "button": "none", "buttons": p.buttons }),
+                    timeout,
+                )?;
+            }
+            other => bail!("mouse takes move, down, up, click or wheel, not {other:?}"),
+        }
+        if let Ok(mut slot) = self.pointer.lock() {
+            *slot = p;
+        }
+        let buttons: Vec<&str> = [(1u8, "left"), (2, "right"), (4, "middle")]
+            .iter()
+            .filter(|(b, _)| p.buttons & b != 0)
+            .map(|(_, n)| *n)
+            .collect();
+        Ok(json!({ "x": p.x, "y": p.y, "held": buttons }))
     }
 
     /// Press or release one key (`down`), without the other half.
@@ -2379,6 +2483,7 @@ impl Page {
             }
         }
         if let (Some(x), Some(y)) = (point.get("x").and_then(Value::as_f64), point.get("y").and_then(Value::as_f64)) {
+            self.moved_to(x, y);
             self.send(
                 "Input.dispatchMouseEvent",
                 json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0 }),

@@ -241,6 +241,27 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<f64>,
     },
+    /// Raw mouse input at a point: `move`, `down`, `up`, `click`, `wheel`
+    /// (x and y are then the scroll deltas). Viewport CSS pixels, or from
+    /// the target's top-left corner when one is given (a canvas).
+    #[serde(rename = "mouse")]
+    Mouse {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        button: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        count: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        steps: Option<u32>,
+        #[serde(flatten)]
+        target: TargetArgs,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<f64>,
+    },
     /// Choose `<select>` option(s) by value or label.
     #[serde(rename = "select")]
     Select {
@@ -904,6 +925,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("press", "<key> [--selector <css> | --ref <n>]", "press a key or chord: Enter, Tab, Escape, ArrowDown, Control+a"),
     ("select", "<ref> <option>... | --selector <css> --value <option> [--add]", "choose <select> option(s) by value or label (whitespace-insensitive); --add keeps the options already chosen"),
     ("hover", "<ref> | --selector <css> | --text <t>", "move the mouse over an element (hover menus)"),
+    ("mouse", "move <x> <y> [--steps n] | down | up | click <x> <y> [--count 2] | wheel <dx> <dy>  [--button right|middle] [<target>]", "raw mouse at a point, for what has no element to aim at (a canvas, a map, a game): viewport CSS pixels (as in a screenshot), or from the target's top-left corner; the pointer stays where it went and held buttons stay held, so down, moves, up drags or draws"),
     ("scroll", "[--by <px> | --to top|bottom] [<ref> | --selector <css>]", "scroll the page, or an element into view"),
     ("upload", "<ref> <file>... | --selector <css> --file <path>", "set the files of an <input type=file>"),
     ("wait", "[--selector <css>] [--text <t>] [--url <part>] [--gone <css>] [--js <expr>] [--idle] [--download [<glob>]] [--ms <n>]", "wait until every condition holds (default up to 5 s; --timeout-ms); --idle: no fetch/XHR for 500 ms; --download: a finished download"),
@@ -1440,6 +1462,34 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
             Command::Click { target: target_args(&mut args, true)?, timeout_ms, button, force }
         }
         "hover" => Command::Hover { target: target_args(&mut args, true)?, timeout_ms },
+        "mouse" => {
+            let action = positional(&mut args).ok_or_else(|| need("mouse", "move, down, up, click or wheel"))?;
+            if !matches!(action.as_str(), "move" | "down" | "up" | "click" | "wheel") {
+                return Err(ArgsError::Invalid(format!("mouse takes move, down, up, click or wheel, not {action:?}")));
+            }
+            let button = str_flag(&mut args, "--button")?;
+            let count = num_flag(&mut args, "--count")?.map(|v| v as u32);
+            let steps = num_flag(&mut args, "--steps")?.map(|v| v as u32);
+            let target = target_args(&mut args, false)?;
+            let mut nums = Vec::new();
+            if matches!(action.as_str(), "move" | "click" | "wheel") {
+                for what in ["x", "y"] {
+                    let raw = positional(&mut args)
+                        .ok_or_else(|| need("mouse", &format!("{action} <x> <y> (got no {what})")))?;
+                    nums.push(parse_f64(&raw, &format!("mouse {action} {what}")).map_err(ArgsError::Invalid)?);
+                }
+            }
+            Command::Mouse {
+                action,
+                x: nums.first().copied(),
+                y: nums.get(1).copied(),
+                button,
+                count,
+                steps,
+                target,
+                timeout_ms,
+            }
+        }
         "fill" => {
             let keys = extract_present(&mut args, "--keys");
             let target = target_args(&mut args, true)?;
@@ -2466,6 +2516,37 @@ impl Driver {
                 }
                 Ok(state)
             }
+            Command::Mouse { action, x, y, button, count, steps, target, timeout_ms } => {
+                // From a target's top-left corner, when one is named.
+                let origin = match target.optional("mouse")? {
+                    Some(t) => {
+                        let b = s
+                            .get_prop(&t, "box", None, *timeout_ms)
+                            .map_err(|e| anyhow::anyhow!("mouse {action} {}: {e:#}", t.label()))?;
+                        (b["x"].as_f64().unwrap_or(0.0), b["y"].as_f64().unwrap_or(0.0))
+                    }
+                    None => (0.0, 0.0),
+                };
+                let (at, delta) = match (action.as_str(), x, y) {
+                    ("wheel", Some(dx), Some(dy)) => (None, (*dx, *dy)),
+                    (_, Some(x), Some(y)) => (Some((origin.0 + x, origin.1 + y)), (0.0, 0.0)),
+                    _ => (None, (0.0, 0.0)),
+                };
+                let r = s
+                    .mouse(
+                        action,
+                        at,
+                        button.as_deref().unwrap_or("left"),
+                        count.unwrap_or(1),
+                        steps.unwrap_or(1),
+                        delta,
+                        *timeout_ms,
+                    )
+                    .map_err(|e| anyhow::anyhow!("mouse {action}: {e:#}"))?;
+                let mut state = self.state_json();
+                state["mouse"] = r;
+                Ok(state)
+            }
             Command::Hover { target, timeout_ms } => {
                 let t = target.target("hover")?;
                 let point = s.hover(&t, *timeout_ms).map_err(|e| anyhow::anyhow!("hover {}: {e:#}", t.label()))?;
@@ -3084,6 +3165,7 @@ impl Command {
             Command::Click { target, .. }
             | Command::Fill { target, .. }
             | Command::Hover { target, .. }
+            | Command::Mouse { target, .. }
             | Command::Select { target, .. }
             | Command::Press { target, .. }
             | Command::Type { target, .. }

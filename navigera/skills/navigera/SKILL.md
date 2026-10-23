@@ -166,6 +166,7 @@ page "Checkout — Acme" http://shop.test/checkout
 | `press <key> [--ref N]` | `Enter`, `Tab`, `Escape`, `ArrowDown`, `Control+a`, … |
 | `select <ref> "<option>"` | pick a `<select>` option by label or value |
 | `hover <ref>` | move the mouse over an element (hover menus) |
+| `mouse move\|click <x> <y> [--selector canvas]`, `mouse down\|up`, `mouse wheel <dx> <dy>` | raw mouse at a point, for a canvas, map or game (no element to aim at): viewport CSS pixels as in a screenshot, or from the target's corner; down, moves, up drags or draws |
 | `scroll [--by 800 \| --to bottom] [<ref>]` | scroll the page (infinite lists load more) or bring a ref into view |
 | `upload <ref> <file>…` | set an `<input type=file>` |
 | `wait --text "Saved" \| --selector <css> \| --url <part> \| --gone <css> \| --js "<expr>" \| --ms 500` | wait for a condition (default up to 5 s) |

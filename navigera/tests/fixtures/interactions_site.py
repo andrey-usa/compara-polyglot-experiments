@@ -118,6 +118,26 @@ PAGES["/nbsp-select"] = ("nbsp select", "", """
   <option value=sf>San&nbsp;Francisco</option>
 </select>""")
 
+PAGES["/canvas"] = ("canvas", "body{margin:0}canvas{position:absolute;left:50px;top:40px;width:300px;height:200px;background:#eee}", """
+<canvas id=c width=300 height=200></canvas>
+<script>
+window.log = [];
+const g = c.getContext('2d');
+let last = null;
+const at = (e) => `${Math.round(e.offsetX)} ${Math.round(e.offsetY)}`;
+for (const t of ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu']) {
+  c.addEventListener(t, (e) => { log.push(`${t} ${at(e)} ${e.button} ${e.buttons}`); if (t === 'contextmenu') e.preventDefault(); });
+}
+c.addEventListener('mousemove', (e) => {
+  log.push(`move ${at(e)} ${e.buttons}`);
+  if (e.buttons & 1 && last) { g.beginPath(); g.lineWidth = 4; g.moveTo(last[0], last[1]); g.lineTo(e.offsetX, e.offsetY); g.stroke(); }
+  last = [e.offsetX, e.offsetY];
+});
+c.addEventListener('wheel', (e) => { log.push(`wheel ${Math.round(e.deltaX)} ${Math.round(e.deltaY)}`); e.preventDefault(); }, { passive: false });
+window.ink = (x, y) => g.getImageData(x, y, 1, 1).data[3];
+</script>
+""")
+
 PAGES["/download"] = ("download", "", """
 <a id=dl href="/file.csv">Download CSV</a>
 <button id=blob type=button>Save notes</button>

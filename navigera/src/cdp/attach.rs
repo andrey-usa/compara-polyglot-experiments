@@ -129,7 +129,8 @@ pub(crate) fn live_endpoint(dir: &Path) -> Option<String> {
 pub fn page_endpoint(spec: &str) -> Option<(String, String)> {
     let rest = spec.trim().strip_prefix("ws://")?;
     let (hostport, id) = rest.split_once("/devtools/page/")?;
-    (!hostport.is_empty() && !id.is_empty() && !id.contains('/')).then(|| (format!("http://{hostport}"), id.to_string()))
+    (!hostport.is_empty() && !id.is_empty() && !id.contains('/'))
+        .then(|| (format!("http://{hostport}"), id.to_string()))
 }
 
 pub fn resolve(spec: &str) -> Result<String> {
