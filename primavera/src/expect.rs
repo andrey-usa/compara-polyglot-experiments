@@ -12,17 +12,24 @@
 //! expect --label Email value contains @
 //! expect --selector .card count >= 3
 //! expect --selector #faq attr open is ""
+//! expect --testid badge style color is "rgb(0, 128, 0)"
 //! expect ${order} matches "^ORD-[0-9]+$"
+//! expect request POST /api/orders json $.total is 36
+//! expect download report-*.csv
 //! expect no errors
 //! expect not --selector .toast visible   (any expectation can be negated)
+//! expect text "Saved" --soft             (noted, the scenario goes on, fails at the end)
 //! ```
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Subject {
     Url,
     Title,
-    /// Visible text anywhere on the page.
-    Text(String),
+    /// Visible text anywhere on the page, or inside the `--within` target.
+    Text {
+        text: String,
+        within: Option<Vec<String>>,
+    },
     /// A variable (the word as written, `${…}`), interpolated at run time.
     Var(String),
     /// An element (navigera target flags) and what to read from it.
@@ -35,11 +42,13 @@ pub enum Subject {
     /// A JavaScript expression in the page: truthy, or compared.
     Js(String),
     /// A request the page made (since the scenario started): method (or
-    /// `*`), URL glob, and an optional status.
+    /// `*`), URL glob, an optional status, and what to compare: nothing
+    /// (one was made), a value in its JSON response, or how many.
     Request {
         method: String,
         url: String,
         status: Option<String>,
+        read: RequestRead,
     },
     /// A cookie of the browser context: present, or its value compared.
     Cookie(String),
@@ -48,15 +57,30 @@ pub enum Subject {
         area: String,
         key: String,
     },
+    /// A finished download whose file name matches the glob.
+    Download(String),
+    /// A console message (any level) compared: `console contains "x"`.
+    Console,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestRead {
+    Made,
+    /// `json <$.path>`: a value in the last matching response's JSON.
+    Json(String),
+    Count,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Prop {
-    /// visible, hidden, enabled, disabled, checked, unchecked, focused, editable.
+    /// visible, hidden, enabled, disabled, checked, unchecked, focused,
+    /// editable, empty.
     State(String),
     Text,
     Value,
     Attr(String),
+    /// A computed CSS property.
+    Style(String),
     Count,
 }
 
@@ -82,9 +106,67 @@ pub struct Expect {
     pub matcher: Matcher,
     pub value: String,
     pub timeout_ms: Option<u64>,
+    /// `--soft`: a failure is noted and the scenario goes on; it fails at
+    /// the end.
+    pub soft: bool,
 }
 
-const STATES: &[&str] = &["visible", "hidden", "enabled", "disabled", "checked", "unchecked", "focused", "editable"];
+const STATES: &[&str] =
+    &["visible", "hidden", "enabled", "disabled", "checked", "unchecked", "focused", "editable", "empty"];
+
+/// The words of a JSON path: `$`, `.key`, `[0]`, `["key"]`.
+pub fn json_path(path: &str) -> Result<Vec<JsonStep>, String> {
+    let bad = || format!("bad JSON path {path:?} (like $.items[0].name)");
+    let mut rest = path.strip_prefix('$').ok_or_else(bad)?;
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix('.') {
+            let end = r.find(['.', '[']).unwrap_or(r.len());
+            if end == 0 {
+                return Err(bad());
+            }
+            out.push(JsonStep::Key(r[..end].to_string()));
+            rest = &r[end..];
+        } else if let Some(r) = rest.strip_prefix('[') {
+            let end = r.find(']').ok_or_else(bad)?;
+            let inner = r[..end].trim();
+            if let Ok(i) = inner.parse::<usize>() {
+                out.push(JsonStep::Index(i));
+            } else if inner.len() >= 2
+                && (inner.starts_with('"') && inner.ends_with('"') || inner.starts_with('\'') && inner.ends_with('\''))
+            {
+                out.push(JsonStep::Key(inner[1..inner.len() - 1].to_string()));
+            } else {
+                return Err(bad());
+            }
+            rest = &r[end + 1..];
+        } else {
+            return Err(bad());
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonStep {
+    Key(String),
+    Index(usize),
+}
+
+/// The value at a JSON path, as text: strings as they are, the rest as JSON.
+pub fn json_at(v: &serde_json::Value, path: &[JsonStep]) -> Option<String> {
+    let mut cur = v;
+    for st in path {
+        cur = match st {
+            JsonStep::Key(k) => cur.get(k)?,
+            JsonStep::Index(i) => cur.get(*i)?,
+        };
+    }
+    Some(match cur {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    })
+}
 
 fn matcher(word: &str) -> Option<Matcher> {
     Some(match word {
@@ -123,7 +205,16 @@ fn tail(words: &[String], what: &str) -> Result<(Matcher, String), String> {
 
 /// Parse the words after `expect`.
 pub fn parse(words: &[String]) -> Result<Expect, String> {
-    let mut words: Vec<String> = words.to_vec();
+    let mut e = parse_inner(words)?;
+    if words.iter().any(|w| w == "--soft") {
+        e.soft = true;
+    }
+    Ok(e)
+}
+
+fn parse_inner(words: &[String]) -> Result<Expect, String> {
+    let mut words: Vec<String> = words.iter().filter(|w| *w != "--soft").cloned().collect();
+    let soft = false;
     let mut timeout_ms = None;
     if let Some(i) = words.iter().position(|w| w == "--timeout-ms") {
         let v = words.get(i + 1).ok_or("--timeout-ms needs a number")?;
@@ -147,14 +238,16 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
                     matcher: Matcher::Holds,
                     value: String::new(),
                     timeout_ms,
+                    soft,
                 })
             }
-            Some("text") if words.len() == 2 => Ok(Expect {
+            Some("text") if words.len() >= 2 => Ok(Expect {
                 negate,
-                subject: Subject::Text(words[1].clone()),
+                subject: Subject::Text { text: words[1].clone(), within: within(&words[2..])? },
                 matcher: Matcher::Holds,
                 value: String::new(),
                 timeout_ms,
+                soft,
             }),
             Some("cookie") if words.len() == 2 => Ok(Expect {
                 negate,
@@ -162,22 +255,45 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
                 matcher: Matcher::Holds,
                 value: String::new(),
                 timeout_ms,
+                soft,
             }),
             Some("request") if words.len() == 3 => Ok(Expect {
                 negate,
-                subject: Subject::Request { method: words[1].to_uppercase(), url: words[2].clone(), status: None },
+                subject: Subject::Request {
+                    method: words[1].to_uppercase(),
+                    url: words[2].clone(),
+                    status: None,
+                    read: RequestRead::Made,
+                },
                 matcher: Matcher::Holds,
                 value: String::new(),
                 timeout_ms,
+                soft,
             }),
-            _ => Err("after `no`: `errors`, `text \"<text>\"`, `cookie <name>` or `request <METHOD> <url>`".into()),
+            Some("download") if words.len() == 2 => Ok(Expect {
+                negate,
+                subject: Subject::Download(words[1].clone()),
+                matcher: Matcher::Holds,
+                value: String::new(),
+                timeout_ms,
+                soft,
+            }),
+            Some("console") if words.len() == 2 => Ok(Expect {
+                negate,
+                subject: Subject::Console,
+                matcher: Matcher::Contains,
+                value: words[1].clone(),
+                timeout_ms,
+                soft,
+            }),
+            _ => Err("after `no`: `errors`, `text \"<text>\"`, `cookie <name>`, `request <METHOD> <url>`, `download <glob>` or `console \"<text>\"`".into()),
         };
     }
-    let first = words
-        .first()
-        .cloned()
-        .ok_or("expect what? (url, title, text, a target, ${var}, js, request, cookie, storage, no errors)")?;
-    // A subject with an optional comparison after it: present/truthy without one.
+    let first = words.first().cloned().ok_or(
+        "expect what? (url, title, text, a target, ${var}, js, request, cookie, storage, download, console, no errors)",
+    )?;
+    // A subject with an optional comparison after it: present/truthy without
+    // one, gone with `absent`.
     let optional_tail = |rest: &[String], what: &str| -> Result<(Matcher, String), String> {
         if rest.is_empty() {
             Ok((Matcher::Holds, String::new()))
@@ -185,6 +301,15 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
             tail(rest, what)
         }
     };
+    let absent = match first.as_str() {
+        "cookie" => words.len() == 3,
+        "storage" => words.len() == 4,
+        _ => false,
+    };
+    if absent && words.last().map(String::as_str) == Some("absent") {
+        words.pop();
+        negate = !negate;
+    }
     let (subject, matcher, value) = match first.as_str() {
         // `eval` reads as navigera's own command does.
         "js" | "eval" => {
@@ -193,16 +318,46 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
             (Subject::Js(code), m, v)
         }
         "request" => {
-            // request <METHOD> <url glob> [status <n>]
-            let usage = "expect request <METHOD> <url glob> [status <n>]";
+            // request <METHOD> <url glob> [status <n>] [json <$.path> | count <comparison> <value>]
+            let usage =
+                "expect request <METHOD> <url glob> [status <n>] [json <$.path> | count] [<comparison> <value>]";
             let method = words.get(1).ok_or(usage)?.to_uppercase();
             let url = words.get(2).ok_or(usage)?.clone();
-            let status = match &words[3..] {
-                [] => None,
-                [s, n] if s == "status" => Some(n.clone()),
-                other => return Err(format!("after the request: `status <n>` or nothing (got {other:?})")),
-            };
-            (Subject::Request { method, url, status }, Matcher::Holds, String::new())
+            let mut rest = &words[3..];
+            let mut status = None;
+            if rest.first().map(String::as_str) == Some("status") {
+                status = Some(rest.get(1).ok_or("status needs a number")?.clone());
+                rest = &rest[2..];
+            }
+            match rest.first().map(String::as_str) {
+                None => {
+                    (Subject::Request { method, url, status, read: RequestRead::Made }, Matcher::Holds, String::new())
+                }
+                Some("json") => {
+                    let path = rest.get(1).ok_or("json needs a path, like $.items[0].id")?.clone();
+                    json_path(&path)?;
+                    let (m, v) = tail(&rest[2..], "the JSON path")?;
+                    (Subject::Request { method, url, status, read: RequestRead::Json(path) }, m, v)
+                }
+                Some("count") => {
+                    let (m, v) = tail(&rest[1..], "count")?;
+                    v.parse::<f64>().map_err(|_| format!("count compares with a number, not {v:?}"))?;
+                    (Subject::Request { method, url, status, read: RequestRead::Count }, m, v)
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "after the request: `status <n>`, `json <$.path> …`, `count …` or nothing (got {other:?})"
+                    ))
+                }
+            }
+        }
+        "download" => match words.len() {
+            2 => (Subject::Download(words[1].clone()), Matcher::Holds, String::new()),
+            _ => return Err("expect download <file name glob> (like report-*.csv)".into()),
+        },
+        "console" => {
+            let (m, v) = tail(&words[1..], "console")?;
+            (Subject::Console, m, v)
         }
         "cookie" => {
             let name = words.get(1).ok_or("expect cookie <name> [<comparison> <value>]")?.clone();
@@ -225,7 +380,9 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
             (Subject::Title, m, v)
         }
         "text" => match words.len() {
-            2 => (Subject::Text(words[1].clone()), Matcher::Holds, String::new()),
+            2.. => {
+                (Subject::Text { text: words[1].clone(), within: within(&words[2..])? }, Matcher::Holds, String::new())
+            }
             _ => return Err("expect text \"<text>\" (quote text with spaces; it takes no comparator)".into()),
         },
         w if w.starts_with("${") => {
@@ -260,6 +417,11 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
                     let (m, v) = tail(&rest[2..], "attr")?;
                     (Subject::Target { flags, prop: Prop::Attr(name) }, m, v)
                 }
+                Some("style") => {
+                    let name = rest.get(1).ok_or("style needs a CSS property, like color")?.clone();
+                    let (m, v) = tail(&rest[2..], "style")?;
+                    (Subject::Target { flags, prop: Prop::Style(name) }, m, v)
+                }
                 Some("count") => {
                     if !flags.iter().step_by(2).all(|f| f == "--selector") || flags.len() != 2 {
                         return Err("count takes one --selector <css>".into());
@@ -270,7 +432,7 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
                 }
                 other => {
                     return Err(format!(
-                        "after the target: a state ({}), or text/value/attr <name>/count and a comparison (got {:?})",
+                        "after the target: a state ({}), or text/value/attr <name>/style <property>/count and a comparison (got {:?})",
                         STATES.join(", "),
                         other.unwrap_or("nothing")
                     ))
@@ -283,7 +445,29 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
             ))
         }
     };
-    Ok(Expect { negate, subject, matcher, value, timeout_ms })
+    Ok(Expect { negate, subject, matcher, value, timeout_ms, soft })
+}
+
+/// `--within <target flags>` after `text "<t>"`: where to look.
+fn within(rest: &[String]) -> Result<Option<Vec<String>>, String> {
+    match rest.first().map(String::as_str) {
+        None => Ok(None),
+        Some("--within") => {
+            let flags = &rest[1..];
+            if flags.is_empty()
+                || !flags.len().is_multiple_of(2)
+                || !flags.iter().step_by(2).all(|f| f.starts_with("--"))
+            {
+                return Err(
+                    "--within takes a target: --within --testid toast, --within --role dialog --name Cart".into()
+                );
+            }
+            Ok(Some(flags.to_vec()))
+        }
+        Some(other) => {
+            Err(format!("after the text: `--within <target>` or nothing (quote text with spaces; got {other:?})"))
+        }
+    }
 }
 
 /// `*` matches any run of characters (`/api/orders/*`); everything else is
@@ -364,7 +548,7 @@ mod tests {
         let e = p("url ends-with /cart").unwrap();
         assert_eq!((e.subject, e.matcher, e.value.as_str()), (Subject::Url, Matcher::EndsWith, "/cart"));
         let e = p("text \"Thank you\"").unwrap();
-        assert_eq!(e.subject, Subject::Text("Thank you".into()));
+        assert_eq!(e.subject, Subject::Text { text: "Thank you".into(), within: None });
         let e = p("no text Error").unwrap();
         assert!(e.negate);
         let e = p("--role button --name \"Place order\" enabled").unwrap();
@@ -409,7 +593,12 @@ mod tests {
         let e = p("request post /api/orders status 201").unwrap();
         assert_eq!(
             e.subject,
-            Subject::Request { method: "POST".into(), url: "/api/orders".into(), status: Some("201".into()) }
+            Subject::Request {
+                method: "POST".into(),
+                url: "/api/orders".into(),
+                status: Some("201".into()),
+                read: RequestRead::Made
+            }
         );
         let e = p("no request GET /api/tracking*").unwrap();
         assert!(e.negate);
@@ -425,6 +614,46 @@ mod tests {
         assert!(glob("*/cart", "http://x/cart"));
         assert!(glob("/a*c*e", "/abcde"));
         assert!(!glob("/api/orders", "/api/orders/12"));
+    }
+
+    #[test]
+    fn more_subjects() {
+        let e = p("text Saved --within --testid toast --soft").unwrap();
+        assert_eq!(
+            e.subject,
+            Subject::Text { text: "Saved".into(), within: Some(vec!["--testid".into(), "toast".into()]) }
+        );
+        assert!(e.soft);
+        assert!(p("no text Oops --within --role dialog").unwrap().negate);
+        assert!(p("text a --within").is_err());
+        let e = p("--testid badge style color is \"rgb(0, 128, 0)\"").unwrap();
+        assert!(matches!(e.subject, Subject::Target { prop: Prop::Style(ref c), .. } if c == "color"));
+        assert!(
+            matches!(p("--label Notes empty").unwrap().subject, Subject::Target { prop: Prop::State(ref s), .. } if s == "empty")
+        );
+        let e = p("request POST /api/orders status 201 json $.items[0].sku is sku-1").unwrap();
+        assert!(
+            matches!(e.subject, Subject::Request { read: RequestRead::Json(ref j), ref status, .. } if j == "$.items[0].sku" && status.as_deref() == Some("201"))
+        );
+        assert_eq!((e.matcher, e.value.as_str()), (Matcher::Is, "sku-1"));
+        let e = p("request GET /api/items* count >= 2").unwrap();
+        assert!(matches!(e.subject, Subject::Request { read: RequestRead::Count, .. }));
+        assert!(p("request GET /x json total is 1").unwrap_err().contains("JSON path"));
+        assert!(p("request GET /x count is many").is_err());
+        let e = p("cookie session absent").unwrap();
+        assert!(e.negate && e.matcher == Matcher::Holds);
+        assert!(p("storage local cart absent").unwrap().negate);
+        assert!(!p("cookie mode is absent").unwrap().negate);
+        assert_eq!(p("download report-*.csv").unwrap().subject, Subject::Download("report-*.csv".into()));
+        assert!(p("no download *.exe").unwrap().negate);
+        let e = p("console contains ready").unwrap();
+        assert_eq!((e.subject, e.matcher), (Subject::Console, Matcher::Contains));
+        assert!(p("no console Warning").unwrap().negate);
+        let path = json_path("$.a[1][\"b c\"].d").unwrap();
+        let v = serde_json::json!({"a": [0, {"b c": {"d": 7}}]});
+        assert_eq!(json_at(&v, &path).as_deref(), Some("7"));
+        assert_eq!(json_at(&v, &json_path("$.a[5]").unwrap()), None);
+        assert!(json_path("a.b").is_err());
     }
 
     #[test]

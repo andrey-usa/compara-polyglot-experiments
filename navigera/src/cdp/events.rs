@@ -77,11 +77,22 @@ pub struct NetState {
     pub last: Option<std::time::Instant>,
 }
 
+/// Sessions on one browser (forks, or one session across `reset`s) each
+/// keep their own routes, HTTP credentials and dialog answer, keyed by the
+/// browser context their tabs live in: this key ("" for the default
+/// context). A page is registered with the key of the session that opened
+/// or attached it.
+pub type Scope = String;
+
 #[derive(Default)]
 pub struct Shared {
-    pub policy: Mutex<DialogPolicy>,
-    /// Dialogs answered since the last drain: `{type, message, accepted}`.
-    pub dialogs: Mutex<Vec<Value>>,
+    /// How dialogs are answered, per scope (the default when unset).
+    pub policy: Mutex<HashMap<Scope, DialogPolicy>>,
+    /// Dialogs answered since the last drain: (scope, `{type, message,
+    /// accepted}`).
+    pub dialogs: Mutex<Vec<(Scope, Value)>>,
+    /// Page session id -> the scope it belongs to.
+    pub scopes: Mutex<HashMap<String, Scope>>,
     /// Page targets opened by a page (they carry an `openerId`), in order:
     /// (target, opener).
     pub opened: Mutex<Vec<(String, String)>>,
@@ -108,10 +119,11 @@ pub struct Shared {
     pub logs: Mutex<super::logs::Logs>,
     /// Files the pages downloaded (`downloads`, `wait --download`).
     pub downloads: Mutex<super::downloads::Downloads>,
-    /// `route` rules, first match wins; requests matching none continue.
-    pub routes: Mutex<Vec<Route>>,
-    /// `set credentials`: answers HTTP auth challenges.
-    pub credentials: Mutex<Option<(String, String)>>,
+    /// `route` rules per scope, first match wins; requests matching none
+    /// continue.
+    pub routes: Mutex<HashMap<Scope, Vec<Route>>>,
+    /// `set credentials` per scope: answers HTTP auth challenges.
+    pub credentials: Mutex<HashMap<Scope, (String, String)>>,
     /// Several sessions share this browser (`BrowserSession::fork`): each
     /// takes only the tabs its own tabs opened or closed.
     pub forked: std::sync::atomic::AtomicBool,
@@ -159,9 +171,10 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// The answer to a paused request: (method, params) for the CDP call.
-fn route_answer(shared: &Shared, request_id: &str, url: &str) -> (&'static str, Value) {
+fn route_answer(shared: &Shared, session: &str, request_id: &str, url: &str) -> (&'static str, Value) {
+    let scope = shared.scope_of(session);
     let mut routes = shared.routes.lock().unwrap();
-    let Some(route) = routes.iter_mut().find(|r| glob_match(&r.pattern, url)) else {
+    let Some(route) = routes.get_mut(&scope).and_then(|rs| rs.iter_mut().find(|r| glob_match(&r.pattern, url))) else {
         return ("Fetch.continueRequest", json!({ "requestId": request_id }));
     };
     route.hits += 1;
@@ -182,12 +195,59 @@ fn route_answer(shared: &Shared, request_id: &str, url: &str) -> (&'static str, 
 }
 
 impl Shared {
-    pub fn register(&self, session_id: &str, target_id: &str) {
+    pub fn register(&self, session_id: &str, target_id: &str, scope: &str) {
         self.sessions.lock().unwrap().insert(session_id.to_string(), target_id.to_string());
+        self.scopes.lock().unwrap().insert(session_id.to_string(), scope.to_string());
+    }
+
+    /// The scope a page session belongs to ("" when unknown).
+    pub fn scope_of(&self, session_id: &str) -> Scope {
+        self.scopes.lock().unwrap().get(session_id).cloned().unwrap_or_default()
+    }
+
+    /// How dialogs in `scope` are answered.
+    pub fn policy_for(&self, scope: &str) -> DialogPolicy {
+        self.policy.lock().unwrap().get(scope).cloned().unwrap_or_default()
+    }
+
+    /// A session moved to a new browser context (`reset`): its routes,
+    /// credentials and dialog answer go with it; `keep: false` drops them.
+    pub fn move_scope(&self, from: &str, to: &str, keep: bool) {
+        fn mv<T>(map: &Mutex<HashMap<Scope, T>>, from: &str, to: &str, keep: bool) {
+            let mut m = map.lock().unwrap();
+            if let Some(v) = m.remove(from) {
+                if keep {
+                    m.insert(to.to_string(), v);
+                }
+            }
+        }
+        mv(&self.routes, from, to, keep);
+        mv(&self.credentials, from, to, keep);
+        mv(&self.policy, from, to, keep);
+        // A session's downloads stay its own across `reset`; `reset --all`
+        // forgets them (the files stay where they are).
+        let mut downloads = self.downloads.lock().unwrap();
+        if keep {
+            for d in downloads.items.iter_mut().filter(|d| d.scope == from) {
+                d.scope = to.to_string();
+            }
+        } else {
+            downloads.items.retain(|d| d.scope != from);
+        }
+        drop(downloads);
+        // Dialogs not reported yet still are, to the same session.
+        for (s, _) in self.dialogs.lock().unwrap().iter_mut().filter(|(s, _)| s == from) {
+            *s = to.to_string();
+        }
+        let mut scopes = self.scopes.lock().unwrap();
+        for s in scopes.values_mut().filter(|s| *s == from) {
+            *s = to.to_string();
+        }
     }
 
     pub fn unregister(&self, session_id: &str) {
         self.sessions.lock().unwrap().remove(session_id);
+        self.scopes.lock().unwrap().remove(session_id);
         self.nav.lock().unwrap().remove(session_id);
         self.net.lock().unwrap().remove(session_id);
     }
@@ -239,12 +299,13 @@ impl Shared {
     /// downloads. A click compares them before and after (requests are
     /// judged apart: see `Page::click_effect`).
     pub fn activity(&self, session_id: &str) -> [u64; 5] {
+        let scope = self.scope_of(session_id);
         [
             self.nav_state(session_id).generation,
-            self.dialogs.lock().unwrap().len() as u64,
+            self.dialogs.lock().unwrap().iter().filter(|(s, _)| *s == scope).count() as u64,
             self.opened.lock().unwrap().len() as u64,
             self.popups.lock().unwrap().len() as u64,
-            self.downloads.lock().unwrap().items.len() as u64,
+            self.downloads.lock().unwrap().items.iter().filter(|d| d.scope == scope).count() as u64,
         ]
     }
 
@@ -257,8 +318,13 @@ impl Shared {
         state.dom_ready = false;
     }
 
-    pub fn take_dialogs(&self) -> Vec<Value> {
-        std::mem::take(&mut *self.dialogs.lock().unwrap())
+    /// The dialogs answered in `scope` since the last call; other scopes'
+    /// stay for their sessions.
+    pub fn take_dialogs(&self, scope: &str) -> Vec<Value> {
+        let mut all = self.dialogs.lock().unwrap();
+        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *all).into_iter().partition(|(s, _)| s == scope);
+        *all = kept;
+        taken.into_iter().map(|(_, d)| d).collect()
     }
 
     pub fn take_opened(&self) -> Vec<(String, String)> {
@@ -318,7 +384,7 @@ pub async fn arm_dialog(client: &CdpClient, shared: &Shared, session: &str) {
     if !shared.is_single_target() {
         return; // Chrome waits for the answer: the watcher sends it then.
     }
-    let policy = shared.policy.lock().unwrap().clone();
+    let policy = shared.policy_for(&shared.scope_of(session));
     let mut params = json!({ "accept": policy.accept });
     if let Some(text) = &policy.prompt_text {
         params["promptText"] = json!(text);
@@ -400,7 +466,12 @@ fn on_event(client: &CdpClient, shared: &Arc<Shared>, event: &Value) {
     }
     shared.logs.lock().unwrap().on_event(method, &params, session);
     if method.starts_with("Browser.download") {
-        shared.downloads.lock().unwrap().on_event(method, &params);
+        // Started by a tab's main frame (its frame id is the tab's target
+        // id): that tab's scope.
+        let frame = params.get("frameId").and_then(Value::as_str).unwrap_or("");
+        let tab = shared.sessions.lock().unwrap().iter().find(|(_, t)| *t == frame).map(|(s, _)| s.clone());
+        let scope = tab.map(|s| shared.scope_of(&s)).unwrap_or_default();
+        shared.downloads.lock().unwrap().on_event(method, &params, &scope);
     }
     match method {
         "Page.javascriptDialogOpening" if shared.is_single_target() => {
@@ -408,11 +479,14 @@ fn on_event(client: &CdpClient, shared: &Arc<Shared>, event: &Value) {
             // armed response, else a dismissal) and arm the next one.
             let kind = params.get("type").and_then(Value::as_str).unwrap_or("alert");
             let armed = shared.armed.lock().unwrap().remove(session);
-            shared.dialogs.lock().unwrap().push(json!({
-                "type": kind,
-                "message": params.get("message").and_then(Value::as_str).unwrap_or(""),
-                "accepted": armed.as_ref().is_some_and(|p| p.accept),
-            }));
+            shared.dialogs.lock().unwrap().push((
+                shared.scope_of(session),
+                json!({
+                    "type": kind,
+                    "message": params.get("message").and_then(Value::as_str).unwrap_or(""),
+                    "accepted": armed.as_ref().is_some_and(|p| p.accept),
+                }),
+            ));
             if !session.is_empty() {
                 let client = client.clone();
                 let session = session.to_string();
@@ -421,7 +495,8 @@ fn on_event(client: &CdpClient, shared: &Arc<Shared>, event: &Value) {
             }
         }
         "Page.javascriptDialogOpening" => {
-            let policy = shared.policy.lock().unwrap().clone();
+            let scope = shared.scope_of(session);
+            let policy = shared.policy_for(&scope);
             let kind = params.get("type").and_then(Value::as_str).unwrap_or("alert");
             // `beforeunload` is always accepted: refusing it would cancel the
             // navigation the agent just asked for.
@@ -436,11 +511,14 @@ fn on_event(client: &CdpClient, shared: &Arc<Shared>, event: &Value) {
                     .unwrap_or_else(|| params.get("defaultPrompt").and_then(Value::as_str).unwrap_or("").to_string());
                 answer["promptText"] = json!(text);
             }
-            shared.dialogs.lock().unwrap().push(json!({
-                "type": kind,
-                "message": params.get("message").and_then(Value::as_str).unwrap_or(""),
-                "accepted": accept,
-            }));
+            shared.dialogs.lock().unwrap().push((
+                scope,
+                json!({
+                    "type": kind,
+                    "message": params.get("message").and_then(Value::as_str).unwrap_or(""),
+                    "accepted": accept,
+                }),
+            ));
             let client = client.clone();
             let session = session.to_string();
             tokio::spawn(async move {
@@ -457,7 +535,7 @@ fn on_event(client: &CdpClient, shared: &Arc<Shared>, event: &Value) {
         "Fetch.requestPaused" => {
             let id = params.get("requestId").and_then(Value::as_str).unwrap_or("").to_string();
             let url = params.pointer("/request/url").and_then(Value::as_str).unwrap_or("");
-            let (method, answer) = route_answer(shared, &id, url);
+            let (method, answer) = route_answer(shared, session, &id, url);
             let client = client.clone();
             let session = session.to_string();
             tokio::spawn(async move {
@@ -474,7 +552,7 @@ fn on_event(client: &CdpClient, shared: &Arc<Shared>, event: &Value) {
         }
         "Fetch.authRequired" => {
             let id = params.get("requestId").and_then(Value::as_str).unwrap_or("").to_string();
-            let response = match shared.credentials.lock().unwrap().clone() {
+            let response = match shared.credentials.lock().unwrap().get(&shared.scope_of(session)).cloned() {
                 Some((user, pass)) => json!({ "response": "ProvideCredentials", "username": user, "password": pass }),
                 None => json!({ "response": "Default" }),
             };
@@ -607,20 +685,48 @@ mod tests {
     #[test]
     fn first_matching_route_answers() {
         let shared = Shared::default();
-        shared.routes.lock().unwrap().push(Route { pattern: "*.png".into(), action: RouteAction::Abort, hits: 0 });
-        shared.routes.lock().unwrap().push(Route {
-            pattern: "*/api/*".into(),
-            action: RouteAction::Fulfill {
-                status: 200,
-                headers: vec![("content-type".into(), "application/json".into())],
-                body_base64: "e30=".into(),
+        shared.register("s1", "t1", "");
+        shared.routes.lock().unwrap().entry(String::new()).or_default().extend([
+            Route { pattern: "*.png".into(), action: RouteAction::Abort, hits: 0 },
+            Route {
+                pattern: "*/api/*".into(),
+                action: RouteAction::Fulfill {
+                    status: 200,
+                    headers: vec![("content-type".into(), "application/json".into())],
+                    body_base64: "e30=".into(),
+                },
+                hits: 0,
             },
-            hits: 0,
-        });
-        assert_eq!(route_answer(&shared, "1", "http://h/a.png").0, "Fetch.failRequest");
-        let (m, p) = route_answer(&shared, "2", "http://h/api/x");
+        ]);
+        assert_eq!(route_answer(&shared, "s1", "1", "http://h/a.png").0, "Fetch.failRequest");
+        let (m, p) = route_answer(&shared, "s1", "2", "http://h/api/x");
         assert_eq!((m, p["responseCode"].as_u64()), ("Fetch.fulfillRequest", Some(200)));
-        assert_eq!(route_answer(&shared, "3", "http://h/").0, "Fetch.continueRequest");
-        assert_eq!(shared.routes.lock().unwrap()[0].hits, 1);
+        assert_eq!(route_answer(&shared, "s1", "3", "http://h/").0, "Fetch.continueRequest");
+        assert_eq!(shared.routes.lock().unwrap()[""][0].hits, 1);
+    }
+
+    #[test]
+    fn scopes_keep_their_routes_and_dialogs_apart() {
+        let shared = Shared::default();
+        shared.register("a", "ta", "ctx-a");
+        shared.register("b", "tb", "ctx-b");
+        shared
+            .routes
+            .lock()
+            .unwrap()
+            .insert("ctx-a".into(), vec![Route { pattern: "*".into(), action: RouteAction::Abort, hits: 0 }]);
+        assert_eq!(route_answer(&shared, "a", "1", "http://h/").0, "Fetch.failRequest");
+        assert_eq!(route_answer(&shared, "b", "2", "http://h/").0, "Fetch.continueRequest");
+        shared.policy.lock().unwrap().insert("ctx-b".into(), DialogPolicy { accept: false, prompt_text: None });
+        assert!(shared.policy_for("ctx-a").accept);
+        assert!(!shared.policy_for("ctx-b").accept);
+        shared.dialogs.lock().unwrap().push(("ctx-a".into(), json!({"type": "alert"})));
+        assert!(shared.take_dialogs("ctx-b").is_empty());
+        // `reset` moves a scope along; `reset --all` drops what it held.
+        shared.move_scope("ctx-a", "ctx-a2", true);
+        assert_eq!(shared.take_dialogs("ctx-a2").len(), 1);
+        assert!(shared.routes.lock().unwrap().contains_key("ctx-a2"));
+        shared.move_scope("ctx-b", "ctx-b2", false);
+        assert!(shared.policy_for("ctx-b2").accept);
     }
 }

@@ -244,7 +244,7 @@ impl Browser {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("attachToTarget: no sessionId"))?
                 .to_string();
-            self.shared.register(&session_id, &target_id);
+            self.shared.register(&session_id, &target_id, "");
             let page = Page::new(
                 self.handle.clone(),
                 self.client.clone(),
@@ -304,9 +304,10 @@ impl Browser {
         &self.shared
     }
 
-    /// How dialogs are answered from now on.
-    pub fn set_dialog_policy(&self, policy: DialogPolicy) {
-        *self.shared.policy.lock().unwrap() = policy;
+    /// How dialogs in `scope` (a session's browser context, "" for the
+    /// default one) are answered from now on.
+    pub fn set_dialog_policy(&self, scope: &str, policy: DialogPolicy) {
+        self.shared.policy.lock().unwrap().insert(scope.to_string(), policy);
         if self.shared.is_single_target() {
             let sessions: Vec<String> = self.shared.sessions.lock().unwrap().keys().cloned().collect();
             for session in sessions {
@@ -316,8 +317,9 @@ impl Browser {
     }
 
     /// Attach to a page target the browser opened on its own (a popup) and
-    /// enable it like a tab we created.
-    pub fn attach_page(&self, target_id: &str) -> Result<Page> {
+    /// enable it like a tab we created. `scope`: the browser context of the
+    /// session it belongs to ("" for the default one).
+    pub fn attach_page(&self, target_id: &str, scope: &str) -> Result<Page> {
         self.block_on(async {
             let session = self
                 .client
@@ -329,7 +331,7 @@ impl Browser {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("attachToTarget: no sessionId"))?
                 .to_string();
-            self.shared.register(&session_id, target_id);
+            self.shared.register(&session_id, target_id, scope);
             let page = Page::new(
                 self.handle.clone(),
                 self.client.clone(),
@@ -440,7 +442,7 @@ impl Browser {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("attachToTarget: no sessionId"))?
                 .to_string();
-            self.shared.register(&session_id, &target_id);
+            self.shared.register(&session_id, &target_id, context.unwrap_or(""));
             let page = Page::new(
                 self.handle.clone(),
                 self.client.clone(),

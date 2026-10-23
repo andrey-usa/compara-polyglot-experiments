@@ -11,10 +11,11 @@
 //!   expect --testid total text is "$36.00"
 //! ```
 //!
-//! Top-level lines are `set`, `base`, `before each`, `after each` and
-//! `scenario`; the indented lines under a block are its steps. A step is a
-//! navigera command line (tokenized like a shell, without expansion), an
-//! `expect` line, or `save NAME = <command>`.
+//! Top-level lines are `set`, `base`, `use`, `flow`, `auth`, `before
+//! all|each`, `after each|all` and `scenario`; the indented lines under a
+//! block are its steps. A step is a navigera command line (tokenized like a
+//! shell, without expansion), an `expect` line, `save NAME = <command>`,
+//! `run`, `as`, `optional`, `if` or `handoff`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,11 @@ pub enum Action {
         cond: Expect,
         steps: Vec<Step>,
     },
+    /// `as <auth>`: start signed in, from the `auth` block's saved state.
+    As(String),
+    /// `handoff [until <expect clause>]`: the browser on screen for a
+    /// person (a 2FA prompt, a CAPTCHA), until the clause holds or Enter.
+    Handoff(Option<Expect>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,6 +110,34 @@ pub struct Scenario {
     pub vars: BTreeMap<String, String>,
 }
 
+/// `auth name [ttl 30m]`: steps that sign in, run once (or reused from
+/// the last run within the TTL), whose cookies and storage `as name` loads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Auth {
+    pub name: String,
+    /// How long the saved state is reused across runs (seconds); none: once
+    /// per run.
+    pub ttl_s: Option<u64>,
+    pub file: PathBuf,
+    pub line: usize,
+    pub steps: Vec<Step>,
+}
+
+/// `30m`, `1h`, `90s`, `2d`, or plain seconds.
+pub fn duration_s(text: &str) -> Option<u64> {
+    let (num, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len()));
+    let n: u64 = num.parse().ok()?;
+    Some(
+        n * match unit {
+            "" | "s" => 1,
+            "m" => 60,
+            "h" => 3600,
+            "d" => 86400,
+            _ => return None,
+        },
+    )
+}
+
 /// `flow name(a, b)`: steps a scenario runs with `run name x y`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Flow {
@@ -119,10 +153,16 @@ pub struct Suite {
     pub file: PathBuf,
     pub base: Option<String>,
     pub vars: BTreeMap<String, String>,
+    /// Once for the file, before its first scenario; what it saves the
+    /// scenarios see.
+    pub before_all: Vec<Step>,
     pub before_each: Vec<Step>,
     pub after_each: Vec<Step>,
+    /// Once for the file, after its last scenario.
+    pub after_all: Vec<Step>,
     pub scenarios: Vec<Scenario>,
     pub flows: BTreeMap<String, Flow>,
+    pub auths: BTreeMap<String, Auth>,
     /// `use <file.pv>`: files whose flows and `set`s this one takes.
     pub uses: Vec<(usize, PathBuf)>,
 }
@@ -225,7 +265,8 @@ pub fn interpolate(word: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Resul
                 Some((n, d)) => (n, Some(d)),
                 None => (inner, None),
             };
-            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+            let bare = name.strip_prefix("secret:").unwrap_or(name);
+            if bare.is_empty() || !bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
                 return Err(format!("bad variable name {name:?} in {word:?}"));
             }
             match lookup(name).or_else(|| default.map(str::to_string)) {
@@ -340,6 +381,12 @@ pub fn unset_vars(suite: &Suite, sc: &Scenario, run_vars: &[String]) -> Vec<(usi
     let mut known: std::collections::BTreeSet<String> = suite.vars.keys().cloned().collect();
     known.extend(run_vars.iter().cloned());
     known.extend(sc.vars.keys().cloned());
+    known.extend(["run.id", "scenario.name", "download.path", "download.name"].map(String::from));
+    for st in &suite.before_all {
+        if let Action::Save { name, .. } = &st.action {
+            known.insert(name.clone());
+        }
+    }
     let mut out = Vec::new();
     fn words(a: &Action) -> Vec<String> {
         match a {
@@ -347,7 +394,8 @@ pub fn unset_vars(suite: &Suite, sc: &Scenario, run_vars: &[String]) -> Vec<(usi
             Action::Save { command, .. } => command.clone(),
             Action::Run { args, .. } => args.clone(),
             Action::Optional(inner) => words(inner),
-            Action::Expect(_) | Action::If { .. } => Vec::new(),
+            Action::As(name) => vec![name.clone()],
+            Action::Expect(_) | Action::If { .. } | Action::Handoff(_) => Vec::new(),
         }
     }
     for st in suite.before_each.iter().chain(&sc.steps) {
@@ -358,7 +406,8 @@ pub fn unset_vars(suite: &Suite, sc: &Scenario, run_vars: &[String]) -> Vec<(usi
         };
         for w in &ws {
             for (name, has_default) in used_vars(w) {
-                if !has_default && !known.contains(&name) && std::env::var_os(&name).is_none() {
+                let env = std::env::var_os(name.strip_prefix("secret:").unwrap_or(&name)).is_some();
+                if !has_default && !known.contains(&name) && !env {
                     out.push((st.line, name));
                 }
             }
@@ -386,10 +435,13 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
     let mut suite = Suite { file: file.to_path_buf(), ..Suite::default() };
     enum Block {
         None,
+        BeforeAll,
         BeforeEach,
         AfterEach,
+        AfterAll,
         Scenario,
         Flow(String),
+        Auth(String),
     }
     let mut block = Block::None;
     // Data rows of the scenario being read: (line of `examples`, header, rows).
@@ -437,10 +489,13 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
                 Block::None => {
                     return Err(err(line_no, "a step outside any `scenario`, `flow` or `before each` block".into()))
                 }
+                Block::BeforeAll => suite.before_all.push(step),
                 Block::BeforeEach => suite.before_each.push(step),
                 Block::AfterEach => suite.after_each.push(step),
+                Block::AfterAll => suite.after_all.push(step),
                 Block::Scenario => suite.scenarios.last_mut().expect("a scenario is open").steps.push(step),
                 Block::Flow(name) => suite.flows.get_mut(name).expect("the flow is open").steps.push(step),
+                Block::Auth(name) => suite.auths.get_mut(name).expect("the auth is open").steps.push(step),
             }
             continue;
         }
@@ -472,8 +527,45 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
                 suite.uses.push((line_no, dir.join(path)));
                 block = Block::None;
             }
-            Some("before") if words.get(1).map(String::as_str) == Some("each") => block = Block::BeforeEach,
-            Some("after") if words.get(1).map(String::as_str) == Some("each") => block = Block::AfterEach,
+            Some(w @ ("before" | "after")) => {
+                let which = words.get(1).map(String::as_str);
+                if words.len() != 2 || !matches!(which, Some("each" | "all")) {
+                    return Err(err(line_no, format!("expected `{w} each` or `{w} all`")));
+                }
+                let (b, taken) = match (w, which) {
+                    ("before", Some("all")) => (Block::BeforeAll, !suite.before_all.is_empty()),
+                    ("before", _) => (Block::BeforeEach, !suite.before_each.is_empty()),
+                    ("after", Some("all")) => (Block::AfterAll, !suite.after_all.is_empty()),
+                    _ => (Block::AfterEach, !suite.after_each.is_empty()),
+                };
+                if taken {
+                    return Err(err(line_no, format!("a second `{trimmed}` block: put its steps in the first")));
+                }
+                block = b;
+            }
+            Some("auth") => {
+                // auth name [ttl 30m]
+                let name = words.get(1).ok_or_else(|| err(line_no, "expected `auth <name> [ttl 30m]`".into()))?.clone();
+                if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                    return Err(err(line_no, format!("bad auth name {name:?}")));
+                }
+                let ttl_s = match &words[2..] {
+                    [] => None,
+                    [t, d] if t == "ttl" => Some(
+                        duration_s(d)
+                            .ok_or_else(|| err(line_no, format!("ttl takes a duration like 30m, 1h, 90s, 2d (got {d:?})")))?,
+                    ),
+                    other => return Err(err(line_no, format!("after the auth's name: `ttl <duration>` or nothing (got {other:?})"))),
+                };
+                if suite.auths.contains_key(&name) {
+                    return Err(err(line_no, format!("a second auth named {name:?}")));
+                }
+                suite.auths.insert(
+                    name.clone(),
+                    Auth { name: name.clone(), ttl_s, file: file.to_path_buf(), line: line_no, steps: Vec::new() },
+                );
+                block = Block::Auth(name);
+            }
             Some("flow") => {
                 // flow name(a, b)   or   flow name
                 let rest = trimmed["flow".len()..].trim();
@@ -528,15 +620,23 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
             Some(other) => {
                 return Err(err(
                     line_no,
-                    format!("unknown line {other:?} (top level: set, base, use, flow, before each, after each, scenario; steps are indented)"),
+                    format!("unknown line {other:?} (top level: set, base, use, flow, auth, before all|each, after each|all, scenario; steps are indented)"),
                 ))
             }
             None => {}
         }
     }
     let nested = |steps: Vec<Step>| nest(steps).map_err(|(line, m)| err(line, m));
+    suite.before_all = nested(std::mem::take(&mut suite.before_all))?;
     suite.before_each = nested(std::mem::take(&mut suite.before_each))?;
     suite.after_each = nested(std::mem::take(&mut suite.after_each))?;
+    suite.after_all = nested(std::mem::take(&mut suite.after_all))?;
+    for a in suite.auths.values_mut() {
+        a.steps = nested(std::mem::take(&mut a.steps))?;
+        if a.steps.is_empty() {
+            return Err(err(a.line, format!("auth {:?} has no steps", a.name)));
+        }
+    }
     for sc in suite.scenarios.iter_mut() {
         sc.steps = nested(std::mem::take(&mut sc.steps))?;
     }
@@ -603,22 +703,36 @@ pub fn resolve(suites: &mut [Suite]) -> Result<(), ParseError> {
             for (name, flow) in used.flows {
                 suite.flows.entry(name).or_insert(flow);
             }
+            for (name, auth) in used.auths {
+                suite.auths.entry(name).or_insert(auth);
+            }
             for (k, v) in used.vars {
                 suite.vars.entry(k).or_insert(v);
             }
             todo.extend(used.uses);
         }
-        // Every `run`, wherever it is, names a known flow.
-        fn check(steps: &[Step], file: &Path, flows: &BTreeMap<String, Flow>) -> Result<(), ParseError> {
+        // Every `run`, wherever it is, names a known flow; every `as` a
+        // known auth.
+        fn check(steps: &[Step], file: &Path, suite: &Suite) -> Result<(), ParseError> {
+            let flows = &suite.flows;
             for st in steps {
                 let action = match &st.action {
                     Action::Optional(a) => a.as_ref(),
                     Action::If { steps, .. } => {
-                        check(steps, file, flows)?;
+                        check(steps, file, suite)?;
                         continue;
                     }
                     a => a,
                 };
+                if let Action::As(name) = action {
+                    if !suite.auths.contains_key(name) {
+                        return Err(ParseError {
+                            file: file.to_path_buf(),
+                            line: st.line,
+                            message: format!("no auth named {name:?} (define it with `auth {name}` or `use` its file)"),
+                        });
+                    }
+                }
                 if let Action::Run { flow, args } = action {
                     let err = |m: String| ParseError { file: file.to_path_buf(), line: st.line, message: m };
                     let f = flows.get(flow).ok_or_else(|| {
@@ -637,13 +751,17 @@ pub fn resolve(suites: &mut [Suite]) -> Result<(), ParseError> {
             Ok(())
         }
         let file = suite.file.clone();
-        check(&suite.before_each, &file, &suite.flows)?;
-        check(&suite.after_each, &file, &suite.flows)?;
+        for steps in [&suite.before_all, &suite.before_each, &suite.after_each, &suite.after_all] {
+            check(steps, &file, suite)?;
+        }
         for sc in &suite.scenarios {
-            check(&sc.steps, &file, &suite.flows)?;
+            check(&sc.steps, &file, suite)?;
         }
         for f in suite.flows.values() {
-            check(&f.steps, &f.file, &suite.flows)?;
+            check(&f.steps, &f.file, suite)?;
+        }
+        for a in suite.auths.values() {
+            check(&a.steps, &a.file, suite)?;
         }
     }
     Ok(())
@@ -677,6 +795,20 @@ fn parse_words(words: &[String]) -> Result<Action, String> {
             cond.timeout_ms = Some(cond.timeout_ms.unwrap_or(0));
             Ok(Action::If { cond, steps: Vec::new() })
         }
+        Some("as") => match words {
+            [_, name] => Ok(Action::As(name.clone())),
+            _ => Err("expected `as <auth name>`".into()),
+        },
+        Some("handoff") => match words.get(1).map(String::as_str) {
+            None => Ok(Action::Handoff(None)),
+            Some("until") if words.len() > 2 => {
+                let mut cond = crate::expect::parse(&words[2..])?;
+                // A person takes a while: five minutes unless it says.
+                cond.timeout_ms = Some(cond.timeout_ms.unwrap_or(300_000));
+                Ok(Action::Handoff(Some(cond)))
+            }
+            _ => Err("expected `handoff` or `handoff until <expect clause>`".into()),
+        },
         Some("optional") => {
             if words.len() < 2 {
                 return Err("expected `optional <step>`".into());

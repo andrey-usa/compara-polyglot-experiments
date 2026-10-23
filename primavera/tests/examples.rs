@@ -175,3 +175,117 @@ fn if_blocks_look_at_the_page_as_it_is() {
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("1 passed, 0 failed"), "{out}");
 }
+
+/// A GET to the fixture site, its body.
+fn fetch(site: &Site, path: &str) -> String {
+    use std::io::{Read, Write};
+    let hostport = site.1.trim_start_matches("http://");
+    let mut s = std::net::TcpStream::connect(hostport).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n").unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default()
+}
+
+fn secrets_file() -> String {
+    let path = std::env::temp_dir().join(format!("primavera-secrets-{}.env", std::process::id()));
+    std::fs::write(&path, "# test only\nPV_TEST_PW=\"hunter22\"\n").unwrap();
+    path.display().to_string()
+}
+
+#[test]
+fn the_newer_subjects_and_isolation_between_scenarios() {
+    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    for workers in ["1", "2"] {
+        let (code, out) = primavera(&["run", "tests/fixtures/m1.pv", "--base-url", &site.1, "--workers", workers]);
+        assert_eq!(code, 1, "{out}");
+        assert!(out.contains("5 passed, 1 failed"), "workers {workers}: {out}");
+        assert!(out.contains("FAIL  tests/fixtures/m1.pv:21  Soft expectations fail it at the end"), "{out}");
+        assert!(out.contains("2 soft expectation(s) didn't hold"), "{out}");
+    }
+}
+
+#[test]
+fn auth_runs_once_and_hooks_wrap_the_file() {
+    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    let secrets = secrets_file();
+    let (code, out) =
+        primavera(&["run", "tests/fixtures/auth.pv", "--base-url", &site.1, "--workers", "2", "--secrets", &secrets]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("5 passed, 0 failed"), "{out}");
+    // Two auths, each signed in once, for five scenarios on two workers.
+    assert_eq!(fetch(&site, "/logins"), "2", "{out}");
+    assert_eq!(fetch(&site, "/notes"), "setup,teardown", "{out}");
+    // Again: `shopper` signs in anew, `keeper` (ttl 1h) is reused.
+    let (code, out) = primavera(&["run", "tests/fixtures/auth.pv", "--base-url", &site.1, "--secrets", &secrets]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(fetch(&site, "/logins"), "3", "{out}");
+    // A secret never shows in what the run prints.
+    let (code, out) =
+        primavera(&["run", "tests/fixtures/secret-fail.pv", "--base-url", &site.1, "--secrets", &secrets]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("saw \"***\""), "{out}");
+    assert!(!out.contains("hunter22"), "{out}");
+    // A file whose `before all` fails runs none of its scenarios.
+    let (code, out) = primavera(&["run", "tests/fixtures/before-fail.pv", "--base-url", &site.1]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("before all: expected title is \"not this one\""), "{out}");
+    let (_, out) = primavera(&["lint", "tests/fixtures/auth.pv", "--secrets", &secrets]);
+    assert!(out.contains("ok: 1 file(s), 5 scenario(s)") && !out.contains("warning"), "{out}");
+}
+
+#[test]
+fn handoff_waits_only_when_it_must() {
+    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    let (code, out) = primavera(&["run", "tests/fixtures/handoff.pv", "--base-url", &site.1]);
+    assert_eq!(code, 0, "{out}");
+    // Nobody at a screen here: it says so instead of waiting.
+    if cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    {
+        let (code, out) = primavera(&["run", "tests/fixtures/handoff-wait.pv", "--base-url", &site.1]);
+        assert_eq!(code, 1, "{out}");
+        assert!(out.contains("handoff needs a person at a screen"), "{out}");
+    }
+}
+
+#[test]
+fn a_pause_leaves_the_failing_tab_to_navigera() {
+    use std::io::Write;
+    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_primavera"))
+        .args(["run", "tests/fixtures/pause.pv", "--base-url", &site.1, "--pause-on-failure"])
+        .args(["--evidence", &tempfile_dir()])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let err = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let mut seen = String::new();
+    let ws = loop {
+        let line = rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|_| panic!("no pause: {seen}"));
+        seen.push_str(&line);
+        seen.push('\n');
+        if let Some(i) = line.find("--attach ") {
+            break line[i + "--attach ".len()..].trim().to_string();
+        }
+    };
+    assert!(ws.contains("/devtools/page/"), "{ws}");
+    let config = navigera::protocol::SessionConfig { attach: Some(ws), ..Default::default() };
+    let mut look = navigera::protocol::Driver::launch(&config).expect("attach to the paused tab");
+    let here = look.run(&navigera::protocol::Command::Url {}).unwrap();
+    assert_eq!(here["title"], "paused here", "{here}");
+    look.session().close();
+    child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(1));
+}

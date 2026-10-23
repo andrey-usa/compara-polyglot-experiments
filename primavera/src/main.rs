@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Condvar, Mutex};
 use std::time::Instant;
 
 /// The agent skill: the format and the commands, for an agent writing tests.
@@ -30,6 +30,7 @@ usage:
 run options:
   --base-url <url>      where relative URLs (`goto /cart`) point (else `base` in the file, PRIMAVERA_BASE_URL)
   --var <name=value>    a variable for ${name} (repeatable)
+  --secrets <file>      NAME=value lines for ${secret:NAME} (the environment comes first); masked in output
   --grep <text>         only scenarios whose name contains it
   --tag <tag>           only scenarios with this @tag (repeatable: any of them)
   --workers <n|auto>    scenarios at once (default 1; auto: half the CPUs, at most 8)
@@ -46,6 +47,7 @@ run options:
   --headed              show the browser
   --chromium <path>     the browser to run
   --evidence <dir>      failure screenshots (default .primavera/runs/<time>)
+  --pause-on-failure    keep the browser at a failure, open to `navigera --attach`, until Enter (one worker)
 
 exit codes: 0 all passed, 1 a scenario failed, 2 a file or an argument is wrong, 3 the browser didn't start
 ";
@@ -81,6 +83,10 @@ fn parse_args() -> Result<Args, String> {
         grep: None,
         tags: Vec::new(),
         evidence: PathBuf::from(format!(".primavera/runs/{stamp}")),
+        run_id: format!("{stamp}-{}", std::process::id()),
+        secrets: BTreeMap::new(),
+        pause: false,
+        auth: Default::default(),
     };
     let mut junit = None;
     let mut base_flag = None;
@@ -100,6 +106,12 @@ fn parse_args() -> Result<Args, String> {
                 let (k, v) = kv.split_once('=').ok_or_else(|| format!("--var takes name=value, not {kv:?}"))?;
                 opts.vars.insert(k.trim().to_string(), v.to_string());
             }
+            "--secrets" => {
+                let path = val("--secrets")?;
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("--secrets {path}: {e}"))?;
+                opts.secrets = secrets_file(&text).map_err(|e| format!("--secrets {path}: {e}"))?;
+            }
+            "--pause-on-failure" => opts.pause = true,
             "--grep" => opts.grep = Some(val("--grep")?),
             "--tag" => opts.tags.push(val("--tag")?.trim_start_matches('@').to_string()),
             "--junit" => junit = Some(PathBuf::from(val("--junit")?)),
@@ -175,6 +187,26 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args { cmd, paths, opts, junit, workers, retries, fail_on_flaky, shard, reporters, json, isolation })
 }
 
+/// `NAME=value` lines (`#` comments, optional quotes around the value).
+fn secrets_file(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (k, v) = line.split_once('=').ok_or_else(|| format!("line {}: expected NAME=value", i + 1))?;
+        let v = v.trim();
+        let v = match (v.chars().next(), v.chars().last()) {
+            (Some(q @ ('"' | '\'')), Some(e)) if q == e && v.len() >= 2 => &v[1..v.len() - 1],
+            _ => v,
+        };
+        out.insert(k.trim().to_string(), v.to_string());
+    }
+    Ok(out)
+}
+
 fn load(paths: &[PathBuf]) -> Result<Vec<suite::Suite>, String> {
     let files = suite::discover(paths).map_err(|e| format!("reading {:?}: {e}", paths))?;
     if files.is_empty() {
@@ -223,7 +255,8 @@ fn main() -> ExitCode {
             Ok(suites) => {
                 // Variables nothing sets: warnings, since the environment of
                 // the run (a CI secret) may still set them.
-                let run_vars: Vec<String> = args.opts.vars.keys().cloned().collect();
+                let mut run_vars: Vec<String> = args.opts.vars.keys().cloned().collect();
+                run_vars.extend(args.opts.secrets.keys().map(|k| format!("secret:{k}")));
                 let mut warnings = 0;
                 for s in &suites {
                     for sc in &s.scenarios {
@@ -298,7 +331,9 @@ fn run(args: Args) -> ExitCode {
     let jsonl = args.reporters.iter().any(|r| r == "jsonl");
     let console = args.reporters.iter().any(|r| r == "console");
     let github = args.reporters.iter().any(|r| r == "github");
-    let workers = args.workers.min(jobs.len()).max(1);
+    // A pause holds the run at one failure: one worker.
+    let workers = if opts.pause { 1 } else { args.workers.min(jobs.len()).max(1) };
+    let hooks = Hooks::new(&suites, &jobs);
     // One browser, a context per worker (`--isolation context`, the
     // default), or a browser per worker. The first browser is kept here
     // and closes last.
@@ -326,9 +361,9 @@ fn run(args: Args) -> ExitCode {
     std::thread::scope(|scope| {
         for (w, fork) in forks.into_iter().enumerate() {
             let tx = tx.clone();
-            let (queue, suites, opts) = (&queue, &suites, &opts);
+            let (queue, suites, opts, hooks) = (&queue, &suites, &opts, &hooks);
             let retries = args.retries;
-            scope.spawn(move || worker(w, fork, queue, suites, opts, retries, tx));
+            scope.spawn(move || worker(w, fork, queue, suites, opts, hooks, retries, tx));
         }
         drop(tx);
         let mut out = std::io::stdout();
@@ -416,14 +451,89 @@ enum Event {
     LaunchFailed(String),
 }
 
+/// Each file's `before all` (run by the first worker that takes one of its
+/// scenarios, while the others that do wait) and `after all` (run by the
+/// worker that finishes its last).
+struct Hooks {
+    before: Mutex<Vec<Hook>>,
+    ready: Condvar,
+    left: Mutex<Vec<usize>>,
+}
+
+type HookResult = Result<BTreeMap<String, String>, Box<runner::Failure>>;
+
+enum Hook {
+    Idle,
+    Running,
+    Done(HookResult),
+}
+
+impl Hooks {
+    fn new(suites: &[suite::Suite], jobs: &[runner::Job]) -> Self {
+        let mut left = vec![0; suites.len()];
+        for j in jobs {
+            left[j.suite] += 1;
+        }
+        Hooks {
+            before: Mutex::new(suites.iter().map(|_| Hook::Idle).collect()),
+            ready: Condvar::new(),
+            left: Mutex::new(left),
+        }
+    }
+
+    /// File `i`'s `before all`, run once: what it saved, or how it failed.
+    fn before(&self, i: usize, run: impl FnOnce() -> HookResult) -> HookResult {
+        let Ok(mut st) = self.before.lock() else { return Ok(BTreeMap::new()) };
+        loop {
+            match &st[i] {
+                Hook::Done(r) => return r.clone(),
+                Hook::Running => match self.ready.wait(st) {
+                    Ok(g) => st = g,
+                    Err(_) => return Ok(BTreeMap::new()),
+                },
+                Hook::Idle => {
+                    st[i] = Hook::Running;
+                    drop(st);
+                    let r = run();
+                    if let Ok(mut st) = self.before.lock() {
+                        st[i] = Hook::Done(r.clone());
+                    }
+                    self.ready.notify_all();
+                    return r;
+                }
+            }
+        }
+    }
+
+    /// One of file `i`'s scenarios is done: whether it was the last.
+    fn finished(&self, i: usize) -> bool {
+        self.left
+            .lock()
+            .map(|mut l| {
+                l[i] = l[i].saturating_sub(1);
+                l[i] == 0
+            })
+            .unwrap_or(false)
+    }
+
+    fn vars(&self, i: usize) -> BTreeMap<String, String> {
+        match self.before.lock().as_deref().map(|b| &b[i]) {
+            Ok(Hook::Done(Ok(v))) => v.clone(),
+            _ => BTreeMap::new(),
+        }
+    }
+}
+
 /// One worker: its own browser, started when it takes its first scenario,
 /// then scenarios from the shared queue until it is empty.
+#[allow(clippy::too_many_arguments)]
 fn worker(
     id: usize,
     fork: Option<runner::Runner>,
     queue: &Mutex<std::collections::VecDeque<runner::Job>>,
     suites: &[suite::Suite],
     opts: &runner::Options,
+    hooks: &Hooks,
     retries: u32,
     tx: mpsc::Sender<Event>,
 ) {
@@ -446,17 +556,39 @@ fn worker(
         }
         let Some(r) = browser.as_mut() else { return };
         let (suite, sc) = job.get(suites);
-        let mut result = r.run(suite, sc, 1);
-        let mut earlier = Vec::new();
-        while !result.passed() && result.attempt <= retries {
-            earlier.extend(result.failure.take());
-            let next = result.attempt + 1;
-            result = r.run(suite, sc, next);
-        }
-        result.retried = earlier;
+        let before = if suite.before_all.is_empty() {
+            Ok(BTreeMap::new())
+        } else {
+            hooks.before(job.suite, || r.hook(suite, &suite.before_all, "before all", &BTreeMap::new()))
+        };
+        let mut result = match &before {
+            Ok(vars) => {
+                let mut result = r.run(suite, sc, 1, vars);
+                let mut earlier = Vec::new();
+                while !result.passed() && result.attempt <= retries {
+                    earlier.extend(result.failure.take());
+                    let next = result.attempt + 1;
+                    result = r.run(suite, sc, next, vars);
+                }
+                result.retried = earlier;
+                result
+            }
+            // Not run: the file's `before all` failed.
+            Err(f) => runner::ScenarioResult::failed(suite, sc.name.clone(), sc.line, sc.tags.clone(), (**f).clone()),
+        };
         result.worker = id;
         if tx.send(Event::Done(Box::new(result))).is_err() {
             return;
+        }
+        if hooks.finished(job.suite) && !suite.after_all.is_empty() {
+            if let Err(f) = r.hook(suite, &suite.after_all, "after all", &hooks.vars(job.suite)) {
+                let line = suite.after_all[0].line;
+                let mut done = runner::ScenarioResult::failed(suite, "(after all)".into(), line, Vec::new(), *f);
+                done.worker = id;
+                if tx.send(Event::Done(Box::new(done))).is_err() {
+                    return;
+                }
+            }
         }
     }
 }

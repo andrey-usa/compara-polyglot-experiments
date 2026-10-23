@@ -3,15 +3,34 @@
 //! from a clean browser context (`reset`: no cookies, storage or tabs from
 //! the one before).
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use navigera::protocol::{parse_args, Command, Driver, SessionConfig};
 use serde_json::Value;
 
-use crate::expect::{compare, Expect, Matcher, Prop, Subject};
+use crate::expect::{compare, Expect, Matcher, Prop, RequestRead, Subject};
 use crate::suite::{interpolate, Action, Scenario, Step, Suite};
+
+/// The state each `auth` block saved this run (or an earlier one within
+/// its TTL), shared by the workers: the first scenario that needs one runs
+/// it, the others wait for it.
+#[derive(Debug, Default)]
+pub struct AuthCache {
+    slots: Mutex<HashMap<String, AuthSlot>>,
+}
+
+/// One auth's state file once it is known, or why signing in failed.
+type AuthSlot = Arc<Mutex<Option<Result<PathBuf, String>>>>;
+
+impl AuthCache {
+    fn slot(&self, name: &str) -> AuthSlot {
+        self.slots.lock().map(|mut m| m.entry(name.to_string()).or_default().clone()).unwrap_or_default()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -27,6 +46,15 @@ pub struct Options {
     pub tags: Vec<String>,
     /// Where failure evidence (a screenshot) goes.
     pub evidence: PathBuf,
+    /// `${run.id}`: the same for every scenario of a run, different from
+    /// run to run.
+    pub run_id: String,
+    /// `${secret:NAME}`s from `--secrets <file>` (the environment comes
+    /// first).
+    pub secrets: BTreeMap<String, String>,
+    /// `--pause-on-failure`: keep the browser at a failure for a look.
+    pub pause: bool,
+    pub auth: Arc<AuthCache>,
 }
 
 /// Kept for the JSON-lines and HTML reporters (M1).
@@ -78,6 +106,25 @@ pub struct ScenarioResult {
 }
 
 impl ScenarioResult {
+    /// A result that ran no steps: its `before all` failed, or it is an
+    /// `after all` that did.
+    pub fn failed(suite: &Suite, name: String, line: usize, tags: Vec<String>, failure: Failure) -> Self {
+        ScenarioResult {
+            file: suite.file.clone(),
+            name,
+            line,
+            tags,
+            ms: 0.0,
+            steps: Vec::new(),
+            failure: Some(failure),
+            attempt: 1,
+            retried: Vec::new(),
+            saved: BTreeMap::new(),
+            notes: Vec::new(),
+            worker: 0,
+        }
+    }
+
     pub fn passed(&self) -> bool {
         self.failure.is_none()
     }
@@ -144,6 +191,9 @@ impl Runner {
             headed: opts.headed,
             chromium: opts.chromium.clone(),
             wait_ms: opts.wait_ms,
+            // A pause leaves the browser to another navigera session: it
+            // attaches over the DevTools port.
+            transport: opts.pause.then(|| "ws".to_string()),
             ..SessionConfig::default()
         };
         let driver = Driver::launch(&config)?;
@@ -156,28 +206,40 @@ impl Runner {
         Ok(Runner { driver: self.driver.fork()?, opts: self.opts.clone(), fresh: true, attempt: 1 })
     }
 
-    pub fn run(&mut self, suite: &Suite, scenario: &Scenario, attempt: u32) -> ScenarioResult {
+    /// A clean browser context for every scenario but the first one of
+    /// the run (a new browser is clean already): no cookies, storage, tabs,
+    /// routes, init scripts or `set` emulation from the one before.
+    fn clean(&mut self, line: usize) -> Result<(), Box<Failure>> {
+        let fresh = std::mem::replace(&mut self.fresh, false);
+        if fresh {
+            return Ok(());
+        }
+        self.driver.run_op(&Command::Reset { all: true }).map(|_| ()).map_err(|e| {
+            Box::new(Failure {
+                line,
+                text: "(reset)".into(),
+                message: format!("could not start from a clean browser context: {e:#}"),
+                at: None,
+                hint: None,
+                screenshot: None,
+                nearest: Vec::new(),
+            })
+        })
+    }
+
+    /// `file_vars`: what the file's `before all` saved.
+    pub fn run(
+        &mut self,
+        suite: &Suite,
+        scenario: &Scenario,
+        attempt: u32,
+        file_vars: &BTreeMap<String, String>,
+    ) -> ScenarioResult {
         self.attempt = attempt;
         let started = Instant::now();
-        let mut scope = Scope::new(suite, scenario, &self.opts);
+        let mut scope = Scope::new(suite, &scenario.name, scenario.vars.clone(), &self.opts, file_vars);
         let mut steps = Vec::new();
-        let mut failure = None;
-        // A clean browser context for every scenario but the first one of
-        // the run (a new browser is clean already).
-        if !self.fresh {
-            if let Err(e) = self.driver.run_op(&Command::Reset {}) {
-                failure = Some(Failure {
-                    line: scenario.line,
-                    text: "(reset)".into(),
-                    message: format!("could not start from a clean browser context: {e:#}"),
-                    at: None,
-                    hint: None,
-                    screenshot: None,
-                    nearest: Vec::new(),
-                });
-            }
-        }
-        self.fresh = false;
+        let mut failure = self.clean(scenario.line).err().map(|f| *f);
         let all: Vec<&Step> = suite.before_each.iter().chain(&scenario.steps).collect();
         if failure.is_none() {
             for step in all {
@@ -186,21 +248,32 @@ impl Runner {
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 steps.push(StepResult { line: step.line, text: step.text.clone(), ms, ok: res.is_ok() });
                 if let Err(message) = res {
-                    failure = Some(self.failure(step, message, &scope, suite, scenario));
+                    failure = Some(self.failure(step, message, &scope, suite, &scenario.name));
                     break;
                 }
             }
+        }
+        // `--soft` expectations that didn't hold fail the scenario now.
+        if failure.is_none() && !scope.soft.is_empty() {
+            let (first, _) = scope.soft[0].clone();
+            let all: Vec<String> = scope.soft.iter().map(|(st, m)| format!("line {}: {m}", st.line)).collect();
+            let n = all.len();
+            let message = format!("{n} soft expectation(s) didn't hold:\n{}", all.join("\n"));
+            failure = Some(self.failure(&first, message, &scope, suite, &scenario.name));
+        }
+        if let (true, Some(f)) = (self.opts.pause, &failure) {
+            self.pause(f, suite);
         }
         // `after each` runs whatever happened; its own failures count only
         // when the scenario had passed.
         for step in &suite.after_each {
             if let Err(message) = self.step(step, &mut scope, suite) {
                 if failure.is_none() {
-                    failure = Some(self.failure(step, message, &scope, suite, scenario));
+                    failure = Some(self.failure(step, message, &scope, suite, &scenario.name));
                 }
             }
         }
-        ScenarioResult {
+        let mut result = ScenarioResult {
             file: suite.file.clone(),
             name: scenario.name.clone(),
             line: scenario.line,
@@ -210,20 +283,66 @@ impl Runner {
             failure,
             attempt,
             retried: Vec::new(),
-            saved: scope.saved,
-            notes: scope.notes,
+            saved: BTreeMap::new(),
+            notes: Vec::new(),
             worker: 0,
+        };
+        let mask = scope.masker();
+        result.saved = scope.saved.into_iter().map(|(k, v)| (k, mask(&v))).collect();
+        result.notes = scope.notes.iter().map(|n| mask(n)).collect();
+        if let Some(f) = result.failure.as_mut() {
+            f.message = mask(&f.message);
+        }
+        result
+    }
+
+    /// A `before all` or `after all` block: in a clean context of its own;
+    /// what it saved, or how it failed.
+    pub fn hook(
+        &mut self,
+        suite: &Suite,
+        steps: &[Step],
+        label: &str,
+        file_vars: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>, Box<Failure>> {
+        let line = steps.first().map(|s| s.line).unwrap_or(0);
+        self.clean(line)?;
+        let mut scope = Scope::new(suite, label, BTreeMap::new(), &self.opts, file_vars);
+        for step in steps {
+            if let Err(message) = self.step(step, &mut scope, suite) {
+                let mut f = self.failure(step, format!("{label}: {message}"), &scope, suite, label);
+                f.message = scope.masker()(&f.message);
+                return Err(Box::new(f));
+            }
+        }
+        Ok(scope.saved)
+    }
+
+    /// The browser stays as the failure left it, open to another navigera
+    /// session, until Enter.
+    fn pause(&mut self, f: &Failure, suite: &Suite) {
+        // The tab itself, so the look is at the page the failure left.
+        let ws = self.driver.session().page_endpoint().unwrap_or_else(|| self.driver.session().endpoint());
+        eprintln!(
+            "PAUSED  {}:{}  the browser stays as the failure left it; look at it with\n        navigera -s pv start --attach {ws}\n        navigera -s pv ax\n        Enter goes on with the run (Ctrl-C stops it)",
+            suite.file.display(),
+            f.line
+        );
+        if enter(None).is_err() {
+            let secs: u64 = std::env::var("PRIMAVERA_PAUSE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
+            eprintln!("        (no terminal input here: going on in {secs} s)");
+            std::thread::sleep(Duration::from_secs(secs));
         }
     }
 
-    fn failure(&mut self, step: &Step, message: String, scope: &Scope, suite: &Suite, sc: &Scenario) -> Failure {
+    fn failure(&mut self, step: &Step, message: String, scope: &Scope, suite: &Suite, label: &str) -> Failure {
         let at = self.driver.run(&Command::Url {}).ok().map(|v| {
             (
                 v.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
                 v.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
             )
         });
-        let mut dir = evidence_name(&suite.file, &sc.name);
+        let mut dir = evidence_name(&suite.file, label);
         if self.attempt > 1 {
             dir.push_str(&format!("-try{}", self.attempt));
         }
@@ -287,7 +406,19 @@ impl Runner {
                 scope.saved.insert(name.clone(), text);
                 Ok(())
             }
-            Action::Expect(e) => self.expect(e, scope),
+            Action::Expect(e) => match self.expect(e, scope) {
+                // Noted; the scenario goes on and fails at its end.
+                Err(m) if e.soft => {
+                    scope.soft.push((step.clone(), m));
+                    Ok(())
+                }
+                r => r,
+            },
+            Action::As(name) => {
+                let path = self.login(name, suite)?;
+                self.command(&["state".into(), "load".into(), path.display().to_string()]).map(|_| ())
+            }
+            Action::Handoff(until) => self.handoff(until.as_ref(), step, scope),
             Action::If { cond, steps } => {
                 if self.expect(cond, scope).is_ok() {
                     for st in steps {
@@ -324,6 +455,120 @@ impl Runner {
         }
     }
 
+    /// The state file of an `auth` block: saved by running it once in a
+    /// browser context of its own, or reused from an earlier run within
+    /// its TTL.
+    fn login(&mut self, name: &str, suite: &Suite) -> Result<PathBuf, String> {
+        let auth = suite.auths.get(name).ok_or_else(|| format!("no auth named {name:?}"))?;
+        let slot = self.opts.auth.slot(name);
+        let mut done = slot.lock().map_err(|_| "auth: a worker failed while signing in".to_string())?;
+        if let Some(r) = done.as_ref() {
+            return r.clone().map_err(|e| format!("auth {name} failed earlier in this run: {e}"));
+        }
+        // Keyed by where it signs in: another base URL, another state.
+        let base = self.opts.base.clone().or_else(|| suite.base.clone()).unwrap_or_default();
+        let key = base.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+        let dir = std::path::absolute(".primavera/auth").unwrap_or_else(|_| PathBuf::from(".primavera/auth"));
+        let path = dir.join(format!("{name}-{:08x}.json", key as u32));
+        let reusable = auth.ttl_s.is_some_and(|ttl| {
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age.as_secs() < ttl)
+        });
+        let result = if reusable { Ok(path) } else { self.sign_in(auth, suite, &dir, path) };
+        *done = Some(result.clone());
+        result
+    }
+
+    fn sign_in(
+        &mut self,
+        auth: &crate::suite::Auth,
+        suite: &Suite,
+        dir: &Path,
+        path: PathBuf,
+    ) -> Result<PathBuf, String> {
+        let mut aux = Runner {
+            driver: self.driver.fork().map_err(|e| format!("auth {}: {e:#}", auth.name))?,
+            opts: self.opts.clone(),
+            fresh: true,
+            attempt: 1,
+        };
+        let label = format!("auth {}", auth.name);
+        let mut scope = Scope::new(suite, &label, BTreeMap::new(), &self.opts, &BTreeMap::new());
+        let file = auth.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        for st in &auth.steps {
+            aux.action(&st.action, st, &mut scope, suite, 0)
+                .map_err(|e| scope.masker()(&format!("auth {}, {file}:{} `{}`: {e}", auth.name, st.line, st.text)))?;
+        }
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        aux.command(&["state".into(), "save".into(), path.display().to_string()])?;
+        // Signed-in cookies: for this user only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(path)
+    }
+
+    /// The browser on screen for a person, until the clause holds (or
+    /// Enter); then off screen again. Nothing to do when it already holds.
+    fn handoff(&mut self, until: Option<&Expect>, step: &Step, scope: &mut Scope) -> Result<(), String> {
+        if let Some(c) = until {
+            if self.expect(&Expect { timeout_ms: Some(0), ..c.clone() }, scope).is_ok() {
+                return Ok(());
+            }
+        }
+        let show = !self.opts.headed;
+        if show {
+            if cfg!(target_os = "linux")
+                && std::env::var_os("DISPLAY").is_none()
+                && std::env::var_os("WAYLAND_DISPLAY").is_none()
+            {
+                return Err("handoff needs a person at a screen, and there is no display here (DISPLAY is unset): run it where there is one, or start signed in (`as <auth>`, `state load`)".into());
+            }
+            self.command(&["show".into()])?;
+        }
+        let what = match until {
+            Some(_) => {
+                format!("the run goes on once `{}` holds, or on Enter", step.text.trim_start_matches("handoff until "))
+            }
+            None => "press Enter when done".into(),
+        };
+        eprintln!("HANDOFF line {}: the browser is on screen for you; {what}", step.line);
+        let res = match until {
+            Some(c) => {
+                let deadline = Instant::now() + Duration::from_millis(c.timeout_ms.unwrap_or(300_000));
+                loop {
+                    let look = Expect { timeout_ms: Some(0), ..c.clone() };
+                    let entered = matches!(enter(Some(Duration::from_millis(250))), Ok(true));
+                    match self.expect(&look, scope) {
+                        Ok(()) => break Ok(()),
+                        Err(e) if entered || Instant::now() >= deadline => {
+                            break Err(format!("handoff: {e}"));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            None => match enter(None) {
+                Ok(_) => Ok(()),
+                Err(()) => {
+                    Err("handoff waits for Enter, and there is no terminal input here: give it `until <expect clause>`"
+                        .into())
+                }
+            },
+        };
+        if show {
+            if let Err(e) = self.command(&["hide".into()]) {
+                return res.and(Err(format!("handoff: back off screen: {e}")));
+            }
+        }
+        res
+    }
+
     /// One navigera command line, run in-process.
     fn command(&mut self, words: &[String]) -> Result<Value, String> {
         let words = self.absolute(words)?;
@@ -348,7 +593,7 @@ impl Runner {
         Ok(words)
     }
 
-    fn expect(&mut self, e: &Expect, scope: &Scope) -> Result<(), String> {
+    fn expect(&mut self, e: &Expect, scope: &mut Scope) -> Result<(), String> {
         let limit = Duration::from_millis(e.timeout_ms.unwrap_or(self.opts.expect_ms));
         let deadline = Instant::now() + limit;
         let value = scope.word(&e.value)?;
@@ -356,6 +601,12 @@ impl Runner {
             let left = deadline.saturating_duration_since(Instant::now());
             let (holds, actual) = self.check(e, &value, scope, left)?;
             if holds != e.negate {
+                // The file that came: `${download.path}`, `${download.name}`.
+                if let (Subject::Download(_), false) = (&e.subject, e.negate) {
+                    let name = Path::new(&actual).file_name().map(|n| n.to_string_lossy().into_owned());
+                    scope.saved.insert("download.name".into(), name.unwrap_or_default());
+                    scope.saved.insert("download.path".into(), actual);
+                }
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -377,7 +628,20 @@ impl Runner {
                 let actual = v.get(key).and_then(Value::as_str).unwrap_or("").to_string();
                 (compare(&actual, e.matcher, value), actual)
             }
-            Subject::Text(t) => {
+            Subject::Text { text, within: Some(flags) } => {
+                let t = scope.word(text)?;
+                let mut words = vec!["get".to_string(), "text".to_string()];
+                words.extend(scope.words(flags)?);
+                words.extend(["--timeout-ms".to_string(), poll_ms]);
+                match self.command(&words) {
+                    Ok(v) => {
+                        let inside = v.as_str().unwrap_or("").to_string();
+                        (inside.contains(&t), inside)
+                    }
+                    Err(err) => (false, err),
+                }
+            }
+            Subject::Text { text: t, within: None } => {
                 let t = scope.word(t)?;
                 if e.negate {
                     // Gone everywhere a user could read it: look now, again later.
@@ -427,31 +691,95 @@ impl Runner {
                     Err(err) => (false, err),
                 }
             }
-            Subject::Request { method, url, status } => {
+            Subject::Request { method, url, status, read } => {
                 let url = scope.word(url)?;
                 let v = self.command(&["network".into(), "--limit".into(), "1000".into()])?;
                 // `#3 POST 200 Fetch /api/cart 196 B 3 ms`; another origin's
                 // URL in full, matched by its path too.
                 let mut seen = Vec::new();
-                let mut hit = false;
+                let mut hits: Vec<String> = Vec::new();
                 for l in v.as_str().unwrap_or("").lines() {
                     let w: Vec<&str> = l.split_whitespace().collect();
                     if w.len() < 5 {
                         continue;
                     }
-                    let (m, st, u) = (w[1], w[2], w[4]);
+                    let (n, m, st, u) = (w[0], w[1], w[2], w[4]);
                     let path = u.split_once("://").and_then(|(_, r)| r.find('/').map(|i| &r[i..])).unwrap_or(u);
                     if crate::expect::glob(&url, u) || crate::expect::glob(&url, path) {
                         seen.push(format!("{m} {u} {st}"));
                         if (method == "*" || m.eq_ignore_ascii_case(method))
                             && status.as_deref().is_none_or(|s| s == st)
                         {
-                            hit = true;
+                            hits.push(n.trim_start_matches('#').to_string());
                         }
                     }
                 }
-                let actual = if seen.is_empty() { format!("no request to {url}") } else { seen.join(", ") };
-                (hit, actual)
+                let none = || if seen.is_empty() { format!("no request to {url}") } else { seen.join(", ") };
+                match read {
+                    RequestRead::Made => (!hits.is_empty(), none()),
+                    RequestRead::Count => {
+                        let n = hits.len().to_string();
+                        (compare(&n, e.matcher, value), format!("{n} ({})", none()))
+                    }
+                    RequestRead::Json(path) => match hits.last() {
+                        None => (false, none()),
+                        Some(n) => {
+                            let file =
+                                std::env::temp_dir().join(format!("primavera-body-{}-{n}.json", std::process::id()));
+                            let got = self.command(&[
+                                "network".into(),
+                                n.clone(),
+                                "--body-file".into(),
+                                file.display().to_string(),
+                            ]);
+                            let body = got.ok().and_then(|_| std::fs::read_to_string(&file).ok()).unwrap_or_default();
+                            let _ = std::fs::remove_file(&file);
+                            let steps = crate::expect::json_path(path)?;
+                            match serde_json::from_str::<Value>(&body) {
+                                Ok(json) => match crate::expect::json_at(&json, &steps) {
+                                    Some(actual) => (compare(&actual, e.matcher, value), actual),
+                                    None => (false, format!("no {path} in the response")),
+                                },
+                                Err(_) => {
+                                    let cut: String = body.chars().take(120).collect();
+                                    (false, format!("the response isn't JSON: {cut:?}"))
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+            Subject::Download(glob) => {
+                let glob = scope.word(glob)?;
+                let v = self.command(&["downloads".into(), "--json".into()])?;
+                let list = v.as_array().cloned().unwrap_or_default();
+                let name = |d: &Value| d.get("file").and_then(Value::as_str).unwrap_or("").to_string();
+                let done = list.iter().rev().find(|d| {
+                    crate::expect::glob(&glob, &name(d)) && d.get("state").and_then(Value::as_str) == Some("completed")
+                });
+                match done {
+                    Some(d) => {
+                        (true, d.get("path").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| name(d)))
+                    }
+                    None => {
+                        let seen: Vec<String> = list
+                            .iter()
+                            .map(|d| format!("{} ({})", name(d), d.get("state").and_then(Value::as_str).unwrap_or("?")))
+                            .collect();
+                        (false, if seen.is_empty() { "no download".into() } else { seen.join(", ") })
+                    }
+                }
+            }
+            Subject::Console => {
+                let v = self.command(&["console".into(), "--json".into()])?;
+                let texts: Vec<String> = v
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| m.get("text").and_then(Value::as_str).map(str::to_string))
+                    .collect();
+                let hit = texts.iter().any(|t| compare(t, e.matcher, value));
+                (hit, if texts.is_empty() { "no console messages".into() } else { texts.join(" | ") })
             }
             Subject::Cookie(name) => {
                 let name = scope.word(name)?;
@@ -486,6 +814,32 @@ impl Runner {
             Subject::Target { flags, prop } => {
                 let flags = scope.words(flags)?;
                 match prop {
+                    Prop::State(state) if state == "empty" => {
+                        // No text, and no value when it takes one.
+                        let read = |r: &mut Self, what: &str| -> Result<String, String> {
+                            let mut words = vec!["get".to_string(), what.to_string()];
+                            words.extend(flags.clone());
+                            words.extend(["--timeout-ms".to_string(), poll_ms.clone()]);
+                            r.command(&words).map(|v| match v {
+                                Value::String(s) => s,
+                                Value::Null => String::new(),
+                                other => other.to_string(),
+                            })
+                        };
+                        match read(self, "text") {
+                            Ok(text) => {
+                                let value = read(self, "value").unwrap_or_default();
+                                let empty = text.trim().is_empty() && value.is_empty();
+                                let seen = if empty {
+                                    "empty".to_string()
+                                } else {
+                                    format!("{:?}", if value.is_empty() { text.trim() } else { &value })
+                                };
+                                (empty, seen)
+                            }
+                            Err(err) => (false, err),
+                        }
+                    }
                     Prop::State(state) => {
                         let (asked, flip) =
                             if state == "unchecked" { ("checked", true) } else { (state.as_str(), false) };
@@ -506,12 +860,13 @@ impl Runner {
                         let actual = v.to_string();
                         (compare(&actual, e.matcher, value), actual)
                     }
-                    Prop::Text | Prop::Value | Prop::Attr(_) => {
+                    Prop::Text | Prop::Value | Prop::Attr(_) | Prop::Style(_) => {
                         let mut words = vec!["get".to_string()];
                         match prop {
                             Prop::Text => words.push("text".into()),
                             Prop::Value => words.push("value".into()),
                             Prop::Attr(name) => words.extend(["attr".to_string(), name.clone()]),
+                            Prop::Style(name) => words.extend(["style".to_string(), name.clone()]),
                             _ => unreachable!(),
                         }
                         words.extend(flags);
@@ -557,12 +912,23 @@ fn describe(e: &Expect, value: &str, actual: &str, limit: Duration) -> String {
     let what = match &e.subject {
         Subject::Url => "url".to_string(),
         Subject::Title => "title".to_string(),
-        Subject::Text(t) => format!("text {t:?}"),
+        Subject::Text { text, within: None } => format!("text {text:?}"),
+        Subject::Text { text, within: Some(w) } => format!("text {text:?} within {}", w.join(" ")),
+        Subject::Download(g) => format!("a download {g:?}"),
+        Subject::Console => "a console message".to_string(),
         Subject::Var(v) => v.clone(),
         Subject::Errors => "no page errors".to_string(),
         Subject::Js(c) => format!("js {c:?}"),
-        Subject::Request { method, url, status } => {
-            format!("request {method} {url}{}", status.as_ref().map(|s| format!(" status {s}")).unwrap_or_default())
+        Subject::Request { method, url, status, read } => {
+            let read = match read {
+                RequestRead::Made => String::new(),
+                RequestRead::Json(p) => format!(" json {p}"),
+                RequestRead::Count => " count".to_string(),
+            };
+            format!(
+                "request {method} {url}{}{read}",
+                status.as_ref().map(|s| format!(" status {s}")).unwrap_or_default()
+            )
         }
         Subject::Cookie(c) => format!("cookie {c}"),
         Subject::Storage { area, key } => format!("storage {area} {key}"),
@@ -572,6 +938,7 @@ fn describe(e: &Expect, value: &str, actual: &str, limit: Duration) -> String {
                 Prop::Text => "text".into(),
                 Prop::Value => "value".into(),
                 Prop::Attr(a) => format!("attr {a}"),
+                Prop::Style(a) => format!("style {a}"),
                 Prop::Count => "count".into(),
             };
             format!("{} {p}", flags.join(" "))
@@ -607,38 +974,78 @@ struct Scope {
     saved: BTreeMap<String, String>,
     /// The scenario's data row.
     row: BTreeMap<String, String>,
+    /// What the file's `before all` saved.
+    before_all: BTreeMap<String, String>,
     run: BTreeMap<String, String>,
     file: BTreeMap<String, String>,
+    /// `${scenario.name}`, `${run.id}`.
+    name: String,
+    run_id: String,
+    secrets: BTreeMap<String, String>,
+    /// The secrets' values used so far: masked in what the run prints.
+    used_secrets: RefCell<BTreeSet<String>>,
     noop: Option<String>,
     /// Optional steps that didn't happen.
     notes: Vec<String>,
+    /// `--soft` expectations that didn't hold, and why.
+    soft: Vec<(Step, String)>,
 }
 
 impl Scope {
-    fn new(suite: &Suite, scenario: &Scenario, opts: &Options) -> Self {
+    fn new(
+        suite: &Suite,
+        name: &str,
+        row: BTreeMap<String, String>,
+        opts: &Options,
+        before_all: &BTreeMap<String, String>,
+    ) -> Self {
         Scope {
             layers: Vec::new(),
             saved: BTreeMap::new(),
-            row: scenario.vars.clone(),
+            row,
+            before_all: before_all.clone(),
             run: opts.vars.clone(),
             file: suite.vars.clone(),
+            name: name.to_string(),
+            run_id: opts.run_id.clone(),
+            secrets: opts.secrets.clone(),
+            used_secrets: RefCell::new(BTreeSet::new()),
             noop: None,
             notes: Vec::new(),
+            soft: Vec::new(),
         }
     }
 
-    /// A flow's arguments, then what was saved, the data row, `--var`,
-    /// the file's `set`s, the environment.
+    /// A flow's arguments, then what was saved, the data row, the file's
+    /// `before all`, `--var`, the file's `set`s, the environment.
     fn lookup(&self, name: &str) -> Option<String> {
+        if let Some(key) = name.strip_prefix("secret:") {
+            let v = std::env::var(key).ok().or_else(|| self.secrets.get(key).cloned())?;
+            self.used_secrets.borrow_mut().insert(v.clone());
+            return Some(v);
+        }
+        match name {
+            "run.id" => return Some(self.run_id.clone()),
+            "scenario.name" => return Some(self.name.clone()),
+            _ => {}
+        }
         self.layers
             .last()
             .and_then(|l| l.get(name))
             .or_else(|| self.saved.get(name))
             .or_else(|| self.row.get(name))
+            .or_else(|| self.before_all.get(name))
             .or_else(|| self.run.get(name))
             .or_else(|| self.file.get(name))
             .cloned()
             .or_else(|| std::env::var(name).ok())
+    }
+
+    /// Replaces the secrets' values in a text with `***`.
+    fn masker(&self) -> impl Fn(&str) -> String {
+        let mut values: Vec<String> = self.used_secrets.borrow().iter().filter(|v| v.len() >= 3).cloned().collect();
+        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        move |text: &str| values.iter().fold(text.to_string(), |t, v| t.replace(v.as_str(), "***"))
     }
 
     fn word(&self, w: &str) -> Result<String, String> {
@@ -647,5 +1054,47 @@ impl Scope {
 
     fn words(&self, ws: &[String]) -> Result<Vec<String>, String> {
         ws.iter().map(|w| self.word(w)).collect()
+    }
+}
+
+/// Lines typed on stdin, read by one thread for the whole run (pauses and
+/// handoffs wait on it).
+fn stdin_lines() -> &'static Mutex<mpsc::Receiver<Option<String>>> {
+    static LINES: OnceLock<Mutex<mpsc::Receiver<Option<String>>>> = OnceLock::new();
+    LINES.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || loop {
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    let _ = tx.send(None);
+                    return;
+                }
+                Ok(_) => {
+                    if tx.send(Some(line)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Mutex::new(rx)
+    })
+}
+
+/// Waits for Enter, at most `wait` (none: as long as it takes): whether it
+/// came; `Err` when stdin is closed.
+fn enter(wait: Option<Duration>) -> Result<bool, ()> {
+    let rx = stdin_lines().lock().map_err(|_| ())?;
+    let got = match wait {
+        Some(d) => match rx.recv_timeout(d) {
+            Ok(v) => Some(v),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(false),
+            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+        },
+        None => rx.recv().ok(),
+    };
+    match got {
+        Some(Some(_)) => Ok(true),
+        _ => Err(()),
     }
 }
