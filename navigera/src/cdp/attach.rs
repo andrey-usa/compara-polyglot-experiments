@@ -124,6 +124,14 @@ pub(crate) fn live_endpoint(dir: &Path) -> Option<String> {
 }
 
 /// The browser WebSocket endpoint for an `--attach` value.
+/// `ws://host:port/devtools/page/<id>`: one tab of a running browser, to
+/// work in as it is (the browser's `http://host:port`, the tab's target id).
+pub fn page_endpoint(spec: &str) -> Option<(String, String)> {
+    let rest = spec.trim().strip_prefix("ws://")?;
+    let (hostport, id) = rest.split_once("/devtools/page/")?;
+    (!hostport.is_empty() && !id.is_empty() && !id.contains('/')).then(|| (format!("http://{hostport}"), id.to_string()))
+}
+
 pub fn resolve(spec: &str) -> Result<String> {
     let spec = spec.trim();
     if spec.starts_with("ws://") || spec.starts_with("wss://") {

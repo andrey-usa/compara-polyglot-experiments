@@ -21,6 +21,8 @@ pub struct Download {
     /// Where it was saved, once complete (none when the browser keeps it,
     /// as with `--attach`).
     pub path: Option<PathBuf>,
+    /// The scope (browser context) of the tab that started it.
+    pub scope: String,
 }
 
 impl Download {
@@ -45,7 +47,9 @@ pub struct Downloads {
 }
 
 impl Downloads {
-    pub fn on_event(&mut self, method: &str, params: &Value) {
+    /// `scope`: the scope of the tab the download started in (see
+    /// `events::Scope`), for `downloadWillBegin`.
+    pub fn on_event(&mut self, method: &str, params: &Value, scope: &str) {
         let guid = params.get("guid").and_then(Value::as_str).unwrap_or("").to_string();
         match method {
             "Browser.downloadWillBegin" => {
@@ -60,6 +64,7 @@ impl Downloads {
                     received: 0,
                     total: 0,
                     path: None,
+                    scope: scope.to_string(),
                 });
                 if self.items.len() > 1000 {
                     self.items.remove(0);
@@ -143,10 +148,12 @@ mod tests {
             d.on_event(
                 "Browser.downloadWillBegin",
                 &json!({"guid": guid, "url": "http://x/r.csv", "suggestedFilename": "r.csv"}),
+                "",
             );
             d.on_event(
                 "Browser.downloadProgress",
                 &json!({"guid": guid, "receivedBytes": 2, "totalBytes": 2, "state": "completed"}),
+                "",
             );
         }
         let names: Vec<String> = d

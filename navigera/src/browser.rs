@@ -711,8 +711,16 @@ impl BrowserSession {
             AttachTarget::Running(_) => None,
         };
         let mut profile_exe = None;
+        // A tab's own endpoint: work in that tab, not a new one.
+        let adopt = match target {
+            AttachTarget::Running(spec) => cdp::attach::page_endpoint(spec),
+            AttachTarget::Profile { .. } => None,
+        };
         let (ws_url, what) = match target {
-            AttachTarget::Running(spec) => (cdp::attach::resolve(spec)?, format!("attach {spec}")),
+            AttachTarget::Running(spec) => match &adopt {
+                Some((http, _)) => (cdp::attach::resolve(http)?, format!("attach {spec}")),
+                None => (cdp::attach::resolve(spec)?, format!("attach {spec}")),
+            },
             AttachTarget::Profile { name, executable, headless, from, from_profile } => {
                 let dir = cdp::attach::profile_dir(name)?;
                 let Some(exe) = resolve_executable_for(executable.as_deref(), *headless && !natural()) else {
@@ -735,7 +743,10 @@ impl BrowserSession {
         let browser = Browser::connect(&handle, &ws_url, Duration::from_secs(120))?;
         crate::timing::log(&format!("[browser] {what}: connected to {ws_url}"));
         crate::timing::record("browser_up", started);
-        let page = browser.new_page_in(Some("about:blank"), true)?;
+        let page = match &adopt {
+            Some((_, id)) => browser.attach_page(id, "").with_context(|| format!("no tab {id} in that browser"))?,
+            None => browser.new_page_in(Some("about:blank"), true)?,
+        };
         // A `--profile` browser is navigera's: its downloads go where ours
         // do. The user's own browser (`--attach`) keeps its own setting;
         // navigera only listens.
@@ -807,12 +818,13 @@ impl BrowserSession {
         &self.pages[self.active]
     }
 
-    /// Downloads so far (`clear` empties the list afterwards).
+    /// This session's downloads so far (`clear` empties its list afterwards).
     pub fn downloads(&self, clear: bool) -> Vec<cdp::downloads::Download> {
+        let scope = self.scope();
         let mut d = self.browser.shared().downloads.lock().unwrap();
-        let out = d.items.clone();
+        let out: Vec<_> = d.items.iter().filter(|x| x.scope == scope).cloned().collect();
         if clear {
-            d.items.clear();
+            d.items.retain(|x| x.scope != scope);
         }
         out
     }
@@ -877,9 +889,11 @@ impl BrowserSession {
     /// A clean slate in the same browser: a new browser context (no
     /// cookies, storage or cache from before, like a fresh incognito
     /// window) with one blank tab; the session's old tabs close. `set`
-    /// emulation, routes and init scripts carry over. Tens of milliseconds,
-    /// against a few hundred for a new browser.
-    pub fn reset(&mut self) -> Result<()> {
+    /// emulation, routes, credentials, init scripts and the dialog answer
+    /// carry over, unless `all`: then the session starts as a new one
+    /// would. Tens of milliseconds, against a few hundred for a new
+    /// browser.
+    pub fn reset(&mut self, all: bool) -> Result<()> {
         if self.lightpanda {
             bail!("reset needs the chrome engine (Lightpanda has one context per process): start a new session");
         }
@@ -887,6 +901,13 @@ impl BrowserSession {
         // The user's own browser (`--attach`) keeps its download setting.
         let dir = if self.attached && self.profile_dir.is_none() { None } else { download_dir().ok() };
         let _ = self.browser.enable_downloads_in(dir.as_deref(), Some(&context));
+        // Before the new tab exists, so its first requests see its routes.
+        self.browser.shared().move_scope(&self.scope(), &context, !all);
+        if all {
+            self.overrides.clear();
+            self.init_scripts.clear();
+            self.init_ids.clear();
+        }
         let page = self.browser.new_page_with(Some("about:blank"), false, Some(&context))?;
         self.apply_overrides(&page);
         self.apply_init_scripts(&page);
@@ -907,10 +928,12 @@ impl BrowserSession {
 
     /// Another session on the same browser, in a browser context of its
     /// own (cookies, storage, cache and tabs apart), for running several
-    /// sessions at once without a browser each. The process-wide settings
-    /// (element wait, download directory, natural mode) are shared; so is the
-    /// dialog policy. Closing a fork closes its context; the browser closes
-    /// with the session it was forked from.
+    /// sessions at once without a browser each. Routes, credentials, init
+    /// scripts, `set` emulation and the dialog answer are each session's
+    /// own (a fork starts with none); the process-wide settings (element
+    /// wait, download directory, natural mode) are shared. Closing a fork
+    /// closes its context; the browser closes with the session it was
+    /// forked from.
     pub fn fork(&self) -> Result<BrowserSession> {
         if self.lightpanda {
             bail!("the lightpanda engine has one context per process: start another session instead");
@@ -1003,7 +1026,7 @@ impl BrowserSession {
             if self.attached && !self.pages.iter().any(|p| p.target_id() == opener) {
                 continue;
             }
-            match self.browser.attach_page(&target_id) {
+            match self.browser.attach_page(&target_id, &self.scope()) {
                 Ok(page) => {
                     self.apply_overrides(&page);
                     self.apply_init_scripts(&page);
@@ -1369,10 +1392,18 @@ impl BrowserSession {
         }
     }
 
+    /// The key of this session's routes, credentials and dialog answer:
+    /// its browser context ("" for the default one). Other sessions on the
+    /// same browser (forks) have their own.
+    fn scope(&self) -> String {
+        self.context.clone().unwrap_or_default()
+    }
+
     /// Add a `route` rule (a rule with the same pattern is replaced).
     pub fn add_route(&mut self, route: cdp::Route) -> Result<()> {
         {
-            let mut routes = self.browser.shared().routes.lock().unwrap();
+            let mut all = self.browser.shared().routes.lock().unwrap();
+            let routes = all.entry(self.scope()).or_default();
             routes.retain(|r| r.pattern != route.pattern);
             routes.push(route);
         }
@@ -1382,7 +1413,8 @@ impl BrowserSession {
     /// Remove the rule for `pattern`, or every rule; returns how many went.
     pub fn remove_routes(&mut self, pattern: Option<&str>) -> Result<usize> {
         let removed = {
-            let mut routes = self.browser.shared().routes.lock().unwrap();
+            let mut all = self.browser.shared().routes.lock().unwrap();
+            let routes = all.entry(self.scope()).or_default();
             let before = routes.len();
             routes.retain(|r| pattern.is_some_and(|p| r.pattern != p));
             before - routes.len()
@@ -1392,13 +1424,19 @@ impl BrowserSession {
     }
 
     pub fn routes(&self) -> Vec<cdp::Route> {
-        self.browser.shared().routes.lock().unwrap().clone()
+        self.browser.shared().routes.lock().unwrap().get(&self.scope()).cloned().unwrap_or_default()
     }
 
-    /// HTTP auth credentials for every origin (`None`: answer challenges
-    /// the browser's way, i.e. fail them).
+    /// HTTP auth credentials for every origin this session's tabs visit
+    /// (`None`: answer challenges the browser's way, i.e. fail them).
     pub fn set_credentials(&mut self, credentials: Option<(String, String)>) -> Result<()> {
-        *self.browser.shared().credentials.lock().unwrap() = credentials;
+        {
+            let mut all = self.browser.shared().credentials.lock().unwrap();
+            match credentials {
+                Some(c) => all.insert(self.scope(), c),
+                None => all.remove(&self.scope()),
+            };
+        }
         self.sync_fetch()
     }
 
@@ -1407,11 +1445,20 @@ impl BrowserSession {
     /// on navigera.
     fn sync_fetch(&mut self) -> Result<()> {
         let shared = self.browser.shared();
-        let auth = shared.credentials.lock().unwrap().is_some();
+        let scope = self.scope();
+        let auth = shared.credentials.lock().unwrap().contains_key(&scope);
         let patterns: Vec<serde_json::Value> = if auth {
             vec![serde_json::json!({ "urlPattern": "*" })]
         } else {
-            shared.routes.lock().unwrap().iter().map(|r| serde_json::json!({ "urlPattern": r.pattern })).collect()
+            shared
+                .routes
+                .lock()
+                .unwrap()
+                .get(&scope)
+                .into_iter()
+                .flatten()
+                .map(|r| serde_json::json!({ "urlPattern": r.pattern }))
+                .collect()
         };
         if patterns.is_empty() {
             return self.set_override("fetch", vec![], vec![("Fetch.disable", serde_json::json!({}))]);
@@ -1495,12 +1542,13 @@ impl BrowserSession {
     /// Dialogs answered since the last call (`{type, message, accepted}`).
     pub fn take_dialogs(&self) -> Vec<serde_json::Value> {
         self.browser.caught_up();
-        self.browser.shared().take_dialogs()
+        self.browser.shared().take_dialogs(&self.scope())
     }
 
-    /// How future `alert`/`confirm`/`prompt` dialogs are answered.
+    /// How future `alert`/`confirm`/`prompt` dialogs in this session's tabs
+    /// are answered.
     pub fn set_dialog_policy(&self, accept: bool, prompt_text: Option<String>) {
-        self.browser.set_dialog_policy(DialogPolicy { accept, prompt_text });
+        self.browser.set_dialog_policy(&self.scope(), DialogPolicy { accept, prompt_text });
     }
 
     /// Wait for a navigation an earlier action started in the active tab.
@@ -1944,6 +1992,15 @@ impl BrowserSession {
     /// The CDP WebSocket endpoint this session is attached to.
     pub fn endpoint(&self) -> String {
         self.browser.ws_url().to_string()
+    }
+
+    /// The active tab's own endpoint (`ws://host:port/devtools/page/<id>`),
+    /// for another session to `--attach` to and work in that very tab; none
+    /// over the pipe transport.
+    pub fn page_endpoint(&self) -> Option<String> {
+        let ws = self.endpoint();
+        let (hostport, _) = ws.strip_prefix("ws://")?.split_once("/devtools/")?;
+        Some(format!("ws://{hostport}/devtools/page/{}", self.active_tab().target_id()))
     }
 
     /// Shut the browser down. (Lightpanda is now launched directly as
