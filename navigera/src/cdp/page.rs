@@ -233,7 +233,7 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button,
     // the page hasn't wired up yet) from one that did something: changes to
     // the DOM of the page, of the element's document and of the shadow roots
     // around the element; events a DOM observer can't see (input, change,
-    // submit, toggle, invalid, a scroll, a navigation starting); focus moving
+    // submit, toggle, invalid, copy, a scroll, a navigation starting); focus moving
     // elsewhere; form values, the URL or the scroll position a script set.
     // A field, a <select> and a right or middle click are left out: what
     // they open isn't in the DOM. `Page::click_effect` reads it, removes it.
@@ -276,7 +276,8 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button,
             };
             const wins = w === top ? [top] : [top, w];
             for (const v of wins) {
-                for (const t of ['input', 'change', 'submit', 'reset', 'toggle', 'scroll', 'select', 'invalid', 'hashchange', 'play', 'pause']) {
+                for (const t of ['input', 'change', 'submit', 'reset', 'toggle', 'scroll', 'select', 'invalid', 'hashchange',
+                    'play', 'pause', 'copy', 'cut', 'fullscreenchange']) {
                     v.addEventListener(t, onEvent, true);
                     fx.offs.push(() => v.removeEventListener(t, onEvent, true));
                 }
@@ -833,8 +834,25 @@ const WAIT_TEXT: &str = r#"async function (text, ms, what, deep) {
     const SKIP = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT', 'HEAD', 'TITLE', 'META', 'LINK']);
     const ACTION = 'a,button,input,select,textarea,summary,label,option,[role],[onclick],[tabindex],[contenteditable=""],[contenteditable="true"]';
     const maxLen = want.length * 4 + 40;
-    const label = (el) => norm(el.getAttribute('aria-label') || (el.labels && el.labels[0] && el.labels[0].innerText)
-        || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt'));
+    // How an element reads: what it shows and what names it. A button
+    // showing "Add to cart" whose aria-label is "Add Carbon Gear to cart"
+    // matches "Add to cart" by what it shows, and wins over the product card
+    // around it that merely contains the phrase.
+    const readings = (el) => [el.getAttribute('aria-label'), el.labels && el.labels[0] && el.labels[0].innerText,
+        el.value, el.getAttribute('placeholder'), el.getAttribute('title'), el.getAttribute('alt'),
+        textLen(el) <= maxLen * 2 ? el.innerText : null];
+    // The closest reading: exact, else the shortest that contains the phrase.
+    const match = (el) => {
+        let has = null;
+        for (const raw of readings(el)) {
+            if (typeof raw !== 'string') continue;
+            const l = norm(raw);
+            if (!l || l.length > maxLen) continue;
+            if (l === want) return { exact: true, l };
+            if (l.includes(want) && (!has || l.length < has.l.length)) has = { exact: false, l };
+        }
+        return has;
+    };
     // Candidates without touching layout: parents of text nodes holding the
     // phrase (and a few small ancestors, for text split across inline
     // tags), plus elements whose label comes from attributes or a value.
@@ -883,13 +901,11 @@ const WAIT_TEXT: &str = r#"async function (text, ms, what, deep) {
         for (const d of deep.docs()) {
             for (const el of candidates(d.body || d.documentElement)) {
                 if (SKIP.has(el.tagName) || el.closest('head')) continue;
-                const l = label(el);
-                if (!l || l.length > maxLen) continue;
-                const exact = l === want, has = l.includes(want);
-                if (!exact && !has) continue;
+                const m = match(el);
+                if (!m) continue;
                 // Visible beats everything: an exact match on a hidden element
                 // must not win over the button the agent can see.
-                const score = (visible(el) ? 8 : 0) + (exact ? 4 : 0) + (el.matches(ACTION) ? 2 : 0) - l.length / 1000;
+                const score = (visible(el) ? 8 : 0) + (m.exact ? 4 : 0) + (el.matches(ACTION) ? 2 : 0) - m.l.length / 1000;
                 if (score > bestScore) { best = el; bestScore = score; }
             }
             if (best) break;

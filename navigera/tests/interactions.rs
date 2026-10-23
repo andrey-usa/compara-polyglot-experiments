@@ -360,6 +360,11 @@ fn clicks_only_claim_what_a_user_could_do() {
     // Enabled after 600 ms: the click waits for it.
     s.ok(&["click", "--selector", "#unlock-later"]);
     assert_eq!(s.text(&["get", "text", "--selector", "#out"]), "unlocked");
+    // By what it shows: the button, not the product card around it (its
+    // aria-label says something longer).
+    let r = s.ok(&["click", "--text", "Add to cart"]);
+    assert!(r.get("no_effect").is_none(), "{r}");
+    assert_eq!(s.text(&["get", "text", "--selector", "#out"]), "added");
     let err = s.fails(&["fill", "--selector", "#ro", "x", "--timeout-ms", "300"]);
     assert!(err.contains("read-only"), "{err}");
     let err = s.fails(&["fill", "--selector", "#off", "x", "--timeout-ms", "300"]);
@@ -393,8 +398,8 @@ fn a_click_that_changes_nothing_says_so() {
     let (true, Some(site)) = (chrome(), site()) else { return };
     let s = Session::start("effects", &[]);
     s.ok(&["goto", &format!("{}/effects", site.url)]);
-    // Close is wired 1.5 s after load: clicked at once, nothing happens, and
-    // the click says so instead of a plain success.
+    // Close isn't wired yet: nothing happens, and the click says so instead
+    // of a plain success.
     let r = s.ok(&["click", "--selector", "#late"]);
     let note = r["no_effect"].as_str().unwrap_or_default();
     assert!(note.contains("nothing on the page changed"), "{r}");
@@ -402,7 +407,7 @@ fn a_click_that_changes_nothing_says_so() {
     let r = s.ok(&["click", "--selector", "#noop"]);
     assert!(r.get("no_effect").is_some(), "{r}");
     // Once wired, the same click works and claims nothing extra.
-    std::thread::sleep(std::time::Duration::from_millis(1600));
+    s.ok(&["eval", "wire()"]);
     let r = s.ok(&["click", "--selector", "#late"]);
     assert!(r.get("no_effect").is_none(), "{r}");
     assert_eq!(s.text(&["get", "text", "--selector", "#out"]), "closed");
@@ -415,6 +420,7 @@ fn a_click_that_changes_nothing_says_so() {
         ("#send", "request"),
         ("#later", "change 80 ms later"),
         ("#next", "scrolled strip"),
+        ("#copy", "copied to the clipboard"),
     ] {
         let r = s.ok(&["click", "--selector", target]);
         assert!(r.get("no_effect").is_none(), "{what}: {r}");

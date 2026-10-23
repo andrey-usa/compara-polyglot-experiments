@@ -308,6 +308,8 @@ PAGES["/honesty"] = ("honesty", "", """
 <button id=save disabled onclick="out('saved')">Save</button>
 <button id=unlock-later disabled onclick="out('unlocked')">Unlocks soon</button>
 <input id=ro readonly value=fixed> <input id=off disabled>
+<article style="width:300px;padding:40px;border:1px solid #888"><h3>Carbon Gear</h3><div>$34.82</div>
+<button aria-label="Add Carbon Gear to cart" onclick="out('added')">Add to cart</button></article>
 <p id=out>none</p>
 <script>
 function out(t) { document.getElementById('out').textContent = t; }
@@ -323,17 +325,21 @@ PAGES["/effects"] = ("effects", "#strip{width:200px;overflow-x:auto;white-space:
 <button id=send>Send</button>
 <button id=later>Later</button>
 <div id=strip><span>a</span><span>b</span><span>c</span></div> <button id=next>Next</button>
-<a id=self href="#">Top</a>
+<a id=self href="#">Top</a> <button id=copy>Copy</button>
 <x-panel id=panel></x-panel> <x-badge id=badge></x-badge>
 <p id=out>none</p>
 <script>
 const out = (t) => { document.getElementById('out').textContent = t; };
-// Close is wired only once the page has "loaded its scripts".
-setTimeout(() => { document.getElementById('late').onclick = () => out('closed'); }, 1500);
+// Close is wired only once the page has "loaded its scripts": here when
+// the test says so (`wire()`), on a real page a moment after load.
+function wire() { document.getElementById('late').onclick = () => out('closed'); }
 // Clear sets the field from script: no DOM change, no event.
 document.getElementById('clear').onclick = () => { document.getElementById('q').value = ''; };
 // Send only starts a request.
 document.getElementById('send').onclick = () => { fetch('/slow-echo?ms=400'); };
+// Copy puts text on the clipboard and shows nothing.
+document.addEventListener('copy', (e) => { e.clipboardData.setData('text/plain', 'ref 42'); e.preventDefault(); });
+document.getElementById('copy').onclick = () => { document.execCommand('copy'); };
 document.getElementById('later').onclick = () => setTimeout(() => out('later'), 80);
 document.getElementById('next').onclick = () => { document.getElementById('strip').scrollLeft += 150; };
 // A button in one shadow root changes text in another one.

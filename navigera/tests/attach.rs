@@ -121,20 +121,31 @@ impl Drop for Browser {
 #[test]
 fn attach_never_closes_the_users_browser() {
     let Some(exe) = chrome() else { return };
-    let profile = tempfile::tempdir().unwrap();
-    // The user's own browser, with one tab of theirs open.
-    let mut user = Browser(
-        Command::new(&exe)
-            .args(["--headless=new", "--no-sandbox", "--no-first-run", "--remote-debugging-port=0"])
-            .arg(format!("--user-data-dir={}", profile.path().display()))
-            .arg("data:text/html,<title>Mine</title>users%20own%20tab")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start the user's browser"),
-    );
-    let (port, _) = active_port(profile.path(), Duration::from_secs(30)).expect("DevToolsActivePort");
+    // The user's own browser, with one tab of theirs open. A CI Windows
+    // runner sometimes starts Chrome without it ever writing its
+    // DevToolsActivePort: a second launch, on a fresh profile, gets one.
+    let launch = || {
+        let profile = tempfile::tempdir().unwrap();
+        let mut user = Browser(
+            Command::new(&exe)
+                .args(["--headless=new", "--no-sandbox", "--no-first-run", "--remote-debugging-port=0"])
+                .arg(format!("--user-data-dir={}", profile.path().display()))
+                .arg("data:text/html,<title>Mine</title>users%20own%20tab")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start the user's browser"),
+        );
+        match active_port(profile.path(), Duration::from_secs(20)) {
+            Some((port, _)) => Some((user, profile, port)),
+            None => {
+                eprintln!("no DevToolsActivePort after 20 s (exited: {:?}); launching again", user.0.try_wait());
+                None
+            }
+        }
+    };
+    let (mut user, profile, port) = launch().or_else(launch).expect("DevToolsActivePort");
     let dir = profile.path().display().to_string();
     let s = session_name("user");
 
