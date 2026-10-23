@@ -55,6 +55,8 @@ navigera -s work --raw ax --selector main           # read only text you must re
 - Every command prints one JSON line: `{"ok":true,"result":…}` or
   `{"ok":false,"error":"…"}` (exit code 1). Add `--raw` to print only the
   result. Strings are printed as plain text, which is best for `ax` and `eval`.
+  With `--raw` an error goes to stderr (`error: …`) and stdout stays empty:
+  read stderr, or the exit code.
 - Actions return `{tab, tabs, url, title}`, so you can see where you ended up.
 - The browser, its tabs and its cookies persist between commands of the same
   session. `-s <name>` is short for `--session <name>`. `$NAVIGERA_SESSION`
@@ -170,11 +172,12 @@ page "Checkout — Acme" http://shop.test/checkout
 | `eval "<js>"` | run JavaScript in the page; arrow functions are called; result printed as JSON. `eval --file f.js` / `eval -` (stdin) for scripts with quotes |
 | `back` / `forward` / `reload` | history |
 | `screenshot [file.png] [--full-page]` | PNG of the viewport or the whole page |
-| `tab-new [url]`, `tab-list`, `tab-select <i>`, `tab-close [<i>]` | tabs |
+| `tab-new [url]`, `tab-list`, `tab-select <i or target id>`, `tab-close [<i>]` | tabs; a target id from `tab-list` stays right when tabs open and close |
 | `dialog --accept\|--dismiss [--prompt-text t]` | how future `alert`/`confirm`/`prompt` dialogs are answered |
 
 Element commands wait up to 5 s for the element to appear. Pass
-`--timeout-ms <ms>` to wait longer. Besides a ref, `--selector` and
+`--timeout-ms <ms>` to wait longer, or `start --wait-ms <ms>` once for a slow
+app. Besides a ref, `--selector` and
 `--text`, they take `--role button --name "Save"`, `--label "Email"`,
 `--placeholder …`, `--testid …`, and `--nth <i>` (`-1` = last).
 
@@ -188,7 +191,9 @@ Element commands wait up to 5 s for the element to appear. Pass
 | `dblclick`, `focus`, `keydown Shift`/`keyup Shift`, `insert-text "…"` | the rest of the keyboard and mouse |
 | `drag 12 15`, `drag --from-text "Task 1" --to-text "Done"` | drag and drop, sliders, sortable lists |
 | `errors`, `console [--level warn]` | what the page logged; an action whose handler threw says so in `notes` |
-| `network [--failed] [--filter api]`, `network <n>` | requests one line each; one request with its body |
+| `network [--failed] [--filter api] [--since <n>]`, `network <n>` | requests one line each (`--since`: what fired after request #n); one request with its body |
+| `click … --button right`, `select <ref> a b`, `select <ref> --add c` | right click (context menu); several options at once, or added to a multiple select |
+| `downloads`, `wait --download "*.csv"` | files the page downloaded, with their paths |
 | `cookies`, `cookies set <name> <value>`, `storage [get\|set k v]` | cookies and localStorage |
 | `state save auth.json` … `state load auth.json` | sign in once, reuse the session later (Playwright storageState format) |
 | `set device "iPhone 15"`, `set viewport 1280 720`, `set media dark`, `set geo <lat> <lon>`, `set offline on`, `set credentials <user> <pass>` | emulate (`off` resets) |
@@ -207,14 +212,16 @@ Element commands wait up to 5 s for the element to appear. Pass
   ready. The next command never reads the old page. A page that never
   finishes loading is used as it is after about 5 s, and the response says
   `"loading": true`: `wait --text …` for what you need.
-- **Covered elements:** if a toast or overlay covers the target, the click
-  waits up to 3 s. If it is still covered, a DOM click is sent instead and the
-  response says `synthetic_click: "element is covered by …"`. A cookie banner
-  usually needs its own click first. Styled checkboxes and radios are
-  clicked through their label automatically.
-- **Iframes:** refs work inside any iframe, cross-origin included.
-  `--selector` and `--text` only search the top page (and its open shadow
-  roots), so act on iframe content by ref.
+- **Moving and covered elements:** a click waits for the element to stop
+  moving (a dialog sliding in) and for whatever covers it (a toast, a
+  sticky bar) to go. If something still covers it, the click fails and
+  names it: close that first (a cookie banner usually needs its own click).
+  `click --force` sends DOM events to the element anyway. Styled checkboxes
+  and radios are clicked through their label automatically.
+- **Iframes and shadow DOM:** refs work inside any iframe, cross-origin
+  included. `--selector`, `--text` and the locators also look inside
+  same-origin iframes and open shadow roots when the page itself has no
+  match; inside a cross-origin iframe, act by ref.
 - **Files:** `upload ./doc.txt` and `screenshot shot.png` use paths relative
   to your current directory.
 

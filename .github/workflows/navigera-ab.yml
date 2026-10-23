@@ -1,14 +1,15 @@
 name: navigera A/B
 
-# Did the hand-off work slow navigera down? The `navigera/` copy (head, plain
-# and --natural) against `navigera-base/` (the branch it started from), on
-# one runner with its own Chrome, rounds interleaved: a cold one-shot command
-# and a session (start, goto, ax, eval, quit) against the bench site.
+# Did the interaction fixes slow navigera down? The `navigera/` copy (head,
+# plain and --natural) against `navigera-base/` (the branch it started
+# from), on one runner with its own Chrome, rounds interleaved: a cold
+# one-shot command and a session (start, goto, ax, fill, click, click by
+# text, eval, quit) against the bench site.
 # Results are annotations: `navigera ab` (medians, ms).
 
 on:
   push:
-    branches: [experiment-16]
+    branches: [experiment-17]
     paths:
       - "navigera-base/**"
       - "navigera-ab/ab.py"
@@ -18,6 +19,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   ab:

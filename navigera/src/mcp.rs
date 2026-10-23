@@ -106,8 +106,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "browser_click",
-            "Click an element with a real mouse event; waits for it to appear and for any navigation it starts.",
-            object(action(json!({})), &[]),
+            "Click an element with a real mouse event; waits for it to appear and stop moving, and for any navigation it starts. Fails, naming it, if something covers the element.",
+            object(action(json!({"button": {"type": "string", "enum": ["left", "right", "middle"]}})), &[]),
             false,
         ),
         tool(

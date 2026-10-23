@@ -264,6 +264,21 @@ impl Browser {
         self.shared.caught_up(&self.client, Duration::from_millis(250))
     }
 
+    /// Report downloads (`Browser.downloadWillBegin`/`downloadProgress`),
+    /// saving them in `dir`, or where the browser would (no `dir`: a browser
+    /// that is the user's own keeps its own setting).
+    pub fn enable_downloads(&self, dir: Option<&std::path::Path>) -> Result<()> {
+        let params = match dir {
+            Some(d) => {
+                json!({ "behavior": "allowAndName", "downloadPath": d.display().to_string(), "eventsEnabled": true })
+            }
+            None => json!({ "behavior": "default", "eventsEnabled": true }),
+        };
+        self.block_on(self.client.send("Browser.setDownloadBehavior", params, None, CMD_TIMEOUT))?;
+        self.shared.downloads.lock().unwrap().dir = dir.map(std::path::Path::to_path_buf);
+        Ok(())
+    }
+
     /// Grant a permission (e.g. `geolocation`) to every origin.
     pub fn grant_permission(&self, permission: &str) -> Result<()> {
         self.block_on(self.client.send(

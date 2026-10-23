@@ -619,6 +619,13 @@ pub enum Command {
     /// List open tabs: index, target id, and whether it is the active tab.
     #[serde(rename = "tab-list")]
     TabList {},
+    /// Put the browser on screen, with the same tabs and sign-ins: hand the
+    /// session to a person (a login, a 2FA prompt, a CAPTCHA).
+    #[serde(rename = "show")]
+    Show {},
+    /// Take it off screen again (headless), with the same tabs and sign-ins.
+    #[serde(rename = "hide")]
+    Hide {},
     /// Open a fresh tab (optionally at a URL) and make it active.
     #[serde(rename = "tab-new")]
     TabNew {
@@ -702,6 +709,16 @@ pub struct SessionConfig {
     pub profile: Option<String>,
     /// `--headless` for a `--profile` browser (visible by default).
     pub headless: bool,
+    /// `--from <browser|user-data-dir>`: seed the `--profile` browser's
+    /// profile from the user's own browser (a copy: logins, cookies, site
+    /// storage), replacing what it held.
+    pub from: Option<String>,
+    /// `--from-profile <name|dir|email>`: which of that browser's profiles
+    /// (default: the one it used last).
+    pub from_profile: Option<String>,
+    /// `--natural`: a browser that looks like the browser it is, not like an
+    /// automated one (see `browser::natural_flags`).
+    pub natural: bool,
 }
 
 /// Before `ax`/`screenshot`: no fetch/XHR for this long (Playwright's
@@ -728,6 +745,9 @@ impl Default for SessionConfig {
             attach: None,
             profile: None,
             headless: false,
+            from: None,
+            from_profile: None,
+            natural: false,
         }
     }
 }
@@ -742,8 +762,22 @@ impl SessionConfig {
             name: name.clone(),
             executable: self.chromium.clone(),
             headless: self.headless,
+            from: self.from.clone(),
+            from_profile: self.from_profile.clone(),
         })
     }
+}
+
+/// `--from` and `--from-profile` seed a `--profile` browser and mean nothing
+/// without one.
+fn check_profile_flags(config: &SessionConfig) -> Result<(), String> {
+    if (config.from.is_some() || config.from_profile.is_some()) && config.profile.is_none() {
+        return Err("--from copies your browser's profile into a `--profile <name>` browser: add --profile".into());
+    }
+    if config.from_profile.is_some() && config.from.is_none() {
+        return Err("--from-profile picks a profile of the browser --from names: add --from chrome (or another)".into());
+    }
+    Ok(())
 }
 
 /// `--attach` takes an optional value; the default is the user's Chrome.
@@ -751,7 +785,8 @@ const DEFAULT_ATTACH: &str = "chrome";
 
 /// True when `word` is a command name (so it can't be `--attach`'s value).
 fn is_command_word(word: &str) -> bool {
-    matches!(word, "serve" | "mcp" | "skill" | "install-skill" | "help") || OPS.iter().any(|(name, _, _)| *name == word)
+    matches!(word, "serve" | "mcp" | "skill" | "install-skill" | "profiles" | "help")
+        || OPS.iter().any(|(name, _, _)| *name == word)
 }
 
 /// Pull `--attach [value]` out of argv; a bare `--attach` means `chrome`.
@@ -789,6 +824,8 @@ pub enum Local {
         dir: String,
     },
     Version,
+    /// List the browsers and profiles a session can be handed.
+    Profiles,
 }
 
 /// Result of [`parse_args`]: launch config plus an optional one-shot command.
@@ -808,7 +845,7 @@ pub struct ParsedArgs {
 
 /// One op's CLI documentation: (name, synopsis, what it does).
 const OPS: &[(&str, &str, &str)] = &[
-    ("start", "[--attach [<where>] | --profile <name> [--headless]]", "spawn a detached session server + headless browser (needs --session); --attach/--profile use a browser that stays open"),
+    ("start", "[--attach [<where>] | --profile <name> [--from <browser> [--from-profile <p>]] [--headless]] [--natural]", "spawn a detached session server + headless browser (needs --session); --attach/--profile use a browser that stays open; --from seeds the profile with a copy of your browser's sign-ins"),
     ("goto", "<url> [--wait load|domcontentloaded|commit]", "navigate the active tab (default: wait for load)"),
     ("ax", "[--selector <css> | <ref>] [--limit <lines>] [--refs all] [--format json]", "accessibility snapshot: indented tree, [ref=N] on actionable nodes"),
     ("click", "<ref> | --selector <css> | --text <visible text>", "trusted mouse click; waits for the element and for any navigation it starts"),
@@ -854,11 +891,14 @@ const OPS: &[(&str, &str, &str)] = &[
     ("screenshot", "[--path <f.png>] [--full-page]", "PNG of the viewport (or whole page)"),
     ("tab-new", "[<url>]", "open a tab and make it active"),
     ("tab-list", "", "list tabs"),
+    ("show", "", "put the browser on screen with the same tabs and sign-ins, to hand the session to a person (a login, 2FA, a CAPTCHA); `hide` takes it back off"),
+    ("hide", "", "take the browser off screen again (headless), with the same tabs and sign-ins"),
     ("tab-select", "<index>", "switch the active tab"),
     ("tab-close", "[<index>]", "close a tab (default: active)"),
     ("dialog", "--accept [--prompt-text <t>] | --dismiss", "how alert/confirm/prompt are answered (default: accept; every dialog is reported)"),
     ("quit", "[--close-browser]", "close the browser and the session server; attached (--attach/--profile): only disconnect, unless --close-browser"),
     ("mcp", "[--headed] [--profile <name> | --attach [<where>]]", "serve the Model Context Protocol on stdio (for Cline, Roo, Kilo, Continue, VS Code, Claude Desktop, Cursor); the browser starts on the first tool call"),
+    ("profiles", "", "list what a session can be handed: your browsers' profiles (name, email, whether --attach can reach them now) and navigera's own --profile browsers"),
     ("skill", "", "print the agent skill (usage guide) for this version"),
     ("install-skill", "[--dir <skills dir>] [--claude | --continue] [--global]", "install the skill for agents (default ./.agents/skills, read by Cline and Kilo; --claude: ./.claude/skills; --continue: ./.continue/skills)"),
 ];
@@ -890,6 +930,8 @@ pub fn usage(program: &str) -> String {
          --idle-timeout-s <s>   session server idle shutdown (default {DEFAULT_IDLE_TIMEOUT_S}, 0 = never)\n  \
          --attach [chrome|edge|<dir>|<port>]  with `start`: use your running browser (Chrome 144+: chrome://inspect/#remote-debugging); never closes it\n  \
          --profile <name>       with `start`: persistent visible navigera browser, kept open between sessions (--headless to hide)\n  \
+         --from <browser|dir>   with --profile: first copy your own browser's sign-ins into it (cookies, site storage, saved logins); --from-profile <dir|name|email>\n  \
+         --natural              look like the browser it is: no HeadlessChrome user agent, a real screen size ($NAVIGERA_NATURAL=1)\n  \
          --pretty               pretty-print JSON\n\n\
          Output: one JSON object per command, {{\"ok\":true,\"result\":…}} or {{\"ok\":false,\"error\":…}}; exit 1 on error.\n\
          Without --session each command launches and closes its own browser (one-shot).\n\
@@ -1050,6 +1092,16 @@ fn consume_globals(args: &mut std::collections::VecDeque<String>, config: &mut S
     if extract_present(args, "--headless") {
         config.headless = true;
     }
+    if let Some(from) = extract_value(args, "--from")? {
+        config.from = Some(from);
+    }
+    if let Some(from_profile) = extract_value(args, "--from-profile")? {
+        config.from_profile = Some(from_profile);
+    }
+    if extract_present(args, "--natural") {
+        config.natural = true;
+    }
+    check_profile_flags(config)?;
     if config.attach.is_some() && config.profile.is_some() {
         return Err("--attach and --profile are alternatives: pick one".into());
     }
@@ -1188,6 +1240,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
             }
             "--profile" => config.profile = Some(value("--profile")?),
             "--headless" => config.headless = true,
+            "--from" => config.from = Some(value("--from")?),
+            "--from-profile" => config.from_profile = Some(value("--from-profile")?),
+            "--natural" => config.natural = true,
             "--idle-timeout-s" => {
                 let raw = value("--idle-timeout-s")?;
                 config.idle_timeout_s = raw
@@ -1244,6 +1299,12 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
             return Ok(ParsedArgs { config, command: None, start: false, local: None, mcp: true });
         }
         "skill" => return parsed(config, None, false, Some(Local::Skill)),
+        "profiles" => {
+            if let Some(extra) = args.front() {
+                return invalid(format!("unexpected argument {extra:?} after profiles"));
+            }
+            return parsed(config, None, false, Some(Local::Profiles));
+        }
         "install-skill" => {
             let claude = extract_present(&mut args, "--claude");
             let continue_ = extract_present(&mut args, "--continue");
@@ -1666,6 +1727,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
         // one-shot it just launches and closes.
         "quit" | "close" => Command::Quit { close_browser: extract_present(&mut args, "--close-browser") },
         "tab-list" => Command::TabList {},
+        "show" => Command::Show {},
+        "hide" => Command::Hide {},
         "tab-new" => Command::TabNew {
             url: match str_flag(&mut args, "--url")? {
                 Some(u) => Some(u),
@@ -1779,6 +1842,7 @@ pub struct Outcome {
 impl Driver {
     /// Launch the engine described by `config` (Chrome by default).
     pub fn launch(config: &SessionConfig) -> anyhow::Result<Self> {
+        crate::browser::set_natural(config.natural);
         if let Some(target) = config.attach_target() {
             let session = BrowserSession::attach(&target, config.timeout_ms)
                 .map_err(|e| anyhow::anyhow!("could not connect to the browser: {e:#}"))?;
@@ -1927,6 +1991,70 @@ impl Driver {
         Ok(json!(crate::cdp::logs::requests_text(&picked, &origin_of(&self.session.url()))))
     }
 
+    /// `show` / `hide`: the same session in a browser on screen, or off it.
+    /// A `--profile` browser restarts on its own profile, which keeps
+    /// everything; a browser navigera launched is replaced by one carrying its
+    /// cookies and the open tabs' storage (`state save` / `load`). Either way
+    /// the tabs reopen at their pages and the active one stays active.
+    fn relaunch(&mut self, visible: bool) -> anyhow::Result<Value> {
+        let what = if visible { "show" } else { "hide" };
+        if self.session.is_lightpanda() {
+            anyhow::bail!("{what}: Lightpanda has no window; use the chrome engine");
+        }
+        if self.session.is_attached() && self.session.profile_dir().is_none() {
+            anyhow::bail!("{what}: this is your own browser (--attach); it is already where you see it");
+        }
+        let urls = self.session.tab_urls();
+        let active = self.session.active_page();
+        let exe = self.session.profile_executable().unwrap_or(self.session.executable()).to_string();
+        let timeout_ms = self.session.timeout_ms();
+        let new = match self.session.profile_dir() {
+            Some(dir) => {
+                self.session.close_browser()?;
+                let target = crate::browser::AttachTarget::Profile {
+                    name: dir.display().to_string(),
+                    executable: Some(exe),
+                    headless: !visible,
+                    from: None,
+                    from_profile: None,
+                };
+                BrowserSession::attach(&target, timeout_ms)
+            }
+            None => {
+                let state = self.session.storage_state()?;
+                let mut new = BrowserSession::launch_with("chrome", !visible, Some(&exe), timeout_ms, None);
+                if let Ok(new) = &mut new {
+                    new.load_storage_state(&state)?;
+                }
+                new
+            }
+        }
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{what}: could not start the browser {}: {e:#}",
+                if visible { "on screen (is there a display?)" } else { "headless" }
+            )
+        })?;
+        let old = std::mem::replace(&mut self.session, new);
+        if !old.is_attached() {
+            old.close();
+        }
+        for (i, url) in urls.iter().enumerate() {
+            if i > 0 {
+                self.session.new_page().map_err(|e| anyhow::anyhow!("{what}: reopen tab {i}: {e:#}"))?;
+            }
+            if !url.is_empty() && url != "about:blank" {
+                let _ = self.session.goto(url);
+            }
+        }
+        if active < urls.len() {
+            let _ = self.session.select_page(active);
+        }
+        let mut state = self.state_json();
+        state["visible"] = json!(visible);
+        Ok(state)
+    }
+
     fn tabs_json(&self) -> Value {
         let active = self.session.active_page();
         let tabs: Vec<Value> = self
@@ -1957,6 +2085,8 @@ impl Driver {
             Command::Quit { .. }
                 | Command::Dialog { .. }
                 | Command::TabList {}
+                | Command::Show {}
+                | Command::Hide {}
                 | Command::Status {}
                 | Command::Console { .. }
                 | Command::Errors { .. }
@@ -2662,6 +2792,8 @@ impl Driver {
                 Ok(state)
             }
             Command::TabList {} => Ok(self.tabs_json()),
+            Command::Show {} => self.relaunch(true),
+            Command::Hide {} => self.relaunch(false),
             Command::TabNew { url } => {
                 self.session.new_page().map_err(|e| anyhow::anyhow!("tab-new: {e:#}"))?;
                 if let Some(url) = url {
@@ -3116,6 +3248,14 @@ pub fn run_local(local: &Local, config: &SessionConfig, output: &mut dyn Write) 
             let _ = write!(output, "{SKILL_MD}");
             ExitCode::SUCCESS
         }
+        Local::Profiles => {
+            let response = json!({ "id": null, "ok": true, "result": crate::cdp::import::list_profiles() });
+            if print_cli_response(output, &response, config) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
         Local::InstallSkill { dir } => {
             let response = match install_skill(dir) {
                 Ok(path) => json!({ "id": null, "ok": true, "result": { "installed": path } }),
@@ -3457,6 +3597,29 @@ mod tests {
         assert_eq!(p.config.profile.as_deref(), Some("work"));
         assert!(p.config.headless);
         assert!(parse_args(argv(&["navigera", "-s", "me", "start", "--attach", "--profile", "w"])).is_err());
+        // --from seeds a --profile; --natural goes anywhere.
+        let p = parse_args(argv(&[
+            "navigera",
+            "-s",
+            "me",
+            "start",
+            "--profile",
+            "agent",
+            "--from",
+            "chrome",
+            "--from-profile",
+            "Work",
+            "--natural",
+        ]))
+        .unwrap();
+        assert_eq!(p.config.from.as_deref(), Some("chrome"));
+        assert_eq!(p.config.from_profile.as_deref(), Some("Work"));
+        assert!(p.config.natural);
+        let p = parse_args(argv(&["navigera", "--natural", "-s", "me", "start"])).unwrap();
+        assert!(p.config.natural);
+        assert!(parse_args(argv(&["navigera", "-s", "me", "start", "--from", "chrome"])).is_err());
+        assert!(parse_args(argv(&["navigera", "-s", "me", "start", "--profile", "a", "--from-profile", "x"])).is_err());
+        assert_eq!(parse_args(argv(&["navigera", "profiles"])).unwrap().local, Some(Local::Profiles));
         assert!(parse_args(argv(&["navigera", "--engine", "lightpanda", "-s", "me", "start", "--attach"])).is_err());
     }
 

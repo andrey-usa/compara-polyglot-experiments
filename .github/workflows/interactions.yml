@@ -1,25 +1,28 @@
-name: Hand-off
+name: Interactions
 
-# navigera (the copy in `navigera/`): a --profile seeded from another
-# browser's profile starts signed in, and --natural shows a page no sign of
-# automation -- on the runner's own Chrome on Linux, macOS and Windows, where
-# the cookie key lives in a keyring, the Keychain and DPAPI respectively.
-# Results are annotations: `handoff <os>` (passed, failed, the hand-off tests).
+# navigera (the copy in `navigera/`): the interaction fixes -- frames and
+# shadow roots, covered and moving elements, selects, the element wait,
+# downloads, right clicks -- with the whole suite, on the runner's own Chrome
+# on Linux, macOS and Windows. Results are annotations: `interactions <os>`.
 
 on:
   push:
-    branches: [experiment-16]
+    branches: [experiment-17]
     paths:
       - "navigera/**"
-      - ".github/workflows/handoff.yml"
+      - ".github/workflows/interactions.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: "handoff ${{ matrix.os }}"
+    name: "interactions ${{ matrix.os }}"
     strategy:
       fail-fast: false
       matrix:
@@ -57,16 +60,18 @@ jobs:
             # A display for `show`.
             xvfb-run -a cargo test --locked --no-fail-fast 2>&1 | tee test.log
           else
-            cargo test --locked --no-fail-fast --lib --test handoff --test attach 2>&1 | tee test.log
+            cargo test --locked --no-fail-fast --lib --test interactions --test handoff --test attach --test commands 2>&1 | tee test.log
           fi
           code=${PIPESTATUS[0]}
-          python3 - test.log "handoff $RUNNER_OS" <<'PY'
+          python3 - test.log "interactions $RUNNER_OS" <<'PY'
           import re, sys
+          WATCH = {"a_covered_element_is_not_clicked_unless_forced", "locators_reach_into_same_origin_frames",
+                   "downloads_are_saved_and_waited_for", "a_click_waits_for_a_sliding_modal_to_settle"}
           text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
           passed = sum(int(m) for m in re.findall(r"test result: \w+\. (\d+) passed", text))
           failed = re.findall(r"^test (\S+) \.\.\. FAILED", text, re.M)
           ran = re.findall(r"^test (\S+) \.\.\. (ok|FAILED)", text, re.M)
-          handoff = [f"{n}: {r}" for n, r in ran if "signed_in" in n or "natural" in n or "show_and_hide" in n]
+          handoff = [f"{n}: {r}" for n, r in ran if r == "FAILED" or n in WATCH]
           panics = re.findall(r"panicked at .*?\n(.*?)\n", text, re.S)
           msg = f"{passed} passed, {len(failed)} failed {failed}\n" + "\n".join(handoff)
           if panics:

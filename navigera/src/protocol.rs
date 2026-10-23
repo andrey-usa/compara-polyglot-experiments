@@ -197,6 +197,14 @@ pub enum Command {
     Forward {},
     #[serde(rename = "reload")]
     Reload {},
+    /// Files the pages downloaded.
+    #[serde(rename = "downloads")]
+    Downloads {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clear: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<String>,
+    },
     /// Trusted mouse click on the target.
     #[serde(rename = "click")]
     Click {
@@ -204,6 +212,13 @@ pub enum Command {
         target: TargetArgs,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<f64>,
+        /// `left` (default), `right` (opens a context menu) or `middle`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        button: Option<String>,
+        /// DOM events on the element, covered or not (skips the checks a
+        /// user's click passes).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
     },
     /// Set an input's value (native setter + input/change events).
     #[serde(rename = "fill")]
@@ -231,6 +246,9 @@ pub enum Command {
         value: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<f64>,
+        /// Add to the selection of a multiple select instead of replacing it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        add: bool,
     },
     /// Press a key or chord (`Enter`, `Control+a`), optionally on a target.
     #[serde(rename = "press")]
@@ -298,6 +316,9 @@ pub enum Command {
         idle: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<f64>,
+        /// A finished download whose file name matches this glob ("" any).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        download: Option<String>,
     },
     /// How `alert`/`confirm`/`prompt` dialogs are answered from now on.
     #[serde(rename = "dialog")]
@@ -411,6 +432,9 @@ pub enum Command {
         /// With `n`: write the response body to this file.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         body_file: Option<String>,
+        /// Only requests after #n ("what did that click fire?").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
     },
     /// Cookies of the current page (or all of them), or set / delete / clear.
     #[serde(rename = "cookies")]
@@ -634,7 +658,14 @@ pub enum Command {
     },
     /// Switch the active tab by zero-based index.
     #[serde(rename = "tab-select")]
-    TabSelect { index: usize },
+    TabSelect {
+        #[serde(default)]
+        index: usize,
+        /// A tab's `target` id (or its first characters) from `tab-list`:
+        /// stays put when tabs open and close, unlike an index.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
     /// Close one tab by index (defaults to the active tab).
     #[serde(rename = "tab-close")]
     TabClose {
@@ -719,6 +750,12 @@ pub struct SessionConfig {
     /// `--natural`: a browser that looks like the browser it is, not like an
     /// automated one (see `browser::natural_flags`).
     pub natural: bool,
+    /// `--wait-ms`: how long element ops wait for their element when they
+    /// name no timeout (see `browser::element_wait`).
+    pub wait_ms: Option<f64>,
+    /// `--download-dir`: where downloads are saved (see
+    /// `browser::download_dir`).
+    pub download_dir: Option<String>,
 }
 
 /// Before `ax`/`screenshot`: no fetch/XHR for this long (Playwright's
@@ -748,6 +785,8 @@ impl Default for SessionConfig {
             from: None,
             from_profile: None,
             natural: false,
+            wait_ms: None,
+            download_dir: None,
         }
     }
 }
@@ -848,15 +887,16 @@ const OPS: &[(&str, &str, &str)] = &[
     ("start", "[--attach [<where>] | --profile <name> [--from <browser> [--from-profile <p>]] [--headless]] [--natural]", "spawn a detached session server + headless browser (needs --session); --attach/--profile use a browser that stays open; --from seeds the profile with a copy of your browser's sign-ins"),
     ("goto", "<url> [--wait load|domcontentloaded|commit]", "navigate the active tab (default: wait for load)"),
     ("ax", "[--selector <css> | <ref>] [--limit <lines>] [--refs all] [--format json]", "accessibility snapshot: indented tree, [ref=N] on actionable nodes"),
-    ("click", "<ref> | --selector <css> | --text <visible text>", "trusted mouse click; waits for the element and for any navigation it starts"),
+    ("click", "<ref> | --selector <css> | --text <visible text> [--button right|middle] [--force]", "trusted mouse click once the element stops moving; refuses an element covered by another (--force: DOM events anyway); waits for any navigation it starts"),
     ("fill", "<ref> <value> | --selector <css> --value <v>", "set an input/textarea's value"),
     ("type", "<text> [--selector <css> | --ref <n>]", "type key by key into the target or the focused element"),
     ("press", "<key> [--selector <css> | --ref <n>]", "press a key or chord: Enter, Tab, Escape, ArrowDown, Control+a"),
-    ("select", "<ref> <option> | --selector <css> --value <option>", "choose <select> option(s) by value or label"),
+    ("select", "<ref> <option>... | --selector <css> --value <option> [--add]", "choose <select> option(s) by value or label (whitespace-insensitive); --add keeps the options already chosen"),
     ("hover", "<ref> | --selector <css> | --text <t>", "move the mouse over an element (hover menus)"),
     ("scroll", "[--by <px> | --to top|bottom] [<ref> | --selector <css>]", "scroll the page, or an element into view"),
     ("upload", "<ref> <file>... | --selector <css> --file <path>", "set the files of an <input type=file>"),
-    ("wait", "[--selector <css>] [--text <t>] [--url <part>] [--gone <css>] [--js <expr>] [--idle] [--ms <n>]", "wait until every condition holds (default up to 5 s; --timeout-ms); --idle: no fetch/XHR for 500 ms"),
+    ("wait", "[--selector <css>] [--text <t>] [--url <part>] [--gone <css>] [--js <expr>] [--idle] [--download [<glob>]] [--ms <n>]", "wait until every condition holds (default up to 5 s; --timeout-ms); --idle: no fetch/XHR for 500 ms; --download: a finished download"),
+    ("downloads", "[--clear] [--json]", "files the pages downloaded: #n state bytes path (url)"),
     ("eval", "<js> | --file <path.js> | -", "evaluate JS (arrow functions are called); prints the JSON result; `-` reads the script from stdin"),
     ("text", "--selector <css>", "textContent of the first match"),
     ("find", "<description>", "the element a description means, chosen by a decision model (TYPESAFE_API_KEY); element ops also take --find <description>"),
@@ -864,7 +904,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("title", "", "page title"),
     ("console", "[--level error|warn|info|log|debug] [--limit <n>] [--clear] [--json]", "console messages, uncaught exceptions and browser log entries of the active tab"),
     ("errors", "[--limit <n>] [--clear] [--json]", "only the errors: exceptions, console.error, failed loads"),
-    ("network", "[<n>] [--filter <text>] [--type fetch|xhr|document|…] [--failed] [--limit <n>] [--clear] [--har <file>] [--body-file <file>]", "the active tab's requests, one line each (#n METHOD STATUS type url size time); `network <n>` shows one in full with its response body"),
+    ("network", "[<n>] [--filter <text>] [--type fetch|xhr|document|…] [--failed] [--since <n>] [--limit <n>] [--clear] [--har <file>] [--body-file <file>]", "the active tab's requests, one line each (#n METHOD STATUS type url size time); `network <n>` shows one in full with its response body"),
     ("cookies", "[set <name> <value> [--url <u> | --domain <d>] [--path <p>] [--expires <unix s>] [--http-only] [--secure] [--same-site Lax|Strict|None] | delete <name> [--url <u>] | clear] [--all] [--json]", "the current page's cookies (--all: every cookie), or set, delete or clear them"),
     ("pdf", "[--path <f.pdf>] [--landscape] [--background]", "the page as a PDF file"),
     ("storage", "[local|session] [get [<key>] | set <key> <value> | remove <key> | clear]", "the current page's localStorage (or sessionStorage)"),
@@ -893,7 +933,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("tab-list", "", "list tabs"),
     ("show", "", "put the browser on screen with the same tabs and sign-ins, to hand the session to a person (a login, 2FA, a CAPTCHA); `hide` takes it back off"),
     ("hide", "", "take the browser off screen again (headless), with the same tabs and sign-ins"),
-    ("tab-select", "<index>", "switch the active tab"),
+    ("tab-select", "<index> | <target id>", "switch the active tab (a target id from tab-list stays right when tabs open and close)"),
     ("tab-close", "[<index>]", "close a tab (default: active)"),
     ("dialog", "--accept [--prompt-text <t>] | --dismiss", "how alert/confirm/prompt are answered (default: accept; every dialog is reported)"),
     ("quit", "[--close-browser]", "close the browser and the session server; attached (--attach/--profile): only disconnect, unless --close-browser"),
@@ -1014,6 +1054,16 @@ pub enum ArgsError {
     Invalid(String),
 }
 
+/// A path the caller gave, made absolute against the caller's directory
+/// (a session server runs elsewhere).
+fn caller_path(dir: String) -> String {
+    let path = std::path::Path::new(&dir);
+    if path.is_absolute() {
+        return dir;
+    }
+    std::env::current_dir().map(|c| c.join(path).display().to_string()).unwrap_or(dir)
+}
+
 fn parse_f64(raw: &str, flag: &str) -> Result<f64, String> {
     raw.parse::<f64>().map_err(|_| format!("{flag} must be a number, got {raw:?}"))
 }
@@ -1097,6 +1147,12 @@ fn consume_globals(args: &mut std::collections::VecDeque<String>, config: &mut S
     }
     if let Some(from_profile) = extract_value(args, "--from-profile")? {
         config.from_profile = Some(from_profile);
+    }
+    if let Some(raw) = extract_value(args, "--wait-ms")? {
+        config.wait_ms = Some(parse_f64(&raw, "--wait-ms")?);
+    }
+    if let Some(dir) = extract_value(args, "--download-dir")? {
+        config.download_dir = Some(caller_path(dir));
     }
     if extract_present(args, "--natural") {
         config.natural = true;
@@ -1243,6 +1299,11 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
             "--from" => config.from = Some(value("--from")?),
             "--from-profile" => config.from_profile = Some(value("--from-profile")?),
             "--natural" => config.natural = true,
+            "--download-dir" => config.download_dir = Some(caller_path(value("--download-dir")?)),
+            "--wait-ms" => {
+                let raw = value("--wait-ms")?;
+                config.wait_ms = Some(parse_f64(&raw, "--wait-ms").map_err(ArgsError::Invalid)?);
+            }
             "--idle-timeout-s" => {
                 let raw = value("--idle-timeout-s")?;
                 config.idle_timeout_s = raw
@@ -1356,7 +1417,16 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
         "back" => Command::Back {},
         "forward" => Command::Forward {},
         "reload" => Command::Reload {},
-        "click" => Command::Click { target: target_args(&mut args, true)?, timeout_ms },
+        "click" => {
+            let button = str_flag(&mut args, "--button")?;
+            if let Some(b) = &button {
+                if !matches!(b.as_str(), "left" | "right" | "middle") {
+                    return invalid(format!("click --button takes left, right or middle, got {b:?}"));
+                }
+            }
+            let force = extract_present(&mut args, "--force");
+            Command::Click { target: target_args(&mut args, true)?, timeout_ms, button, force }
+        }
         "hover" => Command::Hover { target: target_args(&mut args, true)?, timeout_ms },
         "fill" => {
             let target = target_args(&mut args, true)?;
@@ -1369,6 +1439,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
             Command::Fill { target, value, timeout_ms }
         }
         "select" => {
+            let add = extract_present(&mut args, "--add");
             let target = target_args(&mut args, true)?;
             let mut value = extract_values(&mut args, "--value").map_err(ArgsError::Invalid)?;
             while let Some(v) = positional(&mut args) {
@@ -1377,7 +1448,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
             if value.is_empty() {
                 return Err(need("select", "an option value or label"));
             }
-            Command::Select { target, value, timeout_ms }
+            Command::Select { target, value, timeout_ms, add }
         }
         "press" => {
             let key = match str_flag(&mut args, "--key")? {
@@ -1425,6 +1496,16 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
                         Some(other) => return invalid(format!("wait --load takes networkidle, got {other:?}")),
                     },
                 timeout_ms,
+                download: match args.iter().position(|a| a == "--download") {
+                    Some(i) => {
+                        args.remove(i);
+                        match args.get(i) {
+                            Some(next) if !next.starts_with('-') => args.remove(i),
+                            _ => Some(String::new()),
+                        }
+                    }
+                    None => None,
+                },
             };
             if let (Some(p), Command::Wait { selector, ms, .. }) = (positional(&mut args), &mut cmd) {
                 match p.parse::<f64>() {
@@ -1442,6 +1523,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
                     js: None,
                     ms: None,
                     idle: false,
+                    download: None,
                     ..
                 }
             ) {
@@ -1602,6 +1684,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
             clear: extract_present(&mut args, "--clear"),
             format: extract_present(&mut args, "--json").then(|| "json".to_string()),
         },
+        "downloads" => Command::Downloads {
+            clear: extract_present(&mut args, "--clear"),
+            format: extract_present(&mut args, "--json").then(|| "json".to_string()),
+        },
         "network" => Command::Network {
             filter: str_flag(&mut args, "--filter")?,
             kind: str_flag(&mut args, "--type")?,
@@ -1610,6 +1696,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
             clear: extract_present(&mut args, "--clear"),
             har: str_flag(&mut args, "--har")?,
             body_file: str_flag(&mut args, "--body-file")?,
+            since: num_flag(&mut args, "--since")?.map(|v| v as u64),
             n: match positional(&mut args) {
                 Some(raw) => Some(
                     raw.trim_start_matches('#')
@@ -1735,11 +1822,15 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
                 None => positional(&mut args),
             },
         },
-        "tab-select" => Command::TabSelect {
-            index: match str_flag(&mut args, "--index")?.or_else(|| positional(&mut args)) {
-                Some(raw) => parse_index(&raw).map_err(ArgsError::Invalid)?,
-                None => return Err(need("tab-select", "a tab index")),
+        "tab-select" => match str_flag(&mut args, "--index")?.or_else(|| positional(&mut args)) {
+            Some(raw) => match parse_index(&raw) {
+                Ok(index) => Command::TabSelect { index, target: None },
+                Err(_) if raw.len() >= 4 && raw.chars().all(|c| c.is_ascii_hexdigit()) => {
+                    Command::TabSelect { index: 0, target: Some(raw) }
+                }
+                Err(e) => return invalid(e),
             },
+            None => return Err(need("tab-select", "a tab index or target id")),
         },
         "tab-close" | "close-page" => {
             let index = str_flag(&mut args, "--index")?
@@ -1776,6 +1867,16 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
         };
         return invalid(format!("unexpected argument {extra:?} for `{op}`{hint}"));
     }
+    // `--wait-ms` on one command: that op's element wait, unless it names
+    // its own timeout.
+    let command = match config.wait_ms {
+        Some(ms) if command.clone().target_mut().is_some() && op_timeout_ms(&command).is_none() => {
+            let mut v = serde_json::to_value(&command).map_err(|e| ArgsError::Invalid(e.to_string()))?;
+            v["timeout_ms"] = json!(ms);
+            serde_json::from_value(v).unwrap_or(command)
+        }
+        _ => command,
+    };
     parsed(config, Some(command), false, None)
 }
 
@@ -1843,6 +1944,8 @@ impl Driver {
     /// Launch the engine described by `config` (Chrome by default).
     pub fn launch(config: &SessionConfig) -> anyhow::Result<Self> {
         crate::browser::set_natural(config.natural);
+        crate::browser::set_element_wait(config.wait_ms);
+        crate::browser::set_download_dir(config.download_dir.as_deref());
         if let Some(target) = config.attach_target() {
             let session = BrowserSession::attach(&target, config.timeout_ms)
                 .map_err(|e| anyhow::anyhow!("could not connect to the browser: {e:#}"))?;
@@ -1920,6 +2023,7 @@ impl Driver {
         clear: bool,
         har: Option<&str>,
         body_file: Option<&str>,
+        since: Option<u64>,
     ) -> anyhow::Result<Value> {
         let all = self.session.requests(clear && n.is_none());
         if let Some(n) = n {
@@ -1974,6 +2078,7 @@ impl Driver {
             .filter(|r| filter.is_none_or(|f| r.url.contains(f)))
             .filter(|r| kind.as_ref().is_none_or(|k| r.kind.to_ascii_lowercase() == *k))
             .filter(|r| !failed || r.failed.is_some() || r.status.is_some_and(|s| s >= 400))
+            .filter(|r| since.is_none_or(|n| r.n > n))
             .collect();
         if let Some(path) = har {
             let har = crate::cdp::logs::har(&picked, env!("CARGO_PKG_VERSION"));
@@ -2091,6 +2196,7 @@ impl Driver {
                 | Command::Console { .. }
                 | Command::Errors { .. }
                 | Command::Network { .. }
+                | Command::Downloads { .. }
                 | Command::Cookies { .. }
                 | Command::State { .. }
                 | Command::Route { .. }
@@ -2289,10 +2395,12 @@ impl Driver {
                 s.reload().map_err(|e| anyhow::anyhow!("reload: {e:#}"))?;
                 Ok(self.state_json())
             }
-            Command::Click { target, timeout_ms } => {
+            Command::Click { target, timeout_ms, button, force } => {
                 let t = target.target("click")?;
-                let point =
-                    s.click_target(&t, *timeout_ms).map_err(|e| anyhow::anyhow!("click {}: {e:#}", t.label()))?;
+                let opts = crate::cdp::ClickOptions { button: button.clone().unwrap_or_default(), force: *force };
+                let point = s
+                    .click_target(&t, &opts, *timeout_ms)
+                    .map_err(|e| anyhow::anyhow!("click {}: {e:#}", t.label()))?;
                 let mut state = self.state_json();
                 // Lightpanda lays nothing out, so a DOM-event click there is
                 // the normal case, not a sign of an overlay.
@@ -2328,10 +2436,11 @@ impl Driver {
                 s.fill_target(&t, value, *timeout_ms).map_err(|e| anyhow::anyhow!("fill {}: {e:#}", t.label()))?;
                 Ok(self.state_json())
             }
-            Command::Select { target, value, timeout_ms } => {
+            Command::Select { target, value, timeout_ms, add } => {
                 let t = target.target("select")?;
-                let chosen =
-                    s.select(&t, value, *timeout_ms).map_err(|e| anyhow::anyhow!("select {}: {e:#}", t.label()))?;
+                let chosen = s
+                    .select(&t, value, *add, *timeout_ms)
+                    .map_err(|e| anyhow::anyhow!("select {}: {e:#}", t.label()))?;
                 let mut state = self.state_json();
                 state["selected"] = chosen;
                 Ok(state)
@@ -2355,9 +2464,19 @@ impl Driver {
                 s.upload(&t, files, *timeout_ms).map_err(|e| anyhow::anyhow!("upload {}: {e:#}", t.label()))?;
                 Ok(json!({ "files": files.len() }))
             }
-            Command::Wait { selector, text, url, gone, js, ms, idle, timeout_ms } => {
+            Command::Wait { selector, text, url, gone, js, ms, idle, timeout_ms, download } => {
                 if let Some(ms) = ms {
                     std::thread::sleep(std::time::Duration::from_secs_f64(ms.max(0.0) / 1000.0));
+                }
+                if let Some(glob) = download {
+                    let started = std::time::Instant::now();
+                    let d = s.wait_download(glob, *timeout_ms).map_err(|e| anyhow::anyhow!("wait: {e:#}"))?;
+                    if [selector, text, url, gone, js].iter().all(|c| c.is_none()) && !*idle {
+                        let mut state = self.state_json();
+                        state["download"] = d.to_json();
+                        state["waited_ms"] = json!(started.elapsed().as_millis() as u64);
+                        return Ok(state);
+                    }
                 }
                 if *idle {
                     let max = timeout_ms
@@ -2375,20 +2494,22 @@ impl Driver {
                 }
                 let mut checks = Vec::new();
                 let mut what = Vec::new();
-                const VISIBLE: &str =
-                    "(el) => !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden'";
+                const VISIBLE: &str = "(el) => !!el && el.getClientRects().length > 0 \
+                     && (el.ownerDocument.defaultView || window).getComputedStyle(el).visibility !== 'hidden'";
+                let deep = crate::cdp::DEEP;
                 // Any match counts: a hidden template copy ahead of the
-                // visible element must not decide the wait.
+                // visible element must not decide the wait. Same-origin
+                // frames and open shadow roots are part of the page.
                 if let Some(sel) = selector {
-                    checks.push(format!("[...document.querySelectorAll({})].some({VISIBLE})", json!(sel)));
+                    checks.push(format!("{deep}.all({}).some({VISIBLE})", json!(sel)));
                     what.push(format!("selector {sel:?} visible"));
                 }
                 if let Some(sel) = gone {
-                    checks.push(format!("![...document.querySelectorAll({})].some({VISIBLE})", json!(sel)));
+                    checks.push(format!("!{deep}.all({}).some({VISIBLE})", json!(sel)));
                     what.push(format!("selector {sel:?} gone"));
                 }
                 if let Some(t) = text {
-                    checks.push(format!("!!document.body && document.body.innerText.includes({})", json!(t)));
+                    checks.push(format!("{deep}.text().includes({})", json!(t)));
                     what.push(format!("text {t:?}"));
                 }
                 if let Some(u) = url {
@@ -2406,6 +2527,30 @@ impl Driver {
                 let mut state = self.state_json();
                 state["waited_ms"] = json!(waited);
                 Ok(state)
+            }
+            Command::Downloads { clear, format } => {
+                let items = s.downloads(*clear);
+                if format.as_deref() == Some("json") {
+                    return Ok(json!(items.iter().map(|d| d.to_json()).collect::<Vec<_>>()));
+                }
+                if items.is_empty() {
+                    return Ok(json!("(no downloads)"));
+                }
+                let lines: Vec<String> = items
+                    .iter()
+                    .map(|d| {
+                        let j = d.to_json();
+                        format!(
+                            "#{} {} {} B {}  ({})",
+                            d.n,
+                            j["state"].as_str().unwrap_or(""),
+                            j["bytes"],
+                            j["path"].as_str().unwrap_or(&d.suggested),
+                            d.url
+                        )
+                    })
+                    .collect();
+                Ok(json!(lines.join("\n")))
             }
             Command::Dialog { accept, prompt_text } => {
                 let accept = accept.unwrap_or(true);
@@ -2474,7 +2619,7 @@ impl Driver {
                 Ok(self.console_result(min, *limit, *clear, format.as_deref()))
             }
             Command::Errors { limit, clear, format } => Ok(self.console_result(4, *limit, *clear, format.as_deref())),
-            Command::Network { n, filter, kind, failed, limit, clear, har, body_file } => self.network(
+            Command::Network { n, filter, kind, failed, limit, clear, har, body_file, since } => self.network(
                 *n,
                 filter.as_deref(),
                 kind.as_deref(),
@@ -2483,6 +2628,7 @@ impl Driver {
                 *clear,
                 har.as_deref(),
                 body_file.as_deref(),
+                *since,
             ),
             Command::Cookies {
                 action,
@@ -2801,8 +2947,25 @@ impl Driver {
                 }
                 Ok(self.tabs_json())
             }
-            Command::TabSelect { index } => {
-                self.session.select_page(*index).map_err(|e| anyhow::anyhow!("tab-select {index}: {e:#}"))?;
+            Command::TabSelect { index, target } => {
+                let index = match target {
+                    Some(id) => {
+                        let ids = self.session.page_targets();
+                        let hits: Vec<usize> = ids
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, t)| t.to_ascii_lowercase().starts_with(&id.to_ascii_lowercase()))
+                            .map(|(i, _)| i)
+                            .collect();
+                        match hits.as_slice() {
+                            [i] => *i,
+                            [] => anyhow::bail!("tab-select: no tab with target {id} (`tab-list` shows them)"),
+                            _ => anyhow::bail!("tab-select: {id} matches {} tabs; give more of the id", hits.len()),
+                        }
+                    }
+                    None => *index,
+                };
+                self.session.select_page(index).map_err(|e| anyhow::anyhow!("tab-select {index}: {e:#}"))?;
                 Ok(self.state_json())
             }
             Command::TabClose { index } | Command::ClosePage { index } => {
@@ -3341,13 +3504,20 @@ mod tests {
         );
         assert_eq!(
             cmd(&["click", "@e12"]),
-            Command::Click { target: TargetArgs { node_ref: Some(12), ..Default::default() }, timeout_ms: None }
+            Command::Click {
+                target: TargetArgs { node_ref: Some(12), ..Default::default() },
+                timeout_ms: None,
+                button: None,
+                force: false
+            }
         );
         assert_eq!(
             cmd(&["click", "#buy", "--timeout-ms", "900"]),
             Command::Click {
                 target: TargetArgs { selector: Some("#buy".into()), ..Default::default() },
-                timeout_ms: Some(900.0)
+                timeout_ms: Some(900.0),
+                button: None,
+                force: false,
             }
         );
         assert_eq!(
@@ -3362,7 +3532,9 @@ mod tests {
             cmd(&["click", "--text", "Add to cart"]),
             Command::Click {
                 target: TargetArgs { text: Some("Add to cart".into()), ..Default::default() },
-                timeout_ms: None
+                timeout_ms: None,
+                button: None,
+                force: false,
             }
         );
         assert_eq!(
@@ -3374,7 +3546,8 @@ mod tests {
             Command::Select {
                 target: TargetArgs { node_ref: Some(7), ..Default::default() },
                 value: vec!["Canada".into()],
-                timeout_ms: None
+                timeout_ms: None,
+                add: false,
             }
         );
         assert_eq!(
@@ -3391,7 +3564,8 @@ mod tests {
                 js: None,
                 ms: None,
                 idle: false,
-                timeout_ms: None
+                timeout_ms: None,
+                download: None,
             }
         );
         assert_eq!(
@@ -3404,10 +3578,12 @@ mod tests {
                 js: None,
                 ms: Some(250.0),
                 idle: false,
-                timeout_ms: None
+                timeout_ms: None,
+                download: None,
             }
         );
-        assert_eq!(cmd(&["tab-select", "1"]), Command::TabSelect { index: 1 });
+        assert_eq!(cmd(&["tab-select", "1"]), Command::TabSelect { index: 1, target: None });
+        assert_eq!(cmd(&["tab-select", "9F2A0C"]), Command::TabSelect { index: 0, target: Some("9F2A0C".into()) });
         assert_eq!(cmd(&["snapshot"]), cmd(&["ax"]));
         assert_eq!(cmd(&["close"]), Command::Quit { close_browser: false });
         assert_eq!(cmd(&["quit", "--close-browser"]), Command::Quit { close_browser: true });
@@ -3466,7 +3642,7 @@ mod tests {
 
     #[test]
     fn tab_commands_parse_indexes() {
-        assert_eq!(cmd(&["tab-select", "--index", "2"]), Command::TabSelect { index: 2 });
+        assert_eq!(cmd(&["tab-select", "--index", "2"]), Command::TabSelect { index: 2, target: None });
         assert_eq!(cmd(&["tab-close"]), Command::TabClose { index: None });
         assert!(parse_args(argv(&["navigera", "tab-select"])).is_err());
         assert!(parse_args(argv(&["navigera", "tab-select", "--index", "x"])).is_err());
@@ -3488,7 +3664,12 @@ mod tests {
         let command: Command = serde_json::from_str(r#"{"op":"click","ref":"@e7"}"#).expect("string ref");
         assert_eq!(
             command,
-            Command::Click { target: TargetArgs { node_ref: Some(7), ..Default::default() }, timeout_ms: None }
+            Command::Click {
+                target: TargetArgs { node_ref: Some(7), ..Default::default() },
+                timeout_ms: None,
+                button: None,
+                force: false
+            }
         );
         let command: Command = serde_json::from_str(r#"{"op":"select","ref":3,"values":["a","b"]}"#).expect("values");
         assert!(
@@ -3517,7 +3698,12 @@ mod tests {
     fn commands_round_trip_through_json_for_session_clients() {
         for command in [
             Command::Goto { url: "https://example.com".into(), wait: None, timeout_ms: None },
-            Command::Click { target: TargetArgs { node_ref: Some(9), ..Default::default() }, timeout_ms: Some(500.0) },
+            Command::Click {
+                target: TargetArgs { node_ref: Some(9), ..Default::default() },
+                timeout_ms: Some(500.0),
+                button: None,
+                force: false,
+            },
             Command::Ax {
                 max_depth: None,
                 all: Some(true),
@@ -3531,6 +3717,7 @@ mod tests {
                 target: TargetArgs { text: Some("Country".into()), ..Default::default() },
                 value: vec!["CA".into()],
                 timeout_ms: None,
+                add: false,
             },
             Command::Wait {
                 selector: None,
@@ -3541,6 +3728,7 @@ mod tests {
                 ms: None,
                 idle: false,
                 timeout_ms: None,
+                download: None,
             },
             Command::Quit { close_browser: false },
             Command::Quit { close_browser: true },
@@ -3552,6 +3740,8 @@ mod tests {
         let wire = serde_json::to_string(&Command::Click {
             target: TargetArgs { node_ref: Some(9), ..Default::default() },
             timeout_ms: None,
+            button: None,
+            force: false,
         })
         .unwrap();
         assert_eq!(wire, r#"{"op":"click","ref":9}"#);

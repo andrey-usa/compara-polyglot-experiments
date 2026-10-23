@@ -115,7 +115,7 @@ fn port_open(port: u16) -> bool {
 }
 
 /// The live browser endpoint in a user data directory, if its browser runs.
-fn live_endpoint(dir: &Path) -> Option<String> {
+pub(crate) fn live_endpoint(dir: &Path) -> Option<String> {
     let (port, path) = read_active_port(dir).ok()?;
     if path.is_empty() || !port_open(port) {
         return None;
@@ -168,7 +168,7 @@ pub fn resolve(spec: &str) -> Result<String> {
 /// `--profile`: the endpoint of the persistent browser on `dir`, starting
 /// it first when it isn't running. The browser is detached from navigera
 /// (its own process group, out of any job) and outlives every session.
-pub fn ensure_profile_browser(exe: &str, dir: &Path, headless: bool) -> Result<String> {
+pub fn ensure_profile_browser(exe: &str, dir: &Path, headless: bool, extra: &[String]) -> Result<String> {
     if let Some(url) = live_endpoint(dir) {
         crate::timing::log(&format!("[attach] profile browser already running: {url}"));
         return Ok(url);
@@ -177,13 +177,17 @@ pub fn ensure_profile_browser(exe: &str, dir: &Path, headless: bool) -> Result<S
     // A file left by a crashed browser would be read as the new endpoint.
     let _ = std::fs::remove_file(dir.join("DevToolsActivePort"));
     let mut cmd = Command::new(exe);
+    // `navigator.webdriver` stays false, as in navigera's own launches: a
+    // signed-in profile is the one place a site's bot check matters most.
     cmd.arg(format!("--user-data-dir={}", dir.display()))
         .arg("--remote-debugging-port=0")
         .arg("--no-first-run")
-        .arg("--no-default-browser-check");
+        .arg("--no-default-browser-check")
+        .arg("--disable-blink-features=AutomationControlled");
     if headless {
-        cmd.arg("--headless=new");
+        cmd.arg("--headless=new").arg("--window-size=1440,900");
     }
+    cmd.args(extra);
     if crate::proc::running_as_root() {
         // Chrome refuses to start its sandbox as root (containers, CI).
         cmd.arg("--no-sandbox");

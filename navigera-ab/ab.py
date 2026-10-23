@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Same-runner A/B of navigera builds: a cold one-shot command, and a session
-(start, goto, ax, eval, quit) against the bench site, rounds interleaved so a
+(start, goto, ax, fill, click, click by text, eval, quit) against the bench site, rounds interleaved so a
 noisy moment hits every build alike. Prints a markdown table of medians.
 
     ab.py --build base=PATH --build head=PATH [--build "natural=PATH --natural"] \
@@ -36,10 +36,10 @@ def main():
         name, rest = b.split("=", 1)
         parts = shlex.split(rest)
         builds.append((name, parts[0], parts[1:]))
-    steps = ["cold one-shot", "start", "goto", "ax", "eval", "quit", "session total"]
+    steps = ["cold one-shot", "start", "goto", "ax", "fill", "click", "click text", "eval", "quit", "session total"]
     times = {(n, s): [] for n, _, _ in builds for s in steps}
     tmp = tempfile.mkdtemp()
-    page = args.site.rstrip("/") + "/"
+    page = args.site.rstrip("/") + "/shop"
     for r in range(args.rounds + 1):
         for name, exe, flags in builds:
             got = {}
@@ -49,9 +49,12 @@ def main():
             got["start"] = timed(s + ["start"])
             got["goto"] = timed(s + ["goto", page])
             got["ax"] = timed(s + ["ax"])
+            got["fill"] = timed(s + ["fill", "--selector", "#q", "valve"])
+            got["click"] = timed(s + ["click", "--selector", "#cookie-accept"])
+            got["click text"] = timed(s + ["click", "--text", "Add to cart"])
             got["eval"] = timed(s + ["eval", "document.title"])
             got["quit"] = timed(s + ["quit"])
-            got["session total"] = sum(got[k] for k in ["start", "goto", "ax", "eval", "quit"])
+            got["session total"] = sum(got[k] for k in ["start", "goto", "ax", "fill", "click", "click text", "eval", "quit"])
             if r > 0:  # round 0 warms caches
                 for k, v in got.items():
                     times[(name, k)].append(v)

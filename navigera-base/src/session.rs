@@ -561,6 +561,15 @@ pub fn start(config: &SessionConfig, name: &str, output: &mut dyn Write) -> Exit
     if config.headless {
         cmd.arg("--headless");
     }
+    if let Some(from) = &config.from {
+        cmd.arg("--from").arg(from);
+    }
+    if let Some(from_profile) = &config.from_profile {
+        cmd.arg("--from-profile").arg(from_profile);
+    }
+    if config.natural {
+        cmd.arg("--natural");
+    }
     cmd.arg("serve").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(log));
     let mut child = match crate::proc::spawn_detached(&mut cmd) {
         Ok(child) => child,
@@ -602,7 +611,11 @@ pub fn start(config: &SessionConfig, name: &str, output: &mut dyn Write) -> Exit
                 format!("session server did not listen within {wait}s; see {}", log_path.display()),
             );
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // A failed connect costs microseconds, and the server is usually up
+        // within a few hundred ms: checking every 5 ms keeps `start` from
+        // waiting out a 50 ms step after it is ready. Slower after that.
+        let step = if Instant::now() + Duration::from_secs(wait - 3) < deadline { 5 } else { 50 };
+        std::thread::sleep(Duration::from_millis(step));
     }
 }
 

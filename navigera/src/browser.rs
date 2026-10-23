@@ -115,6 +115,57 @@ pub fn natural() -> bool {
         || std::env::var("NAVIGERA_NATURAL").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
 
+/// How long element ops wait for their element when the op names no
+/// timeout of its own: `--wait-ms` (on `start`, `serve`, `mcp` or a single
+/// command), else `NAVIGERA_WAIT_MS`, else [`DEFAULT_ELEMENT_WAIT`]. A test
+/// suite against a slow app sets it once instead of on every step.
+static ELEMENT_WAIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the element wait for this process (`None` leaves it as it is).
+pub fn set_element_wait(ms: Option<f64>) {
+    if let Some(ms) = ms.filter(|ms| ms.is_finite() && *ms > 0.0) {
+        ELEMENT_WAIT_MS.store(ms as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The element wait in force (see [`set_element_wait`]).
+pub fn element_wait() -> Duration {
+    let ms = ELEMENT_WAIT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if ms > 0 {
+        return Duration::from_millis(ms);
+    }
+    std::env::var("NAVIGERA_WAIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|ms| ms.is_finite() && *ms > 0.0)
+        .map(|ms| Duration::from_millis(ms as u64))
+        .unwrap_or(DEFAULT_ELEMENT_WAIT)
+}
+
+/// Where downloads are saved: `--download-dir`, else
+/// `NAVIGERA_DOWNLOAD_DIR`, else a directory of this process's own under
+/// the system temp directory.
+static DOWNLOAD_DIR: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Set the download directory for the browsers this process starts.
+pub fn set_download_dir(dir: Option<&str>) {
+    if let Some(dir) = dir.filter(|d| !d.trim().is_empty()) {
+        *DOWNLOAD_DIR.lock().unwrap() = Some(std::path::PathBuf::from(dir));
+    }
+}
+
+/// The download directory in force, created if missing (absolute).
+pub fn download_dir() -> Result<std::path::PathBuf> {
+    let dir = DOWNLOAD_DIR
+        .lock()
+        .unwrap()
+        .clone()
+        .or_else(|| std::env::var_os("NAVIGERA_DOWNLOAD_DIR").filter(|v| !v.is_empty()).map(Into::into))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("navigera-downloads-{}", std::process::id())));
+    std::fs::create_dir_all(&dir).with_context(|| format!("download directory {}", dir.display()))?;
+    Ok(std::fs::canonicalize(&dir).unwrap_or(dir))
+}
+
 /// What a headless Chrome shows a page that a windowed one does not, put
 /// right for natural mode: the user agent says `HeadlessChrome` (in
 /// `navigator.userAgent`, in workers, in every request's header), and the
@@ -611,6 +662,13 @@ impl BrowserSession {
             browser.new_page(Some("about:blank")).map_err(|e| anyhow::anyhow!("{e:#} ({})", browser.death_report()))?
         };
         crate::timing::record("first_page", page_started);
+        if !lightpanda {
+            // Best effort: a browser without the call just doesn't report
+            // downloads (`downloads` then says there are none).
+            if let Ok(dir) = download_dir() {
+                let _ = browser.enable_downloads(Some(&dir));
+            }
+        }
         crate::timing::record("launch_total", launch_started);
         Ok(Self {
             browser,
@@ -669,6 +727,11 @@ impl BrowserSession {
         crate::timing::log(&format!("[browser] {what}: connected to {ws_url}"));
         crate::timing::record("browser_up", started);
         let page = browser.new_page_in(Some("about:blank"), true)?;
+        // A `--profile` browser is navigera's: its downloads go where ours
+        // do. The user's own browser (`--attach`) keeps its own setting;
+        // navigera only listens.
+        let dir = if profile_dir.is_some() { download_dir().ok() } else { None };
+        let _ = browser.enable_downloads(dir.as_deref());
         crate::timing::record("launch_total", started);
         Ok(Self {
             browser,
@@ -720,17 +783,54 @@ impl BrowserSession {
 
     /// (element auto-wait, CDP command timeout) for an element op: the op's
     /// own `timeout_ms` bounds the wait; without one, the element wait is
-    /// [`DEFAULT_ELEMENT_WAIT`] (fast feedback on a wrong selector).
+    /// [`element_wait`] (by default 5 s: fast feedback on a wrong selector).
     fn element_budget(&self, override_ms: Option<f64>) -> (Duration, Duration) {
         let wait = match override_ms {
             Some(ms) => Duration::from_secs_f64(ms / 1000.0),
-            None => DEFAULT_ELEMENT_WAIT.min(self.timeout(None)),
+            None => element_wait(),
         };
         (wait, self.timeout(None).max(wait + Duration::from_secs(1)))
     }
 
     fn active_tab(&self) -> &Page {
         &self.pages[self.active]
+    }
+
+    /// Downloads so far (`clear` empties the list afterwards).
+    pub fn downloads(&self, clear: bool) -> Vec<cdp::downloads::Download> {
+        let mut d = self.browser.shared().downloads.lock().unwrap();
+        let out = d.items.clone();
+        if clear {
+            d.items.clear();
+        }
+        out
+    }
+
+    /// Wait for a finished download whose file name matches `glob`
+    /// (`*`, `?`; empty: any). A canceled match is an error.
+    pub fn wait_download(&self, glob: &str, timeout_ms: Option<f64>) -> Result<cdp::downloads::Download> {
+        let (wait, _) = self.element_budget(timeout_ms.or(Some(self.timeout_ms)));
+        let deadline = std::time::Instant::now() + wait;
+        let matches = |d: &cdp::downloads::Download| glob.is_empty() || cdp::glob_match(glob, &d.suggested);
+        loop {
+            let items = self.downloads(false);
+            if let Some(d) = items.iter().rev().find(|d| matches(d) && d.state == "completed") {
+                return Ok(d.clone());
+            }
+            if let Some(d) = items.iter().rev().find(|d| matches(d) && d.state == "canceled") {
+                bail!("download {} was canceled ({})", d.suggested, d.url);
+            }
+            if std::time::Instant::now() >= deadline {
+                let seen: Vec<String> = items.iter().map(|d| format!("{} ({})", d.suggested, d.state)).collect();
+                bail!(
+                    "no finished download{} within {} ms (seen: {})",
+                    if glob.is_empty() { String::new() } else { format!(" matching {glob:?}") },
+                    wait.as_millis(),
+                    if seen.is_empty() { "none".to_string() } else { seen.join(", ") }
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Number of open pages (tabs) in this session.
@@ -959,10 +1059,9 @@ impl BrowserSession {
 
     /// How many elements match a CSS selector (no waiting).
     pub fn count(&self, selector: &str) -> Result<u64> {
-        let n: serde_json::Value = self.active_tab().evaluate(
-            &format!("document.querySelectorAll({}).length", serde_json::json!(selector)),
-            self.timeout(None),
-        )?;
+        let n: serde_json::Value = self
+            .active_tab()
+            .evaluate(&format!("{}.all({}).length", cdp::DEEP, serde_json::json!(selector)), self.timeout(None))?;
         Ok(n.as_u64().unwrap_or(0))
     }
 
@@ -1017,7 +1116,7 @@ impl BrowserSession {
         if checked(self)? == want {
             return Ok(false);
         }
-        self.click_target(target, timeout_ms)?;
+        self.click_target(target, &cdp::ClickOptions::default(), timeout_ms)?;
         if checked(self)? != want {
             bail!("clicking it did not {} it", if want { "check" } else { "uncheck" });
         }
@@ -1447,10 +1546,15 @@ impl BrowserSession {
 
     /// Click the element `target` names (trusted mouse click when hittable).
     /// If the click starts a navigation, waits for the new document.
-    pub fn click_target(&self, target: &Target, timeout_ms: Option<f64>) -> Result<serde_json::Value> {
+    pub fn click_target(
+        &self,
+        target: &Target,
+        opts: &cdp::ClickOptions,
+        timeout_ms: Option<f64>,
+    ) -> Result<serde_json::Value> {
         let (wait, timeout) = self.element_budget(timeout_ms);
         let generation = self.active_tab().nav_generation();
-        let point = self.active_tab().click(target, wait, timeout)?;
+        let point = self.active_tab().click(target, opts, wait, timeout)?;
         if point.get("nav").and_then(|v| v.as_bool()) == Some(true) {
             self.active_tab().navigation_started(generation, NAV_GRACE);
         }
@@ -1468,9 +1572,15 @@ impl BrowserSession {
         self.active_tab().fill(target, value, wait, timeout)
     }
 
-    pub fn select(&self, target: &Target, values: &[String], timeout_ms: Option<f64>) -> Result<serde_json::Value> {
+    pub fn select(
+        &self,
+        target: &Target,
+        values: &[String],
+        add: bool,
+        timeout_ms: Option<f64>,
+    ) -> Result<serde_json::Value> {
         let (wait, timeout) = self.element_budget(timeout_ms);
-        let chosen = self.active_tab().select(target, values, wait, timeout)?;
+        let chosen = self.active_tab().select(target, values, add, wait, timeout)?;
         self.settle_for(timeout_ms);
         Ok(chosen)
     }
@@ -1543,7 +1653,8 @@ impl BrowserSession {
 
     /// Click the first element matching `selector`.
     pub fn click(&self, selector: &str, timeout_ms: Option<f64>) -> Result<()> {
-        self.click_target(&Target::Selector(selector.to_string()), timeout_ms).map(|_| ())
+        self.click_target(&Target::Selector(selector.to_string()), &cdp::ClickOptions::default(), timeout_ms)
+            .map(|_| ())
     }
 
     /// Fill the first matching field with `value`.
@@ -1553,7 +1664,7 @@ impl BrowserSession {
 
     /// Click the node with this `backendNodeId` (an `ax` ref).
     pub fn click_ref(&self, backend_node_id: u64, timeout_ms: Option<f64>) -> Result<()> {
-        self.click_target(&Target::Ref(backend_node_id), timeout_ms).map(|_| ())
+        self.click_target(&Target::Ref(backend_node_id), &cdp::ClickOptions::default(), timeout_ms).map(|_| ())
     }
 
     /// Fill the node with this `backendNodeId` (an `ax` ref) with `value`.

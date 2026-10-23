@@ -190,6 +190,14 @@ fn tools() -> Vec<Value> {
             false,
         ),
         tool(
+            "browser_handoff",
+            "Hand the browser to the person (show: it comes on screen with the same tabs and sign-ins, for a \
+             login, a 2FA prompt or a CAPTCHA you cannot do) and take it back (hide: headless again). Tell the \
+             person what to do, then wait for the page they will reach (browser_wait_for) before going on.",
+            object(props(&[json!({"action": {"type": "string", "enum": ["show", "hide"]}})]), &["action"]),
+            false,
+        ),
+        tool(
             "browser_history",
             "Go back, forward, or reload the active tab.",
             object(
@@ -362,6 +370,13 @@ fn plan(name: &str, arguments: &Value) -> Result<Plan, String> {
                 other => return Err(format!("browser_tabs: unknown action {other:?} (list|new|select|close)")),
             };
             single(op_name, args)
+        }
+        "browser_handoff" => {
+            let action = args.remove("action").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+            if !matches!(action.as_str(), "show" | "hide") {
+                return Err(format!("browser_handoff: unknown action {action:?} (show|hide)"));
+            }
+            single(&action, args)
         }
         "browser_history" => {
             let action = args.remove("action").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
@@ -680,6 +695,7 @@ mod tests {
                 "browser_navigate" => json!({"url": "example.com"}),
                 "browser_tabs" => json!({"action": "list"}),
                 "browser_history" => json!({"action": "back"}),
+                "browser_handoff" => json!({"action": "show"}),
                 "browser_run" => json!({"steps": [{"op": "click", "ref": 3}]}),
                 "browser_resize" => json!({"width": 800, "height": 600}),
                 _ => json!({}),

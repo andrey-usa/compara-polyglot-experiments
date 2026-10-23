@@ -106,6 +106,8 @@ pub struct Shared {
     pub processed: std::sync::atomic::AtomicU64,
     /// Console, exceptions and network requests per tab.
     pub logs: Mutex<super::logs::Logs>,
+    /// Files the pages downloaded (`downloads`, `wait --download`).
+    pub downloads: Mutex<super::downloads::Downloads>,
     /// `route` rules, first match wins; requests matching none continue.
     pub routes: Mutex<Vec<Route>>,
     /// `set credentials`: answers HTTP auth challenges.
@@ -363,6 +365,9 @@ fn on_event(client: &CdpClient, shared: &Arc<Shared>, event: &Value) {
         note_popup(shared, method, &params, session);
     }
     shared.logs.lock().unwrap().on_event(method, &params, session);
+    if method.starts_with("Browser.download") {
+        shared.downloads.lock().unwrap().on_event(method, &params);
+    }
     match method {
         "Page.javascriptDialogOpening" if shared.is_single_target() => {
             // Already answered by the page's engine: report what it got (the
