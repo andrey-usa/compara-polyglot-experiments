@@ -654,6 +654,8 @@ pub enum Command {
     /// Take it off screen again (headless), with the same tabs and sign-ins.
     #[serde(rename = "hide")]
     Hide {},
+    /// A clean slate: a new browser context with one blank tab.
+    Reset {},
     /// Open a fresh tab (optionally at a URL) and make it active.
     #[serde(rename = "tab-new")]
     TabNew {
@@ -933,6 +935,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("forward", "", "history forward"),
     ("reload", "", "reload the page"),
     ("screenshot", "[--path <f.png>] [--full-page]", "PNG of the viewport (or whole page)"),
+    ("reset", "", "a clean slate in the same browser: a new browser context (no cookies, storage or cache from before) with one blank tab; the old tabs close (`set`, routes and init scripts stay)"),
     ("tab-new", "[<url>]", "open a tab and make it active"),
     ("tab-list", "", "list tabs"),
     ("show", "", "put the browser on screen with the same tabs and sign-ins, to hand the session to a person (a login, 2FA, a CAPTCHA); `hide` takes it back off"),
@@ -1821,6 +1824,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
         "tab-list" => Command::TabList {},
         "show" => Command::Show {},
         "hide" => Command::Hide {},
+        "reset" => Command::Reset {},
         "tab-new" => Command::TabNew {
             url: match str_flag(&mut args, "--url")? {
                 Some(u) => Some(u),
@@ -2209,6 +2213,7 @@ impl Driver {
                 | Command::Unroute { .. }
                 | Command::Set { .. }
                 | Command::TabNew { .. }
+                | Command::Reset {}
                 | Command::TabSelect { .. }
                 | Command::TabClose { .. }
                 | Command::ClosePage { .. }
@@ -2977,6 +2982,10 @@ impl Driver {
             Command::TabList {} => Ok(self.tabs_json()),
             Command::Show {} => self.relaunch(true),
             Command::Hide {} => self.relaunch(false),
+            Command::Reset {} => {
+                self.session.reset().map_err(|e| anyhow::anyhow!("reset: {e:#}"))?;
+                Ok(self.tabs_json())
+            }
             Command::TabNew { url } => {
                 self.session.new_page().map_err(|e| anyhow::anyhow!("tab-new: {e:#}"))?;
                 if let Some(url) = url {

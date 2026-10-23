@@ -75,6 +75,8 @@ impl Session {
             .arg("--session")
             .arg(&self.name)
             .args(args)
+            // Clicks say what they saw change (`effect_trace`): failures show it.
+            .env("NAVIGERA_TRACE_EFFECT", "1")
             .stdin(Stdio::null())
             .output()
             .expect("run navigera");
@@ -448,4 +450,25 @@ fn a_click_that_changes_nothing_says_so() {
     s.ok(&["wait", "--text", "saved"]);
     let r = s.ok(&["click", "--selector", "#agree"]);
     assert!(r.get("no_effect").is_none(), "checkbox: {r}");
+}
+
+#[test]
+fn reset_starts_clean_in_the_same_browser() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("reset", &[]);
+    s.ok(&["goto", &format!("{}/effects", site.url)]);
+    s.ok(&["eval", "(localStorage.setItem('k', 'v'), document.cookie = 'c=1; path=/', 1)"]);
+    s.ok(&["tab-new", &format!("{}/honesty", site.url)]);
+    let r = s.ok(&["reset"]);
+    assert_eq!(r["tabs"].as_array().map(Vec::len), Some(1), "{r}");
+    s.ok(&["goto", &format!("{}/effects", site.url)]);
+    assert_eq!(s.ok(&["eval", "[localStorage.getItem('k'), document.cookie]"]), serde_json::json!([null, ""]));
+    // Downloads still land where they should in the new context.
+    s.ok(&["goto", &format!("{}/download", site.url)]);
+    s.ok(&["click", "--selector", "#dl"]);
+    let r = s.ok(&["wait", "--download", "*.csv"]);
+    assert!(r["download"]["path"].as_str().unwrap_or_default().ends_with("report.csv"), "{r}");
+    // Twice in a row: the first context goes away with its tabs.
+    s.ok(&["reset"]);
+    assert_eq!(s.ok(&["tab-list"])["tabs"].as_array().map(Vec::len), Some(1));
 }

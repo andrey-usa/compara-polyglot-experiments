@@ -173,6 +173,7 @@ page "Checkout — Acme" http://shop.test/checkout
 | `back` / `forward` / `reload` | history |
 | `screenshot [file.png] [--full-page]` | PNG of the viewport or the whole page |
 | `tab-new [url]`, `tab-list`, `tab-select <i or target id>`, `tab-close [<i>]` | tabs; a target id from `tab-list` stays right when tabs open and close |
+| `reset` | start clean in the same browser: no cookies, storage or tabs from before (signs you out) |
 | `dialog --accept\|--dismiss [--prompt-text t]` | how future `alert`/`confirm`/`prompt` dialogs are answered |
 
 Element commands wait up to 5 s for the element to appear. Pass

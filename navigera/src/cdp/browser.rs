@@ -268,12 +268,21 @@ impl Browser {
     /// saving them in `dir`, or where the browser would (no `dir`: a browser
     /// that is the user's own keeps its own setting).
     pub fn enable_downloads(&self, dir: Option<&std::path::Path>) -> Result<()> {
-        let params = match dir {
+        self.enable_downloads_in(dir, None)
+    }
+
+    /// [`Browser::enable_downloads`] for one browser context (the default
+    /// one without `context`).
+    pub fn enable_downloads_in(&self, dir: Option<&std::path::Path>, context: Option<&str>) -> Result<()> {
+        let mut params = match dir {
             Some(d) => {
                 json!({ "behavior": "allowAndName", "downloadPath": d.display().to_string(), "eventsEnabled": true })
             }
             None => json!({ "behavior": "default", "eventsEnabled": true }),
         };
+        if let Some(context) = context {
+            params["browserContextId"] = json!(context);
+        }
         self.block_on(self.client.send("Browser.setDownloadBehavior", params, None, CMD_TIMEOUT))?;
         self.shared.downloads.lock().unwrap().dir = dir.map(std::path::Path::to_path_buf);
         Ok(())
@@ -366,9 +375,38 @@ impl Browser {
     /// [`Browser::new_page`] in a window of its own: in a user's browser
     /// the agent works beside their tabs, not among them.
     pub fn new_page_in(&self, url: Option<&str>, new_window: bool) -> Result<Page> {
+        self.new_page_with(url, new_window, None)
+    }
+
+    /// A new browser context: its own cookies, storage and cache, as a
+    /// fresh incognito profile has.
+    pub fn create_context(&self) -> Result<String> {
+        let r = self.block_on(self.client.send("Target.createBrowserContext", json!({}), None, CMD_TIMEOUT))?;
+        r.get("browserContextId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("createBrowserContext: no browserContextId"))
+    }
+
+    /// Close a context made by [`Browser::create_context`] and its tabs.
+    pub fn dispose_context(&self, id: &str) -> Result<()> {
+        self.block_on(self.client.send(
+            "Target.disposeBrowserContext",
+            json!({ "browserContextId": id }),
+            None,
+            CMD_TIMEOUT,
+        ))
+        .map(|_| ())
+    }
+
+    /// A tab, in a window of its own or not, in a context or the default one.
+    pub fn new_page_with(&self, url: Option<&str>, new_window: bool, context: Option<&str>) -> Result<Page> {
         let mut params = json!({ "url": url.unwrap_or("about:blank") });
         if new_window {
             params["newWindow"] = json!(true);
+        }
+        if let Some(context) = context {
+            params["browserContextId"] = json!(context);
         }
         self.block_on(async {
             let target = self

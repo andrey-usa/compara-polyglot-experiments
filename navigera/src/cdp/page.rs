@@ -428,6 +428,10 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button,
     return { synthetic: true, covered: !!hit && !force, covered_by: hit && hit !== el ? describe(hit) : null, nav: mayNavigate(el) };
 }"#;
 
+/// A script sent to a document that a navigation then replaced gets this
+/// long after the new document commits to answer (see `Page::send`).
+const ABANDON_AFTER_COMMIT: Duration = Duration::from_secs(1);
+
 /// How long a click that changed nothing yet is watched before `click`
 /// says so (`no_effect`). Effects of a click almost always show within a
 /// frame or two.
@@ -1293,7 +1297,36 @@ impl Page {
     }
 
     fn send(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        self.block_on(self.client.send(method, params, Some(&self.session_id), timeout))
+        if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") {
+            return self.block_on(self.client.send(method, params, Some(&self.session_id), timeout));
+        }
+        // A script still running in a document a navigation replaced is
+        // normally failed by Chrome ("Execution context was destroyed"), and
+        // the op looks again on the new page. Sometimes no answer ever comes
+        // (seen on macOS); don't wait out the whole timeout for one: a second
+        // after the new document committed, give up on the old one the same
+        // way.
+        let generation = self.nav_generation();
+        self.block_on(async {
+            let call = self.client.send(method, params, Some(&self.session_id), timeout);
+            tokio::pin!(call);
+            loop {
+                tokio::select! {
+                    r = &mut call => return r,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        let nav = self.shared.nav_state(&self.session_id);
+                        if nav.generation > generation
+                            && nav.committed_at.is_some_and(|t| t.elapsed() >= ABANDON_AFTER_COMMIT)
+                        {
+                            bail!(
+                                "Inspected target navigated or closed: the page was replaced while {method} ran \
+                                 and the old one never answered"
+                            );
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// Send one CDP command to this tab's session.

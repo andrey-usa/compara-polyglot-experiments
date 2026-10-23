@@ -548,6 +548,8 @@ pub struct BrowserSession {
     /// Modifiers held with `keydown` (Shift, Control, Alt, Meta): later
     /// `press`es carry them until `keyup`.
     held: std::sync::Mutex<Vec<String>>,
+    /// The browser context `reset` made (its tabs are the session's).
+    context: Option<String>,
     /// Owns the tokio runtime; declared LAST so it drops last, after the
     /// browser/client/pages that use it.
     _runtime: tokio::runtime::Runtime,
@@ -680,6 +682,7 @@ impl BrowserSession {
             lightpanda,
             timeout_ms: nav_timeout_ms,
             abandoned: std::sync::Mutex::new(None),
+            context: None,
             attached: false,
             profile_dir: None,
             profile_exe: None,
@@ -743,6 +746,7 @@ impl BrowserSession {
             lightpanda: false,
             timeout_ms: nav_timeout_ms,
             abandoned: std::sync::Mutex::new(None),
+            context: None,
             attached: true,
             profile_dir,
             profile_exe,
@@ -863,6 +867,37 @@ impl BrowserSession {
         self.pages.push(page);
         self.active = self.pages.len() - 1;
         Ok(self.active)
+    }
+
+    /// A clean slate in the same browser: a new browser context (no
+    /// cookies, storage or cache from before, like a fresh incognito
+    /// window) with one blank tab; the session's old tabs close. `set`
+    /// emulation, routes and init scripts carry over. Tens of milliseconds,
+    /// against a few hundred for a new browser.
+    pub fn reset(&mut self) -> Result<()> {
+        if self.lightpanda {
+            bail!("reset needs the chrome engine (Lightpanda has one context per process): start a new session");
+        }
+        let context = self.browser.create_context()?;
+        // The user's own browser (`--attach`) keeps its download setting.
+        let dir = if self.attached && self.profile_dir.is_none() { None } else { download_dir().ok() };
+        let _ = self.browser.enable_downloads_in(dir.as_deref(), Some(&context));
+        let page = self.browser.new_page_with(Some("about:blank"), false, Some(&context))?;
+        self.apply_overrides(&page);
+        self.apply_init_scripts(&page);
+        let timeout = self.timeout(None);
+        for old in self.pages.drain(..) {
+            let _ = old.close_target(timeout);
+        }
+        self.pages.push(page);
+        self.active = 0;
+        if let Some(old) = self.context.replace(context) {
+            let _ = self.browser.dispose_context(&old);
+        }
+        if let Ok(mut a) = self.abandoned.lock() {
+            *a = None;
+        }
+        self.bring_to_front()
     }
 
     /// Switch the active tab by zero-based index.
@@ -1862,6 +1897,11 @@ impl BrowserSession {
         // Never panic from close: a panicking shutdown turns a successful
         // session into a failed process exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // A browser navigera doesn't own keeps running: take the
+            // context `reset` opened in it away first.
+            if let (true, Some(context)) = (self.attached, self.context.as_deref()) {
+                let _ = self.browser.dispose_context(context);
+            }
             self.browser.close();
         }));
     }
