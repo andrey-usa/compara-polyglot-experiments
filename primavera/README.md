@@ -106,6 +106,7 @@ Status: **M1 in progress** (working name).
 ```text
 primavera run [<file.pv|dir>...] [--base-url <url>] [--var k=v] [--grep <text>] [--tag <tag>]
               [--workers <n|auto>] [--isolation context|browser] [--retries <n>] [--fail-on-flaky] [--shard <i/n>]
+              [--repeat <n>] [--shuffle [<seed>]]
               [--reporter console|jsonl|github] [--junit <file>] [--json]
               [--timeout-ms <ms>] [--wait-ms <ms>] [--headed] [--chromium <path>]
               [--secrets <file>] [--pause-on-failure]
@@ -124,6 +125,10 @@ primavera list [<file.pv|dir>...]
   reported FLAKY with how its first try failed. `--fail-on-flaky` fails
   the run on one. `--shard i/n` takes every n-th scenario, for CI matrix
   jobs.
+- `--repeat 20 --shuffle` hunts flakes and order dependence: every
+  scenario runs 20 times (`name #k`), in a random order whose seed is
+  printed (`--shuffle <seed>` runs that order again), then a pass count per
+  scenario, FLAKY where it isn't all of them.
 - `--reporter jsonl` prints one JSON object per scenario as it finishes
   (the console moves to stderr); `github` writes workflow annotations on
   the failing lines (on by itself under GitHub Actions). `--json` prints

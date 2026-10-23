@@ -84,6 +84,7 @@ primavera lint tests/                       # milliseconds, no browser
 primavera run tests/ --base-url http://127.0.0.1:8000
 primavera run tests/ --workers 4 --retries 1 --junit report.xml
 primavera run tests/ --reporter jsonl       # one JSON object per scenario (console to stderr)
+primavera run tests/ --repeat 20 --shuffle  # flake hunt: pass counts per scenario
 primavera run job.pv --var month=2026-09 --json   # print what was saved
 primavera run tests/ --secrets .env.test   # NAME=value lines for ${secret:NAME}
 primavera run tests/x.pv --pause-on-failure  # keeps the failing tab; prints how to attach

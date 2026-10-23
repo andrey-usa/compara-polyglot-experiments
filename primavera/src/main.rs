@@ -38,6 +38,8 @@ run options:
   --retries <n>         run a failing scenario again, up to n times; one that then passes is flaky
   --fail-on-flaky       a flaky scenario fails the run
   --shard <i/n>         run the i-th of n slices (for CI matrix jobs)
+  --repeat <n>          run every scenario n times (flake hunting: each run is reported, then a pass count)
+  --shuffle [<seed>]    run in a random order (the seed is printed; give it again to repeat the order)
   --reporter <name>     console (default), jsonl (one JSON object per scenario on stdout), github
                         (workflow annotations; on by itself under GitHub Actions); repeatable
   --junit <file>        also write JUnit XML
@@ -65,6 +67,8 @@ struct Args {
     json: bool,
     /// `context` (one browser, a context per worker) or `browser`.
     isolation: String,
+    repeat: u32,
+    shuffle: Option<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -97,7 +101,19 @@ fn parse_args() -> Result<Args, String> {
     let mut reporters: Vec<String> = Vec::new();
     let mut json = false;
     let mut isolation = "context".to_string();
+    let mut repeat = 1u32;
+    let mut shuffle = None;
+    let mut it = it.peekable();
     while let Some(a) = it.next() {
+        if a == "--shuffle" {
+            // An optional seed: the next word when it is a number.
+            let seed = it.peek().and_then(|w| w.parse::<u64>().ok());
+            if seed.is_some() {
+                it.next();
+            }
+            shuffle = Some(seed.unwrap_or(stamp ^ (std::process::id() as u64).rotate_left(32)));
+            continue;
+        }
         let mut val = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
             "--base-url" => base_flag = Some(val("--base-url")?),
@@ -143,6 +159,11 @@ fn parse_args() -> Result<Args, String> {
                 retries = v.parse().map_err(|_| format!("--retries takes a number, not {v:?}"))?;
             }
             "--fail-on-flaky" => fail_on_flaky = true,
+            "--repeat" => {
+                let v = val("--repeat")?;
+                repeat =
+                    v.parse().ok().filter(|n| *n > 0).ok_or_else(|| format!("--repeat takes a number, not {v:?}"))?;
+            }
             "--shard" => {
                 let v = val("--shard")?;
                 let parsed = v
@@ -184,7 +205,21 @@ fn parse_args() -> Result<Args, String> {
     if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") && !reporters.iter().any(|r| r == "github") {
         reporters.push("github".into());
     }
-    Ok(Args { cmd, paths, opts, junit, workers, retries, fail_on_flaky, shard, reporters, json, isolation })
+    Ok(Args {
+        cmd,
+        paths,
+        opts,
+        junit,
+        workers,
+        retries,
+        fail_on_flaky,
+        shard,
+        reporters,
+        json,
+        isolation,
+        repeat,
+        shuffle,
+    })
 }
 
 /// `NAME=value` lines (`#` comments, optional quotes around the value).
@@ -323,10 +358,19 @@ fn run(args: Args) -> ExitCode {
     // Longest first (from the last runs), so the slowest one doesn't start
     // last; ones never timed go first, as they may be long.
     let timings = Timings::load();
-    jobs.sort_by(|a, b| {
-        let t = |j: &runner::Job| timings.get(&j.key(&suites)).copied().unwrap_or(f64::INFINITY);
-        t(b).partial_cmp(&t(a)).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    if args.repeat > 1 {
+        jobs = jobs.iter().flat_map(|j| (1..=args.repeat).map(move |rep| runner::Job { rep, ..*j })).collect();
+    }
+    match args.shuffle {
+        Some(seed) => {
+            shuffle(&mut jobs, seed);
+            eprintln!("shuffled with seed {seed} (--shuffle {seed} runs this order again)");
+        }
+        None => jobs.sort_by(|a, b| {
+            let t = |j: &runner::Job| timings.get(&j.key(&suites)).copied().unwrap_or(f64::INFINITY);
+            t(b).partial_cmp(&t(a)).unwrap_or(std::cmp::Ordering::Equal)
+        }),
+    }
 
     let jsonl = args.reporters.iter().any(|r| r == "jsonl");
     let console = args.reporters.iter().any(|r| r == "console");
@@ -403,6 +447,27 @@ fn run(args: Args) -> ExitCode {
         }
     }
     let ms = started.elapsed().as_secs_f64() * 1000.0;
+    if console && args.repeat > 1 {
+        // How often each scenario passed across its runs.
+        let mut tally: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+        for r in &results {
+            let e = tally.entry(format!("{}  {}", r.file.display(), r.base_name())).or_default();
+            e.1 += 1;
+            if r.passed() {
+                e.0 += 1;
+            }
+        }
+        let mut text = String::from("repeats:\n");
+        for (name, (ok, n)) in &tally {
+            let mark = if ok == n { "    " } else { "FLAKY " };
+            text.push_str(&format!("  {mark}{ok}/{n}  {name}\n"));
+        }
+        if jsonl {
+            eprint!("{text}");
+        } else {
+            print!("{text}");
+        }
+    }
     if console {
         let line = report::summary(&results, ms);
         if jsonl {
@@ -433,6 +498,19 @@ fn run(args: Args) -> ExitCode {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// A seeded Fisher-Yates shuffle (xorshift64*): the same seed, the same
+/// order, on every machine.
+fn shuffle(jobs: &mut [runner::Job], seed: u64) {
+    let mut x = seed.max(1);
+    for i in (1..jobs.len()).rev() {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        let r = x.wrapping_mul(0x2545F4914F6CDD1D);
+        jobs.swap(i, (r % (i as u64 + 1)) as usize);
     }
 }
 
@@ -556,6 +634,7 @@ fn worker(
         }
         let Some(r) = browser.as_mut() else { return };
         let (suite, sc) = job.get(suites);
+        let job_rep = job.rep;
         let before = if suite.before_all.is_empty() {
             Ok(BTreeMap::new())
         } else {
@@ -577,6 +656,10 @@ fn worker(
             Err(f) => runner::ScenarioResult::failed(suite, sc.name.clone(), sc.line, sc.tags.clone(), (**f).clone()),
         };
         result.worker = id;
+        if job_rep > 0 {
+            result.rep = job_rep;
+            result.name = format!("{} #{job_rep}", result.name);
+        }
         if tx.send(Event::Done(Box::new(result))).is_err() {
             return;
         }

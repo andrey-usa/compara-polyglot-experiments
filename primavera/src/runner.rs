@@ -103,6 +103,8 @@ pub struct ScenarioResult {
     pub notes: Vec<String>,
     /// Which worker ran it.
     pub worker: usize,
+    /// Which of `--repeat`'s runs (0 when not repeated); the name says it too.
+    pub rep: u32,
 }
 
 impl ScenarioResult {
@@ -122,6 +124,7 @@ impl ScenarioResult {
             saved: BTreeMap::new(),
             notes: Vec::new(),
             worker: 0,
+            rep: 0,
         }
     }
 
@@ -135,7 +138,15 @@ impl ScenarioResult {
 
     /// `file::name`, the key of `.primavera/timings.json`.
     pub fn key(&self) -> String {
-        format!("{}::{}", self.file.display(), self.name)
+        format!("{}::{}", self.file.display(), self.base_name())
+    }
+
+    /// The scenario's name without `--repeat`'s ` #k`.
+    pub fn base_name(&self) -> &str {
+        match (self.rep, self.name.rsplit_once(" #")) {
+            (1.., Some((base, _))) => base,
+            _ => &self.name,
+        }
     }
 }
 
@@ -144,6 +155,8 @@ impl ScenarioResult {
 pub struct Job {
     pub suite: usize,
     pub scenario: usize,
+    /// `--repeat`'s run number (0 when not repeated).
+    pub rep: u32,
 }
 
 impl Job {
@@ -171,7 +184,7 @@ pub fn jobs(suites: &[Suite], opts: &Options) -> Vec<Job> {
             if !opts.tags.is_empty() && !opts.tags.iter().any(|t| sc.tags.contains(t)) {
                 continue;
             }
-            out.push(Job { suite: si, scenario: ci });
+            out.push(Job { suite: si, scenario: ci, rep: 0 });
         }
     }
     out
@@ -286,6 +299,7 @@ impl Runner {
             saved: BTreeMap::new(),
             notes: Vec::new(),
             worker: 0,
+            rep: 0,
         };
         let mask = scope.masker();
         result.saved = scope.saved.into_iter().map(|(k, v)| (k, mask(&v))).collect();

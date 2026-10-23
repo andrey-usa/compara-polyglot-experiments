@@ -269,6 +269,7 @@ mod tests {
             saved: Default::default(),
             notes: vec![],
             worker: 0,
+            rep: 0,
         };
         let fail = ScenarioResult {
             name: "Total & tax".into(),
@@ -325,6 +326,7 @@ mod tests {
             saved: Default::default(),
             notes: vec![],
             worker: 0,
+            rep: 0,
         }
     }
 }

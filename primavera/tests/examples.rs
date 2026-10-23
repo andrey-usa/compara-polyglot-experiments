@@ -43,10 +43,17 @@ fn own_site() -> Option<Site> {
     Some(Site(child, url))
 }
 
-fn chrome() -> bool {
+/// Browser tests take turns: each primavera run is several Chromes
+/// already, and a small CI machine running them all at once times out.
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The test's turn with the browser (held while the guard lives), or none
+/// without a browser to test with.
+fn chrome() -> Option<std::sync::MutexGuard<'static, ()>> {
     let found = navigera::browser::resolve_executable_for(None, true).is_some();
     assert!(found || std::env::var_os("PRIMAVERA_REQUIRE_BROWSER").is_none(), "no Chrome/Chromium found");
-    found
+    // A test that failed holding it doesn't stop the others.
+    found.then(|| TURN.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 fn primavera(args: &[&str]) -> (i32, String) {
@@ -67,7 +74,7 @@ fn tempfile_dir() -> String {
 
 #[test]
 fn the_examples_pass_on_the_bench_site() {
-    let (true, Some(site)) = (chrome(), site()) else {
+    let (Some(_turn), Some(site)) = (chrome(), site()) else {
         return;
     };
     let junit = std::env::temp_dir().join(format!("primavera-junit-{}.xml", std::process::id()));
@@ -81,7 +88,7 @@ fn the_examples_pass_on_the_bench_site() {
 
 #[test]
 fn a_failure_says_what_was_expected_seen_and_why() {
-    let (true, Some(site)) = (chrome(), site()) else {
+    let (Some(_turn), Some(site)) = (chrome(), site()) else {
         return;
     };
     let (code, out) = primavera(&["run", "tests/fixtures/failing.pv", "--base-url", &site.1]);
@@ -116,7 +123,7 @@ fn lint_and_list_need_no_browser() {
 
 #[test]
 fn workers_retries_and_reporters() {
-    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
     // Retried: the first try fails, the second passes, and that is flaky.
     let (code, out) =
         primavera(&["run", "tests/fixtures/flaky.pv", "--base-url", &site.1, "--retries", "1", "--workers", "2"]);
@@ -170,7 +177,7 @@ fn shards_split_the_scenarios() {
 
 #[test]
 fn if_blocks_look_at_the_page_as_it_is() {
-    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
     let (code, out) = primavera(&["run", "tests/fixtures/if.pv", "--base-url", &site.1]);
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("1 passed, 0 failed"), "{out}");
@@ -195,7 +202,7 @@ fn secrets_file() -> String {
 
 #[test]
 fn the_newer_subjects_and_isolation_between_scenarios() {
-    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
     for workers in ["1", "2"] {
         let (code, out) = primavera(&["run", "tests/fixtures/m1.pv", "--base-url", &site.1, "--workers", workers]);
         assert_eq!(code, 1, "{out}");
@@ -207,7 +214,7 @@ fn the_newer_subjects_and_isolation_between_scenarios() {
 
 #[test]
 fn auth_runs_once_and_hooks_wrap_the_file() {
-    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
     let secrets = secrets_file();
     let (code, out) =
         primavera(&["run", "tests/fixtures/auth.pv", "--base-url", &site.1, "--workers", "2", "--secrets", &secrets]);
@@ -236,7 +243,7 @@ fn auth_runs_once_and_hooks_wrap_the_file() {
 
 #[test]
 fn handoff_waits_only_when_it_must() {
-    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
     let (code, out) = primavera(&["run", "tests/fixtures/handoff.pv", "--base-url", &site.1]);
     assert_eq!(code, 0, "{out}");
     // Nobody at a screen here: it says so instead of waiting.
@@ -253,7 +260,7 @@ fn handoff_waits_only_when_it_must() {
 #[test]
 fn a_pause_leaves_the_failing_tab_to_navigera() {
     use std::io::Write;
-    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
     let mut child = Command::new(env!("CARGO_BIN_EXE_primavera"))
         .args(["run", "tests/fixtures/pause.pv", "--base-url", &site.1, "--pause-on-failure"])
         .args(["--evidence", &tempfile_dir()])
@@ -288,4 +295,29 @@ fn a_pause_leaves_the_failing_tab_to_navigera() {
     child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(1));
+}
+
+#[test]
+fn repeat_and_shuffle_hunt_flakes() {
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
+    let (code, out) =
+        primavera(&["run", "tests/fixtures/flaky.pv", "--base-url", &site.1, "--repeat", "3", "--shuffle", "42"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("shuffled with seed 42"), "{out}");
+    assert!(out.contains("FLAKY 2/3  tests/fixtures/flaky.pv  Fails once, then passes"), "{out}");
+    assert!(out.contains("    3/3  tests/fixtures/flaky.pv  Steady"), "{out}");
+    assert!(out.contains("Steady #3"), "{out}");
+    // The same seed, the same order.
+    let order = |out: &str| -> Vec<String> {
+        out.lines()
+            .filter(|l| l.starts_with("PASS") || l.starts_with("FAIL"))
+            .map(|l| l.split("  ").nth(2).unwrap_or("").to_string())
+            .collect()
+    };
+    let (_, again) = primavera(&["list", "tests/fixtures/flaky.pv"]);
+    assert_eq!(again.lines().count(), 2, "{again}");
+    let site2 = own_site().unwrap();
+    let (_, out2) =
+        primavera(&["run", "tests/fixtures/flaky.pv", "--base-url", &site2.1, "--repeat", "3", "--shuffle", "42"]);
+    assert_eq!(order(&out), order(&out2), "{out}\n{out2}");
 }

@@ -17,8 +17,8 @@ import threading
 import time
 
 
-def descendants(pid):
-    """pid and every process below it."""
+def children():
+    """parent pid -> its children."""
     kids = {}
     for d in os.listdir("/proc"):
         if not d.isdigit():
@@ -29,12 +29,7 @@ def descendants(pid):
             kids.setdefault(ppid, []).append(int(d))
         except (OSError, ValueError, IndexError):
             pass
-    out, todo = [], [pid]
-    while todo:
-        p = todo.pop()
-        out.append(p)
-        todo.extend(kids.get(p, []))
-    return out
+    return kids
 
 
 def rss_kb(pid):
@@ -52,8 +47,28 @@ def is_browser(pid):
     try:
         exe = os.readlink(f"/proc/{pid}/exe")
     except OSError:
-        return False
+        # A process on its way out has no exe link any more: go by its
+        # command line.
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                exe = f.read().split(b"\0")[0].decode(errors="replace")
+        except OSError:
+            return False
     return "chrome" in exe or "headless_shell" in exe
+
+
+def runner_and_browser(root):
+    """(runner pids, browser pids) under root: a browser process and
+    everything below it count as the browser, whatever their exe says."""
+    kids = children()
+    runner, browser = [], []
+    todo = [(root, False)]
+    while todo:
+        p, under = todo.pop()
+        here = under or is_browser(p)
+        (browser if here else runner).append(p)
+        todo.extend((k, here) for k in kids.get(p, []))
+    return runner, browser
 
 
 def run(cmd, cwd, env):
@@ -65,12 +80,9 @@ def run(cmd, cwd, env):
 
     def sample():
         while not done.is_set():
-            runner = total = 0
-            for p in descendants(proc.pid):
-                kb = rss_kb(p)
-                total += kb
-                if not is_browser(p):
-                    runner += kb
+            pids, browser = runner_and_browser(proc.pid)
+            runner = sum(rss_kb(p) for p in pids)
+            total = runner + sum(rss_kb(p) for p in browser)
             peak["runner"] = max(peak["runner"], runner)
             peak["total"] = max(peak["total"], total)
             done.wait(0.02)
