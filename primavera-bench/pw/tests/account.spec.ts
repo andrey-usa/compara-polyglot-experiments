@@ -3,7 +3,10 @@ import { test, expect } from '@playwright/test';
 test('Signing in shows the orders', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', (e) => errors.push(String(e)));
-  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  // The browser's own favicon request isn't the page's error.
+  page.on('console', (m) => {
+    if (m.type() === 'error' && !m.location().url.endsWith('/favicon.ico')) errors.push(m.text());
+  });
   await page.goto('/login');
   await page.getByLabel('Email').fill('demo@acme.test');
   await page.getByLabel('Password').fill(process.env.PASSWORD ?? 'hunter2');

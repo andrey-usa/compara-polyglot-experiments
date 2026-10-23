@@ -152,8 +152,9 @@ def main():
     lines.append("")
     if failures:
         lines.append(f"**{len(failures)} run(s) failed**: " + ", ".join(f"{n} (round {r})" for n, r, _ in failures[:10]))
-        for n, r, out in failures[:3]:
-            lines.append(f"\n<details><summary>{n}, round {r}</summary>\n\n```\n{out}\n```\n</details>")
+        # Details first, so the table stays at the end (annotations keep the tail).
+        details = [f"<details><summary>{n}, round {r}</summary>\n\n```\n{out[-1200:]}\n```\n</details>\n" for n, r, out in failures[:2]]
+        lines = details + lines
     else:
         lines.append("Every run passed all scenarios.")
     print("\n".join(lines))
