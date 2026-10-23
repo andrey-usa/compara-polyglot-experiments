@@ -2061,9 +2061,9 @@ impl Page {
         loop {
             let now = Instant::now();
             let requests = self.shared.logs.lock().unwrap().requests_after(&self.session_id, before.1);
-            if requests.iter().any(|r| r.report == Report::No) {
+            if let Some(r) = requests.iter().find(|r| r.report == Report::No) {
                 self.drop_effects(timeout);
-                return Effect::Changed("request".into());
+                return Effect::Changed(format!("request {}", r.label));
             }
             // Reporting that might also be the action (`/events` can be an
             // app's own API): wait for the answer and what the page does.
