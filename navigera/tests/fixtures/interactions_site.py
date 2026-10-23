@@ -23,6 +23,7 @@ getting wrong, one page each, built the way those sites behave:
                 rendered at the end of <body>
 /typed-only     an input whose app keeps only what was typed
 /lazy-box       a scrollable box that loads more when scrolled to its end
+/honesty        a decoy copy of an id, disabled and read-only controls
 
 Prints "LISTENING http://127.0.0.1:<port>" and serves until killed."""
 import sys
@@ -296,6 +297,19 @@ more();
 list.addEventListener('scroll', () => {
   if (!busy && list.scrollTop + list.clientHeight >= list.scrollHeight - 10 && n < 60) { busy = true; setTimeout(() => { more(); busy = false; }, 100); }
 });
+</script>""")
+
+
+PAGES["/honesty"] = ("honesty", "", """
+<button id=dup style="position:absolute;left:-9999px" onclick="out('decoy')">Decoy</button>
+<button id=dup onclick="out('real')">Real action</button>
+<button id=save disabled onclick="out('saved')">Save</button>
+<button id=unlock-later disabled onclick="out('unlocked')">Unlocks soon</button>
+<input id=ro readonly value=fixed> <input id=off disabled>
+<p id=out>none</p>
+<script>
+function out(t) { document.getElementById('out').textContent = t; }
+setTimeout(() => { document.getElementById('unlock-later').disabled = false; }, 600);
 </script>""")
 
 

@@ -343,3 +343,23 @@ fn scroll_to_bottom_scrolls_the_box_itself() {
     }
     s.ok(&["click", "--text", "Item 55"]);
 }
+
+#[test]
+fn clicks_only_claim_what_a_user_could_do() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("honesty", &[]);
+    s.ok(&["goto", &format!("{}/honesty", site.url)]);
+    // Two #dup: the first is parked off the page, the second is the one shown.
+    s.ok(&["click", "--selector", "#dup"]);
+    assert_eq!(s.text(&["get", "text", "--selector", "#out"]), "real");
+    let err = s.fails(&["click", "--selector", "#save", "--timeout-ms", "400"]);
+    assert!(err.contains("disabled"), "{err}");
+    assert_eq!(s.text(&["get", "text", "--selector", "#out"]), "real");
+    // Enabled after 600 ms: the click waits for it.
+    s.ok(&["click", "--selector", "#unlock-later"]);
+    assert_eq!(s.text(&["get", "text", "--selector", "#out"]), "unlocked");
+    let err = s.fails(&["fill", "--selector", "#ro", "x", "--timeout-ms", "300"]);
+    assert!(err.contains("read-only"), "{err}");
+    let err = s.fails(&["fill", "--selector", "#off", "x", "--timeout-ms", "300"]);
+    assert!(err.contains("disabled"), "{err}");
+}

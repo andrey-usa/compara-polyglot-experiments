@@ -224,6 +224,11 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button)
         { block: 'center', inline: 'center' }, { block: 'start', inline: 'nearest' },
         { block: 'end', inline: 'nearest' }, { block: 'nearest', inline: 'nearest' },
     ];
+    // A disabled control can't be clicked by a user; wait for it to be
+    // enabled (a form that unlocks Submit once valid), else say so.
+    const disabled = () => !!(el.disabled || el.closest('fieldset[disabled]'));
+    while (!force && disabled() && Date.now() < deadline) await new Promise((res) => setTimeout(res, 50));
+    if (!force && strict && disabled()) return { disabled: true };
     let hit = null, tries = 0;
     while (!force) {
         // Checked on every pass: an element that just appeared may only now
@@ -382,7 +387,12 @@ const HOVER_PREP: &str = r#"async function (el, settleMs) {
 /// A field whose centre is under something else (a sticky bar, an
 /// overlapping panel) is scrolled until it isn't, as a user would before
 /// typing; some pages check.
-const FILL_EL: &str = r#"function (el, value) {
+const FILL_EL: &str = r#"async function (el, value, settleMs) {
+    // A disabled or read-only field takes no typing; wait for it to unlock.
+    const locked = () => !!(el.disabled || el.readOnly || el.closest('fieldset[disabled]'));
+    const end = Date.now() + (settleMs || 0);
+    while (locked() && Date.now() < end) await new Promise((res) => setTimeout(res, 50));
+    if (locked()) throw new Error('fill: the field is ' + (el.readOnly ? 'read-only' : 'disabled') + '; a user can\'t type into it');
     const covered = () => {
         const r = el.getBoundingClientRect();
         if (!(r.width > 0 && r.height > 0)) return false;
@@ -585,10 +595,22 @@ const IDENTITY: &str = "function (el) { return el; }";
 const WAIT_FOR: &str = r#"async function (sel, ms, what, deepFn) {
     const end = Date.now() + ms;
     let deep = null;
+    // Somewhere a user could see it: a box, not hidden, not parked at a
+    // negative position no scrolling reaches (a decoy copy of an id).
+    const reachable = (e) => {
+        const r = e.getBoundingClientRect(), w = e.ownerDocument.defaultView || window;
+        return r.width > 0 && r.height > 0 && r.right + w.scrollX > 0 && r.bottom + w.scrollY > 0
+            && w.getComputedStyle(e).visibility !== 'hidden';
+    };
     for (;;) {
         // The plain query first: the deep search is built (and compiled)
-        // only when the top document has no match.
-        const el = document.querySelector(sel) || (deep = deep || deepFn()).first(sel);
+        // only when the top document has no match. When the first match is
+        // out of a user's reach and another isn't, the other is the one.
+        let el = document.querySelector(sel);
+        if (el && !reachable(el)) {
+            for (const c of document.querySelectorAll(sel)) if (reachable(c)) { el = c; break; }
+        }
+        el = el || (deep = deep || deepFn()).first(sel);
         if (el) return el;
         if (Date.now() >= end) throw new Error(what + ': no element matches selector ' + JSON.stringify(sel) + ' within ' + ms + ' ms (run `ax` to see the page and act by --ref)');
         await new Promise((r) => setTimeout(r, 50));
@@ -1523,6 +1545,9 @@ impl Page {
             wait,
             timeout,
         )?;
+        if point.get("disabled").and_then(Value::as_bool) == Some(true) {
+            bail!("the element is disabled (waited {settle} ms for it to be enabled); a user can't click it");
+        }
         if point.get("hidden").and_then(Value::as_bool) == Some(true) {
             let instead = point.get("instead").and_then(Value::as_str);
             bail!(
@@ -1847,7 +1872,8 @@ impl Page {
 
     /// Set an input/textarea/contenteditable's value (native setter + events).
     pub fn fill(&self, target: &Target, value: &str, wait: Duration, timeout: Duration) -> Result<()> {
-        self.on_element(target, "fill", FILL_EL, &[json!(value)], wait, timeout)?;
+        let settle = json!(self.hit_settle_ms(wait));
+        self.on_element(target, "fill", FILL_EL, &[json!(value), settle], wait, timeout)?;
         Ok(())
     }
 
