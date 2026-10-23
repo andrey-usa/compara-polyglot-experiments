@@ -167,3 +167,11 @@ fn shards_split_the_scenarios() {
     let (code, out) = primavera(&["list", "examples", "--shard", "4/3"]);
     assert_eq!(code, 2, "{out}");
 }
+
+#[test]
+fn if_blocks_look_at_the_page_as_it_is() {
+    let (true, Some(site)) = (chrome(), own_site()) else { return };
+    let (code, out) = primavera(&["run", "tests/fixtures/if.pv", "--base-url", &site.1]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("1 passed, 0 failed"), "{out}");
+}

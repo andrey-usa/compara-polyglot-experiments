@@ -288,6 +288,15 @@ impl Runner {
                 Ok(())
             }
             Action::Expect(e) => self.expect(e, scope),
+            Action::If { cond, steps } => {
+                if self.expect(cond, scope).is_ok() {
+                    for st in steps {
+                        self.action(&st.action, st, scope, suite, depth)
+                            .map_err(|e| format!("in the `if`, line {} `{}`: {e}", st.line, st.text))?;
+                    }
+                }
+                Ok(())
+            }
             Action::Optional(inner) => {
                 if let Err(e) = self.action(inner, step, scope, suite, depth) {
                     scope.notes.push(format!("optional step at line {} didn't happen: {e}", step.line));

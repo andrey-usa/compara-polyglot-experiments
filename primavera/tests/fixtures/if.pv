@@ -1,0 +1,8 @@
+scenario "An if runs its steps only when it holds"
+  goto /late?ms=150
+  if --selector "#s" text is ready
+    eval "document.title = 'too early'"
+  wait --text ready
+  if --selector "#s" text is ready
+    eval "document.title = 'ready seen'"
+  expect title is "ready seen"

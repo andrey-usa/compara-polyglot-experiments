@@ -35,7 +35,8 @@ scenario "Adding a product counts it in the cart" @smoke
   `--testid total`, `--placeholder`, `--selector <css>`, `--nth`.
   Frames and open shadow roots are searched for you.
 - `save NAME = <command>` keeps a result (`save id = get text --testid order`).
-- `run name x y` runs a `flow`; `optional <step>` may fail without failing.
+- `run name x y` runs a `flow`; `optional <step>` may fail without failing;
+  `if <expect clause>` runs the steps indented under it when it holds now.
 - Data rows: `examples` plus a `| a | b |` table under the scenario, or
   `scenario "…" for each rows.csv`; columns become `${a}`.
 - Words split like a shell's, no expansion. `${NAME}`, `${NAME:-default}`

@@ -39,6 +39,12 @@ pub enum Action {
     /// `optional <step>`: a failure is noted, not fatal (a banner that may
     /// or may not show).
     Optional(Box<Action>),
+    /// `if <expect clause>` and the steps indented under it: run them when
+    /// the clause holds now (or within its `--timeout-ms`).
+    If {
+        cond: Expect,
+        steps: Vec<Step>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +53,45 @@ pub struct Step {
     /// The line as written (trimmed), for reports.
     pub text: String,
     pub action: Action,
+    /// How far the line is indented: the steps of an `if` are indented
+    /// more than the `if`.
+    pub indent: usize,
+}
+
+/// Steps read in order, nested by indentation under their `if`s.
+fn nest(flat: Vec<Step>) -> Result<Vec<Step>, (usize, String)> {
+    fn level(items: &[Step], i: &mut usize, indent: usize) -> Result<Vec<Step>, (usize, String)> {
+        let mut out = Vec::new();
+        while *i < items.len() {
+            let st = &items[*i];
+            if st.indent < indent {
+                break;
+            }
+            if st.indent > indent {
+                return Err((st.line, "indented more than the step before it (only the steps of an `if` are)".into()));
+            }
+            *i += 1;
+            let mut st = st.clone();
+            if let Action::If { steps, .. } = &mut st.action {
+                match items.get(*i) {
+                    Some(next) if next.indent > indent => *steps = level(items, i, next.indent)?,
+                    _ => return Err((st.line, "`if` needs the steps it guards indented under it".into())),
+                }
+            }
+            out.push(st);
+        }
+        Ok(out)
+    }
+    if flat.is_empty() {
+        return Ok(flat);
+    }
+    let mut i = 0;
+    let base = flat[0].indent;
+    let out = level(&flat, &mut i, base)?;
+    match flat.get(i) {
+        Some(st) => Err((st.line, "indented less than the first step of its block".into())),
+        None => Ok(out),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -302,7 +347,7 @@ pub fn unset_vars(suite: &Suite, sc: &Scenario, run_vars: &[String]) -> Vec<(usi
             Action::Save { command, .. } => command.clone(),
             Action::Run { args, .. } => args.clone(),
             Action::Optional(inner) => words(inner),
-            Action::Expect(_) => Vec::new(),
+            Action::Expect(_) | Action::If { .. } => Vec::new(),
         }
     }
     for st in suite.before_each.iter().chain(&sc.steps) {
@@ -387,7 +432,7 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
                 }
             }
             let step = parse_step(trimmed).map_err(|m| err(line_no, m))?;
-            let step = Step { line: line_no, text: trimmed.to_string(), action: step };
+            let step = Step { line: line_no, text: trimmed.to_string(), action: step, indent: indent_of(raw) };
             match &block {
                 Block::None => {
                     return Err(err(line_no, "a step outside any `scenario`, `flow` or `before each` block".into()))
@@ -489,6 +534,15 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
             None => {}
         }
     }
+    let nested = |steps: Vec<Step>| nest(steps).map_err(|(line, m)| err(line, m));
+    suite.before_each = nested(std::mem::take(&mut suite.before_each))?;
+    suite.after_each = nested(std::mem::take(&mut suite.after_each))?;
+    for sc in suite.scenarios.iter_mut() {
+        sc.steps = nested(std::mem::take(&mut sc.steps))?;
+    }
+    for f in suite.flows.values_mut() {
+        f.steps = nested(std::mem::take(&mut f.steps))?;
+    }
     for s in &suite.scenarios {
         if s.steps.is_empty() {
             return Err(err(s.line, format!("scenario {:?} has no steps", s.name)));
@@ -555,10 +609,14 @@ pub fn resolve(suites: &mut [Suite]) -> Result<(), ParseError> {
             todo.extend(used.uses);
         }
         // Every `run`, wherever it is, names a known flow.
-        let check = |steps: &[Step], file: &Path, flows: &BTreeMap<String, Flow>| -> Result<(), ParseError> {
+        fn check(steps: &[Step], file: &Path, flows: &BTreeMap<String, Flow>) -> Result<(), ParseError> {
             for st in steps {
                 let action = match &st.action {
                     Action::Optional(a) => a.as_ref(),
+                    Action::If { steps, .. } => {
+                        check(steps, file, flows)?;
+                        continue;
+                    }
                     a => a,
                 };
                 if let Action::Run { flow, args } = action {
@@ -577,7 +635,7 @@ pub fn resolve(suites: &mut [Suite]) -> Result<(), ParseError> {
                 }
             }
             Ok(())
-        };
+        }
         let file = suite.file.clone();
         check(&suite.before_each, &file, &suite.flows)?;
         check(&suite.after_each, &file, &suite.flows)?;
@@ -609,6 +667,15 @@ fn parse_words(words: &[String]) -> Result<Action, String> {
         Some("run") => {
             let flow = words.get(1).ok_or("expected `run <flow> <args…>`")?.clone();
             Ok(Action::Run { flow, args: words[2..].to_vec() })
+        }
+        Some("if") => {
+            if words.len() < 2 {
+                return Err("expected `if <expect clause>` (as after `expect`), then indented steps".into());
+            }
+            let mut cond = crate::expect::parse(&words[1..])?;
+            // A condition looks at the page as it is, unless it says how long.
+            cond.timeout_ms = Some(cond.timeout_ms.unwrap_or(0));
+            Ok(Action::If { cond, steps: Vec::new() })
         }
         Some("optional") => {
             if words.len() < 2 {
@@ -793,5 +860,21 @@ mod tests {
         assert_eq!(un, [(6, "row".to_string()), (9, "missing".to_string())]);
         assert_eq!(unset_vars(&s, &s.scenarios[0], &["row".into(), "missing".into()]), []);
         assert_eq!(used_vars("$${x}-${y}-${z:-1}"), [("y".to_string(), false), ("z".to_string(), true)]);
+    }
+
+    #[test]
+    fn if_blocks_nest_by_indentation() {
+        let text = "scenario \"x\"\n  goto /\n  if --selector \"#banner\" visible\n    click --selector \"#close\"\n    if text \"More\"\n      click --text More\n  expect title is t\n";
+        let s = parse(Path::new("t.pv"), text).unwrap();
+        let steps = &s.scenarios[0].steps;
+        assert_eq!(steps.len(), 3);
+        let Action::If { cond, steps: inner } = &steps[1].action else { panic!("{:?}", steps[1]) };
+        assert_eq!(cond.timeout_ms, Some(0));
+        assert_eq!(inner.len(), 2);
+        assert!(matches!(&inner[1].action, Action::If { steps, .. } if steps.len() == 1));
+        let e = parse(Path::new("t.pv"), "scenario \"x\"\n  goto /\n    click --text a\n").unwrap_err();
+        assert_eq!(e.line, 3);
+        let e = parse(Path::new("t.pv"), "scenario \"x\"\n  if text a\n  goto /\n").unwrap_err();
+        assert!(e.message.contains("needs the steps"), "{e}");
     }
 }
