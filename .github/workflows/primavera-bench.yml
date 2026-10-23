@@ -1,0 +1,82 @@
+name: primavera bench
+
+# primavera (one binary, navigera in-process) against Playwright Test on
+# the same scenarios, same runner, same Chrome; rounds interleaved.
+# Results are annotations: `primavera bench`.
+
+on:
+  push:
+    branches: [experiment-18]
+    paths:
+      - "primavera/**"
+      - "primavera-bench/**"
+      - "navigera/src/**"
+      - ".github/workflows/primavera-bench.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: "primavera bench"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - name: Build primavera
+        run: |
+          set -eux
+          start=$(date +%s)
+          (cd primavera && cargo build --release --locked)
+          echo "build_s=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          ls -l primavera/target/release/primavera
+          google-chrome --version
+      - name: Test primavera
+        env:
+          PRIMAVERA_REQUIRE_BROWSER: "1"
+        run: cd primavera && cargo test --release --locked
+      - name: Install Playwright Test
+        run: |
+          set -eux
+          node --version
+          start=$(date +%s%N)
+          (cd primavera-bench/pw && npm install --no-audit --no-fund)
+          echo "npm_ms=$(( ($(date +%s%N) - start) / 1000000 ))" >> "$GITHUB_ENV"
+          echo "pw_kb=$(du -sk primavera-bench/pw/node_modules | cut -f1)" >> "$GITHUB_ENV"
+          (cd primavera-bench/pw && npx playwright --version)
+      - name: Bench
+        run: |
+          set +e -uo pipefail
+          python3 navigera/bench/site/server.py --port 0 > site.out 2>&1 &
+          for _ in $(seq 50); do grep -q LISTENING site.out && break; sleep 0.2; done
+          url=$(grep -o 'http://[^ ]*' site.out | head -1)
+          python3 primavera-bench/bench.py \
+            --primavera primavera/target/release/primavera \
+            --chromium "$(command -v google-chrome)" \
+            --scenarios primavera/examples/bench-site \
+            --pw primavera-bench/pw --site "$url" --rounds 15 2>&1 | tee bench.md
+          code=${PIPESTATUS[0]}
+          bin_kb=$(du -k primavera/target/release/primavera | cut -f1)
+          {
+            echo ""
+            echo "Install: primavera is one binary of $(( bin_kb / 1024 )).$(( bin_kb % 1024 * 10 / 1024 )) MB; Playwright Test is node_modules of $(( pw_kb / 1024 )) MB (npm install ${npm_ms} ms), plus Node. Both use the runner's Chrome."
+          } >> bench.md
+          python3 - bench.md <<'PY'
+          import sys
+          text = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
+          print("::notice title=primavera bench::" + text[-3800:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          PY
+          cat bench.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code

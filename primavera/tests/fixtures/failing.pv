@@ -1,0 +1,11 @@
+# Each scenario fails on purpose; tests/examples.rs checks what is said.
+scenario "Wrong count"
+  goto /shop
+  click --selector "#cookie-accept"
+  click --text "Add to cart"
+  expect --selector "#cart-count" text is 2 --timeout-ms 600
+
+scenario "A click that does nothing, then an expect"
+  goto /docs
+  click --selector "h1"
+  expect text "Something that never shows" --timeout-ms 400
