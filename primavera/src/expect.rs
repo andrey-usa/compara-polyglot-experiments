@@ -186,7 +186,8 @@ pub fn parse(words: &[String]) -> Result<Expect, String> {
         }
     };
     let (subject, matcher, value) = match first.as_str() {
-        "js" => {
+        // `eval` reads as navigera's own command does.
+        "js" | "eval" => {
             let code = words.get(1).ok_or("expect js \"<expression>\"")?.clone();
             let (m, v) = optional_tail(&words[2..], "js")?;
             (Subject::Js(code), m, v)
@@ -401,6 +402,8 @@ mod tests {
     fn page_state_subjects() {
         let e = p("js \"document.forms.length\" >= 1").unwrap();
         assert_eq!((e.subject, e.matcher), (Subject::Js("document.forms.length".into()), Matcher::Ge));
+        let e = p("eval \"String(1 + 1)\" is 2").unwrap();
+        assert_eq!(e.subject, Subject::Js("String(1 + 1)".into()));
         let e = p("js \"window.ready === true\"").unwrap();
         assert_eq!(e.matcher, Matcher::Holds);
         let e = p("request post /api/orders status 201").unwrap();

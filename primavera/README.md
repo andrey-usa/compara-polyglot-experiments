@@ -62,7 +62,7 @@ Status: **M1 in progress** (working name).
 | `<target> text`, `value`, `attr <name>` + a comparison | an element's text, value or attribute |
 | `--selector <css> count` `is`, `>`, `>=`, `<`, `<=` `<n>` | how many match |
 | `${var}` + a comparison | a saved value |
-| `js "<expression>"` [+ a comparison] | a script in the page: truthy, or its value compared |
+| `js "<expression>"` (or `eval`) [+ a comparison] | a script in the page: truthy, or its value compared |
 | `request <METHOD> <url glob> [status <n>]`, `no request …` | a request the page made in this scenario (`*` in the URL matches anything) |
 | `cookie <name>` [+ a comparison], `no cookie <name>` | a cookie of the scenario's browser context |
 | `storage local\|session <key>` [+ a comparison] | Local or Session Storage |

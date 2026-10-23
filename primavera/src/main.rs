@@ -14,6 +14,9 @@ use std::process::ExitCode;
 use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
+/// The agent skill: the format and the commands, for an agent writing tests.
+const SKILL_MD: &str = include_str!("../skills/primavera/SKILL.md");
+
 const USAGE: &str = "\
 primavera: plain-text web tests on real Chrome (through navigera)
 
@@ -21,6 +24,7 @@ usage:
   primavera run [<file.pv|dir>...] [options]   run scenarios (default: the current directory)
   primavera lint [<file.pv|dir>...]             check files without a browser
   primavera list [<file.pv|dir>...]             the scenarios a run would take
+  primavera skill                               the agent skill (the format and commands, for an AI agent)
   primavera --version
 
 run options:
@@ -197,6 +201,10 @@ fn main() -> ExitCode {
         }
     };
     match args.cmd.as_str() {
+        "skill" => {
+            print!("{SKILL_MD}");
+            ExitCode::SUCCESS
+        }
         "--version" | "-V" | "version" => {
             println!("primavera {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
