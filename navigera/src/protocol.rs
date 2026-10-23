@@ -228,6 +228,10 @@ pub enum Command {
         value: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<f64>,
+        /// Clear the field and type the value key by key, for inputs whose
+        /// app only takes what is typed (observable models).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keys: bool,
     },
     /// Move the mouse over the target (hover menus, tooltips).
     #[serde(rename = "hover")]
@@ -888,7 +892,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("goto", "<url> [--wait load|domcontentloaded|commit]", "navigate the active tab (default: wait for load)"),
     ("ax", "[--selector <css> | <ref>] [--limit <lines>] [--refs all] [--format json]", "accessibility snapshot: indented tree, [ref=N] on actionable nodes"),
     ("click", "<ref> | --selector <css> | --text <visible text> [--button right|middle] [--force]", "trusted mouse click once the element stops moving; refuses an element covered by another (--force: DOM events anyway); waits for any navigation it starts"),
-    ("fill", "<ref> <value> | --selector <css> --value <v>", "set an input/textarea's value"),
+    ("fill", "<ref> <value> | --selector <css> --value <v> [--keys]", "set an input/textarea's value; --keys clears it and types the value key by key (for apps that ignore a value set directly)"),
     ("type", "<text> [--selector <css> | --ref <n>]", "type key by key into the target or the focused element"),
     ("press", "<key> [--selector <css> | --ref <n>]", "press a key or chord: Enter, Tab, Escape, ArrowDown, Control+a"),
     ("select", "<ref> <option>... | --selector <css> --value <option> [--add]", "choose <select> option(s) by value or label (whitespace-insensitive); --add keeps the options already chosen"),
@@ -1429,6 +1433,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
         }
         "hover" => Command::Hover { target: target_args(&mut args, true)?, timeout_ms },
         "fill" => {
+            let keys = extract_present(&mut args, "--keys");
             let target = target_args(&mut args, true)?;
             let value = match str_flag(&mut args, "--value")? {
                 Some(v) => v,
@@ -1436,7 +1441,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
                     positional(&mut args).ok_or_else(|| need("fill", "a value (`fill <ref> <value>` or --value)"))?
                 }
             };
-            Command::Fill { target, value, timeout_ms }
+            Command::Fill { target, value, timeout_ms, keys }
         }
         "select" => {
             let add = extract_present(&mut args, "--add");
@@ -2431,9 +2436,13 @@ impl Driver {
                 }
                 Ok(state)
             }
-            Command::Fill { target, value, timeout_ms } => {
+            Command::Fill { target, value, timeout_ms, keys } => {
                 let t = target.target("fill")?;
-                s.fill_target(&t, value, *timeout_ms).map_err(|e| anyhow::anyhow!("fill {}: {e:#}", t.label()))?;
+                if *keys {
+                    s.fill_keys(&t, value, *timeout_ms).map_err(|e| anyhow::anyhow!("fill {}: {e:#}", t.label()))?;
+                } else {
+                    s.fill_target(&t, value, *timeout_ms).map_err(|e| anyhow::anyhow!("fill {}: {e:#}", t.label()))?;
+                }
                 Ok(self.state_json())
             }
             Command::Select { target, value, timeout_ms, add } => {
@@ -3525,7 +3534,8 @@ mod tests {
             Command::Fill {
                 target: TargetArgs { node_ref: Some(31), ..Default::default() },
                 value: "hello world".into(),
-                timeout_ms: None
+                timeout_ms: None,
+                keys: false,
             }
         );
         assert_eq!(
@@ -3659,6 +3669,7 @@ mod tests {
                 target: TargetArgs { selector: Some("#kw".into()), ..Default::default() },
                 value: "600-10070".into(),
                 timeout_ms: Some(10000.0),
+                keys: false,
             }
         );
         let command: Command = serde_json::from_str(r#"{"op":"click","ref":"@e7"}"#).expect("string ref");

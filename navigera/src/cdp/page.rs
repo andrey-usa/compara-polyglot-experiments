@@ -256,10 +256,12 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button)
         }
         // Covered (a toast, a closing overlay) or not laid out yet: try the
         // other alignments at once, then give it a moment, like a user
-        // would. An element with no box at all rarely gets one: don't wait
-        // long.
+        // would. An element with no box at all rarely gets one, and one
+        // whose own ancestor answers the hit test is hidden on purpose (a
+        // styled control's real input): don't wait long for either.
         if (hit && tries < ALIGN.length) continue;
-        if (Date.now() >= deadline || (!hit && Date.now() >= deadline - settleMs + 300)) break;
+        const hiddenHere = !hit || hit.contains(el);
+        if (Date.now() >= deadline || (hiddenHere && Date.now() >= deadline - settleMs + 300)) break;
         await new Promise((res) => setTimeout(res, 100));
     }
     const describe = (n) => {
@@ -268,6 +270,24 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button)
         const t = (n.innerText || n.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
         return t ? s + ' ' + JSON.stringify(t.slice(0, 40)) : s;
     };
+    // What a user would click for a hidden control: its label, or the
+    // nearest ancestor that looks clickable and has a box.
+    const visibleFor = () => {
+        const sized = (n) => { const b = n.getBoundingClientRect(); return b.width >= 4 && b.height >= 4; };
+        const lab = labels.find(sized);
+        if (lab) return lab;
+        const CLICKY = 'a[href],button,label,summary,[role=button],[role=radio],[role=checkbox],[role=option],[role=tab],[role=switch],[role=menuitem],[onclick],[tabindex]';
+        for (let n = el.parentElement || (el.getRootNode() && el.getRootNode().host); n && n !== el.ownerDocument.body; n = n.parentElement || (n.getRootNode() && n.getRootNode().host)) {
+            if (!sized(n)) continue;
+            if (n.matches(CLICKY) || (el.ownerDocument.defaultView || window).getComputedStyle(n).cursor === 'pointer') return n;
+        }
+        return null;
+    };
+    if (!force && strict && (!hit || hit.contains(el))) {
+        // Hidden where it is: zero size, clipped, or under its own wrapper.
+        // A user can't click it; they click what stands for it.
+        return { hidden: true, at: describe(hit), instead: describe(visibleFor()) };
+    }
     if (hit && !force && strict) {
         // Under something else the whole time: a user would hit that
         // instead. Nothing was clicked.
@@ -419,6 +439,66 @@ const SELECT_EL: &str = r#"function (el, wanted, add) {
     return opts.filter(o => o.selected).map(o => norm(o.label));
 }"#;
 
+/// A custom dropdown's parts: whether `el` is (or holds, or sits in) an
+/// ARIA combobox, which element takes keys (it gets focus), whether it is
+/// open, and the listbox it controls.
+pub const COMBO_FOCUS: &str = r#"function (el) {
+    const isCombo = (n) => !!n && n.nodeType === 1 && (n.getAttribute('role') === 'combobox'
+        || n.getAttribute('aria-haspopup') === 'listbox' || n.hasAttribute('aria-expanded'));
+    let box = isCombo(el) ? el : (el.closest('[role=combobox],[aria-haspopup=listbox]') || el.querySelector('[role=combobox],[aria-haspopup=listbox]'));
+    if (!box) return { combobox: false, tag: el.tagName.toLowerCase() };
+    const field = box.matches('input,textarea,[contenteditable=""],[contenteditable=true]') ? box
+        : box.querySelector('input:not([type=hidden]),textarea,[contenteditable=""],[contenteditable=true]');
+    const keys = !!field || box.tabIndex >= 0;
+    (field || box).focus();
+    const expandedOf = (n) => n && n.getAttribute && n.getAttribute('aria-expanded');
+    const expanded = [box, field].some((n) => expandedOf(n) === 'true');
+    const ids = [box, field].map((n) => n && (n.getAttribute('aria-controls') || n.getAttribute('aria-owns'))).filter(Boolean);
+    return { combobox: true, keys, expanded, listbox: ids[0] ? ids[0].split(/\s+/)[0] : null };
+}"#;
+
+/// Find `want` among the options of the open listbox (the one the
+/// combobox names, else any visible one): exact text, then the start, then
+/// anywhere, ignoring case and whitespace. A match is marked with a
+/// one-off attribute so it can be clicked by a trusted click.
+pub const COMBO_PICK: &str = r#"function (want, listboxId, typed, deep) {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const w = norm(want);
+    const shown = (n) => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0 && deep.style(n).visibility !== 'hidden'; };
+    let boxes = [];
+    if (listboxId) for (const r of deep.roots()) { const b = r.getElementById ? r.getElementById(listboxId) : null; if (b) boxes.push(b); }
+    if (!boxes.some(shown)) boxes = deep.all('[role=listbox]');
+    boxes = boxes.filter(shown);
+    const opts = [];
+    for (const b of boxes) opts.push(...b.querySelectorAll('[role=option]'));
+    const live = opts.filter(shown);
+    const label = (o) => norm(o.getAttribute('aria-label') || o.innerText || o.textContent);
+    const hit = live.find((o) => label(o) === w) || live.find((o) => label(o).startsWith(w)) || live.find((o) => label(o).includes(w))
+        || live.find((o) => norm(o.getAttribute('data-value') || o.getAttribute('value')) === w);
+    const options = live.slice(0, 20).map((o) => (o.innerText || o.textContent || '').trim());
+    if (!hit) return { open: boxes.length > 0, picked: false, options };
+    const token = Math.random().toString(36).slice(2, 10);
+    hit.setAttribute('data-nv-pick', token);
+    hit.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+    return { open: true, picked: true, token, label: (hit.innerText || hit.textContent || '').trim(), options };
+}"#;
+
+/// Focus a field and select everything in it, so typing replaces it.
+pub const FOCUS_SELECT_ALL: &str = r#"function (el) {
+    el.scrollIntoView({ block: 'center', behavior: 'instant' });
+    el.focus();
+    if (typeof el.select === 'function') el.select();
+    else if (el.isContentEditable) {
+        const r = el.ownerDocument.createRange();
+        r.selectNodeContents(el);
+        const sel = (el.ownerDocument.defaultView || window).getSelection();
+        sel.removeAllRanges();
+        sel.addRange(r);
+    }
+    const a = el.getRootNode().activeElement || el.ownerDocument.activeElement;
+    return a === el || el.contains(a);
+}"#;
+
 /// Focus an element (for `press`/`type` with a target).
 pub const FOCUS_EL: &str = r#"function (el) {
     el.scrollIntoView({ block: 'center', behavior: 'instant' });
@@ -428,10 +508,16 @@ pub const FOCUS_EL: &str = r#"function (el) {
 }"#;
 
 /// Scroll an element into view (or scroll inside it by `dy`).
-const SCROLL_EL: &str = r#"function (el, dy) {
-    if (dy) { el.scrollBy({ top: dy, behavior: 'instant' }); }
+/// With `to` (`top`/`bottom`) the element's own content scrolls there: a
+/// list that loads more as it reaches its end.
+const SCROLL_EL: &str = r#"function (el, dy, to) {
+    if (to === 'bottom') { el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }); }
+    else if (to === 'top') { el.scrollTo({ top: 0, behavior: 'instant' }); }
+    else if (dy) { el.scrollBy({ top: dy, behavior: 'instant' }); }
     else { el.scrollIntoView({ block: 'center', behavior: 'instant' }); }
-    return { scrollY: Math.round(window.scrollY), scrollHeight: document.documentElement.scrollHeight };
+    const out = { scrollY: Math.round(window.scrollY), scrollHeight: document.documentElement.scrollHeight };
+    if (to || dy) { out.scrollTop = Math.round(el.scrollTop); out.elementScrollHeight = el.scrollHeight; }
+    return out;
 }"#;
 
 /// The element itself (for ops that need its remote object, like upload).
@@ -873,6 +959,15 @@ fn finder_expr(target: &Target, wait_ms: u128, what: &str) -> String {
     }
 }
 
+/// The page an evaluate ran in was replaced by a navigation before it
+/// answered.
+fn navigated_away(e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}");
+    ["Inspected target navigated or closed", "Execution context was destroyed", "Cannot find context with specified id"]
+        .iter()
+        .any(|s| m.contains(s))
+}
+
 /// The element wait the page runs: the wait asked for, unless the CDP
 /// command timeout is so close that the page's own "not found" (which
 /// names the element) could lose the race to the transport's timeout.
@@ -1271,7 +1366,39 @@ impl Page {
     /// Run `function (el, ...args)` on the element `target` names, waiting
     /// up to `wait` for selector/text targets to appear. One round trip for
     /// selector/text; resolve + call + release for refs.
+    ///
+    /// A navigation can replace the page while the op is still looking for
+    /// its element (a reload a click started after a request, a client-side
+    /// redirect). The page's script dies with it; the element is then looked
+    /// for again on the new page, within what is left of the wait. Nothing
+    /// acted yet when that happens: clicks only measure here, and the ops
+    /// that act in the page (fill, select) are the same op again.
     pub(crate) fn on_element(
+        &self,
+        target: &Target,
+        what: &str,
+        function: &str,
+        args: &[Value],
+        wait: Duration,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let started = Instant::now();
+        let mut tries = 0;
+        loop {
+            let left =
+                if tries == 0 { wait } else { wait.saturating_sub(started.elapsed()).max(Duration::from_millis(250)) };
+            match self.on_element_once(target, what, function, args, left, timeout) {
+                Err(e) if tries < 3 && !matches!(target, Target::Ref(_)) && navigated_away(&e) => {
+                    tries += 1;
+                    self.flush_events(Duration::from_millis(100));
+                    let _ = self.settle(left + POST_COMMIT_WAIT);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn on_element_once(
         &self,
         target: &Target,
         what: &str,
@@ -1396,6 +1523,18 @@ impl Page {
             wait,
             timeout,
         )?;
+        if point.get("hidden").and_then(Value::as_bool) == Some(true) {
+            let instead = point.get("instead").and_then(Value::as_str);
+            bail!(
+                "the element isn't visible where it is ({}): a user can't click it{}. \
+                 `--force` sends DOM events to it anyway",
+                match point.get("at").and_then(Value::as_str) {
+                    Some(at) => format!("a click there lands on {at}"),
+                    None => "no box on screen".to_string(),
+                },
+                instead.map(|i| format!("; click what stands for it: {i}")).unwrap_or_default()
+            );
+        }
         if point.get("covered").and_then(Value::as_bool) == Some(true)
             && point.get("synthetic").and_then(Value::as_bool) != Some(true)
         {
@@ -1547,6 +1686,12 @@ impl Page {
             wait,
             timeout,
         )?;
+        if point.get("hidden").and_then(Value::as_bool) == Some(true) {
+            bail!(
+                "the element isn't visible where it is; a user can't double-click it{}",
+                point.get("instead").and_then(Value::as_str).map(|i| format!(" (try {i})")).unwrap_or_default()
+            );
+        }
         if point.get("covered").and_then(Value::as_bool) == Some(true)
             && point.get("synthetic").and_then(Value::as_bool) != Some(true)
         {
@@ -1728,7 +1873,10 @@ impl Page {
         timeout: Duration,
     ) -> Result<Value> {
         if let Some(target) = target {
-            return self.on_element(target, "scroll", SCROLL_EL, &[json!(dy.unwrap_or(0.0))], wait, timeout);
+            if let Some(to) = to.filter(|t| !matches!(*t, "top" | "bottom")) {
+                bail!("scroll --to takes top|bottom, got {to:?}");
+            }
+            return self.on_element(target, "scroll", SCROLL_EL, &[json!(dy.unwrap_or(0.0)), json!(to)], wait, timeout);
         }
         let action = match to {
             Some("top") => "window.scrollTo({ top: 0, behavior: 'instant' })".to_string(),

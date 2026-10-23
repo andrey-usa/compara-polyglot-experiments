@@ -17,6 +17,12 @@ getting wrong, one page each, built the way those sites behave:
 /overlapped     an input whose centre is under a panel until the box
                 scrolls; typing into a covered field clears it
 /right-click    a button that reports right and double clicks
+/wizard         a step that saves with fetch, then reloads into the next
+/card-radios    radio cards whose real inputs are visually hidden
+/combobox       a react-select-style dropdown: ArrowDown opens a listbox
+                rendered at the end of <body>
+/typed-only     an input whose app keeps only what was typed
+/lazy-box       a scrollable box that loads more when scrolled to its end
 
 Prints "LISTENING http://127.0.0.1:<port>" and serves until killed."""
 import sys
@@ -213,6 +219,86 @@ document.getElementById('doubleClickBtn').addEventListener('dblclick', () => {
 </script>""")
 
 
+PAGES["/wizard"] = ("wizard", "", """
+<script>
+const step = new URLSearchParams(location.search).get('step') || '1';
+document.write(step === '1'
+  ? '<label>Name <input id=name></label> <button id=next type=button>Next</button>'
+  : step === '2'
+  ? '<label>Email <input id=email></label> <button id=finish type=button>Finish</button>'
+  : '<p id=done>Saved ' + sessionStorage.getItem('name') + ' / ' + sessionStorage.getItem('email') + '</p>');
+const save = (k, v, next) => fetch('/slow-echo?ms=150').then(() => { sessionStorage.setItem(k, v); location.href = '/wizard?step=' + next; });
+if (step === '1') document.getElementById('next').onclick = () => save('name', document.getElementById('name').value, 2);
+if (step === '2') document.getElementById('finish').onclick = () => save('email', document.getElementById('email').value, 3);
+</script>""")
+
+PAGES["/card-radios"] = ("card radios", ".sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}.card{border:1px solid #888;padding:10px;margin:4px;cursor:pointer;width:200px}", """
+<div class=card data-for=s role=radio aria-checked=false>Small</div>
+<div class=card data-for=m role=radio aria-checked=false>Medium</div>
+<input type=radio name=size value=s id=in-s class=sr><input type=radio name=size value=m id=in-m class=sr>
+<p id=picked>none</p>
+<script>
+document.querySelectorAll('.card').forEach((c) => c.addEventListener('click', () => {
+  document.querySelectorAll('.card').forEach((x) => x.setAttribute('aria-checked', 'false'));
+  c.setAttribute('aria-checked', 'true');
+  document.getElementById('in-' + c.dataset.for).checked = true;
+  document.getElementById('picked').textContent = c.dataset.for;
+}));
+</script>""")
+
+PAGES["/combobox"] = ("combobox", ".opt{padding:4px 8px}.opt.hl{background:#bde}", """
+<div id=cb role=combobox aria-expanded=false aria-haspopup=listbox style="border:1px solid #888;padding:6px;width:220px">
+  <span id=cb-value>Select…</span> <input id=cb-input aria-label=Fruit autocomplete=off style="border:0;width:8em">
+</div>
+<p id=committed>none</p>
+<script>
+const OPTIONS = ['Apple', 'Apricot', 'Banana', 'Blueberry', 'Cherry'];
+const cb = document.getElementById('cb'), input = document.getElementById('cb-input');
+let open = false, list = OPTIONS;
+function render() {
+  document.querySelectorAll('.portal').forEach((e) => e.remove());
+  if (!open) return;
+  const r = cb.getBoundingClientRect(), d = document.createElement('div');
+  d.className = 'portal'; d.setAttribute('role', 'listbox');
+  d.style.cssText = `position:absolute;top:${r.bottom + scrollY}px;left:${r.left}px;border:1px solid #888;background:#fff`;
+  list.slice(0, 3).forEach((o) => {
+    const e = document.createElement('div'); e.className = 'opt'; e.setAttribute('role', 'option'); e.textContent = o;
+    e.addEventListener('mousedown', (ev) => { ev.preventDefault(); choose(o); });
+    d.appendChild(e);
+  });
+  document.body.appendChild(d);
+}
+function choose(o) { document.getElementById('cb-value').textContent = o; document.getElementById('committed').textContent = o; input.value = ''; list = OPTIONS; open = false; cb.setAttribute('aria-expanded', 'false'); render(); }
+input.addEventListener('keydown', (ev) => { if (ev.key === 'ArrowDown') { ev.preventDefault(); open = true; cb.setAttribute('aria-expanded', 'true'); render(); } });
+input.addEventListener('input', () => { list = OPTIONS.filter((o) => o.toLowerCase().includes(input.value.toLowerCase())); render(); });
+// Only three options show at a time: Cherry needs typing to appear.
+</script>""")
+
+PAGES["/typed-only"] = ("typed only", "", """
+<label>Amount <input id=amt></label> <button id=go type=button>Commit</button>
+<p id=model>model=</p>
+<script>
+let model = '';
+const amt = document.getElementById('amt');
+amt.addEventListener('keydown', (e) => { if (!e.isTrusted) return;
+  if (e.key.length === 1) model += e.key; else if (e.key === 'Backspace') model = amt.selectionStart === 0 && amt.selectionEnd === amt.value.length ? '' : model.slice(0, -1); });
+amt.addEventListener('blur', () => { amt.value = model; });
+document.getElementById('go').onclick = () => { document.getElementById('model').textContent = 'model=' + model; };
+</script>""")
+
+PAGES["/lazy-box"] = ("lazy box", "", """
+<div id=list style="height:200px;overflow:auto;border:1px solid #888"></div>
+<script>
+let n = 0, busy = false;
+const list = document.getElementById('list');
+function more() { for (let i = 0; i < 20; i++) { n++; const d = document.createElement('div'); d.style.padding = '8px'; d.textContent = 'Item ' + n; list.appendChild(d); } }
+more();
+list.addEventListener('scroll', () => {
+  if (!busy && list.scrollTop + list.clientHeight >= list.scrollHeight - 10 && n < 60) { busy = true; setTimeout(() => { more(); busy = false; }, 100); }
+});
+</script>""")
+
+
 def slow_page(ms):
     return ("slow", "", f"""
 <p>Loading…</p>
@@ -251,6 +337,10 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/frame-text":
             t = q.get("t", ["?"])[0]
             return self.send(f"<!doctype html><html><body><div id=content>{t}</div></body></html>")
+        if u.path == "/slow-echo":
+            import time
+            time.sleep(int(q.get("ms", ["100"])[0]) / 1000)
+            return self.send("ok", "text/plain")
         if u.path == "/file.csv":
             return self.send("id,name\n1,Ada\n2,Grace\n", "text/csv",
                              [("Content-Disposition", 'attachment; filename="report.csv"')])

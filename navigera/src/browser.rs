@@ -1574,6 +1574,25 @@ impl BrowserSession {
         self.active_tab().fill(target, value, wait, timeout)
     }
 
+    /// `fill --keys`: select what the field holds and type over it, key by
+    /// key; Backspace clears it for an empty value.
+    pub fn fill_keys(&self, target: &Target, value: &str, timeout_ms: Option<f64>) -> Result<()> {
+        let (wait, timeout) = self.element_budget(timeout_ms);
+        let page = self.active_tab();
+        if page.on_element(target, "fill", cdp::page_js::FOCUS_SELECT_ALL, &[], wait, timeout)?
+            != serde_json::Value::Bool(true)
+        {
+            bail!("the field did not take focus (disabled, hidden, or not editable); nothing was typed");
+        }
+        if value.is_empty() {
+            page.press(None, "Backspace", wait, timeout)?;
+        } else {
+            page.type_text(None, value, wait, timeout)?;
+        }
+        self.settle_for(timeout_ms);
+        Ok(())
+    }
+
     pub fn select(
         &self,
         target: &Target,
@@ -1582,9 +1601,112 @@ impl BrowserSession {
         timeout_ms: Option<f64>,
     ) -> Result<serde_json::Value> {
         let (wait, timeout) = self.element_budget(timeout_ms);
-        let chosen = self.active_tab().select(target, values, add, wait, timeout)?;
+        let chosen = match self.active_tab().select(target, values, add, wait, timeout) {
+            Err(e) if format!("{e:#}").contains("not a <select>") => {
+                self.select_combobox(target, values, timeout_ms)?
+            }
+            other => other?,
+        };
         self.settle_for(timeout_ms);
         Ok(chosen)
+    }
+
+    /// `select` on a custom dropdown (an ARIA combobox: react-select and
+    /// the like), the way a user does it: focus its input, open it
+    /// (ArrowDown, or a click where that doesn't), find the option by its
+    /// visible text in whatever listbox opened (often a portal at the end of
+    /// `<body>`), typing to filter when it isn't listed, and click it.
+    fn select_combobox(
+        &self,
+        target: &Target,
+        values: &[String],
+        timeout_ms: Option<f64>,
+    ) -> Result<serde_json::Value> {
+        let (wait, timeout) = self.element_budget(timeout_ms);
+        let page = self.active_tab();
+        let mut chosen = Vec::new();
+        for value in values {
+            let started = std::time::Instant::now();
+            let prep = page.on_element(target, "select", cdp::page_js::COMBO_FOCUS, &[], wait, timeout)?;
+            if prep.get("combobox").and_then(serde_json::Value::as_bool) != Some(true) {
+                bail!(
+                    "the element is {}, not a <select> or a combobox (role=combobox, aria-haspopup=listbox); \
+                     click it and pick the option by ref from `ax`",
+                    prep.get("tag").and_then(serde_json::Value::as_str).unwrap_or("something else")
+                );
+            }
+            let listbox = prep.get("listbox").cloned().unwrap_or(serde_json::Value::Null);
+            let find = |typed: bool| -> Result<serde_json::Value> {
+                page.evaluate(
+                    &format!(
+                        "({})({}, {}, {}, {})",
+                        cdp::page_js::COMBO_PICK,
+                        serde_json::json!(value),
+                        listbox,
+                        serde_json::json!(typed),
+                        cdp::DEEP
+                    ),
+                    timeout,
+                )
+            };
+            let keys = prep.get("keys").and_then(serde_json::Value::as_bool) == Some(true);
+            let mut opened = prep.get("expanded").and_then(serde_json::Value::as_bool) == Some(true);
+            let (mut tried_keys, mut tried_click, mut typed) = (false, false, false);
+            let mut last = std::time::Instant::now();
+            let mut opened_at: Option<std::time::Instant> = opened.then(std::time::Instant::now);
+            let picked = loop {
+                if !opened && keys && !tried_keys {
+                    // Keys go to the focused input.
+                    page.press(None, "ArrowDown", wait, timeout)?;
+                    tried_keys = true;
+                    last = std::time::Instant::now();
+                } else if !opened && !tried_click && (!keys || last.elapsed() > Duration::from_millis(300)) {
+                    // A widget that ignores ArrowDown opens on a click.
+                    self.click_target(target, &cdp::ClickOptions::default(), timeout_ms)?;
+                    tried_click = true;
+                    last = std::time::Instant::now();
+                }
+                let found = find(typed)?;
+                opened = found.get("open").and_then(serde_json::Value::as_bool) == Some(true);
+                if opened && opened_at.is_none() {
+                    opened_at = Some(std::time::Instant::now());
+                }
+                if found.get("picked").and_then(serde_json::Value::as_bool) == Some(true) {
+                    break found;
+                }
+                if keys && !typed && opened_at.is_some_and(|t| t.elapsed() > Duration::from_millis(300)) {
+                    // The open list doesn't have it: type to filter, as a
+                    // user does with a long or lazily loaded list.
+                    page.type_text(None, value, wait, timeout)?;
+                    typed = true;
+                    continue;
+                }
+                if started.elapsed() >= wait {
+                    let seen = found.get("options").cloned().unwrap_or_default();
+                    bail!(
+                        "no option {value:?} in the {} (options seen: {seen})",
+                        if opened { "open listbox" } else { "combobox: it didn't open on ArrowDown or a click" }
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let token = picked.get("token").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+            self.click_target(
+                &Target::Selector(format!("[data-nv-pick=\"{token}\"]")),
+                &cdp::ClickOptions::default(),
+                timeout_ms,
+            )
+            .map_err(|e| anyhow::anyhow!("clicking option {value:?}: {e:#}"))?;
+            let _ = page.evaluate(
+                &format!(
+                    "() => {{ for (const e of {}.all('[data-nv-pick=\"{token}\"]')) e.removeAttribute('data-nv-pick'); return true; }}",
+                    cdp::DEEP
+                ),
+                timeout,
+            );
+            chosen.push(picked.get("label").cloned().unwrap_or(serde_json::Value::Null));
+        }
+        Ok(serde_json::Value::Array(chosen))
     }
 
     pub fn press(&self, target: Option<&Target>, key: &str, timeout_ms: Option<f64>) -> Result<()> {

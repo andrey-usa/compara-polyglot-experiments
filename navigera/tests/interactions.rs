@@ -272,3 +272,74 @@ fn tabs_by_target_id_and_requests_since() {
     let since = s.text(&["network", "--since", &last.to_string()]);
     assert!(since.contains("/multi-select") && !since.contains("/right-click"), "{since}");
 }
+
+#[test]
+fn an_op_after_a_late_reload_finds_the_next_page() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("wizard", &[]);
+    for _ in 0..3 {
+        s.ok(&["goto", &format!("{}/wizard", site.url)]);
+        s.ok(&["fill", "--selector", "#name", "Ada"]);
+        // The click saves with a request, and only then reloads: the next
+        // op starts on the old page and has to carry on on the new one.
+        s.ok(&["click", "--selector", "#next"]);
+        s.ok(&["fill", "--selector", "#email", "ada@example.com"]);
+        s.ok(&["click", "--selector", "#finish"]);
+        assert_eq!(s.text(&["get", "text", "--selector", "#done"]), "Saved Ada / ada@example.com");
+    }
+}
+
+#[test]
+fn a_hidden_control_fails_fast_and_its_card_works() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("cards", &[]);
+    s.ok(&["goto", &format!("{}/card-radios", site.url)]);
+    let started = std::time::Instant::now();
+    let err = s.fails(&["click", "--selector", "#in-s"]);
+    assert!(err.contains("isn't visible"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "fails fast, not after the whole wait");
+    assert_eq!(s.text(&["get", "text", "--selector", "#picked"]), "none");
+    s.ok(&["click", "--role", "radio", "--name", "Medium"]);
+    assert_eq!(s.text(&["get", "text", "--selector", "#picked"]), "m");
+}
+
+#[test]
+fn select_works_on_an_aria_combobox() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("combo", &[]);
+    s.ok(&["goto", &format!("{}/combobox", site.url)]);
+    let r = s.ok(&["select", "--selector", "#cb", "Banana"]);
+    assert_eq!(r["selected"], serde_json::json!(["Banana"]), "{r}");
+    assert_eq!(s.text(&["get", "text", "--selector", "#committed"]), "Banana");
+    // Not among the first three shown: typed to filter.
+    s.ok(&["select", "--label", "Fruit", "cherry"]);
+    assert_eq!(s.text(&["get", "text", "--selector", "#committed"]), "Cherry");
+    let err = s.fails(&["select", "--selector", "#cb", "Durian", "--timeout-ms", "1200"]);
+    assert!(err.contains("no option \"Durian\""), "{err}");
+}
+
+#[test]
+fn fill_keys_reaches_an_app_that_keeps_only_typing() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("keys", &[]);
+    s.ok(&["goto", &format!("{}/typed-only", site.url)]);
+    s.ok(&["fill", "--selector", "#amt", "123"]);
+    s.ok(&["click", "--selector", "#go"]);
+    assert_eq!(s.text(&["get", "text", "--selector", "#model"]), "model=", "a set value is not typing");
+    s.ok(&["fill", "--selector", "#amt", "--keys", "28036"]);
+    s.ok(&["click", "--selector", "#go"]);
+    assert_eq!(s.text(&["get", "text", "--selector", "#model"]), "model=28036");
+}
+
+#[test]
+fn scroll_to_bottom_scrolls_the_box_itself() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("lazybox", &[]);
+    s.ok(&["goto", &format!("{}/lazy-box", site.url)]);
+    for _ in 0..3 {
+        let r = s.ok(&["scroll", "--selector", "#list", "--to", "bottom"]);
+        assert!(r["scrollTop"].as_u64().unwrap() > 0, "{r}");
+        s.ok(&["wait", "--ms", "250"]);
+    }
+    s.ok(&["click", "--text", "Item 55"]);
+}

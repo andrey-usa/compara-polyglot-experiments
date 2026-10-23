@@ -192,7 +192,9 @@ app. Besides a ref, `--selector` and
 | `drag 12 15`, `drag --from-text "Task 1" --to-text "Done"` | drag and drop, sliders, sortable lists |
 | `errors`, `console [--level warn]` | what the page logged; an action whose handler threw says so in `notes` |
 | `network [--failed] [--filter api] [--since <n>]`, `network <n>` | requests one line each (`--since`: what fired after request #n); one request with its body |
-| `click … --button right`, `select <ref> a b`, `select <ref> --add c` | right click (context menu); several options at once, or added to a multiple select |
+| `click … --button right`, `select <ref> a b`, `select <ref> --add c` | right click (context menu); several options at once, or added to a multiple select. `select` also works on custom dropdowns (react-select style): it opens them and clicks the option |
+| `fill --keys <ref> "text"` | type over the field key by key, for forms that ignore a value set directly ("looks filled, then says required") |
+| `scroll --selector "#list" --to bottom` | scroll inside a box (lists that load more at their end) |
 | `downloads`, `wait --download "*.csv"` | files the page downloaded, with their paths |
 | `cookies`, `cookies set <name> <value>`, `storage [get\|set k v]` | cookies and localStorage |
 | `state save auth.json` … `state load auth.json` | sign in once, reuse the session later (Playwright storageState format) |
@@ -217,7 +219,8 @@ app. Besides a ref, `--selector` and
   sticky bar) to go. If something still covers it, the click fails and
   names it: close that first (a cookie banner usually needs its own click).
   `click --force` sends DOM events to the element anyway. Styled checkboxes
-  and radios are clicked through their label automatically.
+  and radios are clicked through their label automatically; a hidden input
+  with no label fails at once and names what to click instead (the card).
 - **Iframes and shadow DOM:** refs work inside any iframe, cross-origin
   included. `--selector`, `--text` and the locators also look inside
   same-origin iframes and open shadow roots when the page itself has no
