@@ -1978,6 +1978,13 @@ impl Driver {
         &self.session
     }
 
+    /// Another driver on the same browser, in a browser context of its own
+    /// (see [`BrowserSession::fork`]): one browser for several sessions at
+    /// once.
+    pub fn fork(&self) -> anyhow::Result<Self> {
+        Ok(Self { session: self.session.fork()? })
+    }
+
     /// Active tab state the model needs after every op.
     fn state_json(&self) -> Value {
         let (url, title) = self.session.url_title();
@@ -3881,5 +3888,15 @@ mod tests {
         }
         assert_eq!(parse_ref("#buy"), None);
         assert_eq!(parse_ref("button"), None);
+    }
+}
+
+#[cfg(test)]
+mod fork_send {
+    /// A forked driver is moved into a worker thread.
+    #[test]
+    fn a_driver_can_move_to_another_thread() {
+        fn is_send<T: Send>() {}
+        is_send::<super::Driver>();
     }
 }

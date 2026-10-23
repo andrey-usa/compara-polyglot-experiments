@@ -388,6 +388,17 @@ impl Browser {
             .ok_or_else(|| anyhow::anyhow!("createBrowserContext: no browserContextId"))
     }
 
+    /// Every cookie of a browser context (the default one without
+    /// `context`). Asked of the browser itself: a page's session may not
+    /// name a context.
+    pub fn context_cookies(&self, context: Option<&str>) -> Result<Value> {
+        let params = match context {
+            Some(c) => json!({ "browserContextId": c }),
+            None => json!({}),
+        };
+        self.block_on(self.client.send("Storage.getCookies", params, None, CMD_TIMEOUT))
+    }
+
     /// Close a context made by [`Browser::create_context`] and its tabs.
     pub fn dispose_context(&self, id: &str) -> Result<()> {
         self.block_on(self.client.send(
