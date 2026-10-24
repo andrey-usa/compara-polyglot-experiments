@@ -105,6 +105,7 @@ def main():
     ap.add_argument("--rounds", type=int, default=15)
     ap.add_argument("--grep", default="empty cart")
     ap.add_argument("--chromium", help="the Chrome primavera runs (Playwright: channel chrome)")
+    ap.add_argument("--title", default="primavera vs Playwright Test")
     a = ap.parse_args()
 
     env = dict(os.environ, BASE_URL=a.site, CI="1")
@@ -148,8 +149,10 @@ def main():
         return statistics.median(xs) if xs else float("nan")
 
     base = med(suite["primavera (1 worker)"][1:])
+    listed = subprocess.run([pv, "list", *scen], capture_output=True, text=True).stdout
+    n = len([ln for ln in listed.splitlines() if ln.strip()])
     lines = [
-        f"#### primavera vs Playwright Test: 7 scenarios, {a.rounds} interleaved rounds",
+        f"#### {a.title}: {n} scenarios, {a.rounds} interleaved rounds",
         "",
         "| | suite, first round (ms) | suite, median of the rest (ms) | vs primavera, 1 worker | one scenario, median (ms) | runner peak RSS (MB) | total peak RSS incl. Chrome (MB) |",
         "|---|---:|---:|---:|---:|---:|---:|",
