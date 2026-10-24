@@ -125,9 +125,13 @@ jobs:
             echo CHROME DID NOT COME UP
             exit /b 1
           )
-          curl -s --max-time 5 http://127.0.0.1:%CDP_PORT%/json/version | head -c 300
-          echo.
-          tasklist /FI "IMAGENAME eq chrome.exe" /FO TABLE | head -6
+          curl -s --max-time 5 -o "%RUNNER_TEMP%\chrome-version.json" http://127.0.0.1:%CDP_PORT%/json/version
+          if !ERRORLEVEL! neq 0 (
+            echo VERSION FETCH FAILED
+            exit /b 1
+          )
+          echo chrome json-version fetched
+          tasklist /FI "IMAGENAME eq chrome.exe"
 
       - name: Start Chrome with remote debugging (bash)
         if: matrix.shell == 'bash'
@@ -143,8 +147,9 @@ jobs:
             sleep 1
           done
           curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" || { echo "CHROME DID NOT COME UP"; exit 1; }
-          curl -s --max-time 5 "http://127.0.0.1:$CDP_PORT/json/version" | head -c 300; echo
-          tasklist //FI "IMAGENAME eq chrome.exe" //FO TABLE | head -6
+          curl -s --max-time 5 -o "$RUNNER_TEMP/chrome-version.json" "http://127.0.0.1:$CDP_PORT/json/version" || { echo "VERSION FETCH FAILED"; exit 1; }
+          echo "chrome json-version fetched"
+          tasklist //FI "IMAGENAME eq chrome.exe"
 
       # 27 runs: 3 forms x 3 shells x 3 attempts. ensure_chrome() re-verifies
       # /json/version before every attempt and relaunches + re-synthesizes
