@@ -26,6 +26,16 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(30);
 /// before working on the partly parsed document.
 const POST_COMMIT_WAIT: Duration = Duration::from_secs(5);
 
+/// How often a load wait also looks at the page itself (see `wait_load`).
+const LOAD_LOOK: Duration = Duration::from_secs(2);
+
+/// Which document a load wait is for: the one with this loader id (`""`:
+/// any), or any but this one (a reload).
+enum Loader<'a> {
+    Is(&'a str),
+    Not(&'a str),
+}
+
 /// Default auto-wait for an element when the op carries no `timeout_ms`:
 /// long enough for SPA rendering, short enough that an agent with a wrong
 /// selector hears about it quickly.
@@ -1496,7 +1506,7 @@ impl Page {
             // frameNavigated carries the loaderId Page.navigate returned), so
             // a late load event from the previous document can't end the wait.
             let mut committed = false;
-            self.wait_event(&mut events, timeout, |method, params| {
+            let pred = |method: &str, params: &Value| {
                 if method == "Page.frameNavigated" {
                     let frame = params.get("frame").unwrap_or(&Value::Null);
                     let main = frame.get("parentId").is_none();
@@ -1507,7 +1517,8 @@ impl Page {
                     }
                 }
                 committed && method == want
-            })
+            };
+            self.wait_load(&mut events, timeout, pred, Loader::Is(&loader), want)
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
@@ -1527,25 +1538,97 @@ impl Page {
         timeout: Duration,
         mut pred: impl FnMut(&str, &Value) -> bool,
     ) -> Result<()> {
-        tokio::time::timeout(timeout, async {
-            loop {
-                match events.recv().await {
-                    Ok(event) => {
-                        if event.get("sessionId").and_then(Value::as_str) != Some(self.session_id.as_str()) {
-                            continue;
-                        }
-                        let method = event.get("method").and_then(Value::as_str).unwrap_or("");
-                        if pred(method, event.get("params").unwrap_or(&Value::Null)) {
-                            return Ok(());
-                        }
+        tokio::time::timeout(timeout, self.next_event(events, &mut pred))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out after {} ms", timeout.as_millis()))?
+    }
+
+    /// The next event of this tab's session that `pred` accepts.
+    async fn next_event(
+        &self,
+        events: &mut tokio::sync::broadcast::Receiver<Value>,
+        pred: &mut impl FnMut(&str, &Value) -> bool,
+    ) -> Result<()> {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if event.get("sessionId").and_then(Value::as_str) != Some(self.session_id.as_str()) {
+                        continue;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(e) => bail!("CDP event stream ended: {e}"),
+                    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+                    if pred(method, event.get("params").unwrap_or(&Value::Null)) {
+                        return Ok(());
+                    }
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => bail!("CDP event stream ended: {e}"),
             }
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out after {} ms", timeout.as_millis()))?
+        }
+    }
+
+    /// [`Page::wait_event`] for a load, and every 2 s a look at the page
+    /// itself: its main frame shows the document `loader` (any but `not`)
+    /// and has reached `want`. An event lost on the way (a lagging event
+    /// stream on a slow machine) then costs 2 s, not the whole timeout.
+    async fn wait_load(
+        &self,
+        events: &mut tokio::sync::broadcast::Receiver<Value>,
+        timeout: Duration,
+        mut pred: impl FnMut(&str, &Value) -> bool,
+        loader: Loader<'_>,
+        want: &str,
+    ) -> Result<()> {
+        let end = Instant::now() + timeout;
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("timed out after {} ms", timeout.as_millis());
+            }
+            if let Ok(done) = tokio::time::timeout(left.min(LOAD_LOOK), self.next_event(events, &mut pred)).await {
+                return done;
+            }
+            if self.load_reached(&loader, want).await {
+                eprintln!("[page] {want} seen on the page itself, not by its event");
+                return Ok(());
+            }
+        }
+    }
+
+    /// The loader id of the main frame's document.
+    async fn main_loader(&self) -> Option<String> {
+        let session = Some(self.session_id.as_str());
+        let tree = self.client.send("Page.getFrameTree", json!({}), session, LOAD_LOOK).await.ok()?;
+        tree.pointer("/frameTree/frame/loaderId").and_then(Value::as_str).map(str::to_string)
+    }
+
+    /// The main frame's document and how far it has loaded.
+    async fn main_document(&self) -> Option<(String, String)> {
+        let session = Some(self.session_id.as_str());
+        let loader = self.main_loader().await?;
+        let state = self
+            .client
+            .send(
+                "Runtime.evaluate",
+                json!({ "expression": "document.readyState", "returnByValue": true }),
+                session,
+                LOAD_LOOK,
+            )
+            .await
+            .ok()?;
+        let state = state.pointer("/result/value").and_then(Value::as_str)?.to_string();
+        Some((loader, state))
+    }
+
+    async fn load_reached(&self, loader: &Loader<'_>, want: &str) -> bool {
+        let Some((now, state)) = self.main_document().await else { return false };
+        let ours = match loader {
+            Loader::Is(id) => id.is_empty() || now == *id,
+            Loader::Not(old) => now != *old,
+        };
+        ours && match want {
+            "Page.domContentEventFired" => state != "loading",
+            _ => state == "complete",
+        }
     }
 
     /// Navigate and return as soon as the navigation commits (no load wait).
@@ -1581,17 +1664,20 @@ impl Page {
 
     pub fn reload(&self, timeout: Duration) -> Result<()> {
         self.block_on(async {
+            // The document before, so a look at the page can tell the new one.
+            let before = self.main_loader().await.unwrap_or_default();
             let mut events = self.client.subscribe();
             self.send_page_op("Page.reload", json!({}), timeout).await?;
             let mut committed = false;
-            self.wait_event(&mut events, timeout, |method, params| {
+            let pred = |method: &str, params: &Value| {
                 if method == "Page.frameNavigated" && params.get("frame").is_some_and(|f| f.get("parentId").is_none()) {
                     committed = true;
                 }
                 committed && method == "Page.loadEventFired"
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for reload"))
+            };
+            self.wait_load(&mut events, timeout, pred, Loader::Not(&before), "Page.loadEventFired")
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out waiting for reload"))
         })
     }
 
