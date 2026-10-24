@@ -1,0 +1,118 @@
+name: gauntlet-pv
+
+# The flake gauntlet as .pv: 16 timing/DOM-trap scenarios against the local
+# gauntlet app, `primavera run gauntlet/ --repeat 20 --shuffle`, on Linux,
+# macOS and Windows. Results are annotations: `gauntlet-pv <os>`, and the
+# job summary carries the per-scenario pass counts and the shuffle seed.
+
+on:
+  push:
+    branches: [experiment-20]
+    paths:
+      - "gauntlet/**"
+      - "primavera/**"
+      - "navigera/src/**"
+      - ".github/workflows/gauntlet-pv.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gauntlet:
+    name: "gauntlet-pv ${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      GAUNTLET_URL: http://127.0.0.1:18201
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Chrome
+        run: |
+          case "$RUNNER_OS" in
+            Linux) google-chrome --version ;;
+            macOS) "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version ;;
+            Windows) ls "/c/Program Files/Google/Chrome/Application/" ;;
+          esac
+      - name: Build primavera
+        working-directory: primavera
+        run: cargo build --release --locked
+      - name: Start the gauntlet app
+        run: |
+          PY=python3
+          [ "$RUNNER_OS" = Windows ] && PY=python
+          "$PY" -u gauntlet/server.py --port 18201 --xo-port 18202 \
+            --seed 7 --jitter 0 --telemetry 1 > gauntlet.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:18201/late-render \
+            && curl -sf -o /dev/null http://127.0.0.1:18202/xo-form && break
+            sleep 1
+          done
+          curl -sf -o /dev/null http://127.0.0.1:18201/late-render \
+            || { echo "gauntlet server did not start"; cat gauntlet.log; exit 1; }
+      - name: Gauntlet
+        run: |
+          set +e -o pipefail
+          BIN=./primavera/target/release/primavera
+          [ "$RUNNER_OS" = Windows ] && BIN="$BIN.exe"
+          "$BIN" run gauntlet/ \
+            --repeat 20 --shuffle --reporter github --reporter jsonl 2>&1 | tee run.log
+          code=${PIPESTATUS[0]}
+          python3 - run.log "gauntlet-pv $RUNNER_OS" "$code" <<'PY'
+          import json, re, sys
+          log, os_name, code = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          text = open(log, encoding="utf-8", errors="replace").read()
+          seed = re.search(r"shuffled with seed (\d+)", text)
+          seed = seed.group(1) if seed else "?"
+          counts = {}
+          order = []
+          for line in text.splitlines():
+              if not line.startswith("{"):
+                  continue
+              try:
+                  o = json.loads(line)
+              except ValueError:
+                  continue
+              if o.get("event") != "scenario":
+                  continue
+              name = re.sub(r" #\d+$", "", o.get("name", "?"))
+              if name not in counts:
+                  counts[name] = [0, 0]
+                  order.append(name)
+              counts[name][0 if o.get("status") == "passed" else 1] += 1
+          total_p = sum(p for p, _ in counts.values())
+          total_f = sum(f for _, f in counts.values())
+          rows = "\n".join(
+              f"| {n} | {p}/20 |" if p + f == 20 else f"| {n} | {p}/{p+f} |"
+              for n in order for p, f in [counts[n]])
+          summary = (
+              f"# gauntlet-pv {os_name}\n\n"
+              f"shuffle seed: {seed} · {total_p} passed, {total_f} failed "
+              f"(exit {code})\n\n"
+              f"| scenario | pass |\n|---|---|\n{rows}\n")
+          with open("summary.md", "w", encoding="utf-8") as fh:
+              fh.write(summary)
+          msg = f"seed {seed}: {total_p} passed, {total_f} failed"
+          print("::notice title=" + os_name + "::" + msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          PY
+          exit $code
+      - name: Summary
+        if: always()
+        run: '[ -f summary.md ] && cat summary.md >> "$GITHUB_STEP_SUMMARY" || true'
