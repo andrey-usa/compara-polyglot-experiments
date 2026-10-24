@@ -110,19 +110,26 @@ jobs:
         run: |
           @echo off
           setlocal enabledelayedexpansion
-          "%CHROME_EXE%" --version
+          rem No foreground "%CHROME_EXE%" --version here: cmd waits for the
+          rem Chrome process, which stays alive as the browser, so the step
+          rem would never reach the launch below. The browser version is
+          rem read from /json/version after launch instead.
           taskkill /F /IM chrome.exe >nul 2>&1
-          timeout /t 2 /nobreak >nul
+          timeout /t 2 /nobreak <nul >nul
           start "" "%CHROME_EXE%" --remote-debugging-port=%CDP_PORT% --user-data-dir=%RUNNER_TEMP%\chrome-profile --no-first-run about:blank
           set CHROME_UP=0
           for /L %%i in (1,1,60) do (
             if !CHROME_UP! equ 0 (
               curl -sf --max-time 5 -o nul http://127.0.0.1:%CDP_PORT%/json/version >nul 2>&1
-              if !ERRORLEVEL! equ 0 (set CHROME_UP=1) else (timeout /t 1 /nobreak >nul)
+              if !ERRORLEVEL! equ 0 (set CHROME_UP=1) else (timeout /t 1 /nobreak <nul >nul)
             )
           )
           if !CHROME_UP! equ 0 (
-            echo CHROME DID NOT COME UP
+            echo CHROME DID NOT COME UP after 60 probes
+            echo --- chrome processes ---
+            tasklist /FI "IMAGENAME eq chrome.exe"
+            echo --- listeners on %CDP_PORT% ---
+            netstat -ano | findstr ":%CDP_PORT%"
             exit /b 1
           )
           curl -s --max-time 5 -o "%RUNNER_TEMP%\chrome-version.json" http://127.0.0.1:%CDP_PORT%/json/version
@@ -131,24 +138,38 @@ jobs:
             exit /b 1
           )
           echo chrome json-version fetched
+          type "%RUNNER_TEMP%\chrome-version.json"
+          echo.
           tasklist /FI "IMAGENAME eq chrome.exe"
 
       - name: Start Chrome with remote debugging (bash)
         if: matrix.shell == 'bash'
         run: |
-          "$CHROME_EXE" --version
+          # No foreground "$CHROME_EXE" --version here: bash waits for the
+          # Chrome process, which stays alive as the browser, so the step
+          # would never reach the launch below. The browser version is
+          # read from /json/version after launch instead.
           taskkill //F //IM chrome.exe >/dev/null 2>&1 || true
           sleep 2
           CHROME_WIN=$(cygpath -w "$CHROME_EXE")
           PROFILE_WIN=$(cygpath -w "$RUNNER_TEMP/chrome-profile")
-          cmd.exe /c start '""' "\"$CHROME_WIN\"" --remote-debugging-port="$CDP_PORT" --user-data-dir="\"$PROFILE_WIN\"" --no-first-run about:blank
+          timeout -k 5 30 cmd.exe /c start '""' "\"$CHROME_WIN\"" --remote-debugging-port="$CDP_PORT" --user-data-dir="\"$PROFILE_WIN\"" --no-first-run about:blank < /dev/null || { echo "CHROME LAUNCH FAILED OR TIMED OUT"; exit 1; }
+          up=0
           for i in $(seq 1 60); do
-            curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" && break
+            if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version"; then up=1; break; fi
             sleep 1
           done
-          curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" || { echo "CHROME DID NOT COME UP"; exit 1; }
+          if [ "$up" -eq 0 ]; then
+            echo "CHROME DID NOT COME UP after 60 probes"
+            echo "--- chrome processes ---"
+            tasklist //FI "IMAGENAME eq chrome.exe" || true
+            echo "--- listeners on $CDP_PORT ---"
+            netstat -ano | grep ":$CDP_PORT" || true
+            exit 1
+          fi
           curl -s --max-time 5 -o "$RUNNER_TEMP/chrome-version.json" "http://127.0.0.1:$CDP_PORT/json/version" || { echo "VERSION FETCH FAILED"; exit 1; }
           echo "chrome json-version fetched"
+          cat "$RUNNER_TEMP/chrome-version.json"; echo
           tasklist //FI "IMAGENAME eq chrome.exe"
 
       # 27 runs: 3 forms x 3 shells x 3 attempts. ensure_chrome() re-verifies
