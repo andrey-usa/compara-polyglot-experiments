@@ -1,0 +1,182 @@
+name: miniwob-eval
+
+# MiniWoB++ model-driven browser-tool comparison: same model, same shell
+# loop, two browser-driving CLIs (navigera, agent-browser), so the numbers
+# compare tools rather than whoever drove them.
+#
+# Protocol (frozen):
+# - Task set: 112 of the 130 MiniWoB++ tasks - the 18 canvas/shapes.js
+#   tasks excluded (bench/miniwob/tasks.txt, sorted, frozen).
+# - Suite pinned: Farama-Foundation/miniwob-plusplus @ 33c3b4ddef8c6eb67c57a29663d844b1eda7e614,
+#   HTML served locally by python3 -m http.server.
+# - Episode control: Math.seedrandom("<task>-<seed>") + core.startEpisodeReal();
+#   core.EPISODE_MAX_TIME raised 10s -> 600s; reward from WOB_REWARD_GLOBAL,
+#   raw reward from core.reward (time-proportional per suite default).
+# - Seeds: 3 per task (0, 1, 2), interleaved task-major.
+# - Model: deepseek-ai/DeepSeek-V4.1-Flash, temperature 0, max_tokens 1024,
+#   no client retries; pattern-A recovery: a commandless text-only reply is
+#   re-prompted up to 2 consecutive times; finish_reason recorded per request.
+# - navigera cell: built from an assembled tree - experiment-17 @ 89ce1d4
+#   with only navigera/skills/navigera/SKILL.md overlaid from 2033910 (the
+#   trimmed skill, embedded at compile time); ancestry-checked. The system
+#   prompt reads the skill the built binary installs (NAVIGERA_SKILL_MD).
+# - agent-browser cell: npm agent-browser@0.39.1.
+#
+# Provider: SiliconFlow global (https://api.siliconflow.com/v1), key in
+# the `main` environment as SILICONFLOW_API_KEY.
+#
+# Spend is guarded (bench/miniwob/miniwob_run.py): each job has a per-cell
+# budget (--max-spend), and before every request the computed usage cost so
+# far plus retained reservations for unknown-outcome requests plus that
+# request's documented maximum (context ceiling x input price + max_tokens
+# x output price) must fit it. Computed cost = usage x listed prices; it is
+# not provider-billed spend (SiliconFlow exposes no balance API).
+#
+# This workflow exists only on experiment-23, which the dispatch API cannot
+# address (it indexes workflows from the default branch), so a push to the
+# harness paths fires it. Push default: PUSH_DEFAULT_SUMMARY (filled at dispatch).
+
+on:
+  push:
+    branches: [experiment-23]
+    paths:
+      - bench/miniwob/**
+      - .github/workflows/miniwob-eval.yml
+  workflow_dispatch:
+    inputs:
+      tools:
+        description: "comma-separated: navigera,agent-browser"
+        default: "navigera,agent-browser"
+      seeds:
+        description: "seeds per task"
+        default: "3"
+      count:
+        description: "tasks per cell"
+        default: "112"
+      offset:
+        description: "start at this index into tasks.txt"
+        default: "0"
+      max_spend:
+        description: "per-cell budget in USD (computed-ledger stop; see header)"
+        default: "2.49"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          TOOLS: ${{ inputs.tools || 'navigera,agent-browser' }}
+          SEEDS: ${{ inputs.seeds || '3' }}
+          COUNT: ${{ inputs.count || '112' }}
+          OFFSET: ${{ inputs.offset || '0' }}
+          MAX_SPEND: ${{ inputs.max_spend || '2.49' }}
+        run: |
+          python3 - <<'PYEOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          cells = []
+          for tool in [t.strip() for t in os.environ["TOOLS"].split(",") if t.strip()]:
+              variant = "exp17-2033910sk" if tool == "navigera" else "v0.39.1"
+              cells.append({"tool": tool, "variant": variant,
+                            "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+                            "slug": "deepseek-ai-DeepSeek-V4.1-Flash",
+                            "seeds": os.environ["SEEDS"], "count": os.environ["COUNT"],
+                            "offset": os.environ["OFFSET"], "max_spend": os.environ["MAX_SPEND"]})
+          print("matrix=" + json.dumps(cells))
+          PYEOF
+
+  eval:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    name: MiniWoB++ (${{ matrix.cell.tool }}[${{ matrix.cell.variant }}] x V4.1-Flash)
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 155
+    environment: main
+    env:
+      SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+      TOOL: ${{ matrix.cell.tool }}
+      VARIANT: ${{ matrix.cell.variant }}
+      MODEL: ${{ matrix.cell.model }}
+      SEEDS: ${{ matrix.cell.seeds }}
+      COUNT: ${{ matrix.cell.count }}
+      OFFSET: ${{ matrix.cell.offset }}
+      MAX_SPEND: ${{ matrix.cell.max_spend }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        if: startsWith(matrix.cell.tool, 'navigera')
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: startsWith(matrix.cell.tool, 'agent-browser')
+        with:
+          node-version: 24
+      # Build navigera from the pinned experiment-17 candidate tree; the
+      # ancestry check fails the job rather than build a moved candidate.
+      - name: Build navigera (release; variant $VARIANT)
+        if: startsWith(matrix.cell.tool, 'navigera')
+        run: |
+          # Assembled candidate: experiment-17 @ 89ce1d4 in full, except
+          # navigera/skills/navigera/SKILL.md from experiment-17 @ 2033910
+          # (trimmed skill, embedded at compile time via include_str!).
+          # Ancestry checks fail the job rather than build a moved candidate.
+          git fetch --depth 10 origin experiment-17
+          git merge-base --is-ancestor 89ce1d4 FETCH_HEAD
+          git merge-base --is-ancestor 2033910 FETCH_HEAD
+          mkdir -p "$RUNNER_TEMP/nav-build"
+          git archive 89ce1d4 navigera | tar -x -C "$RUNNER_TEMP/nav-build"
+          git archive 2033910 navigera/skills/navigera/SKILL.md | tar -x -C "$RUNNER_TEMP/nav-build"
+          mv "$RUNNER_TEMP/nav-build/navigera" "$RUNNER_TEMP/nav-build/src"
+          echo "base provenance: $(git rev-parse 89ce1d4)"
+          echo "skill provenance: $(git rev-parse 2033910)"
+          echo "skill sha256: $(sha256sum "$RUNNER_TEMP/nav-build/src/skills/navigera/SKILL.md")"
+          echo "skill bytes: $(wc -c < "$RUNNER_TEMP/nav-build/src/skills/navigera/SKILL.md")"
+          cd "$RUNNER_TEMP/nav-build/src"
+          cargo build --release --locked --bin navigera
+          echo "NAV_BIN=$RUNNER_TEMP/nav-build/src/target/release/navigera" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/nav-build/src/target/release/navigera" --version
+          # The harness's system prompt reads the skill the binary installs,
+          # so the prompt provably matches the build.
+          "$RUNNER_TEMP/nav-build/src/target/release/navigera" install-skill --dir "$RUNNER_TEMP/skills"
+          echo "NAVIGERA_SKILL_MD=$RUNNER_TEMP/skills/navigera/SKILL.md" >> "$GITHUB_ENV"
+          sha256sum "$RUNNER_TEMP/skills/navigera/SKILL.md"
+      - name: Install agent-browser
+        if: startsWith(matrix.cell.tool, 'agent-browser')
+        run: |
+          npm install -g agent-browser@0.39.1
+          echo "AB_BIN=$(npm prefix -g)/bin/agent-browser" >> "$GITHUB_ENV"
+          agent-browser --version
+      - name: Chrome
+        run: |
+          google-chrome --version
+      - name: MiniWoB++ suite (pinned)
+        run: |
+          git clone https://github.com/Farama-Foundation/miniwob-plusplus "$RUNNER_TEMP/miniwob-plusplus"
+          git -C "$RUNNER_TEMP/miniwob-plusplus" checkout 33c3b4ddef8c6eb67c57a29663d844b1eda7e614
+          git -C "$RUNNER_TEMP/miniwob-plusplus" log -1 --format='suite commit %H %s'
+      - name: MiniWoB++ matrix slice
+        run: |
+          python3 bench/miniwob/miniwob_run.py --tool "$TOOL" --model "$MODEL" \
+            --tasks-file bench/miniwob/tasks.txt --offset "$OFFSET" --count "$COUNT" \
+            --seeds "$SEEDS" --max-spend "$MAX_SPEND" \
+            --nav-bin "${NAV_BIN:-navigera}" --ab-bin "${AB_BIN:-agent-browser}" \
+            --miniwob-dir "$RUNNER_TEMP/miniwob-plusplus" --out out/miniwob
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: miniwob-eval-${{ matrix.cell.tool }}-${{ matrix.cell.variant }}-o${{ matrix.cell.offset }}c${{ matrix.cell.count }}s${{ matrix.cell.seeds }}
+          path: out/miniwob/
+          if-no-files-found: ignore
