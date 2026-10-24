@@ -1,0 +1,24 @@
+[package]
+name = "primavera"
+version = "0.0.1"
+edition = "2021"
+description = "Plain-text web tests that run on real Chrome through navigera: one native binary, no Node."
+license = "MIT"
+publish = false
+rust-version = "1.91"
+
+[[bin]]
+name = "primavera"
+path = "src/main.rs"
+
+[dependencies]
+# navigera checked out beside this repository (../navigera).
+navigera = { path = "../navigera" }
+anyhow = "1"
+serde_json = "1"
+regex = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

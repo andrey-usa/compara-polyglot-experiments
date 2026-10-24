@@ -1,0 +1,42 @@
+scenario "Subjects"
+  goto /m1
+  expect text Saved --within --testid toast
+  expect no text Error --within --testid toast
+  expect --testid badge style color is "rgb(0, 128, 0)"
+  expect --label Notes empty
+  expect not --label Filled empty
+  click --selector "#order"
+  expect title is ORD-7
+  expect request POST /api/order json $.items[0].sku is sku-1
+  expect request POST /api/order status 200 count is 1
+  expect console contains "m1 ready"
+  expect cookie nothing absent
+  expect storage local nothing absent
+  click --selector "#dl"
+  expect download report-*.csv
+  expect ${download.name} is report-2026.csv
+  expect ${scenario.name} is Subjects
+  expect ${run.id} matches "^[0-9]+-[0-9]+$"
+
+scenario "Soft expectations fail it at the end"
+  goto /m1
+  expect text Nope --soft --timeout-ms 200
+  expect text "Also nope" --soft --timeout-ms 200
+  expect --testid toast text contains Saved
+
+scenario "Mocks its API"
+  route "*/api/x" --body mocked
+  dialog --dismiss
+  goto /m1
+  expect js "fetch('/api/x').then((r) => r.text())" is mocked
+  expect js "confirm('sure?')" is false
+
+scenario "Sees the real API ${n}"
+  examples
+    | n |
+    | 1 |
+    | 2 |
+    | 3 |
+  goto /m1
+  expect js "fetch('/api/x').then((r) => r.text())" is real
+  expect js "confirm('sure?')" is true

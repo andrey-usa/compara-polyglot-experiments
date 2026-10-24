@@ -1,0 +1,11 @@
+# Flows other files `use`.
+
+flow sign-in(email, password)
+  goto /login
+  fill --label Email ${email}
+  fill --label Password ${password}
+  click --role button --name "Sign in"
+  expect url ends-with /account
+
+flow accept-cookies
+  optional click --selector "#cookie-accept" --timeout-ms 500
