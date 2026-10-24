@@ -217,7 +217,9 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button,
             Promise.all(anims.map((a) => a.finished.catch(() => null))),
             new Promise((res) => setTimeout(res, Math.max(0, deadline - Date.now()))),
         ]);
-        await new Promise((res) => requestAnimationFrame(() => res()));
+        // A frame, but not forever: a renderer that paints nothing (a
+        // starved or hidden page) must not hold the click up to its timeout.
+        await new Promise((res) => { requestAnimationFrame(() => res()); setTimeout(res, 100); });
     };
     // Mouse events are dispatched in top-level viewport coordinates: add the
     // offsets of every iframe on the way up (null if one is cross-origin).
@@ -2767,7 +2769,7 @@ impl Page {
             // :hover styles apply on the next frame; let two pass so an `ax`
             // right after sees the opened menu.
             self.evaluate_raw(
-                "new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))",
+                "new Promise((r) => { requestAnimationFrame(() => requestAnimationFrame(() => r(true))); setTimeout(() => r(false), 250); })",
                 timeout,
             )?;
         }
