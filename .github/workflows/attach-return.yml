@@ -1,0 +1,314 @@
+name: attach-return
+
+# Reproduction: does `navigera -s job start --attach` return on Windows, or
+# hang with the session server listening? Two attach forms (user-data-dir
+# and the single-tab ws://.../devtools/page/<id> from /json/list), three
+# attempts each, from pwsh, cmd and Git Bash (18 runs). Every attempt has a
+# 60 s budget enforced by a watchdog that kills navigera.exe; ~10 s into the
+# attempt `navigera -s job tab-list` runs to see whether the session answers
+# meanwhile. Transcripts, session logs and per-attempt verdicts are uploaded
+# as artifacts; the pwsh job additionally narrows a hang (Start-Process vs
+# direct call, output redirected vs console).
+#
+# Deviation from the original observation setup: Chrome gets a FIXED
+# --remote-debugging-port (19022) instead of port 0, because the single-tab
+# form needs a discoverable port to fetch /json/list from.
+
+on:
+  push:
+    branches: [experiment-21]
+    paths:
+      - "navigera/**"
+      - ".github/workflows/attach-return.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repro:
+    name: "attach-return ${{ matrix.shell }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, cmd, bash]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    env:
+      CDP_PORT: "19022"
+      CHROME_EXE: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+
+      - name: Build navigera
+        working-directory: navigera
+        run: cargo build --release --locked
+
+      - name: Confirm CLI syntax (pwsh)
+        if: matrix.shell == 'pwsh'
+        run: |
+          & "$env:GITHUB_WORKSPACE\navigera\target\release\navigera.exe" -s job start --help
+      - name: Confirm CLI syntax (cmd)
+        if: matrix.shell == 'cmd'
+        run: '"%GITHUB_WORKSPACE%\navigera\target\release\navigera.exe" -s job start --help'
+      - name: Confirm CLI syntax (bash)
+        if: matrix.shell == 'bash'
+        run: '"$GITHUB_WORKSPACE/navigera/target/release/navigera.exe" -s job start --help'
+
+      - name: Prepare log dir
+        if: matrix.shell == 'pwsh'
+        run: New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\attach-logs" | Out-Null
+      - name: Prepare log dir
+        if: matrix.shell == 'cmd'
+        run: mkdir "%RUNNER_TEMP%\attach-logs" 2>nul & exit /b 0
+      - name: Prepare log dir
+        if: matrix.shell == 'bash'
+        run: mkdir -p "$RUNNER_TEMP/attach-logs"
+
+      - name: Start Chrome with remote debugging
+        if: matrix.shell == 'pwsh'
+        run: |
+          Start-Process -FilePath $env:CHROME_EXE -ArgumentList @(
+            "--remote-debugging-port=$env:CDP_PORT",
+            "--user-data-dir=$env:RUNNER_TEMP\chrome-profile",
+            "--no-first-run", "about:blank")
+          for ($i=0; $i -lt 60; $i++) {
+            try { (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$env:CDP_PORT/json/list" -TimeoutSec 2).StatusCode | Out-Null; break }
+            catch { Start-Sleep 1 }
+          }
+          Invoke-RestMethod "http://127.0.0.1:$env:CDP_PORT/json/list" | Format-Table id, type, url
+
+      - name: Start Chrome with remote debugging
+        if: matrix.shell == 'cmd'
+        run: |
+          start "" /b "%CHROME_EXE%" --remote-debugging-port=%CDP_PORT% --user-data-dir=%RUNNER_TEMP%\chrome-profile --no-first-run about:blank
+          for /L %%i in (1,1,60) do (curl -sf -o nul http://127.0.0.1:%CDP_PORT%/json/list && goto :chromeup & timeout /t 1 /nobreak >nul)
+          :chromeup
+          curl -s http://127.0.0.1:%CDP_PORT%/json/list
+
+      - name: Start Chrome with remote debugging
+        if: matrix.shell == 'bash'
+        run: |
+          "$CHROME_EXE" --remote-debugging-port="$CDP_PORT" --user-data-dir="$RUNNER_TEMP/chrome-profile" --no-first-run about:blank &
+          for i in $(seq 1 60); do
+            curl -sf -o /dev/null "http://127.0.0.1:$CDP_PORT/json/list" && break
+            sleep 1
+          done
+          curl -s "http://127.0.0.1:$CDP_PORT/json/list"
+
+      - name: Pick a page target for the single-tab form
+        if: matrix.shell == 'pwsh'
+        run: |
+          $ws = python -c "import json,urllib.request; items=json.load(urllib.request.urlopen('http://127.0.0.1:$env:CDP_PORT/json/list',timeout=10)); print(next(t['webSocketDebuggerUrl'] for t in items if t.get('type')=='page'))"
+          "PAGE_WS=$ws" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "PAGE_WS=$ws"
+
+      - name: Pick a page target for the single-tab form
+        if: matrix.shell == 'cmd'
+        run: |
+          python -c "import json,urllib.request; items=json.load(urllib.request.urlopen('http://127.0.0.1:%CDP_PORT%/json/list',timeout=10)); print(next(t['webSocketDebuggerUrl'] for t in items if t.get('type')=='page'))" > "%RUNNER_TEMP%\pagews.txt"
+          set /p PAGE_WS=<"%RUNNER_TEMP%\pagews.txt"
+          echo PAGE_WS=%PAGE_WS%>> "%GITHUB_ENV%"
+
+      - name: Pick a page target for the single-tab form
+        if: matrix.shell == 'bash'
+        run: |
+          WS=$(python -c "import json,urllib.request; items=json.load(urllib.request.urlopen('http://127.0.0.1:$CDP_PORT/json/list',timeout=10)); print(next(t['webSocketDebuggerUrl'] for t in items if t.get('type')=='page'))")
+          echo "PAGE_WS=$WS" >> "$GITHUB_ENV"
+          echo "PAGE_WS=$WS"
+
+      # 18 runs: 2 forms x 3 shells x 3 attempts. Each attempt runs
+      # `navigera -s job start --attach <form>` as a DIRECT call in the
+      # step's shell; a watchdog kills navigera.exe 62 s in unless the
+      # attempt wrote its .done file (hang verdict at >=60 s elapsed).
+      - name: Run attempts (pwsh)
+        if: matrix.shell == 'pwsh'
+        run: |
+          $nav = "$env:GITHUB_WORKSPACE\navigera\target\release\navigera.exe"
+          $logd = "$env:RUNNER_TEMP\attach-logs"
+          $summary = @()
+          foreach ($form in @('dir','url')) {
+            $attach = if ($form -eq 'dir') { "$env:RUNNER_TEMP\chrome-profile" } else { $env:PAGE_WS }
+            for ($n=1; $n -le 3; $n++) {
+              $tag = "pwsh-$form-$n"
+              $out="$logd\$tag.out"; $err="$logd\$tag.err"; $tl="$logd\$tag.tablist"
+              $done="$logd\$tag.done"; $killed="$logd\$tag.killed"
+              Remove-Item $done,$killed -ErrorAction SilentlyContinue
+              "started $(Get-Date -Format o)`nattach=$attach" | Out-File "$logd\$tag.meta"
+              $wd = Start-Job -ScriptBlock {
+                param($d,$k) Start-Sleep 62
+                if (-not (Test-Path $d)) { 'killed' | Out-File $k; Get-Process navigera -ErrorAction SilentlyContinue | Stop-Process -Force }
+              } -ArgumentList $done,$killed
+              $tlj = Start-Job -ScriptBlock {
+                param($n,$f) Start-Sleep 10; & $n -s job tab-list > $f 2>&1; $LASTEXITCODE | Out-File "$f.rc"
+              } -ArgumentList $nav,$tl
+              $sw = [System.Diagnostics.Stopwatch]::StartNew()
+              & $nav -s job start --attach "$attach" > $out 2> $err
+              $rc = $LASTEXITCODE
+              $sw.Stop()
+              '' | Out-File $done
+              Wait-Job $tlj -Timeout 60 | Out-Null
+              $tlrc = if (Test-Path "$tl.rc") { (Get-Content "$tl.rc" -Raw).Trim() } else { 'missing' }
+              Remove-Job $wd,$tlj -Force -ErrorAction SilentlyContinue
+              $hang = Test-Path $killed
+              $elapsed = [int]$sw.Elapsed.TotalSeconds
+              "elapsed=${elapsed}s rc=$rc hang=$hang tablist_rc=$tlrc" | Out-File "$logd\$tag.meta" -Append
+              $slog = "$env:RUNNER_TEMP\navigera\job.log"
+              if (Test-Path $slog) { Copy-Item $slog "$logd\$tag.session.log" }
+              & $nav -s job quit > $null 2>&1
+              Get-Process navigera -ErrorAction SilentlyContinue | Stop-Process -Force
+              Start-Sleep 2
+              $summary += "$tag elapsed=${elapsed}s rc=$rc hang=$hang tablist_rc=$tlrc"
+              Write-Host "$tag elapsed=${elapsed}s rc=$rc hang=$hang tablist_rc=$tlrc"
+            }
+          }
+          $summary | Out-File "$logd\summary-pwsh.txt"
+
+      - name: Run attempts (cmd)
+        if: matrix.shell == 'cmd'
+        run: |
+          @echo off
+          setlocal enabledelayedexpansion
+          set NAV=%GITHUB_WORKSPACE%\navigera\target\release\navigera.exe
+          set LOGD=%RUNNER_TEMP%\attach-logs
+          for %%F in (dir url) do (
+            if "%%F"=="dir" (set ATTACH=%RUNNER_TEMP%\chrome-profile) else (set ATTACH=%PAGE_WS%)
+            for /L %%N in (1,1,3) do call :attempt %%F %%N
+          )
+          exit /b 0
+          :attempt
+          set FORM=%~1
+          set N=%~2
+          set TAG=cmd-!FORM!-!N!
+          set DONE=%LOGD%\!TAG!.done
+          set KILLED=%LOGD%\!TAG!.killed
+          if exist "!DONE!" del "!DONE!"
+          if exist "!KILLED!" del "!KILLED!"
+          echo started %DATE% %TIME% > "%LOGD%\!TAG!.meta"
+          echo attach=!ATTACH! >> "%LOGD%\!TAG!.meta"
+          start "" /min cmd /c "timeout /t 62 /nobreak >nul & if not exist ""!DONE!"" (echo killed>""!KILLED!"" & taskkill /F /IM navigera.exe >nul 2>&1)"
+          start "" /b cmd /c "timeout /t 10 /nobreak >nul & ""%NAV%"" -s job tab-list > ""%LOGD%\!TAG!.tablist"" 2>&1 & (call echo RC=%%errorlevel%%) > ""%LOGD%\!TAG!.tablist.rc"""
+          "%NAV%" -s job start --attach "!ATTACH!" > "%LOGD%\!TAG!.out" 2> "%LOGD%\!TAG!.err"
+          set RC=%ERRORLEVEL%
+          echo. > "!DONE!"
+          if exist "!KILLED!" (set HANG=true) else (set HANG=false)
+          set /p TLRC=<"%LOGD%\!TAG!.tablist.rc"
+          if not defined TLRC set TLRC=missing
+          echo rc=!RC! hang=!HANG! tablist_rc=!TLRC! >> "%LOGD%\!TAG!.meta"
+          if exist "%RUNNER_TEMP%\navigera\job.log" copy /y "%RUNNER_TEMP%\navigera\job.log" "%LOGD%\!TAG!.session.log" >nul
+          "%NAV%" -s job quit >nul 2>&1
+          taskkill /F /IM navigera.exe >nul 2>&1
+          timeout /t 2 /nobreak >nul
+          echo !TAG! rc=!RC! hang=!HANG! tablist_rc=!TLRC!
+          exit /b 0
+
+      - name: Run attempts (bash)
+        if: matrix.shell == 'bash'
+        run: |
+          set -u
+          NAV="$GITHUB_WORKSPACE/navigera/target/release/navigera.exe"
+          LOGD="$RUNNER_TEMP/attach-logs"
+          for form in dir url; do
+            if [ "$form" = dir ]; then ATTACH="$RUNNER_TEMP/chrome-profile"; else ATTACH="$PAGE_WS"; fi
+            for n in 1 2 3; do
+              tag="bash-$form-$n"
+              done_f="$LOGD/$tag.done"; killed_f="$LOGD/$tag.killed"
+              rm -f "$done_f" "$killed_f"
+              { echo "started $(date -u +%FT%TZ)"; echo "attach=$ATTACH"; } > "$LOGD/$tag.meta"
+              ( sleep 62; if [ ! -f "$done_f" ]; then echo killed > "$killed_f"; taskkill //F //IM navigera.exe >/dev/null 2>&1; fi ) &
+              ( sleep 10; "$NAV" -s job tab-list >"$LOGD/$tag.tablist" 2>&1; echo $? > "$LOGD/$tag.tablist.rc" ) &
+              t0=$(date +%s)
+              "$NAV" -s job start --attach "$ATTACH" >"$LOGD/$tag.out" 2>"$LOGD/$tag.err"; rc=$?
+              t1=$(date +%s)
+              touch "$done_f"
+              if [ -f "$killed_f" ]; then hang=true; else hang=false; fi
+              tlrc=$(cat "$LOGD/$tag.tablist.rc" 2>/dev/null || echo missing)
+              echo "elapsed=$((t1-t0))s rc=$rc hang=$hang tablist_rc=$tlrc" >> "$LOGD/$tag.meta"
+              [ -f "$RUNNER_TEMP/navigera/job.log" ] && cp "$RUNNER_TEMP/navigera/job.log" "$LOGD/$tag.session.log"
+              "$NAV" -s job quit >/dev/null 2>&1 || true
+              taskkill //F //IM navigera.exe >/dev/null 2>&1 || true
+              sleep 2
+              echo "$tag elapsed=$((t1-t0))s rc=$rc hang=$hang tablist_rc=$tlrc"
+            done
+          done
+
+      # Narrowing (always runs; cheap, and is the evidence either way):
+      # Start-Process vs direct call on the user-data-dir form, plus a
+      # direct call with output going to the console (not redirected).
+      - name: Narrow the hang (pwsh)
+        if: matrix.shell == 'pwsh'
+        run: |
+          $nav = "$env:GITHUB_WORKSPACE\navigera\target\release\navigera.exe"
+          $logd = "$env:RUNNER_TEMP\attach-logs"
+          $dir = "$env:RUNNER_TEMP\chrome-profile"
+          # V1: Start-Process (the form the original observation used), 60 s budget
+          $tag = "narrow-startprocess-dir"
+          $proc = Start-Process -FilePath $nav -ArgumentList @('-s','job','start','--attach',$dir) -NoNewWindow -PassThru -RedirectStandardOutput "$logd\$tag.out" -RedirectStandardError "$logd\$tag.err"
+          $tlj = Start-Job -ScriptBlock { param($n,$f) Start-Sleep 10; & $n -s job tab-list > $f 2>&1; $LASTEXITCODE | Out-File "$f.rc" } -ArgumentList $nav,"$logd\$tag.tablist"
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $exited = $proc.WaitForExit(60000)
+          $sw.Stop()
+          if (-not $exited) { $proc.Kill() }
+          Wait-Job $tlj -Timeout 60 | Out-Null
+          $tlrc = if (Test-Path "$logd\$tag.tablist.rc") { (Get-Content "$logd\$tag.tablist.rc" -Raw).Trim() } else { 'missing' }
+          Remove-Job $tlj -Force -ErrorAction SilentlyContinue
+          "startprocess elapsed=$([int]$sw.Elapsed.TotalSeconds)s returned_within_60s=$exited tablist_rc=$tlrc" | Out-File "$logd\$tag.meta"
+          Write-Host "startprocess elapsed=$([int]$sw.Elapsed.TotalSeconds)s returned=$exited tablist_rc=$tlrc"
+          & $nav -s job quit > $null 2>&1
+          Get-Process navigera -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep 2
+          # V2: direct call, stdout/stderr to the console (no redirect)
+          $tag = "narrow-direct-console-dir"
+          $done="$logd\$tag.done"; $killed="$logd\$tag.killed"
+          Remove-Item $done,$killed -ErrorAction SilentlyContinue
+          $wd = Start-Job -ScriptBlock { param($d,$k) Start-Sleep 62; if (-not (Test-Path $d)) { 'killed' | Out-File $k; Get-Process navigera -ErrorAction SilentlyContinue | Stop-Process -Force } } -ArgumentList $done,$killed
+          $tlj = Start-Job -ScriptBlock { param($n,$f) Start-Sleep 10; & $n -s job tab-list > $f 2>&1; $LASTEXITCODE | Out-File "$f.rc" } -ArgumentList $nav,"$logd\$tag.tablist"
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          & $nav -s job start --attach $dir
+          $rc = $LASTEXITCODE
+          $sw.Stop()
+          '' | Out-File $done
+          Wait-Job $tlj -Timeout 60 | Out-Null
+          $tlrc = if (Test-Path "$logd\$tag.tablist.rc") { (Get-Content "$logd\$tag.tablist.rc" -Raw).Trim() } else { 'missing' }
+          Remove-Job $wd,$tlj -Force -ErrorAction SilentlyContinue
+          $hang = Test-Path $killed
+          "direct_console elapsed=$([int]$sw.Elapsed.TotalSeconds)s rc=$rc hang=$hang tablist_rc=$tlrc" | Out-File "$logd\$tag.meta"
+          Write-Host "direct_console elapsed=$([int]$sw.Elapsed.TotalSeconds)s rc=$rc hang=$hang tablist_rc=$tlrc"
+          & $nav -s job quit > $null 2>&1
+          Get-Process navigera -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Stop Chrome
+        if: always() && matrix.shell == 'pwsh'
+        run: Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force
+      - name: Stop Chrome
+        if: always() && matrix.shell == 'cmd'
+        run: taskkill /F /IM chrome.exe >nul 2>&1 & exit /b 0
+      - name: Stop Chrome
+        if: always() && matrix.shell == 'bash'
+        run: taskkill //F //IM chrome.exe >/dev/null 2>&1 || true
+
+      - name: Upload transcripts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: attach-return-${{ matrix.shell }}
+          path: ${{ runner.temp }}\attach-logs\
+          if-no-files-found: error
+
+      - name: Summary
+        if: always() && matrix.shell == 'pwsh'
+        run: |
+          '## attach-return (pwsh)' >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:RUNNER_TEMP\attach-logs\summary-pwsh.txt" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
