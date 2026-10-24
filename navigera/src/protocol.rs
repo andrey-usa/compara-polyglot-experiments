@@ -1909,15 +1909,21 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
                 None => positional(&mut args),
             },
         },
-        "tab-select" => match str_flag(&mut args, "--index")?.or_else(|| positional(&mut args)) {
-            Some(raw) => match parse_index(&raw) {
+        "tab-select" => match (str_flag(&mut args, "--index")?, positional(&mut args)) {
+            (Some(raw), _) => match parse_index(&raw) {
                 Ok(index) => Command::TabSelect { index, target: None },
-                Err(_) if raw.len() >= 4 && raw.chars().all(|c| c.is_ascii_hexdigit()) => {
-                    Command::TabSelect { index: 0, target: Some(raw) }
-                }
                 Err(e) => return invalid(e),
             },
-            None => return Err(need("tab-select", "a tab index or target id")),
+            // A target id (or 4+ characters of one) even when it happens to
+            // be all digits; a tab index is short.
+            (None, Some(raw)) if raw.len() >= 4 && raw.chars().all(|c| c.is_ascii_hexdigit()) => {
+                Command::TabSelect { index: 0, target: Some(raw) }
+            }
+            (None, Some(raw)) => match parse_index(&raw) {
+                Ok(index) => Command::TabSelect { index, target: None },
+                Err(e) => return invalid(e),
+            },
+            (None, None) => return Err(need("tab-select", "a tab index or target id")),
         },
         "tab-close" | "close-page" => {
             let index = str_flag(&mut args, "--index")?
@@ -3762,6 +3768,11 @@ mod tests {
         );
         assert_eq!(cmd(&["tab-select", "1"]), Command::TabSelect { index: 1, target: None });
         assert_eq!(cmd(&["tab-select", "9F2A0C"]), Command::TabSelect { index: 0, target: Some("9F2A0C".into()) });
+        // A target id that happens to be all digits is still one.
+        assert_eq!(
+            cmd(&["tab-select", "8895149696"]),
+            Command::TabSelect { index: 0, target: Some("8895149696".into()) }
+        );
         assert_eq!(cmd(&["snapshot"]), cmd(&["ax"]));
         assert_eq!(cmd(&["close"]), Command::Quit { close_browser: false });
         assert_eq!(cmd(&["quit", "--close-browser"]), Command::Quit { close_browser: true });
