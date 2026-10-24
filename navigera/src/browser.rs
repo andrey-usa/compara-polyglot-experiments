@@ -919,6 +919,9 @@ impl BrowserSession {
         if self.lightpanda {
             bail!("reset needs the chrome engine (Lightpanda has one context per process): start a new session");
         }
+        // Events already sent (a dialog answered a moment ago) are handled
+        // first, so they are moved along, or dropped by `--all`, with the rest.
+        self.browser.caught_up();
         let context = self.browser.create_context()?;
         if all {
             self.downloads_dir = None;
