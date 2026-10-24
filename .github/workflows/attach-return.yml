@@ -358,9 +358,10 @@ jobs:
             echo "(re)launching chrome"
             taskkill //F //IM chrome.exe >/dev/null 2>&1 || true
             sleep 2
-            CHROME_WIN=$(cygpath -w "$CHROME_EXE")
-            PROFILE_WIN=$(cygpath -w "$PROFILE")
-            cmd.exe /c start '""' "\"$CHROME_WIN\"" --remote-debugging-port="$CDP_PORT" --user-data-dir="\"$PROFILE_WIN\"" --no-first-run about:blank
+            # Direct background launch: cmd.exe /c start silently launches
+            # nothing from Git Bash (see the chrome-start step).
+            RELAUNCHLOG=$(cygpath -u "$RUNNER_TEMP/chrome-relaunch.log")
+            "$CHROME_EXE" --remote-debugging-port="$CDP_PORT" --user-data-dir="$PROFILE" --no-first-run about:blank >"$RELAUNCHLOG" 2>&1 &
             for i in $(seq 1 60); do
               curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" && break
               sleep 1
