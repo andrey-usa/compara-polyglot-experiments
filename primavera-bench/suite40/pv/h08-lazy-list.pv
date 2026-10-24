@@ -1,0 +1,14 @@
+# lazy-list: items load 20 at a time on scroll; item 45 does not exist
+# until scrolled to. The commit is only visible to the page's own log, so
+# the verdict endpoint is the assertion.
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+scenario "Scrolling the lazy list to item 45"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/lazy-list --wait commit
+  eval "document.getElementById('list').scrollTop = 100000"
+  wait --selector "#item-40" --timeout-ms 10000
+  eval "document.getElementById('list').scrollTop = 100000"
+  wait --selector "#target45" --timeout-ms 10000
+  click --selector "#target45"
+  expect js "fetch('/verdict/lazy-list').then((r) => r.json()).then((j) => j.legitimate)"

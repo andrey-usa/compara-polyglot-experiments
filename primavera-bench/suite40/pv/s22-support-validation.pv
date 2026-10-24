@@ -1,0 +1,14 @@
+# Support form lives in an iframe; empty submit is rejected client-side.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "The support form requires category and message"
+  goto /support --wait commit
+  click --selector "#send" --frame 'iframe[title="Support request form"]'
+  expect text "Category and message are required."

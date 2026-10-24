@@ -483,7 +483,8 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
                     _ => return Err(err(line_no, "`examples` belongs under a scenario".into())),
                 }
             }
-            let step = parse_step(trimmed).map_err(|m| err(line_no, m))?;
+            let mut step = parse_step(trimmed).map_err(|m| err(line_no, m))?;
+            anchor_inputs(&mut step, file.parent().unwrap_or(Path::new(".")));
             let step = Step { line: line_no, text: trimmed.to_string(), action: step, indent: indent_of(raw) };
             match &block {
                 Block::None => {
@@ -767,6 +768,79 @@ pub fn resolve(suites: &mut [Suite]) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// Files a step reads (`upload`, `state load`, `eval --file`, `init-script
+/// --file`, `route --body-file`) are found next to the `.pv` file, as `use`
+/// and `for each` are, so a suite runs the same from any directory. Absolute
+/// paths, `-` (stdin) and paths that start with a variable are left alone.
+fn anchor_inputs(action: &mut Action, dir: &Path) {
+    let words = match action {
+        Action::Command(w) | Action::Save { command: w, .. } => w,
+        Action::Optional(inner) => return anchor_inputs(inner, dir),
+        _ => return,
+    };
+    let anchor = |w: &mut String| {
+        if !w.is_empty() && w != "-" && !w.starts_with("${") && Path::new(w.as_str()).is_relative() {
+            *w = dir.join(w.as_str()).to_string_lossy().into_owned();
+        }
+    };
+    let flag_value = |words: &mut [String], flag: &str| {
+        let mut i = 1;
+        while i + 1 < words.len() {
+            if words[i] == flag {
+                anchor(&mut words[i + 1]);
+                i += 1;
+            }
+            i += 1;
+        }
+    };
+    match words.first().map(String::as_str) {
+        Some("upload") => {
+            // `upload [<target>] --file a [--file b] [c d …]`: every flag
+            // takes a value; the first bare word is the target when no
+            // locator flag names one, the rest are files.
+            const TARGET: &[&str] = &[
+                "--selector",
+                "--ref",
+                "--text",
+                "--find",
+                "--role",
+                "--name",
+                "--label",
+                "--placeholder",
+                "--testid",
+                "--nth",
+                "--frame",
+            ];
+            let mut target_open = !words.iter().any(|w| TARGET.contains(&w.as_str()));
+            let mut i = 1;
+            while i < words.len() {
+                if words[i] == "--file" {
+                    if let Some(v) = words.get_mut(i + 1) {
+                        anchor(v);
+                    }
+                    i += 2;
+                } else if words[i].starts_with("--") {
+                    i += 2;
+                } else if target_open {
+                    target_open = false;
+                    i += 1;
+                } else {
+                    anchor(&mut words[i]);
+                    i += 1;
+                }
+            }
+        }
+        Some("state") if words.get(1).is_some_and(|w| w == "load") => {
+            if let Some(path) = words.get_mut(2) {
+                anchor(path);
+            }
+        }
+        Some("eval" | "evaluate" | "init-script" | "addinitscript") => flag_value(words, "--file"),
+        Some("route") => flag_value(words, "--body-file"),
+        _ => {}
+    }
+}
+
 fn parse_step(line: &str) -> Result<Action, String> {
     let words = tokenize(line)?;
     parse_words(&words)
@@ -961,6 +1035,42 @@ mod tests {
             parse(Path::new("t.pv"), "scenario \"Plain\"\n  examples\n    | a |\n    | 1 |\n    | 2 |\n  goto /${a}\n")
                 .unwrap();
         assert_eq!(s.scenarios[1].name, "Plain [2]");
+    }
+
+    #[test]
+    fn files_a_step_reads_are_found_next_to_the_suite() {
+        let dir = Path::new("suites").join("shop");
+        let text =
+            "scenario \"Files\"\n  upload --selector \"#f\" a.txt --file b.txt /abs/c.txt\n  upload #g d.txt\n  \
+                    upload --frame iframe e.txt\n  optional state load s.json\n  eval --file x.js\n  \
+                    route **/api --body-file body.json\n  upload --file ${download.path}\n  eval -\n  \
+                    fill --selector a.txt b.txt\n";
+        let suite = parse(&dir.join("t.pv"), text).unwrap();
+        let at = |p: &str| dir.join(p).to_string_lossy().into_owned();
+        let words: Vec<Vec<String>> = suite.scenarios[0]
+            .steps
+            .iter()
+            .map(|s| match &s.action {
+                Action::Command(w) => w.clone(),
+                Action::Optional(a) => match a.as_ref() {
+                    Action::Command(w) => w.clone(),
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            })
+            .collect();
+        let abs = if cfg!(windows) { at("/abs/c.txt") } else { "/abs/c.txt".to_string() };
+        assert_eq!(words[0], ["upload", "--selector", "#f", &at("a.txt"), "--file", &at("b.txt"), &abs]);
+        assert_eq!(words[1], ["upload", "#g", &at("d.txt")]);
+        assert_eq!(words[2], ["upload", "--frame", "iframe", &at("e.txt")]);
+        assert_eq!(words[3], ["state", "load", &at("s.json")]);
+        assert_eq!(words[4], ["eval", "--file", &at("x.js")]);
+        assert_eq!(words[5], ["route", "**/api", "--body-file", &at("body.json")]);
+        assert_eq!(words[6], ["upload", "--file", "${download.path}"]);
+        assert_eq!(words[7], ["eval", "-"]);
+        assert_eq!(words[8], ["fill", "--selector", "a.txt", "b.txt"]);
+        // The step's text stays as written, for messages.
+        assert!(suite.scenarios[0].steps[0].text.contains(" a.txt "));
     }
 
     #[test]

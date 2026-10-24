@@ -1,0 +1,8 @@
+# /slow: the image never finishes, so the load event hangs; the DOM is
+# ready long before. --wait commit must not hang on the load event.
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+scenario "Content is usable before the load event finishes"
+  goto /slow --wait commit
+  expect text "DOM is ready."

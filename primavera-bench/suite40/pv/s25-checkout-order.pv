@@ -1,0 +1,33 @@
+# End to end: 3 x Brass Widget + standard shipping = $185.96; card in the
+# payment iframe; confirm() accepted; order id matches A-20xx (global counter).
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "Placing an order end to end"
+  goto /shop/p/101 --wait commit
+  fill --selector "#qty" --value "3"
+  click --selector "#detail-add"
+  expect --selector "#cart-count" text is 3
+  goto /cart --wait commit
+  click --selector "#checkout"
+  expect url ends-with "/checkout"
+  fill --selector "#name" --value "Ada Lovelace"
+  select --selector "#country" --value "United States"
+  click --selector 'input[name="speed"][value="standard"]'
+  click --selector "#continue"
+  expect --selector "#step2" visible
+  expect --selector "#summary" text contains "$185.96"
+  fill --selector "#card" --value "4242424242424242" --frame "#payframe"
+  fill --selector "#exp" --value "12/30" --frame "#payframe"
+  fill --selector "#cvc" --value "123" --frame "#payframe"
+  dialog --accept
+  click --selector "#place"
+  expect --selector "#order-id" text matches "^A-20[0-9]{2}$"
+  expect text "Total charged: $185.96"
+  expect request POST /api/orders status 200

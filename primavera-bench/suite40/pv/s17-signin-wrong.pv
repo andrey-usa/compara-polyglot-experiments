@@ -1,0 +1,14 @@
+# Wrong password: 401, stays on the sign-in page with the error.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "A wrong password stays on the sign-in page"
+  run sign-in demo@acme.test wrong
+  expect --role alert text contains "Wrong email or password"
+  expect title contains "Sign in"

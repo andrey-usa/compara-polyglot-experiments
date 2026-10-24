@@ -1,0 +1,11 @@
+# Shared flows for the suite40 shop scenarios (bench/suite40/pv/common.pv).
+# Imported with `use common.pv`; carries no scenarios of its own.
+
+flow accept-cookies()
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+flow sign-in(email, password)
+  goto /login --wait commit
+  fill --label Email ${email}
+  fill --label Password ${password}
+  click --role button --name "Sign in"

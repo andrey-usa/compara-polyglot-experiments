@@ -25,7 +25,8 @@ PASS  tests/shop.pv:7  Adding a product counts it in the cart  (557 ms)
 1 passed, 0 failed in 0.9 s
 ```
 
-Status: **M1 in progress** (working name).
+Status: **M1 in progress** (working name). The plan, the language and the
+milestones are in agent-guidance `plans/prova.md`.
 
 ## The format
 
@@ -39,6 +40,11 @@ Status: **M1 in progress** (working name).
   with `--name`, `--label`, `--text`, `--placeholder`, `--testid`,
   `--selector`, `--nth`). Refs from `ax` are refused: they change between
   runs.
+- A relative path a step reads (`upload`, `state load`, `eval --file`,
+  `init-script --file`, `route --body-file`) is found next to the `.pv`
+  file, as `use` and `for each` files are, so a suite runs the same from
+  any directory. Files a step writes (`screenshot`, `state save`) land in
+  the current directory.
 - Words split like a shell's, with no expansion. `${NAME}` and
   `${NAME:-default}` come from `save`, a flow's arguments, the data row,
   `before all`, `--var`, `set`, then the environment; `$$` (or `\$` in

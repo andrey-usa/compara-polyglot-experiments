@@ -1,0 +1,19 @@
+# Support form happy path: select + radio + textarea + file upload, in the iframe.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "Filing a support request with an attachment"
+  goto /support --wait commit
+  select --selector "#category" --value "Billing" --frame 'iframe[title="Support request form"]'
+  click --selector 'input[name="priority"][value="high"]' --frame 'iframe[title="Support request form"]'
+  fill --selector "#message" --value "The widget arrived dented." --frame 'iframe[title="Support request form"]'
+  upload --selector "#attachment" --file "../fixtures/upload.txt" --frame 'iframe[title="Support request form"]'
+  click --selector "#send" --frame 'iframe[title="Support request form"]'
+  expect text "Thanks!"
+  expect js "document.querySelector('iframe[title=\"Support request form\"]').contentDocument.body.innerText" matches "T-[0-9]+"

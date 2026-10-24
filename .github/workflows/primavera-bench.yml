@@ -86,21 +86,23 @@ jobs:
         if: hashFiles('primavera-bench/suite40/pv/**') != ''
         run: |
           set +e -uo pipefail
-          python3 navigera/bench/site/server.py --port 0 > site40.out 2>&1 &
-          for _ in $(seq 50); do grep -q LISTENING site40.out && break; sleep 0.2; done
-          url=$(grep -o 'http://[^ ]*' site40.out | head -1)
-          if [ -f primavera-bench/suite40/gauntlet/server.py ]; then
-            python3 primavera-bench/suite40/gauntlet/server.py --port 0 > gauntlet.out 2>&1 &
-            for _ in $(seq 50); do grep -q LISTENING gauntlet.out && break; sleep 0.2; done
-            export GAUNTLET_URL=$(grep -o 'http://[^ ]*' gauntlet.out | head -1)
-          fi
-          (cd primavera-bench/suite40/pw && npm install --no-audit --no-fund >/dev/null 2>&1)
+          S=primavera-bench/suite40
+          python3 $S/site/server.py --port 18001 > site40.out 2>&1 &
+          python3 $S/gauntlet/server.py --port 18201 --xo-port 18202 --seed 7 --jitter 0 --telemetry 1 > gauntlet.out 2>&1 &
+          for _ in $(seq 100); do
+            curl -sf -o /dev/null http://127.0.0.1:18001/ && curl -sf -o /dev/null http://127.0.0.1:18202/xo-form && break
+            sleep 0.2
+          done
+          export BASE_URL=http://127.0.0.1:18001 GAUNTLET_URL=http://127.0.0.1:18201
+          # Playwright drives the same Chrome as primavera.
+          export CHROME_SHELL="$(command -v google-chrome)"
+          (cd $S/pw && npm ci --no-audit --no-fund >/dev/null 2>&1 || npm install --no-audit --no-fund >/dev/null 2>&1)
           python3 primavera-bench/bench.py \
             --title "primavera vs Playwright Test, 40-scenario suite" \
             --primavera primavera/target/release/primavera \
-            --chromium "$(command -v google-chrome)" \
-            --scenarios primavera-bench/suite40/pv \
-            --pw primavera-bench/suite40/pw --site "$url" --rounds 9 2>&1 | tee bench40.md
+            --chromium "$CHROME_SHELL" \
+            --scenarios $S/pv \
+            --pw $S/pw --site "$BASE_URL" --rounds 9 --grep "accepting the cookie banner" 2>&1 | tee bench40.md
           code=${PIPESTATUS[0]}
           python3 - bench40.md <<'PY'
           import sys
