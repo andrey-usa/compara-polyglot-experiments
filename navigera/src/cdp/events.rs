@@ -261,9 +261,15 @@ impl Shared {
             dialogs.retain(|(s, _)| s != from);
         }
         drop(dialogs);
-        let mut scopes = self.scopes.lock().unwrap();
-        for s in scopes.values_mut().filter(|s| *s == from) {
-            *s = to.to_string();
+        // The old tabs' sessions follow along only when what they held does:
+        // after `reset --all`, an event of an old tab still on its way (a
+        // dialog answered just before) belongs to no one, not to the new
+        // session.
+        if keep {
+            let mut scopes = self.scopes.lock().unwrap();
+            for s in scopes.values_mut().filter(|s| *s == from) {
+                *s = to.to_string();
+            }
         }
     }
 
