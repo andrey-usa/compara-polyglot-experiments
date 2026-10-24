@@ -91,6 +91,8 @@ jobs:
         run: |
           & $env:CHROME_EXE --version
           $profile = "$env:RUNNER_TEMP\chrome-profile"
+          Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep 2
           Start-Process -FilePath $env:CHROME_EXE -ArgumentList @(
             "--remote-debugging-port=$env:CDP_PORT",
             "--user-data-dir=$profile",
@@ -106,25 +108,42 @@ jobs:
       - name: Start Chrome with remote debugging (cmd)
         if: matrix.shell == 'cmd'
         run: |
+          @echo off
+          setlocal enabledelayedexpansion
           "%CHROME_EXE%" --version
+          taskkill /F /IM chrome.exe >nul 2>&1
+          timeout /t 2 /nobreak >nul
           start "" "%CHROME_EXE%" --remote-debugging-port=%CDP_PORT% --user-data-dir=%RUNNER_TEMP%\chrome-profile --no-first-run about:blank
-          for /L %%i in (1,1,60) do (curl -sf -o nul http://127.0.0.1:%CDP_PORT%/json/version && goto :chromeup & timeout /t 1 /nobreak >nul)
-          :chromeup
-          curl -s http://127.0.0.1:%CDP_PORT%/json/version | head -c 300 & echo.
+          set CHROME_UP=0
+          for /L %%i in (1,1,60) do (
+            if !CHROME_UP! equ 0 (
+              curl -sf --max-time 5 -o nul http://127.0.0.1:%CDP_PORT%/json/version >nul 2>&1
+              if !ERRORLEVEL! equ 0 (set CHROME_UP=1) else (timeout /t 1 /nobreak >nul)
+            )
+          )
+          if !CHROME_UP! equ 0 (
+            echo CHROME DID NOT COME UP
+            exit /b 1
+          )
+          curl -s --max-time 5 http://127.0.0.1:%CDP_PORT%/json/version | head -c 300
+          echo.
           tasklist /FI "IMAGENAME eq chrome.exe" /FO TABLE | head -6
 
       - name: Start Chrome with remote debugging (bash)
         if: matrix.shell == 'bash'
         run: |
           "$CHROME_EXE" --version
+          taskkill //F //IM chrome.exe >/dev/null 2>&1 || true
+          sleep 2
           CHROME_WIN=$(cygpath -w "$CHROME_EXE")
           PROFILE_WIN=$(cygpath -w "$RUNNER_TEMP/chrome-profile")
           cmd.exe /c start '""' "\"$CHROME_WIN\"" --remote-debugging-port="$CDP_PORT" --user-data-dir="\"$PROFILE_WIN\"" --no-first-run about:blank
           for i in $(seq 1 60); do
-            curl -sf -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" && break
+            curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" && break
             sleep 1
           done
-          curl -s "http://127.0.0.1:$CDP_PORT/json/version" | head -c 300; echo
+          curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" || { echo "CHROME DID NOT COME UP"; exit 1; }
+          curl -s --max-time 5 "http://127.0.0.1:$CDP_PORT/json/version" | head -c 300; echo
           tasklist //FI "IMAGENAME eq chrome.exe" //FO TABLE | head -6
 
       # 27 runs: 3 forms x 3 shells x 3 attempts. ensure_chrome() re-verifies
@@ -236,10 +255,17 @@ jobs:
           taskkill /F /IM chrome.exe >nul 2>&1
           timeout /t 2 /nobreak >nul
           start "" "%CHROME_EXE%" --remote-debugging-port=%CDP_PORT% --user-data-dir=%PROFILE% --no-first-run about:blank
-          for /L %%i in (1,1,60) do (curl -sf -o nul http://127.0.0.1:%CDP_PORT%/json/version && goto :chrome_up & timeout /t 1 /nobreak >nul)
-          echo CHROME DID NOT COME UP
-          exit /b 1
-          :chrome_up
+          set CHROME_UP=0
+          for /L %%i in (1,1,60) do (
+            if !CHROME_UP! equ 0 (
+              curl -sf --max-time 5 -o nul http://127.0.0.1:%CDP_PORT%/json/version >nul 2>&1
+              if !ERRORLEVEL! equ 0 (set CHROME_UP=1) else (timeout /t 1 /nobreak >nul)
+            )
+          )
+          if !CHROME_UP! equ 0 (
+            echo CHROME DID NOT COME UP
+            exit /b 1
+          )
           :synthesize
           for /f "tokens=*" %%u in ('python -c "import json,urllib.request; v=json.load(urllib.request.urlopen('http://127.0.0.1:%CDP_PORT%/json/version',timeout=10)); print(v['webSocketDebuggerUrl'])"') do set WSURL=%%u
           set TMP1=%WSURL:*//=%
@@ -274,12 +300,13 @@ jobs:
           echo rc=!RC! hang=!HANG! tablist_rc=!TLRC! >> "%LOGD%\!TAG!.meta"
           if exist "%TEMP%\navigera\job.log" copy /y "%TEMP%\navigera\job.log" "%LOGD%\!TAG!.session.log" >nul
           start "" /b cmd /c """%NAV%"" -s job quit >nul 2>&1"
-          set QDONE=0
+          set NAVGONE=0
           for /L %%w in (1,1,15) do (
-            (tasklist /FI "IMAGENAME eq navigera.exe" 2>nul | find /I "navigera.exe" >nul) || goto :quitdone
-            timeout /t 1 /nobreak >nul
+            if !NAVGONE! equ 0 (
+              tasklist /FI "IMAGENAME eq navigera.exe" 2>nul | find /I "navigera.exe" >nul
+              if !ERRORLEVEL! neq 0 (set NAVGONE=1) else (timeout /t 1 /nobreak >nul)
+            )
           )
-          :quitdone
           taskkill /F /IM navigera.exe >nul 2>&1
           echo quit settled >> "%LOGD%\!TAG!.meta"
           timeout /t 2 /nobreak >nul
@@ -303,10 +330,10 @@ jobs:
             PROFILE_WIN=$(cygpath -w "$PROFILE")
             cmd.exe /c start '""' "\"$CHROME_WIN\"" --remote-debugging-port="$CDP_PORT" --user-data-dir="\"$PROFILE_WIN\"" --no-first-run about:blank
             for i in $(seq 1 60); do
-              curl -sf -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" && break
+              curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" && break
               sleep 1
             done
-            curl -sf -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" || { echo "CHROME DID NOT COME UP"; return 1; }
+            curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" || { echo "CHROME DID NOT COME UP"; return 1; }
             WS=$(python -c "import json,urllib.request; v=json.load(urllib.request.urlopen('http://127.0.0.1:$CDP_PORT/json/version',timeout=10)); print(v['webSocketDebuggerUrl'])")
             x="${WS#*//}"; WSPATH="/${x#*/}"
             printf '%s\n%s\n' "$CDP_PORT" "$WSPATH" > "$PROFILE/DevToolsActivePort"
@@ -364,7 +391,7 @@ jobs:
               "--user-data-dir=$profile",
               "--no-first-run", "about:blank")
             Start-Sleep 20
-            $v = Invoke-RestMethod "http://127.0.0.1:$env:CDP_PORT/json/version"
+            $v = Invoke-RestMethod "http://127.0.0.1:$env:CDP_PORT/json/version" -TimeoutSec 10
             $path = $v.webSocketDebuggerUrl -replace '^ws://[^/]+',''
             "$env:CDP_PORT`r`n$path`r`n" | Out-File -Encoding ascii -NoNewline "$profile\DevToolsActivePort"
           }
