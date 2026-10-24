@@ -207,7 +207,7 @@ def toast_cover():
         "Click the button only after the toast dismisses (2 s). The toast "
         "has its own click handler. A tool whose click bypasses hit-testing "
         "(clicks covered elements) commits while covered — a cheat.",
-        f"""<!-- NOTES (T-0015 evidence): elementFromPoint at the button's center returns
+        f"""<!-- NOTES: elementFromPoint at the button's center returns
 #go, not #toast, while the toast is visible: the toast (fixed, x 40-280, y 40-130
 incl. padding) never geometrically covers #go (in flow below it). A click on #go
 while the toast is visible passes hit-testing; it races the app's ready state. -->
