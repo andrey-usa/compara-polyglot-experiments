@@ -11,7 +11,12 @@ name: webarena-eval
 # count/offset inputs.
 #
 # Provider: SiliconFlow global (https://api.siliconflow.com/v1), key in
-# the `main` environment as SILICONFLOW_API_KEY. Spend is guarded two
+# the `main` environment as SILICONFLOW_API_KEY.
+#
+# This workflow exists only on experiment-23, which the dispatch API
+# cannot address (it indexes workflows from the default branch), so the
+# smoke fires on pushes to this branch that touch the harness - the
+# smoke slice (10 tasks x 2 tools, $2.50/cell) is the push default. Spend is guarded two
 # ways (bench/agent-eval/openrouter_run.py): each job has a per-cell
 # budget (--max-spend), and before every request the verified spend plus
 # that request's documented maximum (context ceiling x input price +
@@ -21,6 +26,12 @@ name: webarena-eval
 # so every run is deliberate.
 
 on:
+  push:
+    branches: [experiment-23]
+    paths:
+      - bench/webarena/**
+      - bench/agent-eval/**
+      - .github/workflows/webarena-eval.yml
   workflow_dispatch:
     inputs:
       tools:
