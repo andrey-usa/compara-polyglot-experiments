@@ -920,6 +920,9 @@ impl BrowserSession {
             bail!("reset needs the chrome engine (Lightpanda has one context per process): start a new session");
         }
         let context = self.browser.create_context()?;
+        if all {
+            self.downloads_dir = None;
+        }
         // The user's own browser (`--attach`) keeps its download setting,
         // unless the session chose a directory.
         let dir = match &self.downloads_dir {
@@ -1660,6 +1663,12 @@ impl BrowserSession {
     /// `commit`. Retries benign aborts (third-party trackers can abort the
     /// main-frame load mid-flight).
     pub fn goto_wait(&self, url: &str, wait: &str, timeout_ms: Option<f64>) -> Result<()> {
+        self.goto_or_download(url, wait, timeout_ms).map(|_| ())
+    }
+
+    /// [`BrowserSession::goto_wait`]; true when the URL turned out to be a
+    /// download (the page stays where it was; `downloads` lists the file).
+    pub fn goto_or_download(&self, url: &str, wait: &str, timeout_ms: Option<f64>) -> Result<bool> {
         if !matches!(wait, "load" | "domcontentloaded" | "commit") {
             bail!("--wait takes load|domcontentloaded|commit, got {wait:?}");
         }
@@ -1667,11 +1676,39 @@ impl BrowserSession {
         let timeout = self.timeout(timeout_ms);
         let max_attempts = 3;
         let mut attempt = 0;
+        let downloads_before = self.downloads(false).iter().map(|d| d.n).max().unwrap_or(0);
+        let requests_before = self.requests(false).last().map(|r| r.n).unwrap_or(0);
         loop {
             match self.active_tab().navigate(url, wait, timeout) {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(false),
                 Err(e) => {
                     let msg = format!("{e:#}");
+                    // ERR_ABORTED is the outcome, not a hiccup, when the URL
+                    // answered with no content (the browser stays put) or
+                    // turned into a download (saved: `downloads` lists it).
+                    // Trying again would fetch it again: a download link
+                    // downloaded the file four times.
+                    if msg.contains("ERR_ABORTED") {
+                        let status = self
+                            .requests(false)
+                            .into_iter()
+                            .filter(|r| r.n > requests_before && r.kind == "Document")
+                            .filter_map(|r| r.status)
+                            .last();
+                        if let Some(code @ (204 | 205)) = status {
+                            bail!("{msg}: the server answered {code} (no content), so the browser stays on the page it was on");
+                        }
+                        let end = std::time::Instant::now() + Duration::from_secs(1);
+                        loop {
+                            if self.downloads(false).iter().any(|d| d.n > downloads_before) {
+                                return Ok(true);
+                            }
+                            if std::time::Instant::now() >= end {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
                     attempt += 1;
                     let transient = msg.contains("ERR_ABORTED") || msg.contains("ERR_CONNECTION_RESET");
                     if transient && attempt <= max_attempts {
@@ -1753,6 +1790,38 @@ impl BrowserSession {
             self.settle_for(timeout_ms);
         }
         Ok(r)
+    }
+
+    /// Where `mouse` goes for a target: `dx`,`dy` from its top-left corner,
+    /// or its center, in top-level viewport pixels; scrolled into view
+    /// first when that point is out of it. Fails when the point can't be
+    /// brought into the viewport, or the element is in a cross-origin frame.
+    pub fn mouse_point(&self, target: &Target, d: Option<(f64, f64)>, timeout_ms: Option<f64>) -> Result<(f64, f64)> {
+        let (wait, timeout) = self.element_budget(timeout_ms);
+        let (dx, dy) = match d {
+            Some((x, y)) => (serde_json::json!(x), serde_json::json!(y)),
+            None => (serde_json::Value::Null, serde_json::Value::Null),
+        };
+        let v = self.active_tab().on_element(target, "mouse", cdp::page_js::MOUSE_AT, &[dx, dy], wait, timeout)?;
+        if v.get("xframe").is_some() {
+            bail!("the element is in a cross-origin frame: aim with viewport coordinates (`get box` of its frame, plus the offset)");
+        }
+        let (x, y) = (v["x"].as_f64().unwrap_or(0.0), v["y"].as_f64().unwrap_or(0.0));
+        if v.get("outside").is_some() {
+            bail!(
+                "the point ({x:.0}, {y:.0}) is outside the viewport ({}x{}) even with the element scrolled into view: \
+                 an offset beyond the element?",
+                v["width"],
+                v["height"]
+            );
+        }
+        Ok((x, y))
+    }
+
+    /// The viewport's size in CSS pixels.
+    pub fn viewport_size(&self) -> Result<(f64, f64)> {
+        let v: Vec<f64> = self.evaluate("[innerWidth, innerHeight]")?;
+        Ok((v.first().copied().unwrap_or(0.0), v.get(1).copied().unwrap_or(0.0)))
     }
 
     pub fn hover(&self, target: &Target, timeout_ms: Option<f64>) -> Result<serde_json::Value> {

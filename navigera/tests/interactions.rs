@@ -213,6 +213,16 @@ fn downloads_are_saved_and_waited_for() {
     s.ok(&["downloads", "--clear"]);
     let err = s.fails(&["wait", "--download", "--timeout-ms", "300"]);
     assert!(err.contains("no finished download"), "{err}");
+    // A goto of a download is the download, once; the page stays.
+    let r = s.ok(&["goto", &format!("{}/file.csv", site.url)]);
+    assert_eq!(r["download"], "report.csv", "{r}");
+    assert!(r["url"].as_str().unwrap_or("").ends_with("/download"), "{r}");
+    s.ok(&["wait", "--download", "report*.csv"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(s.ok(&["downloads", "--json"]).as_array().map(Vec::len), Some(1));
+    // A 204 is an answer, not a hiccup to retry.
+    let err = s.fails(&["goto", &format!("{}/no-content", site.url)]);
+    assert!(err.contains("204 (no content)"), "{err}");
 }
 
 #[test]
@@ -520,6 +530,18 @@ fn the_mouse_goes_where_it_is_told_on_a_canvas() {
     assert!(events.iter().any(|e| e.starts_with("contextmenu 30 30 2 ")), "{events:?}");
     s.ok(&["mouse", "wheel", "0", "-120"]);
     assert_eq!(log(&s), ["wheel 0 -120"]);
+    // A target scrolled out of view is brought back, as a click would; down,
+    // up and wheel with a target go to its center.
+    s.ok(&["eval", "(scrollTo(0, 1500), 1)"]);
+    s.ok(&["mouse", "click", "15", "25", "--selector", "canvas"]);
+    assert!(log(&s).contains(&"click 15 25 0 0".to_string()));
+    s.ok(&["eval", "(scrollTo(0, 1500), 1)"]);
+    s.ok(&["mouse", "down", "--selector", "canvas"]);
+    s.ok(&["mouse", "up"]);
+    assert!(log(&s).contains(&"mousedown 150 100 0 1".to_string()));
+    // A click where the page isn't would land on nothing: refused.
+    assert!(s.fails(&["mouse", "click", "10", "5000"]).contains("outside the viewport"));
+    assert!(s.fails(&["mouse", "click", "10", "9000", "--selector", "canvas"]).contains("outside the viewport"));
     // Mistakes are argument errors, said before anything runs.
     let says = |args: &[&str]| {
         let out = Command::new(tool_exe()).arg("--session").arg(&s.name).args(args).output().unwrap();
@@ -564,7 +586,9 @@ fn frame_scopes_pick_the_frame_when_ids_repeat() {
     assert!(err.contains("in frame \"#card\" not met"), "{err}");
     // Mistakes say what's wrong.
     let err = s.fails(&["click", "--text", "Save", "--frame", "#nowhere", "--timeout-ms", "300"]);
-    assert!(err.contains("in frame \"#nowhere\""), "{err}");
+    assert!(err.contains("no frame matches --frame \"#nowhere\""), "{err}");
+    let err = s.fails(&["fill", "--selector", "#name", "--frame", "#billing >> #nope", "x", "--timeout-ms", "300"]);
+    assert!(err.contains("no frame matches"), "{err}");
     let err = s.fails(&["click", "--text", "Save", "--frame", "#log"]);
     assert!(err.contains("not a frame"), "{err}");
 }

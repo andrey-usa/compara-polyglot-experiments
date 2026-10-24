@@ -118,7 +118,7 @@ PAGES["/nbsp-select"] = ("nbsp select", "", """
   <option value=sf>San&nbsp;Francisco</option>
 </select>""")
 
-PAGES["/canvas"] = ("canvas", "body{margin:0}canvas{position:absolute;left:50px;top:40px;width:300px;height:200px;background:#eee}", """
+PAGES["/canvas"] = ("canvas", "body{margin:0;height:3000px}canvas{position:absolute;left:50px;top:40px;width:300px;height:200px;background:#eee}", """
 <canvas id=c width=300 height=200></canvas>
 <script>
 window.log = [];
@@ -476,6 +476,10 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/file.csv":
             return self.send("id,name\n1,Ada\n2,Grace\n", "text/csv",
                              [("Content-Disposition", 'attachment; filename="report.csv"')])
+        if u.path == "/no-content":
+            self.send_response(204)
+            self.end_headers()
+            return
         if u.path == "/slow":
             page = slow_page(int(q.get("ms", ["2000"])[0]))
         elif u.path == "/twin-frames":
