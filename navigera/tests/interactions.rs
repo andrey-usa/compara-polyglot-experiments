@@ -529,3 +529,42 @@ fn the_mouse_goes_where_it_is_told_on_a_canvas() {
     assert!(says(&["mouse", "jump", "1", "2"]).contains("move, down, up, click or wheel"));
     assert!(says(&["mouse", "move", "5"]).contains("no y"));
 }
+
+#[test]
+fn frame_scopes_pick_the_frame_when_ids_repeat() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("frame-scopes", &[]);
+    s.ok(&["goto", &format!("{}/twin-frames", site.url)]);
+    // Two frames of this origin with the same form.
+    s.ok(&["fill", "--selector", "#name", "--frame", "#billing", "Ada"]);
+    s.ok(&["click", "--text", "Save", "--frame", "#billing"]);
+    assert_eq!(s.text(&["get", "value", "--selector", "#name", "--frame", "#billing"]), "Ada");
+    assert_eq!(s.text(&["get", "value", "--selector", "#name", "--frame", "#shipping"]), "");
+    s.ok(&["fill", "--label", "Name", "--frame", "#shipping", "Bo"]);
+    s.ok(&["click", "--role", "button", "--name", "Save", "--frame", "#shipping"]);
+    // Two of another origin with the same card form: the second one.
+    s.ok(&["fill", "--selector", "#cardnumber", "--frame", "#card2", "4242424242424242"]);
+    let r = s.ok(&["click", "--selector", "#pay", "--frame", "#card2"]);
+    assert!(r.get("synthetic_click").is_none(), "{r}");
+    // The page hears it by postMessage, from another process: wait for it.
+    s.ok(&["wait", "--text", "card2:4242"]);
+    // A frame inside a frame.
+    s.ok(&["click", "--text", "Deep", "--frame", "#outer >> #inner"]);
+    s.ok(&["wait", "--text", "deep"]);
+    // Each action landed in the frame it named, and only there.
+    let log = s.text(&["get", "text", "--selector", "#log"]);
+    assert_eq!(s.text(&["get", "text", "--selector", "#status", "--frame", "#card"]), "idle");
+    assert!(log.starts_with("billing:Ada shipping:Bo card2:4242"), "{log}");
+    assert!(log.trim_end().ends_with("deep"), "{log}");
+    assert!(!log.contains("card:"), "{log}");
+    // Waits look in the frame they name, of either origin.
+    s.ok(&["wait", "--selector", "#name", "--frame", "#billing"]);
+    s.ok(&["wait", "--text", "sent 4242424242424242", "--frame", "#card2"]);
+    let err = s.fails(&["wait", "--text", "sent", "--frame", "#card", "--timeout-ms", "300"]);
+    assert!(err.contains("in frame \"#card\" not met"), "{err}");
+    // Mistakes say what's wrong.
+    let err = s.fails(&["click", "--text", "Save", "--frame", "#nowhere", "--timeout-ms", "300"]);
+    assert!(err.contains("in frame \"#nowhere\""), "{err}");
+    let err = s.fails(&["click", "--text", "Save", "--frame", "#log"]);
+    assert!(err.contains("not a frame"), "{err}");
+}

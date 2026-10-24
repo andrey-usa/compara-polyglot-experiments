@@ -380,6 +380,29 @@ customElements.define('x-panel', class extends HTMLElement {
 </script>""")
 
 
+def twin_frames(port):
+    """Frames that hold the same ids: two of this origin, two of another
+    (localhost in a 127.0.0.1 page), and one inside another."""
+    form = lambda who: ("<label>Name <input id=name></label><button id=save type=button "
+                        f"onclick=\"parent.document.getElementById('log').textContent += '{who}:' + document.getElementById('name').value + ' '\">Save</button>")
+    outer = "<p>outer</p><iframe id=inner srcdoc='<button type=button onclick=top.deep()>Deep</button>'></iframe>"
+    return ("twin frames", "iframe{width:420px;height:120px;border:1px solid #888;display:block}", f"""
+<p id=log></p>
+<iframe id=shipping srcdoc="{form('shipping').replace('"', '&quot;')}"></iframe>
+<iframe id=billing srcdoc="{form('billing').replace('"', '&quot;')}"></iframe>
+<iframe id=card src="http://localhost:{port}/xo-child"></iframe>
+<iframe id=card2 src="http://localhost:{port}/xo-child"></iframe>
+<iframe id=outer srcdoc="{outer.replace('"', '&quot;')}"></iframe>
+<script>
+window.deep = () => {{ document.getElementById('log').textContent += 'deep '; }};
+addEventListener('message', (e) => {{
+  if (!e.data || !e.data.paid) return;
+  const who = e.source === document.getElementById('card2').contentWindow ? 'card2' : 'card';
+  document.getElementById('log').textContent += who + ':' + e.data.paid + ' ';
+}});
+</script>""")
+
+
 def xo_parent(port, child_host):
     return ("xo parent", "iframe{width:420px;height:170px;border:1px solid #888}", f"""
 <h1>Checkout</h1>
@@ -455,6 +478,8 @@ class Handler(BaseHTTPRequestHandler):
                              [("Content-Disposition", 'attachment; filename="report.csv"')])
         if u.path == "/slow":
             page = slow_page(int(q.get("ms", ["2000"])[0]))
+        elif u.path == "/twin-frames":
+            page = twin_frames(self.server.server_address[1])
         elif u.path == "/xo-parent":
             # localhost and 127.0.0.1 are different sites: the frame is
             # cross-site, so Chrome runs it in a process of its own.

@@ -43,6 +43,10 @@ pub enum Target {
     /// By role and accessible name, label, placeholder, test id, and/or
     /// CSS, optionally the nth match (auto-waits).
     Locator(Locator),
+    /// The target looked for only inside one frame (`--frame <css>`, or a
+    /// chain `#outer >> #inner`): the same element names in two frames no
+    /// longer race.
+    InFrame(String, Box<Target>),
 }
 
 /// `--role/--name/--label/--placeholder/--testid/--nth` (and `--selector`
@@ -104,6 +108,7 @@ impl Target {
             Target::Ref(r) => format!("ref {r}"),
             Target::Text(t) => format!("text {t:?}"),
             Target::Locator(l) => l.describe(),
+            Target::InFrame(f, t) => format!("{} in frame {f:?}", t.label()),
         }
     }
 }
@@ -114,6 +119,11 @@ impl Target {
 /// stops at a shadow root or a frame; a user's eyes don't. Cross-origin
 /// frames are out of reach here (their elements are in `ax` with refs).
 pub const DEEP: &str = r#"(() => {
+    // Where the search starts: the page, or the frame a `--frame` names
+    // (`__nvStart`, defined around a scoped finder; null while that frame
+    // isn't there yet).
+    const start = () => (typeof __nvStart === 'function' ? __nvStart() : document);
+    const topDocs = () => { const d = start(); return d ? docs(d, []) : []; };
     const docs = (d, out) => {
         out.push(d);
         for (const f of d.querySelectorAll('iframe, frame')) {
@@ -130,14 +140,15 @@ pub const DEEP: &str = r#"(() => {
         }
         return out;
     };
-    const roots = () => { const out = []; for (const d of docs(document, [])) { out.push(d); shadows(d, out); } return out; };
+    const roots = () => { const out = []; for (const d of topDocs()) { out.push(d); shadows(d, out); } return out; };
     return {
         roots,
-        docs: () => docs(document, []),
+        docs: topDocs,
         // The top document's own answer first: a plain query costs nothing
         // extra when the element is where it usually is.
         first(sel) {
-            const el = document.querySelector(sel);
+            const d = start();
+            const el = d && d.querySelector(sel);
             if (el) return el;
             for (const r of roots().slice(1)) { const e = r.querySelector(sel); if (e) return e; }
             return null;
@@ -146,7 +157,7 @@ pub const DEEP: &str = r#"(() => {
         style: (el) => (el.ownerDocument.defaultView || window).getComputedStyle(el),
         text() {
             let t = '';
-            for (const d of docs(document, [])) {
+            for (const d of topDocs()) {
                 if (d.body) t += '\n' + d.body.innerText;
                 for (const s of shadows(d, [])) t += '\n' + s.textContent;
             }
@@ -751,9 +762,10 @@ const WAIT_FOR: &str = r#"async function (sel, ms, what, deepFn) {
         // The plain query first: the deep search is built (and compiled)
         // only when the top document has no match. When the first match is
         // out of a user's reach and another isn't, the other is the one.
-        let el = document.querySelector(sel);
+        const doc = typeof __nvStart === 'function' ? __nvStart() : document;
+        let el = doc && doc.querySelector(sel);
         if (el && !reachable(el)) {
-            for (const c of document.querySelectorAll(sel)) if (reachable(c)) { el = c; break; }
+            for (const c of doc.querySelectorAll(sel)) if (reachable(c)) { el = c; break; }
         }
         el = el || (deep = deep || deepFn()).first(sel);
         if (el) return el;
@@ -1160,8 +1172,45 @@ fn finder_expr(target: &Target, wait_ms: u128, what: &str) -> String {
     finder_expr_in(target, wait_ms, what, TextMode::Best)
 }
 
+/// The document a `--frame` chain (`#outer >> #inner`, each an iframe or
+/// frame by CSS in the document before) leads to, or null while it isn't
+/// there. A frame of another origin can't be entered from here: that is an
+/// error naming which step, for the caller to look in that frame itself.
+const FRAME_DOC: &str = r#"function (chain) {
+    const steps = chain.split('>>').map((s) => s.trim()).filter(Boolean);
+    let doc = document;
+    for (let i = 0; i < steps.length; i++) {
+        const f = doc.querySelector(steps[i]);
+        if (!f) return null;
+        if (f.tagName !== 'IFRAME' && f.tagName !== 'FRAME')
+            throw new Error('--frame ' + JSON.stringify(chain) + ': ' + JSON.stringify(steps[i]) + ' is a <' + f.tagName.toLowerCase() + '>, not a frame');
+        let d = null; try { d = f.contentDocument; } catch (_) {}
+        if (!d) throw new Error('--frame ' + JSON.stringify(chain) + ': another origin (navigera:xo ' + i + ' of ' + steps.length + ')');
+        doc = d;
+    }
+    return doc.documentElement ? doc : null;
+}"#;
+
+/// The first frame element of another origin along a `--frame` chain.
+const FRAME_EL: &str = r#"function (chain) {
+    let doc = document;
+    for (const s of chain.split('>>').map((x) => x.trim()).filter(Boolean)) {
+        const f = doc.querySelector(s);
+        if (!f) return null;
+        let d = null; try { d = f.contentDocument; } catch (_) {}
+        if (!d) return f;
+        doc = d;
+    }
+    return null;
+}"#;
+
 fn finder_expr_in(target: &Target, wait_ms: u128, what: &str, mode: TextMode) -> String {
     match target {
+        Target::InFrame(chain, inner) => format!(
+            "(() => {{ const __nvStart = () => ({FRAME_DOC})({}); return {}; }})()",
+            json!(chain),
+            finder_expr_in(inner, wait_ms, what, mode)
+        ),
         Target::Selector(sel) => format!("({WAIT_FOR})({}, {wait_ms}, {}, () => {DEEP})", json!(sel), json!(what)),
         Target::Text(text) => {
             format!("({WAIT_TEXT})({}, {wait_ms}, {}, {DEEP}, {})", json!(text), json!(what), mode as u8)
@@ -1695,6 +1744,37 @@ impl Page {
             )
         };
         let expr = |ms: u128| expr_in(ms, TextMode::FlagInexact);
+        if let Target::InFrame(chain, inner) = target {
+            if matches!(**inner, Target::Ref(_) | Target::InFrame(..)) {
+                bail!("{what}: --frame scopes a --selector, --text or locator (a ref already names one element)");
+            }
+            // In the page's own world: the frame and the ones inside it, as
+            // long as they are of this origin; wait there.
+            let e = match self.evaluate_raw(&expr_in(wait_ms, TextMode::Best), timeout) {
+                Err(e) if format!("{e:#}").contains("(navigera:xo ") => e,
+                other => return other,
+            };
+            let m = format!("{e:#}");
+            let step = |key: &str| m.split(key).nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next());
+            let num = |key: &str| step(key).and_then(|v| v.parse::<usize>().ok());
+            if let (Some(i), Some(n)) = (num("(navigera:xo "), num(" of ")) {
+                if i + 1 != n {
+                    bail!("{what}: --frame {chain:?}: a frame of another origin can only be the chain's last step");
+                }
+            }
+            // Of another origin: in a world navigera makes inside it.
+            let context = self.foreign_frame_context(chain, timeout)?;
+            let inner_expr = format!(
+                "(async () => {{ const el = await {}; return ({function})(el{extra}); }})()",
+                finder_expr_in(inner, wait_ms, what, TextMode::Best)
+            );
+            let mut v = self.evaluate_in(context, &inner_expr, timeout)?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("__frame".into(), json!(context));
+                obj.insert("__frame_mode".into(), json!(TextMode::Best as u8));
+            }
+            return Ok(v);
+        }
         // Most often the element is there: one round trip.
         match self.evaluate_raw(&expr(0), timeout) {
             Err(e) if not_found(&e) || inexact(&e) => {}
@@ -1817,6 +1897,26 @@ impl Page {
         })
     }
 
+    /// An isolated world in the frame of another origin a `--frame` chain
+    /// leads to: its execution context.
+    fn foreign_frame_context(&self, chain: &str, timeout: Duration) -> Result<i64> {
+        let res = self.send(
+            "Runtime.evaluate",
+            json!({ "expression": format!("({FRAME_EL})({})", json!(chain)), "objectGroup": "nv-frame-el" }),
+            timeout,
+        )?;
+        let object = res.pointer("/result/objectId").and_then(Value::as_str).map(str::to_string);
+        let node = object.and_then(|o| self.send("DOM.describeNode", json!({ "objectId": o }), timeout).ok());
+        let _ = self.send("Runtime.releaseObjectGroup", json!({ "objectGroup": "nv-frame-el" }), timeout);
+        let frame = node
+            .and_then(|n| n.pointer("/node/frameId").and_then(Value::as_str).map(str::to_string))
+            .ok_or_else(|| anyhow::anyhow!("--frame {chain:?}: no frame there"))?;
+        let r = self.send("Page.createIsolatedWorld", json!({ "frameId": frame, "worldName": "navigera" }), timeout)?;
+        r.get("executionContextId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("--frame {chain:?}: could not enter the frame"))
+    }
+
     /// Evaluate in one execution context (a frame's isolated world).
     fn evaluate_in(&self, context: i64, expression: &str, timeout: Duration) -> Result<Value> {
         let res = self.send(
@@ -1835,6 +1935,11 @@ impl Page {
     /// `found` is what the frame search returned (its `__frame_mode` says
     /// how the element was matched, so the same one is measured).
     fn center_in_frame(&self, context: i64, target: &Target, found: &Value, timeout: Duration) -> Option<(f64, f64)> {
+        // Inside the frame, the element is looked for from its own document.
+        let target = match target {
+            Target::InFrame(_, inner) => inner.as_ref(),
+            t => t,
+        };
         let mode = match found.get("__frame_mode").and_then(Value::as_u64) {
             Some(1) => TextMode::ExactOnly,
             Some(0) => TextMode::FlagInexact,
@@ -2688,6 +2793,23 @@ impl Page {
     /// One poll of a `wait` condition; true when satisfied.
     pub fn check(&self, js_predicate: &str, timeout: Duration) -> Result<bool> {
         Ok(self.evaluate_raw(js_predicate, timeout)?.as_bool().unwrap_or(false))
+    }
+
+    /// [`Page::check`] with the page's element searches (`DEEP`) scoped to
+    /// the frame a `--frame` chain names; in that frame itself when it is of
+    /// another origin. False while the frame isn't there.
+    pub fn check_in_frame(&self, chain: &str, js_predicate: &str, timeout: Duration) -> Result<bool> {
+        let scoped = format!(
+            "(() => {{ const __nvStart = () => ({FRAME_DOC})({}); return !!({js_predicate}); }})()",
+            json!(chain)
+        );
+        match self.check(&scoped, timeout) {
+            Err(e) if format!("{e:#}").contains("(navigera:xo ") => {
+                let context = self.foreign_frame_context(chain, timeout)?;
+                Ok(self.evaluate_in(context, &format!("!!({js_predicate})"), timeout)?.as_bool() == Some(true))
+            }
+            other => other,
+        }
     }
 
     /// PNG screenshot bytes; `full_page` captures beyond the viewport.

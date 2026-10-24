@@ -1957,6 +1957,31 @@ impl BrowserSession {
         }
     }
 
+    /// [`BrowserSession::wait_until_or_in_frames`] inside the one frame a
+    /// `--frame` chain names.
+    pub fn wait_until_in_frame(
+        &self,
+        chain: &str,
+        js_predicate: &str,
+        what: &str,
+        timeout_ms: Option<f64>,
+    ) -> Result<f64> {
+        let (wait, timeout) = self.element_budget(timeout_ms);
+        let started = std::time::Instant::now();
+        loop {
+            self.settle_within(wait.saturating_sub(started.elapsed()));
+            match self.active_tab().check_in_frame(chain, js_predicate, timeout) {
+                Ok(true) => return Ok((started.elapsed().as_secs_f64() * 1000.0).round()),
+                Err(e) if format!("{e:#}").contains("not a frame") => return Err(e),
+                _ => {}
+            }
+            if started.elapsed() >= wait {
+                bail!("wait: {what} in frame {chain:?} not met within {} ms", wait.as_millis());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Click the first element matching `selector`.
     pub fn click(&self, selector: &str, timeout_ms: Option<f64>) -> Result<()> {
         self.click_target(&Target::Selector(selector.to_string()), &cdp::ClickOptions::default(), timeout_ms)
