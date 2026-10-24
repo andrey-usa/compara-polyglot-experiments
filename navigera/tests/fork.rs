@@ -143,12 +143,15 @@ fn each_session_saves_downloads_where_it_was_told() {
     assert_eq!(fetch_file(&mut a), at(1, "report.csv"));
     assert_eq!(fetch_file(&mut b), at(2, "report.csv"));
     assert_eq!(fetch_file(&mut owner), at(0, "report.csv"));
-    // `reset --all` keeps the directory: a second file there is numbered.
-    op(&mut a, &["reset", "--all"]);
+    // `reset` keeps the directory: a second file there is numbered.
+    op(&mut a, &["reset"]);
     assert_eq!(fetch_file(&mut a), at(1, "report (2).csv"));
     // A new directory starts the names over.
     op(&mut a, &["downloads", "--dir", dirs[3].path().to_str().unwrap()]);
     assert_eq!(fetch_file(&mut a), at(3, "report.csv"));
+    // `reset --all` starts as a new session would: the process's directory.
+    op(&mut a, &["reset", "--all"]);
+    assert!(!fetch_file(&mut a).starts_with(dirs[3].path()));
     a.session().close();
     b.session().close();
     owner.session().close();

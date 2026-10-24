@@ -33,5 +33,5 @@ pub use page::{AxOptions, ClickOptions, Locator, Page, Target, DEEP, DEFAULT_ELE
 
 /// Element functions shared with the session layer.
 pub(crate) mod page_js {
-    pub(crate) use super::page::{COMBO_FOCUS, COMBO_PICK, FOCUS_EL, FOCUS_SELECT_ALL, GET_EL, IS_EL};
+    pub(crate) use super::page::{COMBO_FOCUS, COMBO_PICK, FOCUS_EL, FOCUS_SELECT_ALL, GET_EL, IS_EL, MOUSE_AT};
 }

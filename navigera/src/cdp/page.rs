@@ -488,6 +488,35 @@ const DBLCLICK_REST: &str = r#"function (el) {
 }"#;
 
 /// What `get` reads from an element.
+/// `mouse … <target>`: the point `dx`,`dy` from the element's top-left
+/// corner (its center when `dx` is null), in top-level viewport pixels.
+/// Scrolled into view first when the point isn't in the viewport, as a
+/// click would be. `{ outside }` when it still isn't (an offset beyond the
+/// page), `{ xframe }` inside a cross-origin frame.
+pub const MOUSE_AT: &str = r#"function (el, dx, dy) {
+    const at = () => {
+        const r = el.getBoundingClientRect();
+        let x = r.left + (dx == null ? r.width / 2 : dx), y = r.top + (dy == null ? r.height / 2 : dy);
+        let w = el.ownerDocument.defaultView;
+        while (w && w !== w.top) {
+            const fe = w.frameElement;
+            if (!fe) return null;
+            const fr = fe.getBoundingClientRect();
+            x += fr.left + fe.clientLeft; y += fr.top + fe.clientTop;
+            w = w.parent;
+        }
+        const top = w || window;
+        return { x, y, inside: x >= 0 && y >= 0 && x < top.innerWidth && y < top.innerHeight };
+    };
+    let p = at();
+    if (!p) return { xframe: true };
+    if (!p.inside) {
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        p = at();
+    }
+    return p.inside ? { x: p.x, y: p.y } : { outside: true, x: p.x, y: p.y, width: (window.top || window).innerWidth, height: (window.top || window).innerHeight };
+}"#;
+
 pub const GET_EL: &str = r#"function (el, what, name) {
     switch (what) {
         case 'text': return (el.innerText ?? el.textContent ?? '').trim();
@@ -1216,10 +1245,18 @@ const FRAME_EL: &str = r#"function (chain) {
 
 fn finder_expr_in(target: &Target, wait_ms: u128, what: &str, mode: TextMode) -> String {
     match target {
+        // When nothing matches the frame itself, the error says so, not
+        // that the element is missing.
         Target::InFrame(chain, inner) => format!(
-            "(() => {{ const __nvStart = () => ({FRAME_DOC})({}); return {}; }})()",
-            json!(chain),
-            finder_expr_in(inner, wait_ms, what, mode)
+            "(() => {{ const __nvStart = () => ({FRAME_DOC})({chain}); \
+             return Promise.resolve({}).catch((e) => {{ \
+               let gone = false; try {{ gone = __nvStart() === null; }} catch (_) {{}} \
+               const m = String(e && e.message || e); \
+               if (gone && m.includes(': no element')) \
+                 throw new Error(m.slice(0, m.indexOf(': no element')) + ': no frame matches --frame ' + JSON.stringify({chain}) + ' (the element was not looked for)'); \
+               throw e; }}); }})()",
+            finder_expr_in(inner, wait_ms, what, mode),
+            chain = json!(chain),
         ),
         Target::Selector(sel) => format!("({WAIT_FOR})({}, {wait_ms}, {}, () => {DEEP})", json!(sel), json!(what)),
         Target::Text(text) => {
@@ -2597,8 +2634,12 @@ impl Page {
             )
         };
         let mut p = self.pointer.lock().map(|p| *p).unwrap_or_default();
-        if matches!(action, "move" | "click") {
-            let (x, y) = at.ok_or_else(|| anyhow::anyhow!("mouse {action} needs x and y"))?;
+        if matches!(action, "move" | "click") && at.is_none() {
+            bail!("mouse {action} needs x and y");
+        }
+        // A point: the pointer goes there first (`down`, `up` and `wheel`
+        // over a target go to its center).
+        if let Some((x, y)) = at {
             let n = steps.max(1);
             for i in 1..=n {
                 let t = i as f64 / n as f64;

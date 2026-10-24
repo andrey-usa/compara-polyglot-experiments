@@ -939,19 +939,19 @@ pub struct ParsedArgs {
 
 /// One op's CLI documentation: (name, synopsis, what it does).
 const OPS: &[(&str, &str, &str)] = &[
-    ("start", "[--attach [<where>] | --profile <name> [--from <browser> [--from-profile <p>]] [--headless]] [--natural]", "spawn a detached session server + headless browser (needs --session); --attach/--profile use a browser that stays open; --from seeds the profile with a copy of your browser's sign-ins"),
+    ("start", "[--attach [<where>] | --profile <name> [--from <browser> [--from-profile <p>]] [--headless]] [--natural] [--download-dir <dir>]", "spawn a detached session server + headless browser (needs --session); --attach/--profile use a browser that stays open; --from seeds the profile with a copy of your browser's sign-ins"),
     ("goto", "<url> [--wait load|domcontentloaded|commit]", "navigate the active tab (default: wait for load)"),
     ("ax", "[--selector <css> | <ref>] [--limit <lines>] [--refs all] [--format json]", "accessibility snapshot: indented tree, [ref=N] on actionable nodes"),
-    ("click", "<ref> | --selector <css> | --text <visible text> [--button right|middle] [--force]", "trusted mouse click once the element stops moving; refuses an element covered by another (--force: DOM events anyway); waits for any navigation it starts"),
-    ("fill", "<ref> <value> | --selector <css> --value <v> [--keys]", "set an input/textarea's value; --keys clears it and types the value key by key (for apps that ignore a value set directly)"),
+    ("click", "<ref> | --selector <css> | --text <visible text> [--frame <css>] [--button right|middle] [--force]", "trusted mouse click once the element stops moving; refuses an element covered by another (--force: DOM events anyway); waits for any navigation it starts"),
+    ("fill", "<ref> <value> | --selector <css> --value <v> [--frame <css>] [--keys]", "set an input/textarea's value; --keys clears it and types the value key by key (for apps that ignore a value set directly)"),
     ("type", "<text> [--selector <css> | --ref <n>]", "type key by key into the target or the focused element"),
     ("press", "<key> [--selector <css> | --ref <n>]", "press a key or chord: Enter, Tab, Escape, ArrowDown, Control+a"),
     ("select", "<ref> <option>... | --selector <css> --value <option> [--add]", "choose <select> option(s) by value or label (whitespace-insensitive); --add keeps the options already chosen"),
     ("hover", "<ref> | --selector <css> | --text <t>", "move the mouse over an element (hover menus)"),
-    ("mouse", "move <x> <y> [--steps n] | down | up | click <x> <y> [--count 2] | wheel <dx> <dy>  [--button right|middle] [<target>]", "raw mouse at a point, for what has no element to aim at (a canvas, a map, a game): viewport CSS pixels (as in a screenshot), or from the target's top-left corner; the pointer stays where it went and held buttons stay held, so down, moves, up drags or draws"),
+    ("mouse", "move <x> <y> [--steps n] | down | up | click <x> <y> [--count 2] | wheel <dx> <dy>  [--button right|middle] [<target>]", "raw mouse at a point, for what has no element to aim at (a canvas, a map, a game): viewport CSS pixels (as in a screenshot), or from the target's top-left corner (scrolled into view if need be; down, up and wheel with a target go to its center); the pointer stays where it went and held buttons stay held, so down, moves, up drags or draws; a click outside the viewport is refused"),
     ("scroll", "[--by <px> | --to top|bottom] [<ref> | --selector <css>]", "scroll the page, or an element into view"),
     ("upload", "<ref> <file>... | --selector <css> --file <path>", "set the files of an <input type=file>"),
-    ("wait", "[--selector <css>] [--text <t>] [--url <part>] [--gone <css>] [--js <expr>] [--idle] [--download [<glob>]] [--ms <n>]", "wait until every condition holds (default up to 5 s; --timeout-ms); --idle: no fetch/XHR for 500 ms; --download: a finished download"),
+    ("wait", "[--selector <css>] [--text <t>] [--url <part>] [--gone <css>] [--js <expr>] [--frame <css>] [--idle] [--download [<glob>]] [--ms <n>]", "wait until every condition holds (default up to 5 s; --timeout-ms); --idle: no fetch/XHR for 500 ms; --download: a finished download"),
     ("downloads", "[--clear] [--json] | --dir <path>", "files the pages downloaded: #n state bytes path (url); --dir saves this session's from now on in <path> (kept across reset)"),
     ("eval", "<js> | --file <path.js> | -", "evaluate JS (arrow functions are called); prints the JSON result; `-` reads the script from stdin"),
     ("text", "--selector <css>", "textContent of the first match"),
@@ -985,7 +985,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("forward", "", "history forward"),
     ("reload", "", "reload the page"),
     ("screenshot", "[--path <f.png>] [--full-page]", "PNG of the viewport (or whole page)"),
-    ("reset", "[--all]", "a clean slate in the same browser: a new browser context (no cookies, storage or cache from before) with one blank tab; the old tabs close (`set`, routes, init scripts and the dialog answer stay; --all drops them too)"),
+    ("reset", "[--all]", "a clean slate in the same browser: a new browser context (no cookies, storage or cache from before) with one blank tab; the old tabs close (`set`, routes, credentials, init scripts, the dialog answer and `downloads --dir` stay; --all drops them too)"),
     ("tab-new", "[<url>]", "open a tab and make it active"),
     ("tab-list", "", "list tabs"),
     ("show", "", "put the browser on screen with the same tabs and sign-ins, to hand the session to a person (a login, 2FA, a CAPTCHA); `hide` takes it back off"),
@@ -2485,8 +2485,15 @@ impl Driver {
                 Ok(self.state_json())
             }
             Command::Goto { url, wait, timeout_ms } => {
-                self.goto(url, wait.as_deref(), *timeout_ms)?;
-                Ok(self.state_json())
+                let download = self.goto(url, wait.as_deref(), *timeout_ms)?;
+                let mut state = self.state_json();
+                if let Some(file) = download {
+                    state["download"] = json!(file);
+                    state["note"] = json!(
+                        "the URL is a download: the page stayed where it was; `wait --download` waits for the file, `downloads` lists it"
+                    );
+                }
+                Ok(state)
             }
             Command::Back {} => {
                 s.back().map_err(|e| anyhow::anyhow!("back: {e:#}"))?;
@@ -2550,20 +2557,34 @@ impl Driver {
                 Ok(state)
             }
             Command::Mouse { action, x, y, button, count, steps, target, timeout_ms } => {
-                // From a target's top-left corner, when one is named.
-                let origin = match target.optional("mouse")? {
-                    Some(t) => {
-                        let b = s
-                            .get_prop(&t, "box", None, *timeout_ms)
-                            .map_err(|e| anyhow::anyhow!("mouse {action} {}: {e:#}", t.label()))?;
-                        (b["x"].as_f64().unwrap_or(0.0), b["y"].as_f64().unwrap_or(0.0))
-                    }
-                    None => (0.0, 0.0),
+                let point = match (action.as_str(), x, y) {
+                    ("move" | "click", Some(x), Some(y)) => Some((*x, *y)),
+                    _ => None,
                 };
-                let (at, delta) = match (action.as_str(), x, y) {
-                    ("wheel", Some(dx), Some(dy)) => (None, (*dx, *dy)),
-                    (_, Some(x), Some(y)) => (Some((origin.0 + x, origin.1 + y)), (0.0, 0.0)),
-                    _ => (None, (0.0, 0.0)),
+                let delta = match (action.as_str(), x, y) {
+                    ("wheel", Some(dx), Some(dy)) => (*dx, *dy),
+                    _ => (0.0, 0.0),
+                };
+                let at = match target.optional("mouse")? {
+                    // From the target's top-left corner (its center for
+                    // down, up and wheel), scrolled into view if need be.
+                    Some(t) => Some(
+                        s.mouse_point(&t, point, *timeout_ms)
+                            .map_err(|e| anyhow::anyhow!("mouse {action} {}: {e:#}", t.label()))?,
+                    ),
+                    None => {
+                        // A click where the page can't be is a click on
+                        // nothing; a move may leave it (a drag out).
+                        if let (Some((px, py)), "click") = (point, action.as_str()) {
+                            let (w, h) = s.viewport_size().unwrap_or((f64::INFINITY, f64::INFINITY));
+                            if px < 0.0 || py < 0.0 || px >= w || py >= h {
+                                anyhow::bail!(
+                                    "mouse click: ({px}, {py}) is outside the viewport ({w}x{h}): scroll first, or aim from an element (`mouse click <x> <y> --selector <css>` scrolls it into view)"
+                                );
+                            }
+                        }
+                        point
+                    }
                 };
                 let r = s
                     .mouse(
@@ -3194,11 +3215,17 @@ impl Driver {
     }
 
     /// Navigate the active page, applying the engine-aware policy.
-    fn goto(&self, url: &str, wait: Option<&str>, timeout_ms: Option<f64>) -> anyhow::Result<()> {
+    /// The file's name when the URL turned out to be a download.
+    fn goto(&self, url: &str, wait: Option<&str>, timeout_ms: Option<f64>) -> anyhow::Result<Option<String>> {
         let url = normalize_url(url);
-        self.session
-            .goto_wait(&url, wait.unwrap_or("load"), timeout_ms)
-            .map_err(|e| anyhow::anyhow!("goto {url}: {e:#}"))
+        let before = self.session.downloads(false).iter().map(|d| d.n).max().unwrap_or(0);
+        let download = self
+            .session
+            .goto_or_download(&url, wait.unwrap_or("load"), timeout_ms)
+            .map_err(|e| anyhow::anyhow!("goto {url}: {e:#}"))?;
+        Ok(download
+            .then(|| self.session.downloads(false).into_iter().filter(|d| d.n > before).map(|d| d.suggested).next())
+            .flatten())
     }
 }
 
