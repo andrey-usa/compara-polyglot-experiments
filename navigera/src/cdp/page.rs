@@ -233,11 +233,26 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button,
         return { x, y };
     };
     // Will a click here likely load a new document (link, form submit)?
+    // Only a navigation of the tab's own top document is waited for: a
+    // link saved (`download`) or opened elsewhere (`_blank`, a named
+    // window), or one inside a frame that navigates only the frame, isn't.
+    const here = (target, e) => {
+        const t = (target || '').toLowerCase();
+        if (t === '_top' || t === '_parent') return true;
+        if (t && t !== '_self') return false;
+        const w = e.ownerDocument.defaultView;
+        return !w || w === w.top;
+    };
     const mayNavigate = (e) => {
         const a = e.closest('a[href]');
-        if (a) { const h = a.getAttribute('href') || ''; return !(h.startsWith('#') || h.startsWith('javascript:')); }
+        if (a) {
+            const h = a.getAttribute('href') || '';
+            if (h.startsWith('#') || h.startsWith('javascript:') || a.hasAttribute('download')) return false;
+            return here(a.getAttribute('target'), e);
+        }
         const c = e.closest('button, input');
-        return !!(c && c.form && (c.type === 'submit' || c.type === 'image'));
+        if (!(c && c.form && (c.type === 'submit' || c.type === 'image'))) return false;
+        return here(c.getAttribute('formtarget') || c.form.getAttribute('target'), e);
     };
     // A styled checkbox/radio is often a hidden or covered <input> inside a
     // visible <label>: clicking the label is what a user does and toggles it.
@@ -1771,12 +1786,29 @@ impl Page {
     /// submissions are scheduled as a task, so the request can trail the
     /// input event's CDP reply — then wait for the new document.
     pub fn navigation_started(&self, since_generation: u64, grace: Duration) -> bool {
+        let others = self.shared.activity(&self.session_id);
+        self.navigation_started_since([since_generation, others[1], others[2], others[3], others[4]], grace)
+    }
+
+    /// What the tab's browser side has seen so far (see
+    /// [`Shared::activity`]): navigations, dialogs, tabs opened, popups,
+    /// downloads.
+    pub fn activity(&self) -> [u64; 5] {
+        self.shared.activity(&self.session_id)
+    }
+
+    /// [`Page::navigation_started`] from an [`Page::activity`] taken before
+    /// the input: a dialog, a new tab or a download that came instead is
+    /// the answer, so the grace isn't waited out (a download link, a
+    /// `target=_blank` link).
+    pub fn navigation_started_since(&self, before: [u64; 5], grace: Duration) -> bool {
         let end = Instant::now() + grace;
         loop {
-            if self.nav_generation() > since_generation {
+            let now = self.activity();
+            if now[0] > before[0] {
                 return true;
             }
-            if Instant::now() >= end {
+            if now[1..] != before[1..] || Instant::now() >= end {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(5));
