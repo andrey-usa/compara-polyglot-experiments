@@ -80,6 +80,10 @@ jobs:
             # A display for `show`.
             python3 watchdog.py test.log 1500 xvfb-run -a cargo test --locked --no-fail-fast
           else
+            # macOS runners have 3 cores: three tests at once, each with its
+            # own Chrome, put the load average at 50-80 and pages stop
+            # answering for 35 s and more. Two at a time.
+            if [ "$RUNNER_OS" = macOS ]; then export RUST_TEST_THREADS=2; fi
             python3 watchdog.py test.log 1500 cargo test --locked --no-fail-fast --lib --test interactions --test handoff --test attach --test commands --test fork --test verify_scopes
           fi
           code=$?
