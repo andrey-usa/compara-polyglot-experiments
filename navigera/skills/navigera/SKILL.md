@@ -181,7 +181,11 @@ Element commands wait up to 5 s for the element to appear. Pass
 `--timeout-ms <ms>` to wait longer, or `start --wait-ms <ms>` once for a slow
 app. Besides a ref, `--selector` and
 `--text`, they take `--role button --name "Save"`, `--label "Email"`,
-`--placeholder …`, `--testid …`, and `--nth <i>` (`-1` = last).
+`--placeholder …`, `--testid …`, and `--nth <i>` (`-1` = last). Frames
+are searched for you; when two frames hold the same element, `--frame
+"#billing"` (CSS of the iframe; `"#outer >> #inner"` for one inside
+another; either origin) looks only there, for element commands and
+`wait --selector/--text`.
 
 ## Inspecting, state, emulation
 

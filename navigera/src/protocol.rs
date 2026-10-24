@@ -111,6 +111,10 @@ pub struct TargetArgs {
     /// Which match (0-based; -1 = the last), with any of the above or `selector`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nth: Option<i64>,
+    /// Look only inside this frame: an iframe/frame by CSS, or a chain
+    /// `#outer >> #inner`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
 }
 
 impl TargetArgs {
@@ -131,6 +135,18 @@ impl TargetArgs {
     }
 
     fn optional(&self, op: &str) -> anyhow::Result<Option<Target>> {
+        let found = self.unframed(op)?;
+        match (&self.frame, found) {
+            (Some(f), Some(Target::Ref(_))) => {
+                anyhow::bail!("{op}: --frame {f:?} with a ref: a ref already names one element; drop --frame")
+            }
+            (Some(f), Some(t)) => Ok(Some(Target::InFrame(f.clone(), Box::new(t)))),
+            (Some(f), None) => anyhow::bail!("{op}: --frame {f:?} needs a target in it (--selector, --text, --role …)"),
+            (None, t) => Ok(t),
+        }
+    }
+
+    fn unframed(&self, op: &str) -> anyhow::Result<Option<Target>> {
         let given = [
             self.node_ref.is_some(),
             self.text.is_some(),
@@ -333,6 +349,10 @@ pub enum Command {
         /// A JS expression that becomes truthy.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         js: Option<String>,
+        /// Look for `selector`, `text` and `gone` only inside this frame
+        /// (CSS, or a chain `#outer >> #inner`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<String>,
         /// Just sleep this long.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ms: Option<f64>,
@@ -946,7 +966,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("route", "[<url glob> [--abort | --status <n> [--body <text> | --body-file <f>] [--content-type <t>] [--header 'Name: value']]]", "fail or answer requests whose URL matches (* and ? globs); no flags = fail; no pattern = list the rules"),
     ("unroute", "[<url glob>]", "remove one route rule, or all"),
     ("init-script", "[<js> | --file <path.js> | --clear]", "run a script before the page's own in every document of every tab; no argument lists them"),
-    ("get", "text|value|html|outer|box|attr <name>|style <prop> <target> | count <css>", "read one property of an element (target: ref, --selector, --text, --role/--name, --label, --placeholder, --testid, --nth)"),
+    ("get", "text|value|html|outer|box|attr <name>|style <prop> <target> | count <css>", "read one property of an element (target: ref, --selector, --text, --role/--name, --label, --placeholder, --testid, --nth; --frame <css> to look only inside that frame)"),
     ("is", "visible|hidden|enabled|disabled|checked|editable|focused <target>", "true/false; a missing element is not visible"),
     ("dblclick", "<target>", "trusted double click"),
     ("drag", "<from> <to> | --from-text <t> --to-text <t>", "drag one element onto another (each a ref or CSS selector): HTML5 drag and drop for a draggable source, a held mouse moved across otherwise"),
@@ -1242,6 +1262,7 @@ fn target_args(args: &mut Args, positional_target: bool) -> Result<TargetArgs, A
             })?),
             None => None,
         },
+        frame: str_flag(args, "--frame")?,
     };
     if positional_target && t == TargetArgs::default() {
         if let Some(first) = args.front().filter(|a| !a.starts_with("--")).cloned() {
@@ -1551,6 +1572,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
                 url: str_flag(&mut args, "--url")?,
                 gone: str_flag(&mut args, "--gone")?,
                 js: str_flag(&mut args, "--js")?,
+                frame: str_flag(&mut args, "--frame")?,
                 ms: num_flag(&mut args, "--ms")?,
                 idle: extract_present(&mut args, "--idle")
                     || match str_flag(&mut args, "--load")?.as_deref() {
@@ -1630,6 +1652,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
                             | "--placeholder"
                             | "--testid"
                             | "--nth"
+                            | "--frame"
                     )
                 })
                 || (args.len() == 1 && parse_ref(&args[0]).is_some()) =>
@@ -2595,7 +2618,7 @@ impl Driver {
                 s.upload(&t, files, *timeout_ms).map_err(|e| anyhow::anyhow!("upload {}: {e:#}", t.label()))?;
                 Ok(json!({ "files": files.len() }))
             }
-            Command::Wait { selector, text, url, gone, js, ms, idle, timeout_ms, download } => {
+            Command::Wait { selector, text, url, gone, js, frame, ms, idle, timeout_ms, download } => {
                 if let Some(ms) = ms {
                     std::thread::sleep(std::time::Duration::from_secs_f64(ms.max(0.0) / 1000.0));
                 }
@@ -2653,6 +2676,18 @@ impl Driver {
                 }
                 if checks.is_empty() {
                     return Ok(json!({ "waited_ms": ms.unwrap_or(0.0) }));
+                }
+                if let Some(chain) = frame {
+                    if url.is_some() || js.is_some() {
+                        anyhow::bail!(
+                            "wait --frame scopes --selector, --text and --gone; --url and --js are the page's"
+                        );
+                    }
+                    let waited =
+                        s.wait_until_in_frame(chain, &checks.join(" && "), &what.join(" and "), *timeout_ms)?;
+                    let mut state = self.state_json();
+                    state["waited_ms"] = json!(waited);
+                    return Ok(state);
                 }
                 // One --text or --selector wait also looks in cross-origin
                 // frames (text shown by a payment or sign-in frame).
@@ -3703,6 +3738,7 @@ mod tests {
                 url: None,
                 gone: None,
                 js: None,
+                frame: None,
                 ms: None,
                 idle: false,
                 timeout_ms: None,
@@ -3717,6 +3753,7 @@ mod tests {
                 url: None,
                 gone: None,
                 js: None,
+                frame: None,
                 ms: Some(250.0),
                 idle: false,
                 timeout_ms: None,
@@ -3867,6 +3904,7 @@ mod tests {
                 url: None,
                 gone: None,
                 js: None,
+                frame: None,
                 ms: None,
                 idle: false,
                 timeout_ms: None,
