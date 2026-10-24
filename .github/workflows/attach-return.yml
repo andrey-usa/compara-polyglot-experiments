@@ -1,18 +1,26 @@
 name: attach-return
 
 # Reproduction: does `navigera -s job start --attach` return on Windows, or
-# hang with the session server listening? Two attach forms (user-data-dir
-# and the single-tab ws://.../devtools/page/<id> from /json/list), three
-# attempts each, from pwsh, cmd and Git Bash (18 runs). Every attempt has a
-# 60 s budget enforced by a watchdog that kills navigera.exe; ~10 s into the
-# attempt `navigera -s job tab-list` runs to see whether the session answers
-# meanwhile. Transcripts, session logs and per-attempt verdicts are uploaded
-# as artifacts; the pwsh job additionally narrows a hang (Start-Process vs
-# direct call, output redirected vs console).
+# hang with the session server listening? Three attach forms —
+#   (a) user-data-dir, (b) single-tab ws://.../devtools/page/<id>,
+#   (c) bare port (resolves via /json/version) —
+# 3 attempts each, from pwsh, cmd and Git Bash (27 runs). Every attempt is a
+# DIRECT call in the step's shell under a 60 s watchdog (kills navigera.exe
+# at 62 s unless the attempt wrote its .done file); `navigera -s job
+# tab-list` runs ~10 s in; stdout/stderr, session log and tab-list output
+# are saved as artifacts. The pwsh job additionally narrows a hang
+# (Start-Process vs direct call, console vs redirected output).
 #
-# Deviation from the original observation setup: Chrome gets a FIXED
-# --remote-debugging-port (19022) instead of port 0, because the single-tab
-# form needs a discoverable port to fetch /json/list from.
+# Deviations from the original observation setup:
+# - Chrome gets a FIXED --remote-debugging-port (19022) instead of port 0,
+#   because the single-tab and port forms need a discoverable port.
+# - Current Chrome (156 locally; the runner's, printed in the log) does NOT
+#   write DevToolsActivePort into the user-data-dir any more (verified
+#   headed and headless: CDP serves fine, no such file anywhere under the
+#   profile). The workflow therefore synthesizes the file from
+#   /json/version (port + browser path), exactly what older Chrome wrote, so
+#   the user-data-dir discovery path is genuinely exercised. The missing
+#   file itself is a finding: see the report.
 
 on:
   push:
@@ -75,70 +83,122 @@ jobs:
         if: matrix.shell == 'bash'
         run: mkdir -p "$RUNNER_TEMP/attach-logs"
 
-      - name: Start Chrome with remote debugging
+      - name: Start Chrome with remote debugging (pwsh)
         if: matrix.shell == 'pwsh'
         run: |
+          & $env:CHROME_EXE --version
+          $profile = "$env:RUNNER_TEMP\chrome-profile"
           Start-Process -FilePath $env:CHROME_EXE -ArgumentList @(
             "--remote-debugging-port=$env:CDP_PORT",
-            "--user-data-dir=$env:RUNNER_TEMP\chrome-profile",
+            "--user-data-dir=$profile",
             "--no-first-run", "about:blank")
           for ($i=0; $i -lt 60; $i++) {
-            try { (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$env:CDP_PORT/json/list" -TimeoutSec 2).StatusCode | Out-Null; break }
+            try { (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$env:CDP_PORT/json/version" -TimeoutSec 2).StatusCode | Out-Null; break }
             catch { Start-Sleep 1 }
           }
-          Invoke-RestMethod "http://127.0.0.1:$env:CDP_PORT/json/list" | Format-Table id, type, url
+          $v = Invoke-RestMethod "http://127.0.0.1:$env:CDP_PORT/json/version"
+          Write-Host "browser: $($v.Browser)"
+          Write-Host "chrome command lines (first 3):"
+          Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Select-Object -First 3 -ExpandProperty CommandLine | Out-Host
+          Write-Host "profile listing:"
+          Get-ChildItem $profile | Select-Object -First 30 Name | Out-Host
+          Write-Host "DevToolsActivePort present: $(Test-Path $profile\DevToolsActivePort)"
 
-      - name: Start Chrome with remote debugging
+      - name: Start Chrome with remote debugging (cmd)
         if: matrix.shell == 'cmd'
         run: |
-          start "" /b "%CHROME_EXE%" --remote-debugging-port=%CDP_PORT% --user-data-dir=%RUNNER_TEMP%\chrome-profile --no-first-run about:blank
-          for /L %%i in (1,1,60) do (curl -sf -o nul http://127.0.0.1:%CDP_PORT%/json/list && goto :chromeup & timeout /t 1 /nobreak >nul)
+          "%CHROME_EXE%" --version
+          start "" "%CHROME_EXE%" --remote-debugging-port=%CDP_PORT% --user-data-dir=%RUNNER_TEMP%\chrome-profile --no-first-run about:blank
+          for /L %%i in (1,1,60) do (curl -sf -o nul http://127.0.0.1:%CDP_PORT%/json/version && goto :chromeup & timeout /t 1 /nobreak >nul)
           :chromeup
-          curl -s http://127.0.0.1:%CDP_PORT%/json/list
+          curl -s http://127.0.0.1:%CDP_PORT%/json/version
+          echo profile listing:
+          dir /b "%RUNNER_TEMP%\chrome-profile" | head -30
+          if exist "%RUNNER_TEMP%\chrome-profile\DevToolsActivePort" (echo DevToolsActivePort: present) else (echo DevToolsActivePort: MISSING)
+          wmic process where "name='chrome.exe'" get ProcessId,CommandLine /format:list | head -12
 
-      - name: Start Chrome with remote debugging
+      - name: Start Chrome with remote debugging (bash)
         if: matrix.shell == 'bash'
         run: |
-          "$CHROME_EXE" --remote-debugging-port="$CDP_PORT" --user-data-dir="$RUNNER_TEMP/chrome-profile" --no-first-run about:blank &
+          "$CHROME_EXE" --version
+          CHROME_WIN=$(cygpath -w "$CHROME_EXE")
+          PROFILE_WIN=$(cygpath -w "$RUNNER_TEMP/chrome-profile")
+          cmd.exe /c start '""' "\"$CHROME_WIN\"" --remote-debugging-port="$CDP_PORT" --user-data-dir="\"$PROFILE_WIN\"" --no-first-run about:blank
           for i in $(seq 1 60); do
-            curl -sf -o /dev/null "http://127.0.0.1:$CDP_PORT/json/list" && break
+            curl -sf -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version" && break
             sleep 1
           done
-          curl -s "http://127.0.0.1:$CDP_PORT/json/list"
+          curl -s "http://127.0.0.1:$CDP_PORT/json/version" | head -c 300; echo
+          echo "profile listing:"; ls "$RUNNER_TEMP/chrome-profile" | head -30
+          if [ -f "$RUNNER_TEMP/chrome-profile/DevToolsActivePort" ]; then echo "DevToolsActivePort: present"; else echo "DevToolsActivePort: MISSING"; fi
+          tasklist //FI "IMAGENAME eq chrome.exe" //FO TABLE | head -5
 
-      - name: Pick a page target for the single-tab form
+      # Current Chrome does not write DevToolsActivePort any more (verified
+      # locally on Chromium 156, headed and headless). Synthesize it from
+      # /json/version so the user-data-dir discovery path is exercised
+      # exactly as with older Chrome.
+      - name: Synthesize DevToolsActivePort (pwsh)
+        if: matrix.shell == 'pwsh'
+        run: |
+          $profile = "$env:RUNNER_TEMP\chrome-profile"
+          $v = Invoke-RestMethod "http://127.0.0.1:$env:CDP_PORT/json/version"
+          $path = $v.webSocketDebuggerUrl -replace '^ws://[^/]+',''
+          "$env:CDP_PORT`r`n$path`r`n" | Out-File -Encoding ascii -NoNewline "$profile\DevToolsActivePort"
+          Write-Host "wrote $profile\DevToolsActivePort:"; Get-Content "$profile\DevToolsActivePort" | Out-Host
+
+      - name: Synthesize DevToolsActivePort (cmd)
+        if: matrix.shell == 'cmd'
+        run: |
+          for /f "tokens=*" %%u in ('python -c "import json,urllib.request; v=json.load(urllib.request.urlopen('http://127.0.0.1:%CDP_PORT%/json/version',timeout=10)); print(v['webSocketDebuggerUrl'])"') do set WSURL=%%u
+          set TMP1=%WSURL:*//=%
+          set WSPATH=%TMP1:*/=%
+          (echo %CDP_PORT%& echo /%WSPATH%) > "%RUNNER_TEMP%\chrome-profile\DevToolsActivePort"
+          type "%RUNNER_TEMP%\chrome-profile\DevToolsActivePort"
+
+      - name: Synthesize DevToolsActivePort (bash)
+        if: matrix.shell == 'bash'
+        run: |
+          WS=$(python -c "import json,urllib.request; v=json.load(urllib.request.urlopen('http://127.0.0.1:$CDP_PORT/json/version',timeout=10)); print(v['webSocketDebuggerUrl'])")
+          x="${WS#*//}"; WSPATH="/${x#*/}"
+          printf '%s\n%s\n' "$CDP_PORT" "$WSPATH" > "$RUNNER_TEMP/chrome-profile/DevToolsActivePort"
+          cat "$RUNNER_TEMP/chrome-profile/DevToolsActivePort"
+
+      - name: Pick a page target for the single-tab form (pwsh)
         if: matrix.shell == 'pwsh'
         run: |
           $ws = python -c "import json,urllib.request; items=json.load(urllib.request.urlopen('http://127.0.0.1:$env:CDP_PORT/json/list',timeout=10)); print(next(t['webSocketDebuggerUrl'] for t in items if t.get('type')=='page'))"
           "PAGE_WS=$ws" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "PAGE_WS=$ws"
 
-      - name: Pick a page target for the single-tab form
+      - name: Pick a page target for the single-tab form (cmd)
         if: matrix.shell == 'cmd'
         run: |
           python -c "import json,urllib.request; items=json.load(urllib.request.urlopen('http://127.0.0.1:%CDP_PORT%/json/list',timeout=10)); print(next(t['webSocketDebuggerUrl'] for t in items if t.get('type')=='page'))" > "%RUNNER_TEMP%\pagews.txt"
           set /p PAGE_WS=<"%RUNNER_TEMP%\pagews.txt"
           echo PAGE_WS=%PAGE_WS%>> "%GITHUB_ENV%"
 
-      - name: Pick a page target for the single-tab form
+      - name: Pick a page target for the single-tab form (bash)
         if: matrix.shell == 'bash'
         run: |
           WS=$(python -c "import json,urllib.request; items=json.load(urllib.request.urlopen('http://127.0.0.1:$CDP_PORT/json/list',timeout=10)); print(next(t['webSocketDebuggerUrl'] for t in items if t.get('type')=='page'))")
           echo "PAGE_WS=$WS" >> "$GITHUB_ENV"
           echo "PAGE_WS=$WS"
 
-      # 18 runs: 2 forms x 3 shells x 3 attempts. Each attempt runs
-      # `navigera -s job start --attach <form>` as a DIRECT call in the
-      # step's shell; a watchdog kills navigera.exe 62 s in unless the
-      # attempt wrote its .done file (hang verdict at >=60 s elapsed).
+      # 27 runs: 3 forms x 3 shells x 3 attempts. Each attempt is a DIRECT
+      # call in the step's shell; a watchdog kills navigera.exe 62 s in
+      # unless the attempt wrote its .done file (hang verdict at >=60 s).
       - name: Run attempts (pwsh)
         if: matrix.shell == 'pwsh'
         run: |
           $nav = "$env:GITHUB_WORKSPACE\navigera\target\release\navigera.exe"
           $logd = "$env:RUNNER_TEMP\attach-logs"
           $summary = @()
-          foreach ($form in @('dir','url')) {
-            $attach = if ($form -eq 'dir') { "$env:RUNNER_TEMP\chrome-profile" } else { $env:PAGE_WS }
+          foreach ($form in @('dir','url','port')) {
+            $attach = switch ($form) {
+              'dir'  { "$env:RUNNER_TEMP\chrome-profile" }
+              'url'  { $env:PAGE_WS }
+              'port' { $env:CDP_PORT }
+            }
             for ($n=1; $n -le 3; $n++) {
               $tag = "pwsh-$form-$n"
               $out="$logd\$tag.out"; $err="$logd\$tag.err"; $tl="$logd\$tag.tablist"
@@ -163,7 +223,7 @@ jobs:
               $hang = Test-Path $killed
               $elapsed = [int]$sw.Elapsed.TotalSeconds
               "elapsed=${elapsed}s rc=$rc hang=$hang tablist_rc=$tlrc" | Out-File "$logd\$tag.meta" -Append
-              $slog = "$env:RUNNER_TEMP\navigera\job.log"
+              $slog = "$env:TEMP\navigera\job.log"
               if (Test-Path $slog) { Copy-Item $slog "$logd\$tag.session.log" }
               & $nav -s job quit > $null 2>&1
               Get-Process navigera -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -173,6 +233,7 @@ jobs:
             }
           }
           $summary | Out-File "$logd\summary-pwsh.txt"
+          exit 0
 
       - name: Run attempts (cmd)
         if: matrix.shell == 'cmd'
@@ -181,8 +242,8 @@ jobs:
           setlocal enabledelayedexpansion
           set NAV=%GITHUB_WORKSPACE%\navigera\target\release\navigera.exe
           set LOGD=%RUNNER_TEMP%\attach-logs
-          for %%F in (dir url) do (
-            if "%%F"=="dir" (set ATTACH=%RUNNER_TEMP%\chrome-profile) else (set ATTACH=%PAGE_WS%)
+          for %%F in (dir url port) do (
+            if "%%F"=="dir" (set ATTACH=%RUNNER_TEMP%\chrome-profile) else if "%%F"=="url" (set ATTACH=%PAGE_WS%) else (set ATTACH=%CDP_PORT%)
             for /L %%N in (1,1,3) do call :attempt %%F %%N
           )
           exit /b 0
@@ -205,7 +266,7 @@ jobs:
           set /p TLRC=<"%LOGD%\!TAG!.tablist.rc"
           if not defined TLRC set TLRC=missing
           echo rc=!RC! hang=!HANG! tablist_rc=!TLRC! >> "%LOGD%\!TAG!.meta"
-          if exist "%RUNNER_TEMP%\navigera\job.log" copy /y "%RUNNER_TEMP%\navigera\job.log" "%LOGD%\!TAG!.session.log" >nul
+          if exist "%TEMP%\navigera\job.log" copy /y "%TEMP%\navigera\job.log" "%LOGD%\!TAG!.session.log" >nul
           "%NAV%" -s job quit >nul 2>&1
           taskkill /F /IM navigera.exe >nul 2>&1
           timeout /t 2 /nobreak >nul
@@ -218,8 +279,12 @@ jobs:
           set -u
           NAV="$GITHUB_WORKSPACE/navigera/target/release/navigera.exe"
           LOGD="$RUNNER_TEMP/attach-logs"
-          for form in dir url; do
-            if [ "$form" = dir ]; then ATTACH="$RUNNER_TEMP/chrome-profile"; else ATTACH="$PAGE_WS"; fi
+          for form in dir url port; do
+            case "$form" in
+              dir) ATTACH="$RUNNER_TEMP/chrome-profile" ;;
+              url) ATTACH="$PAGE_WS" ;;
+              port) ATTACH="$CDP_PORT" ;;
+            esac
             for n in 1 2 3; do
               tag="bash-$form-$n"
               done_f="$LOGD/$tag.done"; killed_f="$LOGD/$tag.killed"
@@ -228,13 +293,13 @@ jobs:
               ( sleep 62; if [ ! -f "$done_f" ]; then echo killed > "$killed_f"; taskkill //F //IM navigera.exe >/dev/null 2>&1; fi ) &
               ( sleep 10; "$NAV" -s job tab-list >"$LOGD/$tag.tablist" 2>&1; echo $? > "$LOGD/$tag.tablist.rc" ) &
               t0=$(date +%s)
-              "$NAV" -s job start --attach "$ATTACH" >"$LOGD/$tag.out" 2>"$LOGD/$tag.err"; rc=$?
+              rc=0; "$NAV" -s job start --attach "$ATTACH" >"$LOGD/$tag.out" 2>"$LOGD/$tag.err" || rc=$?
               t1=$(date +%s)
               touch "$done_f"
               if [ -f "$killed_f" ]; then hang=true; else hang=false; fi
               tlrc=$(cat "$LOGD/$tag.tablist.rc" 2>/dev/null || echo missing)
               echo "elapsed=$((t1-t0))s rc=$rc hang=$hang tablist_rc=$tlrc" >> "$LOGD/$tag.meta"
-              [ -f "$RUNNER_TEMP/navigera/job.log" ] && cp "$RUNNER_TEMP/navigera/job.log" "$LOGD/$tag.session.log"
+              [ -f "$TEMP/navigera/job.log" ] && cp "$TEMP/navigera/job.log" "$LOGD/$tag.session.log"
               "$NAV" -s job quit >/dev/null 2>&1 || true
               taskkill //F //IM navigera.exe >/dev/null 2>&1 || true
               sleep 2
@@ -286,6 +351,7 @@ jobs:
           Write-Host "direct_console elapsed=$([int]$sw.Elapsed.TotalSeconds)s rc=$rc hang=$hang tablist_rc=$tlrc"
           & $nav -s job quit > $null 2>&1
           Get-Process navigera -ErrorAction SilentlyContinue | Stop-Process -Force
+          exit 0
 
       - name: Stop Chrome
         if: always() && matrix.shell == 'pwsh'
@@ -303,12 +369,14 @@ jobs:
         with:
           name: attach-return-${{ matrix.shell }}
           path: ${{ runner.temp }}\attach-logs\
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Summary
         if: always() && matrix.shell == 'pwsh'
         run: |
           '## attach-return (pwsh)' >> $env:GITHUB_STEP_SUMMARY
           '```' >> $env:GITHUB_STEP_SUMMARY
-          Get-Content "$env:RUNNER_TEMP\attach-logs\summary-pwsh.txt" >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path "$env:RUNNER_TEMP\attach-logs\summary-pwsh.txt") {
+            Get-Content "$env:RUNNER_TEMP\attach-logs\summary-pwsh.txt" >> $env:GITHUB_STEP_SUMMARY
+          }
           '```' >> $env:GITHUB_STEP_SUMMARY
