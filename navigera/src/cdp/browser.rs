@@ -491,10 +491,24 @@ impl Browser {
         Ok(())
     }
 
+    /// Bring a tab to the front, as best it can be: on a busy macOS machine
+    /// the browser sometimes takes the whole command timeout to answer (the
+    /// window it activates never comes forward), and a `reset` or
+    /// `tab-select` failed with it. A few seconds, then on without it: the
+    /// tab is the one the session acts on either way.
     pub fn activate_target(&self, target_id: &str) -> Result<()> {
         self.block_on(async {
-            self.client.send("Target.activateTarget", json!({ "targetId": target_id }), None, CMD_TIMEOUT).await?;
-            Ok(())
+            match self
+                .client
+                .send("Target.activateTarget", json!({ "targetId": target_id }), None, Duration::from_secs(3))
+                .await
+            {
+                Err(e) if format!("{e:#}").contains("timed out") => {
+                    eprintln!("[browser] activating tab {target_id} took over 3 s; going on");
+                    Ok(())
+                }
+                other => other.map(|_| ()),
+            }
         })
     }
 
