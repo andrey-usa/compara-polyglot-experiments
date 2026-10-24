@@ -16,10 +16,15 @@ name: webarena-eval
 # This workflow exists only on experiment-23, which the dispatch API
 # cannot address (it indexes workflows from the default branch), so
 # a push to the harness paths fires it - the push default is now the
-# candidate cell: navigera built from this repo's experiment-17 tree
-# pinned at 89ce1d4 (the "0.6 candidate"), the full 48-task pilot,
-# $4.08 = the remainder under the cumulative USD 5 authority after the
-# first two runs' computed $0.9176, rounded down. Spend is guarded
+# skill-trim candidate cell: navigera built from an ASSEMBLED tree that is
+# experiment-17 @ 89ce1d4 in full EXCEPT navigera/skills/navigera/SKILL.md
+# taken from experiment-17 @ 2033910 (13,312 bytes; embedded at compile
+# time via include_str!). That isolates exactly the skill change against
+# the 89ce1d4 cell; the 146f78e tab-focus behavior change between the two
+# pins is excluded. Full 48-task pilot, $3.56 = the remainder under the
+# cumulative USD 5 authority after the first three runs' computed
+# $1.4379, rounded down. Job timeout 360 min / task-start deadline 340
+# min so the cell is not truncated (both finite). Spend is guarded
 # two ways (bench/agent-eval/openrouter_run.py): each job has a per-cell
 # budget (--max-spend), and before every request the computed usage cost
 # so far plus retained reservations for unknown-outcome requests plus
@@ -51,7 +56,7 @@ on:
         default: "0"
       max_spend:
         description: "per-cell budget in USD (hard stop; see header)"
-        default: "4.08"
+        default: "3.56"
 
 permissions:
   contents: read
@@ -68,7 +73,7 @@ jobs:
           MODELS: ${{ inputs.models || 'deepseek-ai/DeepSeek-V4.1-Flash' }}
           COUNT: ${{ inputs.count || '48' }}
           OFFSET: ${{ inputs.offset || '0' }}
-          MAX_SPEND: ${{ inputs.max_spend || '4.08' }}
+          MAX_SPEND: ${{ inputs.max_spend || '3.56' }}
         run: |
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
           import json, os
@@ -76,7 +81,7 @@ jobs:
           for tool in [t.strip() for t in os.environ["TOOLS"].split(",") if t.strip()]:
               variant = "v0.5.0"
               if tool == "navigera-exp17":
-                  tool, variant = "navigera", "exp17-89ce1d4"
+                  tool, variant = "navigera", "exp17-2033910sk"
               for model in [m.strip() for m in os.environ["MODELS"].split(",") if m.strip()]:
                   cells.append({"tool": tool, "model": model, "variant": variant,
                                 "slug": model.replace("/", "-"),
@@ -94,7 +99,7 @@ jobs:
       matrix:
         cell: ${{ fromJson(needs.plan.outputs.matrix) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 155
+    timeout-minutes: 360
     environment: main
     env:
       SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
@@ -129,17 +134,26 @@ jobs:
       # candidate tree, per the cell's variant.
       - name: Build navigera (release; variant $VARIANT)
         run: |
-          if [ "$VARIANT" = "exp17-89ce1d4" ]; then
-            # Pinned candidate: this repo's experiment-17 tree at exactly
-            # 89ce1d4. The ancestry check fails the job rather than build a
-            # moved candidate.
-            git fetch --depth 1 origin experiment-17
+          if [ "$VARIANT" = "exp17-2033910sk" ]; then
+            # Assembled candidate: experiment-17 @ 89ce1d4 in full, except
+            # navigera/skills/navigera/SKILL.md from experiment-17 @ 2033910
+            # (the trimmed skill). The binary embeds the skill at compile
+            # time (include_str!), so the cell varies only the skill text
+            # against the 89ce1d4 run. Ancestry checks fail the job rather
+            # than build a moved candidate.
+            git fetch --depth 10 origin experiment-17
             git merge-base --is-ancestor 89ce1d4 FETCH_HEAD
+            git merge-base --is-ancestor 2033910 FETCH_HEAD
             mkdir -p "$RUNNER_TEMP/nav-build"
             git archive 89ce1d4 navigera | tar -x -C "$RUNNER_TEMP/nav-build"
+            git archive 2033910 navigera/skills/navigera/SKILL.md | tar -x -C "$RUNNER_TEMP/nav-build"
             mv "$RUNNER_TEMP/nav-build/navigera" "$RUNNER_TEMP/nav-build/src"
-            echo "candidate provenance: $(git rev-parse 89ce1d4)"
+            echo "base provenance: $(git rev-parse 89ce1d4)"
             git log -1 --format='commit %H %s' 89ce1d4
+            echo "skill provenance: $(git rev-parse 2033910)"
+            git log -1 --format='commit %H %s' 2033910
+            echo "skill sha256: $(sha256sum "$RUNNER_TEMP/nav-build/src/skills/navigera/SKILL.md")"
+            echo "skill bytes: $(wc -c < "$RUNNER_TEMP/nav-build/src/skills/navigera/SKILL.md")"
             cd "$RUNNER_TEMP/nav-build/src"
           else
             git clone --depth 1 --branch v0.5.0 https://github.com/andrey-usa/navigera "$RUNNER_TEMP/nav-build/src"
@@ -172,6 +186,7 @@ jobs:
         run: |
           python3 bench/webarena/webarena_run.py --tool "$TOOL" --model "$MODEL" \
             --offset "$OFFSET" --count "$COUNT" --max-spend "$MAX_SPEND" \
+            --deadline-minutes 340 \
             --nv-bin-dir "$NV_BIN_DIR" --out out/webarena
       - name: Upload the results
         if: always()
