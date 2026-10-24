@@ -2249,12 +2249,17 @@ impl Driver {
         if !old.is_attached() {
             old.close();
         }
+        // Each tab gets its page back, with a second try; one that still
+        // doesn't load is named in the result rather than left blank unsaid.
+        let mut missed = Vec::new();
         for (i, url) in urls.iter().enumerate() {
             if i > 0 {
                 self.session.new_page().map_err(|e| anyhow::anyhow!("{what}: reopen tab {i}: {e:#}"))?;
             }
             if !url.is_empty() && url != "about:blank" {
-                let _ = self.session.goto(url);
+                if let Err(e) = self.session.goto(url).or_else(|_| self.session.goto(url)) {
+                    missed.push(format!("tab {i} ({url}): {e:#}"));
+                }
             }
         }
         if active < urls.len() {
@@ -2262,6 +2267,9 @@ impl Driver {
         }
         let mut state = self.state_json();
         state["visible"] = json!(visible);
+        if !missed.is_empty() {
+            state["note"] = json!(format!("{what}: not every tab got its page back: {}", missed.join("; ")));
+        }
         Ok(state)
     }
 
