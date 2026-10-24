@@ -50,10 +50,14 @@ fn forks_share_a_browser_and_nothing_else() {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     let seen = op(&mut d, &["eval", "[localStorage.getItem('who'), document.cookie]"]);
                     let cookies = op(&mut d, &["cookies", "--all", "--json"]);
+                    // A tab it opens is in its own context too.
+                    op(&mut d, &["tab-new", &format!("{url}/effects")]);
+                    let in_new_tab = op(&mut d, &["eval", "document.cookie"]);
+                    op(&mut d, &["tab-close"]);
                     op(&mut d, &["click", "--selector", "#agree"]);
                     let checked = op(&mut d, &["get", "checked", "--selector", "#agree"]);
                     d.session().close();
-                    serde_json::json!({ "me": me, "seen": seen, "cookies": cookies.as_array().map(Vec::len), "checked": checked })
+                    serde_json::json!({ "me": me, "seen": seen, "cookies": cookies.as_array().map(Vec::len), "checked": checked, "new_tab": in_new_tab })
                 })
             })
             .collect();
@@ -64,6 +68,7 @@ fn forks_share_a_browser_and_nothing_else() {
         assert_eq!(r["seen"], serde_json::json!([me, format!("who={me}")]), "{r}");
         assert_eq!(r["cookies"], 1, "{r}");
         assert_eq!(r["checked"], true, "{r}");
+        assert_eq!(r["new_tab"], format!("who={me}"), "{r}");
     }
     // The owner still works after its forks are gone, and closes the browser.
     let mut owner = owner;

@@ -93,6 +93,9 @@ pub struct Shared {
     pub dialogs: Mutex<Vec<(Scope, Value)>>,
     /// Page session id -> the scope it belongs to.
     pub scopes: Mutex<HashMap<String, Scope>>,
+    /// Frame id of a subframe -> the scope of the tab it is in (a download
+    /// a subframe starts is that tab's).
+    pub frame_scopes: Mutex<HashMap<String, Scope>>,
     /// Page targets opened by a page (they carry an `openerId`), in order:
     /// (target, opener).
     pub opened: Mutex<Vec<(String, String)>>,
@@ -224,6 +227,16 @@ impl Shared {
         mv(&self.routes, from, to, keep);
         mv(&self.credentials, from, to, keep);
         mv(&self.policy, from, to, keep);
+        {
+            let mut frames = self.frame_scopes.lock().unwrap();
+            if keep {
+                for s in frames.values_mut().filter(|s| *s == from) {
+                    *s = to.to_string();
+                }
+            } else {
+                frames.retain(|_, s| s != from);
+            }
+        }
         // A session's downloads stay its own across `reset`; `reset --all`
         // forgets them (the files stay where they are).
         let mut downloads = self.downloads.lock().unwrap();
@@ -235,14 +248,32 @@ impl Shared {
             downloads.items.retain(|d| d.scope != from);
         }
         drop(downloads);
-        // Dialogs not reported yet still are, to the same session.
-        for (s, _) in self.dialogs.lock().unwrap().iter_mut().filter(|(s, _)| s == from) {
-            *s = to.to_string();
+        // Dialogs not reported yet still are, to the same session; after
+        // `reset --all` there are none, as in a new session.
+        let mut dialogs = self.dialogs.lock().unwrap();
+        if keep {
+            for (s, _) in dialogs.iter_mut().filter(|(s, _)| s == from) {
+                *s = to.to_string();
+            }
+        } else {
+            dialogs.retain(|(s, _)| s != from);
         }
+        drop(dialogs);
         let mut scopes = self.scopes.lock().unwrap();
         for s in scopes.values_mut().filter(|s| *s == from) {
             *s = to.to_string();
         }
+    }
+
+    /// A session closed (a fork): what its scope held goes with it.
+    pub fn drop_scope(&self, scope: &str) {
+        self.routes.lock().unwrap().remove(scope);
+        self.credentials.lock().unwrap().remove(scope);
+        self.policy.lock().unwrap().remove(scope);
+        self.dialogs.lock().unwrap().retain(|(s, _)| s != scope);
+        self.downloads.lock().unwrap().items.retain(|d| d.scope != scope);
+        self.frame_scopes.lock().unwrap().retain(|_, s| s != scope);
+        self.scopes.lock().unwrap().retain(|_, s| s != scope);
     }
 
     pub fn unregister(&self, session_id: &str) {
@@ -465,12 +496,30 @@ fn on_event(client: &CdpClient, shared: &Arc<Shared>, event: &Value) {
         note_popup(shared, method, &params, session);
     }
     shared.logs.lock().unwrap().on_event(method, &params, session);
+    // Subframes, with the scope of the tab they are in.
+    match method {
+        "Page.frameAttached" => {
+            if let Some(id) = params.get("frameId").and_then(Value::as_str) {
+                let scope = shared.scope_of(session);
+                shared.frame_scopes.lock().unwrap().insert(id.to_string(), scope);
+            }
+        }
+        "Page.frameDetached" => {
+            if let Some(id) = params.get("frameId").and_then(Value::as_str) {
+                shared.frame_scopes.lock().unwrap().remove(id);
+            }
+        }
+        _ => {}
+    }
     if method.starts_with("Browser.download") {
         // Started by a tab's main frame (its frame id is the tab's target
-        // id): that tab's scope.
+        // id) or one of its subframes: that tab's scope.
         let frame = params.get("frameId").and_then(Value::as_str).unwrap_or("");
         let tab = shared.sessions.lock().unwrap().iter().find(|(_, t)| *t == frame).map(|(s, _)| s.clone());
-        let scope = tab.map(|s| shared.scope_of(&s)).unwrap_or_default();
+        let scope = match tab {
+            Some(s) => shared.scope_of(&s),
+            None => shared.frame_scopes.lock().unwrap().get(frame).cloned().unwrap_or_default(),
+        };
         shared.downloads.lock().unwrap().on_event(method, &params, &scope);
     }
     match method {

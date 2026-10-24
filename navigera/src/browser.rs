@@ -878,7 +878,9 @@ impl BrowserSession {
             // `TargetAlreadyLoaded` as soon as a page exists.
             bail!("the lightpanda engine supports one tab only; use the chrome engine for tabs");
         }
-        let page = self.browser.new_page(Some("about:blank"))?;
+        // In this session's own browser context (a fork's, or the one
+        // `reset` made), not the default one.
+        let page = self.browser.new_page_with(Some("about:blank"), false, self.context.as_deref())?;
         self.apply_overrides(&page);
         self.apply_init_scripts(&page);
         self.pages.push(page);
@@ -2064,6 +2066,8 @@ impl BrowserSession {
             // its own context.
             if let (true, Some(context)) = (self.attached || !self.owner, self.context.as_deref()) {
                 let _ = self.browser.dispose_context(context);
+                // Its routes, answers and downloads go with it.
+                self.browser.shared().drop_scope(context);
             }
             if self.owner {
                 self.browser.close();
