@@ -195,6 +195,8 @@ pub struct Runner {
     opts: Options,
     fresh: bool,
     attempt: u32,
+    /// Which of `--repeat`'s runs is under way (0 when not repeated).
+    pub rep: u32,
 }
 
 impl Runner {
@@ -210,13 +212,13 @@ impl Runner {
             ..SessionConfig::default()
         };
         let driver = Driver::launch(&config)?;
-        Ok(Runner { driver, opts, fresh: true, attempt: 1 })
+        Ok(Runner { driver, opts, fresh: true, attempt: 1, rep: 0 })
     }
 
     /// Another runner on this one's browser, in a browser context of its
     /// own: a worker without a browser of its own.
     pub fn fork(&self) -> anyhow::Result<Self> {
-        Ok(Runner { driver: self.driver.fork()?, opts: self.opts.clone(), fresh: true, attempt: 1 })
+        Ok(Runner { driver: self.driver.fork()?, opts: self.opts.clone(), fresh: true, attempt: 1, rep: 0 })
     }
 
     /// A clean browser context for every scenario but the first one of
@@ -253,6 +255,7 @@ impl Runner {
         let mut scope = Scope::new(suite, &scenario.name, scenario.vars.clone(), &self.opts, file_vars);
         let mut steps = Vec::new();
         let mut failure = self.clean(scenario.line).err().map(|f| *f);
+        let downloads = if failure.is_none() { self.own_downloads(suite, &scenario.name) } else { None };
         let all: Vec<&Step> = suite.before_each.iter().chain(&scenario.steps).collect();
         if failure.is_none() {
             for step in all {
@@ -307,7 +310,34 @@ impl Runner {
         if let Some(f) = result.failure.as_mut() {
             mask_failure(f, &mask);
         }
+        tidy(downloads);
         result
+    }
+
+    /// The scenario's (or hook's) evidence: its screenshot, its downloads.
+    fn evidence_dir(&self, suite: &Suite, label: &str) -> PathBuf {
+        let mut dir = match self.rep {
+            0 => evidence_name(&suite.file, label),
+            k => evidence_name(&suite.file, &format!("{label} #{k}")),
+        };
+        if self.attempt > 1 {
+            dir.push_str(&format!("-try{}", self.attempt));
+        }
+        self.opts.evidence.join(dir)
+    }
+
+    /// Downloads go to a directory of the scenario's own, beside its
+    /// evidence, so a file name never carries over from an earlier
+    /// scenario (`report (2).csv`); `tidy` removes it when nothing came.
+    /// One a run before left files in (same `--evidence`) is kept, and the
+    /// next free name taken.
+    fn own_downloads(&mut self, suite: &Suite, label: &str) -> Option<PathBuf> {
+        let base = self.evidence_dir(suite, label);
+        let dir = (1..1000)
+            .map(|i| if i == 1 { base.join("downloads") } else { base.join(format!("downloads-{i}")) })
+            .find(|d| std::fs::read_dir(d).map_or(true, |mut e| e.next().is_none()))?;
+        let cmd = parse(&["downloads".into(), "--dir".into(), dir.display().to_string()]).ok()?;
+        self.driver.run(&cmd).ok().map(|_| dir)
     }
 
     /// A `before all` or `after all` block: in a clean context of its own;
@@ -321,14 +351,17 @@ impl Runner {
     ) -> Result<BTreeMap<String, String>, Box<Failure>> {
         let line = steps.first().map(|s| s.line).unwrap_or(0);
         self.clean(line)?;
+        let downloads = self.own_downloads(suite, label);
         let mut scope = Scope::new(suite, label, BTreeMap::new(), &self.opts, file_vars);
         for step in steps {
             if let Err(message) = self.step(step, &mut scope, suite) {
                 let mut f = self.failure(step, format!("{label}: {message}"), &scope, suite, label);
                 mask_failure(&mut f, &scope.masker());
+                tidy(downloads);
                 return Err(Box::new(f));
             }
         }
+        tidy(downloads);
         Ok(scope.saved)
     }
 
@@ -367,11 +400,7 @@ impl Runner {
                 v.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
             )
         });
-        let mut dir = evidence_name(&suite.file, label);
-        if self.attempt > 1 {
-            dir.push_str(&format!("-try{}", self.attempt));
-        }
-        let shot = self.opts.evidence.join(dir).join("screenshot.png");
+        let shot = self.evidence_dir(suite, label).join("screenshot.png");
         let screenshot = std::fs::create_dir_all(shot.parent().unwrap_or(Path::new(".")))
             .ok()
             .and_then(|_| {
@@ -519,6 +548,7 @@ impl Runner {
             opts: self.opts.clone(),
             fresh: true,
             attempt: 1,
+            rep: 0,
         };
         let label = format!("auth {}", auth.name);
         let mut scope = Scope::new(suite, &label, BTreeMap::new(), &self.opts, &BTreeMap::new());
@@ -976,6 +1006,18 @@ fn describe(e: &Expect, value: &str, actual: &str, limit: Duration) -> String {
         actual.to_string()
     };
     format!("expected {not}{what}{want} within {} ms; saw {seen:?}", limit.as_millis())
+}
+
+/// A downloads directory nothing landed in, and the evidence directory
+/// above it when that is empty too.
+fn tidy(downloads: Option<PathBuf>) {
+    if let Some(dir) = downloads {
+        if std::fs::remove_dir(&dir).is_ok() {
+            if let Some(parent) = dir.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
 }
 
 fn evidence_name(file: &Path, scenario: &str) -> String {

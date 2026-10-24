@@ -284,7 +284,16 @@ impl Browser {
             params["browserContextId"] = json!(context);
         }
         self.block_on(self.client.send("Browser.setDownloadBehavior", params, None, CMD_TIMEOUT))?;
-        self.shared.downloads.lock().unwrap().dir = dir.map(std::path::Path::to_path_buf);
+        let mut downloads = self.shared.downloads.lock().unwrap();
+        match (context, dir) {
+            (None, dir) => downloads.dir = dir.map(std::path::Path::to_path_buf),
+            (Some(c), Some(d)) => {
+                downloads.dirs.insert(c.to_string(), d.to_path_buf());
+            }
+            (Some(c), None) => {
+                downloads.dirs.remove(c);
+            }
+        }
         Ok(())
     }
 

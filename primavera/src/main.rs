@@ -48,7 +48,7 @@ run options:
   --wait-ms <ms>        how long a step waits for its element (navigera's default 5000)
   --headed              show the browser
   --chromium <path>     the browser to run
-  --evidence <dir>      failure screenshots (default .primavera/runs/<time>)
+  --evidence <dir>      failure screenshots and downloads (default .primavera/runs/<time>)
   --pause-on-failure    keep the browser at a failure, open to `navigera --attach`, until Enter (one worker)
 
 exit codes: 0 all passed, 1 a scenario failed, 2 a file or an argument is wrong, 3 the browser didn't start
@@ -635,6 +635,7 @@ fn worker(
         let Some(r) = browser.as_mut() else { return };
         let (suite, sc) = job.get(suites);
         let job_rep = job.rep;
+        r.rep = job_rep;
         let before = if suite.before_all.is_empty() {
             Ok(BTreeMap::new())
         } else {

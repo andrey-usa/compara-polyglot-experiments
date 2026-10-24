@@ -23,6 +23,9 @@ pub struct Download {
     pub path: Option<PathBuf>,
     /// The scope (browser context) of the tab that started it.
     pub scope: String,
+    /// The directory the browser saves it in (its scope's, when it has
+    /// its own).
+    pub dir: Option<PathBuf>,
 }
 
 impl Download {
@@ -42,6 +45,9 @@ impl Download {
 pub struct Downloads {
     /// Where files go; `None` when the browser's own setting is kept.
     pub dir: Option<PathBuf>,
+    /// A browser context's own directory (`downloads --dir`, a fork's or a
+    /// `reset`'s new context), by scope; others use `dir`.
+    pub dirs: std::collections::HashMap<String, PathBuf>,
     pub items: Vec<Download>,
     next: u64,
 }
@@ -65,13 +71,13 @@ impl Downloads {
                     total: 0,
                     path: None,
                     scope: scope.to_string(),
+                    dir: self.dirs.get(scope).or(self.dir.as_ref()).cloned(),
                 });
                 if self.items.len() > 1000 {
                     self.items.remove(0);
                 }
             }
             "Browser.downloadProgress" => {
-                let dir = self.dir.clone();
                 let taken: Vec<PathBuf> = self.items.iter().filter_map(|d| d.path.clone()).collect();
                 let Some(d) = self.items.iter_mut().find(|d| d.guid == guid) else {
                     return;
@@ -80,7 +86,7 @@ impl Downloads {
                 d.total = params.get("totalBytes").and_then(Value::as_f64).unwrap_or(0.0) as u64;
                 let state = params.get("state").and_then(Value::as_str).unwrap_or("inProgress");
                 if state == "completed" && d.state != "completed" {
-                    if let Some(dir) = dir {
+                    if let Some(dir) = d.dir.clone() {
                         d.path = Some(settle(&dir, &d.guid, &d.suggested, &taken));
                     }
                 }
@@ -164,5 +170,30 @@ mod tests {
         assert_eq!(names, ["r.csv", "r (2).csv"]);
         assert_eq!(std::fs::read_to_string(dir.path().join("r (2).csv")).unwrap(), "g2");
         assert_eq!(d.items[0].to_json()["state"], "completed");
+    }
+
+    #[test]
+    fn a_scope_with_its_own_directory_starts_its_names_over() {
+        let shared = tempfile::tempdir().unwrap();
+        let own = tempfile::tempdir().unwrap();
+        let mut d = Downloads { dir: Some(shared.path().to_path_buf()), ..Default::default() };
+        d.dirs.insert("ctx".into(), own.path().to_path_buf());
+        std::fs::write(shared.path().join("r.csv"), "old").unwrap();
+        for (guid, scope, dir) in [("g1", "", shared.path()), ("g2", "ctx", own.path())] {
+            std::fs::write(dir.join(guid), guid).unwrap();
+            d.on_event(
+                "Browser.downloadWillBegin",
+                &json!({"guid": guid, "url": "http://x/r.csv", "suggestedFilename": "r.csv"}),
+                scope,
+            );
+            d.on_event(
+                "Browser.downloadProgress",
+                &json!({"guid": guid, "receivedBytes": 2, "totalBytes": 2, "state": "completed"}),
+                scope,
+            );
+        }
+        assert_eq!(d.items[0].path.as_deref(), Some(shared.path().join("r (2).csv").as_path()));
+        assert_eq!(d.items[1].path.as_deref(), Some(own.path().join("r.csv").as_path()));
+        assert_eq!(std::fs::read_to_string(own.path().join("r.csv")).unwrap(), "g2");
     }
 }

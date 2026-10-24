@@ -61,3 +61,23 @@ jobs:
           print(f"::notice title={sys.argv[2]}::" + msg[:3800].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
           PY
           exit $code
+      - name: The 40-scenario suite
+        if: always() && hashFiles('primavera-bench/suite40/pv/**') != ''
+        run: |
+          set +e -uo pipefail
+          S=../primavera-bench/suite40
+          python3 $S/site/server.py --port 18001 > site40.out 2>&1 &
+          python3 $S/gauntlet/server.py --port 18201 --xo-port 18202 --seed 7 --jitter 0 --telemetry 1 > gauntlet.out 2>&1 &
+          for _ in $(seq 150); do
+            curl -sf -o /dev/null http://127.0.0.1:18001/ && curl -sf -o /dev/null http://127.0.0.1:18202/xo-form && break
+            sleep 0.2
+          done
+          [ -x target/debug/primavera ] || cargo build --locked
+          export GAUNTLET_URL=http://127.0.0.1:18201
+          ./target/debug/primavera run $S/pv --base-url http://127.0.0.1:18001 --workers 4 \
+            --repeat 3 --shuffle --junit suite40.xml 2>&1 | tee suite40.log
+          code=${PIPESTATUS[0]}
+          tally=$(grep -E "^[0-9]+ passed" suite40.log | tail -1)
+          flaky=$(grep -cE "^FLAKY" suite40.log)
+          echo "::notice title=primavera suite40 $RUNNER_OS::40 scenarios x3, 4 workers, shuffled: ${tally:-no tally} (flaky: $flaky)"
+          exit $code

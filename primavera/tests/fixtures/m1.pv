@@ -15,6 +15,7 @@ scenario "Subjects"
   click --selector "#dl"
   expect download report-*.csv
   expect ${download.name} is report-2026.csv
+  expect ${download.path} contains downloads
   expect ${scenario.name} is Subjects
   expect ${run.id} matches "^[0-9]+-[0-9]+$"
 

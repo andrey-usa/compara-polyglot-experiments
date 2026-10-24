@@ -102,7 +102,7 @@ milestones are in agent-guidance `plans/prova.md`.
 | `request … count` + a comparison | how many matching requests |
 | `cookie <name>` [+ a comparison], `no cookie <name>`, `cookie <name> absent` | a cookie of the scenario's browser context |
 | `storage local\|session <key>` [+ a comparison \| `absent`] | Local or Session Storage |
-| `download <file glob>`, `no download …` | a finished download (then `${download.path}`, `${download.name}`: the latest match; a second file of the same name arrives as `name (2).ext`) |
+| `download <file glob>`, `no download …` | a finished download (then `${download.path}`, `${download.name}`: the latest match). Each scenario's downloads go to a directory of its own beside its evidence (`.primavera/runs/<time>/<scenario>/downloads`, kept only when something came), so a name never carries over from another scenario; a second file of the same name in one scenario arrives as `name (2).ext` |
 | `console` + a comparison, `no console "<t>"` | a console message (any level) |
 | `no errors` | no page exceptions or console errors |
 | `not …` | any of them, negated |
