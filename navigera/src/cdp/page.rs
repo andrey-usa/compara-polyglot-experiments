@@ -1469,13 +1469,7 @@ impl Page {
         self.block_on(async {
             let mut events = self.client.subscribe();
             let res = self
-                .client
-                .send(
-                    "Page.navigate",
-                    json!({ "url": url }),
-                    Some(&self.session_id),
-                    timeout,
-                )
+                .send_page_op("Page.navigate", json!({ "url": url }), timeout)
                 .await
                 .with_context(|| format!("navigate to {url}"))?;
             if let Some(error) = res.get("errorText").and_then(Value::as_str) {
@@ -1588,7 +1582,7 @@ impl Page {
     pub fn reload(&self, timeout: Duration) -> Result<()> {
         self.block_on(async {
             let mut events = self.client.subscribe();
-            self.client.send("Page.reload", json!({}), Some(&self.session_id), timeout).await?;
+            self.send_page_op("Page.reload", json!({}), timeout).await?;
             let mut committed = false;
             self.wait_event(&mut events, timeout, |method, params| {
                 if method == "Page.frameNavigated" && params.get("frame").is_some_and(|f| f.get("parentId").is_none()) {
@@ -1599,6 +1593,23 @@ impl Page {
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for reload"))
         })
+    }
+
+    /// `Page.navigate`/`Page.reload`, again after a moment when the tab's
+    /// frame was between two documents ("Not attached to an active page":
+    /// refused before anything happened, so trying again is safe). Seen once
+    /// in ~700 reloads of a parallel test run.
+    async fn send_page_op(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        let mut tries = 0;
+        loop {
+            match self.client.send(method, params.clone(), Some(&self.session_id), timeout).await {
+                Err(e) if tries < 3 && format!("{e:#}").contains("Not attached to an active page") => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(100 * tries)).await;
+                }
+                other => return other,
+            }
+        }
     }
 
     /// If an earlier action started a navigation in this tab, wait (up to
