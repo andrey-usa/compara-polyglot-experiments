@@ -14,11 +14,12 @@ name: webarena-eval
 # the `main` environment as SILICONFLOW_API_KEY.
 #
 # This workflow exists only on experiment-23, which the dispatch API
-# cannot address (it indexes workflows from the default branch), so the
+# cannot address (it indexes workflows from the default branch), so
 # a push to the harness paths fires it - the push default is now the
-# pilot remainder slice (offset 10, 38 tasks x 2 tools, $2.37/cell:
-# the per-cell remainder under the cumulative USD 5 authority after the
-# smoke's computed $0.0582 + $0.1239, rounded down). Spend is guarded
+# candidate cell: navigera built from this repo's experiment-17 tree
+# pinned at 89ce1d4 (the "0.6 candidate"), the full 48-task pilot,
+# $4.08 = the remainder under the cumulative USD 5 authority after the
+# first two runs' computed $0.9176, rounded down. Spend is guarded
 # two ways (bench/agent-eval/openrouter_run.py): each job has a per-cell
 # budget (--max-spend), and before every request the computed usage cost
 # so far plus retained reservations for unknown-outcome requests plus
@@ -44,13 +45,13 @@ on:
         default: "deepseek-ai/DeepSeek-V4.1-Flash"
       count:
         description: "pilot tasks per cell"
-        default: "38"
+        default: "48"
       offset:
         description: "start at this index into pilot_tasks.json"
-        default: "10"
+        default: "0"
       max_spend:
         description: "per-cell budget in USD (hard stop; see header)"
-        default: "2.37"
+        default: "4.08"
 
 permissions:
   contents: read
@@ -63,18 +64,21 @@ jobs:
     steps:
       - id: m
         env:
-          TOOLS: ${{ inputs.tools || 'navigera,agent-browser' }}
+          TOOLS: ${{ inputs.tools || 'navigera-exp17' }}
           MODELS: ${{ inputs.models || 'deepseek-ai/DeepSeek-V4.1-Flash' }}
-          COUNT: ${{ inputs.count || '38' }}
-          OFFSET: ${{ inputs.offset || '10' }}
-          MAX_SPEND: ${{ inputs.max_spend || '2.37' }}
+          COUNT: ${{ inputs.count || '48' }}
+          OFFSET: ${{ inputs.offset || '0' }}
+          MAX_SPEND: ${{ inputs.max_spend || '4.08' }}
         run: |
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
           import json, os
           cells = []
           for tool in [t.strip() for t in os.environ["TOOLS"].split(",") if t.strip()]:
+              variant = "v0.5.0"
+              if tool == "navigera-exp17":
+                  tool, variant = "navigera", "exp17-89ce1d4"
               for model in [m.strip() for m in os.environ["MODELS"].split(",") if m.strip()]:
-                  cells.append({"tool": tool, "model": model,
+                  cells.append({"tool": tool, "model": model, "variant": variant,
                                 "slug": model.replace("/", "-"),
                                 "count": os.environ["COUNT"], "offset": os.environ["OFFSET"],
                                 "max_spend": os.environ["MAX_SPEND"]})
@@ -84,7 +88,7 @@ jobs:
   eval:
     needs: plan
     if: needs.plan.outputs.matrix != '[]'
-    name: WebArena-Verified (${{ matrix.cell.tool }} × ${{ matrix.cell.slug }})
+    name: WebArena-Verified (${{ matrix.cell.tool }}[${{ matrix.cell.variant }}] × ${{ matrix.cell.slug }})
     strategy:
       fail-fast: false
       matrix:
@@ -95,6 +99,7 @@ jobs:
     env:
       SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
       TOOL: ${{ matrix.cell.tool }}
+      VARIANT: ${{ matrix.cell.variant }}
       MODEL: ${{ matrix.cell.model }}
       COUNT: ${{ matrix.cell.count }}
       OFFSET: ${{ matrix.cell.offset }}
@@ -120,15 +125,31 @@ jobs:
         if: startsWith(matrix.cell.tool, 'agent-browser')
         with:
           node-version: 24
-      # navigera is its own public repository; build the pinned tag.
-      - name: Build navigera (release, v0.5.0)
+      # Build navigera: the pinned v0.5.0 tag, or the pinned experiment-17
+      # candidate tree, per the cell's variant.
+      - name: Build navigera (release; variant $VARIANT)
         run: |
-          git clone --depth 1 --branch v0.5.0 https://github.com/andrey-usa/navigera "$RUNNER_TEMP/navigera"
-          cd "$RUNNER_TEMP/navigera"
+          if [ "$VARIANT" = "exp17-89ce1d4" ]; then
+            # Pinned candidate: this repo's experiment-17 tree at exactly
+            # 89ce1d4. The ancestry check fails the job rather than build a
+            # moved candidate.
+            git fetch --depth 1 origin experiment-17
+            git merge-base --is-ancestor 89ce1d4 FETCH_HEAD
+            mkdir -p "$RUNNER_TEMP/nav-build"
+            git archive 89ce1d4 navigera | tar -x -C "$RUNNER_TEMP/nav-build"
+            mv "$RUNNER_TEMP/nav-build/navigera" "$RUNNER_TEMP/nav-build/src"
+            echo "candidate provenance: $(git rev-parse 89ce1d4)"
+            git log -1 --format='commit %H %s' 89ce1d4
+            cd "$RUNNER_TEMP/nav-build/src"
+          else
+            git clone --depth 1 --branch v0.5.0 https://github.com/andrey-usa/navigera "$RUNNER_TEMP/nav-build/src"
+            git -C "$RUNNER_TEMP/nav-build/src" log -1 --format='commit %H %s'
+            cd "$RUNNER_TEMP/nav-build/src"
+          fi
           cargo build --release --locked --bin navigera
           rustup default stable
-          echo "NV_BIN_DIR=$RUNNER_TEMP/navigera/target/release" >> "$GITHUB_ENV"
-          "$RUNNER_TEMP/navigera/target/release/navigera" --version
+          echo "NV_BIN_DIR=$RUNNER_TEMP/nav-build/src/target/release" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/nav-build/src/target/release/navigera" --version
       - name: Chrome
         run: |
           echo "CHROME_BIN=$(which google-chrome)" >> "$GITHUB_ENV"
@@ -156,6 +177,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: webarena-eval-${{ matrix.cell.tool }}-${{ matrix.cell.slug }}-o${{ matrix.cell.offset }}c${{ matrix.cell.count }}
+          name: webarena-eval-${{ matrix.cell.tool }}-${{ matrix.cell.variant }}-${{ matrix.cell.slug }}-o${{ matrix.cell.offset }}c${{ matrix.cell.count }}
           path: out/webarena/
           if-no-files-found: ignore
