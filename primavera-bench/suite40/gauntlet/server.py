@@ -96,9 +96,19 @@ def page(name):
     return deco
 
 
+def draw(name):
+    """The random source for one page's timings: the run's one stream, or
+    with --fixed-delays a stream of the page's own, started over on every
+    load, so every load waits the same (a benchmark compares tools, not
+    draws)."""
+    if CFG.get("fixed"):
+        return random.Random("%d:%s" % (CFG["seed"], name))
+    return CFG["rng"]
+
+
 @page("late-render")
 def late_render():
-    delay = 1.0 + CFG["rng"].random() * 7.0          # 1..8 s, seeded
+    delay = 1.0 + draw("late-render").random() * 7.0  # 1..8 s, seeded
     CFG["late_render_delay"] = delay
     return shell("late-render", "Late render",
         "Wait until the app says Ready (data arrives after a seeded 1-8 s "
@@ -289,8 +299,9 @@ def modal_late_handlers_verdict(evs):
 
 @page("slow-xhr")
 def slow_xhr():
-    base = 2.0 + CFG["rng"].random() * 2.0            # 2..4 s, seeded
-    jit = CFG["rng"].random() * CFG["jitter_ms"] / 1000.0
+    rng = draw("slow-xhr")
+    base = 2.0 + rng.random() * 2.0                    # 2..4 s, seeded
+    jit = rng.random() * CFG["jitter_ms"] / 1000.0
     CFG["slow_xhr_delay"] = base + jit
     return shell("slow-xhr", "Slow and jittery XHR",
         "Click Load, then use the result. The XHR takes a seeded 2-4 s plus "
@@ -840,6 +851,8 @@ def main():
                          "0: pages buffer events and flush one batch on "
                          "__flushEvents(), so per-event logging requests do "
                          "not mask click-effect detection")
+    ap.add_argument("--fixed-delays", action="store_true",
+                    help="every load of a page waits the same seeded time")
     args = ap.parse_args()
 
     port = free_port() if args.port == 0 else args.port
@@ -848,7 +861,7 @@ def main():
 
     CFG.update(seed=args.seed, jitter_ms=args.jitter, rng=rng,
                port=port, xo_port=xo_port, download_served=False,
-               telemetry=args.telemetry)
+               telemetry=args.telemetry, fixed=args.fixed_delays)
 
     main_srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     main_srv.is_xo = False

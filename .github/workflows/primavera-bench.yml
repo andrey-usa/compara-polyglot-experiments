@@ -88,7 +88,10 @@ jobs:
           set +e -uo pipefail
           S=primavera-bench/suite40
           python3 $S/site/server.py --port 18001 > site40.out 2>&1 &
-          python3 $S/gauntlet/server.py --port 18201 --xo-port 18202 --seed 7 --jitter 0 --telemetry 1 > gauntlet.out 2>&1 &
+          # --fixed-delays: every load of a gauntlet page waits the same
+          # seeded time (late render 1.6 s, slow XHR 2.2 s), so both tools
+          # and every round wait alike.
+          python3 $S/gauntlet/server.py --port 18201 --xo-port 18202 --seed 7 --jitter 0 --telemetry 1 --fixed-delays > gauntlet.out 2>&1 &
           for _ in $(seq 100); do
             curl -sf -o /dev/null http://127.0.0.1:18001/ && curl -sf -o /dev/null http://127.0.0.1:18202/xo-form && break
             sleep 0.2
@@ -104,10 +107,21 @@ jobs:
             --scenarios $S/pv \
             --pw $S/pw --site "$BASE_URL" --rounds 9 --grep "accepting the cookie banner" 2>&1 | tee bench40.md
           code=${PIPESTATUS[0]}
-          python3 - bench40.md <<'PY'
+          # The 25 everyday flows alone (s01-s25): the 15 hard ones wait on
+          # the app by design (1.6-2.6 s each), which is the same for any tool.
+          python3 primavera-bench/bench.py \
+            --title "primavera vs Playwright Test, the 25 everyday flows" \
+            --primavera primavera/target/release/primavera \
+            --chromium "$CHROME_SHELL" \
+            --scenarios $S/pv/s[0-9][0-9]-*.pv \
+            --pw $S/pw --pw-grep "s[0-9][0-9] — " --site "$BASE_URL" --rounds 9 --grep "accepting the cookie banner" 2>&1 | tee bench25.md
+          code25=${PIPESTATUS[0]}
+          python3 - bench40.md "primavera bench 40" bench25.md "primavera bench 25" <<'PY'
           import sys
-          text = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
-          print("::notice title=primavera bench 40::" + text[-3800:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          for path, title in zip(sys.argv[1::2], sys.argv[2::2]):
+              text = open(path, encoding="utf-8", errors="replace").read().strip()
+              print(f"::notice title={title}::" + text[-3800:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
           PY
-          cat bench40.md >> "$GITHUB_STEP_SUMMARY"
+          cat bench40.md bench25.md >> "$GITHUB_STEP_SUMMARY"
+          [ $code -eq 0 ] && exit $code25
           exit $code

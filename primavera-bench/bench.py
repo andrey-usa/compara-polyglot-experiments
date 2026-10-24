@@ -106,6 +106,7 @@ def main():
     ap.add_argument("--grep", default="empty cart")
     ap.add_argument("--chromium", help="the Chrome primavera runs (Playwright: channel chrome)")
     ap.add_argument("--title", default="primavera vs Playwright Test")
+    ap.add_argument("--pw-grep", help="only the Playwright tests whose title matches (-g), to match --scenarios")
     a = ap.parse_args()
 
     env = dict(os.environ, BASE_URL=a.site, CI="1")
@@ -113,11 +114,12 @@ def main():
     scen = [os.path.abspath(x) for x in a.scenarios]
     npx = shutil.which("npx") or "npx"
     extra = ["--chromium", a.chromium] if a.chromium else []
+    pw_only = ["-g", a.pw_grep] if a.pw_grep else []
     tools = {
         "primavera (1 worker)": ([pv, "run", *scen, "--base-url", a.site] + extra, None),
         "primavera (4 workers)": ([pv, "run", *scen, "--base-url", a.site, "--workers", "4"] + extra, None),
-        "playwright test (1 worker)": ([npx, "playwright", "test", "--workers=1"], a.pw),
-        "playwright test (4 workers)": ([npx, "playwright", "test", "--workers=4"], a.pw),
+        "playwright test (1 worker)": ([npx, "playwright", "test", "--workers=1", *pw_only], a.pw),
+        "playwright test (4 workers)": ([npx, "playwright", "test", "--workers=4", *pw_only], a.pw),
     }
     one = {
         "primavera (1 worker)": ([pv, "run", *scen, "--base-url", a.site, "--grep", a.grep] + extra, None),

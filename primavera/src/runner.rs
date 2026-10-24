@@ -674,8 +674,13 @@ impl Runner {
     /// One look: whether the subject holds, and what was seen.
     fn check(&mut self, e: &Expect, value: &str, scope: &Scope, left: Duration) -> Result<(bool, String), String> {
         // Each read waits for its element at most this long, so an
-        // expectation keeps being re-read until its own deadline.
-        let poll_ms = left.as_millis().clamp(50, 1000).to_string();
+        // expectation keeps being re-read until its own deadline. When the
+        // element's absence is an answer (`hidden`, any `not …`), a read
+        // doesn't wait for it to appear: that held every such look up by a
+        // second (a dismissed banner took 2 s to be seen gone).
+        let absence_answers =
+            e.negate || matches!(&e.subject, Subject::Target { prop: Prop::State(s), .. } if s == "hidden");
+        let poll_ms = if absence_answers { "0".to_string() } else { left.as_millis().clamp(50, 1000).to_string() };
         Ok(match &e.subject {
             Subject::Url | Subject::Title => {
                 let v = self.command(&["url".into()])?;
