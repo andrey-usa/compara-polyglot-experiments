@@ -56,13 +56,33 @@ jobs:
       - name: Tests
         run: |
           set +e -o pipefail
+          # A watchdog under the job's timeout: a hung test is killed and named
+          # in the annotation (the job log isn't readable from everywhere).
+          cat > watchdog.py <<'PY'
+          import os, signal, subprocess, sys
+          log, limit, cmd = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+          with open(log, "w", encoding="utf-8", errors="replace") as f:
+              p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, start_new_session=(os.name != "nt"))
+              try:
+                  code = p.wait(timeout=limit)
+              except subprocess.TimeoutExpired:
+                  if os.name != "nt":
+                      os.killpg(p.pid, signal.SIGKILL)
+                  else:
+                      p.kill()
+                  p.wait()
+                  code = 124
+                  f.write(f"\nWATCHDOG: killed after {limit} s\n")
+          sys.stdout.write(open(log, encoding="utf-8", errors="replace").read())
+          sys.exit(code)
+          PY
           if [ "$RUNNER_OS" = Linux ]; then
             # A display for `show`.
-            xvfb-run -a cargo test --locked --no-fail-fast 2>&1 | tee test.log
+            python3 watchdog.py test.log 1500 xvfb-run -a cargo test --locked --no-fail-fast
           else
-            cargo test --locked --no-fail-fast --lib --test interactions --test handoff --test attach --test commands --test fork --test verify_scopes 2>&1 | tee test.log
+            python3 watchdog.py test.log 1500 cargo test --locked --no-fail-fast --lib --test interactions --test handoff --test attach --test commands --test fork --test verify_scopes
           fi
-          code=${PIPESTATUS[0]}
+          code=$?
           python3 - test.log "interactions $RUNNER_OS" <<'PY'
           import re, sys
           WATCH = {"a_covered_element_is_not_clicked_unless_forced", "locators_reach_into_same_origin_frames",
@@ -74,6 +94,11 @@ jobs:
           handoff = [f"{n}: {r}" for n, r in ran if r == "FAILED" or n in WATCH]
           panics = re.findall(r"panicked at .*?\n(.*?)\n", text, re.S)
           msg = f"{passed} passed, {len(failed)} failed {failed}\n" + "\n".join(handoff)
+          slow = re.findall(r"^test (\S+) has been running for over \d+ seconds", text, re.M)
+          if slow:
+              msg += "\nslow: " + ", ".join(slow)
+          if "WATCHDOG: killed" in text:
+              msg += "\nWATCHDOG killed the run; last lines:\n" + "\n".join(text.strip().splitlines()[-25:])
           if panics:
               msg += "\n" + "\n".join(p[:600] for p in panics[:4])
           print(f"::notice title={sys.argv[2]}::" + msg[:3800].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
