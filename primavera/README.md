@@ -47,7 +47,10 @@ Status: **M1 in progress** (working name).
   after `expect download`.
 - `${secret:NAME}`: from the environment, else `--secrets <file>`
   (`NAME=value` lines). Its value is masked as `***` in everything the run
-  prints and saves.
+  prints and saves (messages, the page's URL and title, saved values,
+  JUnit and JSON lines).
+- A default with spaces is one word: quote it whole,
+  `"${GREETING:-hello there}"` (words split before `${…}` is filled in).
 - `save NAME = <command>` keeps a command's result (`get text …`).
 - `flow name(a, b)` at the top level holds steps; `run name x y` runs them
   with `${a}` and `${b}` set. `use other.pv` takes another file's flows
@@ -93,7 +96,7 @@ Status: **M1 in progress** (working name).
 | `request … count` + a comparison | how many matching requests |
 | `cookie <name>` [+ a comparison], `no cookie <name>`, `cookie <name> absent` | a cookie of the scenario's browser context |
 | `storage local\|session <key>` [+ a comparison \| `absent`] | Local or Session Storage |
-| `download <file glob>`, `no download …` | a finished download (then `${download.path}`) |
+| `download <file glob>`, `no download …` | a finished download (then `${download.path}`, `${download.name}`: the latest match; a second file of the same name arrives as `name (2).ext`) |
 | `console` + a comparison, `no console "<t>"` | a console message (any level) |
 | `no errors` | no page exceptions or console errors |
 | `not …` | any of them, negated |
@@ -149,7 +152,10 @@ primavera list [<file.pv|dir>...]
 - `--pause-on-failure` stops at a failure with the browser as the failure
   left it and prints how to look at that very tab (`navigera -s pv start
   --attach ws://…/devtools/page/…`, then `navigera -s pv ax`); Enter goes
-  on with the run. It runs one worker.
+  on with the run. It runs one worker. With no terminal to press Enter in,
+  it waits `PRIMAVERA_PAUSE_S` seconds (default 600, for an agent looking
+  from elsewhere), and under CI (`CI` set) it doesn't pause unless that is
+  set.
 - Exit codes: 0 passed, 1 a scenario failed, 2 a file or argument is wrong,
   3 the browser didn't start.
 

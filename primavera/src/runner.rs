@@ -305,7 +305,7 @@ impl Runner {
         result.saved = scope.saved.into_iter().map(|(k, v)| (k, mask(&v))).collect();
         result.notes = scope.notes.iter().map(|n| mask(n)).collect();
         if let Some(f) = result.failure.as_mut() {
-            f.message = mask(&f.message);
+            mask_failure(f, &mask);
         }
         result
     }
@@ -325,7 +325,7 @@ impl Runner {
         for step in steps {
             if let Err(message) = self.step(step, &mut scope, suite) {
                 let mut f = self.failure(step, format!("{label}: {message}"), &scope, suite, label);
-                f.message = scope.masker()(&f.message);
+                mask_failure(&mut f, &scope.masker());
                 return Err(Box::new(f));
             }
         }
@@ -343,9 +343,20 @@ impl Runner {
             f.line
         );
         if enter(None).is_err() {
-            let secs: u64 = std::env::var("PRIMAVERA_PAUSE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
-            eprintln!("        (no terminal input here: going on in {secs} s)");
-            std::thread::sleep(Duration::from_secs(secs));
+            // No one can press Enter: an agent looking from elsewhere gets
+            // a while (PRIMAVERA_PAUSE_S, default 600 s); CI none.
+            let ci = std::env::var("CI").is_ok_and(|v| !v.is_empty() && v != "false");
+            let secs: u64 = std::env::var("PRIMAVERA_PAUSE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(if ci {
+                0
+            } else {
+                600
+            });
+            if secs == 0 {
+                eprintln!("        (no terminal input, and CI: not pausing; PRIMAVERA_PAUSE_S=<s> to pause anyway)");
+            } else {
+                eprintln!("        (no terminal input here: going on in {secs} s; PRIMAVERA_PAUSE_S sets how long)");
+                std::thread::sleep(Duration::from_secs(secs));
+            }
         }
     }
 
@@ -1068,6 +1079,25 @@ impl Scope {
 
     fn words(&self, ws: &[String]) -> Result<Vec<String>, String> {
         ws.iter().map(|w| self.word(w)).collect()
+    }
+}
+
+/// A failure as the run prints and saves it: secrets used in the scenario
+/// replaced by `***` wherever they could show (the message, the page's URL
+/// and title, what the page offered instead).
+fn mask_failure(f: &mut Failure, mask: &impl Fn(&str) -> String) {
+    f.message = mask(&f.message);
+    f.text = mask(&f.text);
+    if let Some((url, title)) = f.at.as_mut() {
+        *url = mask(url);
+        *title = mask(title);
+    }
+    for (what, locator, _) in f.nearest.iter_mut() {
+        *what = mask(what);
+        *locator = mask(locator);
+    }
+    if let Some(hint) = f.hint.as_mut() {
+        *hint = mask(hint);
     }
 }
 
