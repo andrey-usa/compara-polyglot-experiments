@@ -201,7 +201,7 @@ another; either origin) looks only there, for element commands and
 | `click … --button right`, `select <ref> a b`, `select <ref> --add c` | right click (context menu); several options at once, or added to a multiple select. `select` also works on custom dropdowns (react-select style): it opens them and clicks the option |
 | `fill --keys <ref> "text"` | type over the field key by key, for forms that ignore a value set directly ("looks filled, then says required") |
 | `scroll --selector "#list" --to bottom` | scroll inside a box (lists that load more at their end) |
-| `downloads`, `wait --download "*.csv"` | files the page downloaded, with their paths |
+| `downloads`, `wait --download "*.csv"` | files the page downloaded, with their paths; `downloads --dir <path>` saves this session's there |
 | `cookies`, `cookies set <name> <value>`, `storage [get\|set k v]` | cookies and localStorage |
 | `state save auth.json` … `state load auth.json` | sign in once, reuse the session later (Playwright storageState format) |
 | `set device "iPhone 15"`, `set viewport 1280 720`, `set media dark`, `set geo <lat> <lon>`, `set offline on`, `set credentials <user> <pass>` | emulate (`off` resets) |

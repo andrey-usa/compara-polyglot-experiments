@@ -537,6 +537,9 @@ pub struct BrowserSession {
     /// binary that runs it.
     profile_dir: Option<std::path::PathBuf>,
     profile_exe: Option<String>,
+    /// Where this session's downloads go (`downloads --dir`), when not
+    /// the process's download directory; kept across `reset`.
+    downloads_dir: Option<std::path::PathBuf>,
     /// `set …` overrides (keyed by what they set): applied to every open
     /// tab and replayed on tabs opened later.
     overrides: std::collections::BTreeMap<&'static str, Vec<(&'static str, serde_json::Value)>>,
@@ -690,6 +693,7 @@ impl BrowserSession {
             attached: false,
             profile_dir: None,
             profile_exe: None,
+            downloads_dir: None,
             overrides: Default::default(),
             init_scripts: Vec::new(),
             init_ids: Default::default(),
@@ -766,6 +770,7 @@ impl BrowserSession {
             attached: true,
             profile_dir,
             profile_exe,
+            downloads_dir: None,
             overrides: Default::default(),
             init_scripts: Vec::new(),
             init_ids: Default::default(),
@@ -819,6 +824,21 @@ impl BrowserSession {
     }
 
     /// This session's downloads so far (`clear` empties its list afterwards).
+    /// Save this session's downloads in `dir` from now on (created if
+    /// missing), across `reset`; other sessions keep theirs. A test runner
+    /// gives each test its own, so names don't carry over between tests.
+    pub fn set_downloads_dir(&mut self, dir: &std::path::Path) -> Result<std::path::PathBuf> {
+        if self.lightpanda {
+            bail!("downloads --dir needs the chrome engine");
+        }
+        std::fs::create_dir_all(dir).with_context(|| format!("download directory {}", dir.display()))?;
+        // Not `canonicalize` (see `download_dir`).
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        self.browser.enable_downloads_in(Some(&dir), self.context.as_deref())?;
+        self.downloads_dir = Some(dir.clone());
+        Ok(dir)
+    }
+
     pub fn downloads(&self, clear: bool) -> Vec<cdp::downloads::Download> {
         let scope = self.scope();
         let mut d = self.browser.shared().downloads.lock().unwrap();
@@ -900,8 +920,13 @@ impl BrowserSession {
             bail!("reset needs the chrome engine (Lightpanda has one context per process): start a new session");
         }
         let context = self.browser.create_context()?;
-        // The user's own browser (`--attach`) keeps its download setting.
-        let dir = if self.attached && self.profile_dir.is_none() { None } else { download_dir().ok() };
+        // The user's own browser (`--attach`) keeps its download setting,
+        // unless the session chose a directory.
+        let dir = match &self.downloads_dir {
+            Some(own) => Some(own.clone()),
+            None if self.attached && self.profile_dir.is_none() => None,
+            None => download_dir().ok(),
+        };
         let _ = self.browser.enable_downloads_in(dir.as_deref(), Some(&context));
         // Before the new tab exists, so its first requests see its routes.
         self.browser.shared().move_scope(&self.scope(), &context, !all);
@@ -956,6 +981,7 @@ impl BrowserSession {
             attached: self.attached,
             profile_dir: None,
             profile_exe: None,
+            downloads_dir: None,
             overrides: Default::default(),
             init_scripts: Vec::new(),
             init_ids: Default::default(),

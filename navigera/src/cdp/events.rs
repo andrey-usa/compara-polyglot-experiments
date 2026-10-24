@@ -240,6 +240,8 @@ impl Shared {
         // A session's downloads stay its own across `reset`; `reset --all`
         // forgets them (the files stay where they are).
         let mut downloads = self.downloads.lock().unwrap();
+        // The new context has its directory already (set before the move).
+        downloads.dirs.remove(from);
         if keep {
             for d in downloads.items.iter_mut().filter(|d| d.scope == from) {
                 d.scope = to.to_string();
@@ -271,7 +273,11 @@ impl Shared {
         self.credentials.lock().unwrap().remove(scope);
         self.policy.lock().unwrap().remove(scope);
         self.dialogs.lock().unwrap().retain(|(s, _)| s != scope);
-        self.downloads.lock().unwrap().items.retain(|d| d.scope != scope);
+        {
+            let mut downloads = self.downloads.lock().unwrap();
+            downloads.items.retain(|d| d.scope != scope);
+            downloads.dirs.remove(scope);
+        }
         self.frame_scopes.lock().unwrap().retain(|_, s| s != scope);
         self.scopes.lock().unwrap().retain(|_, s| s != scope);
     }

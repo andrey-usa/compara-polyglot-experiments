@@ -122,6 +122,41 @@ fn routes_and_dialog_answers_are_each_sessions_own() {
 }
 
 #[test]
+fn each_session_saves_downloads_where_it_was_told() {
+    let Some((mut site, url)) = site() else { return };
+    let mut owner = Driver::launch(&SessionConfig::default()).expect("launch");
+    let (mut a, mut b) = (owner.fork().expect("fork"), owner.fork().expect("fork"));
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let fetch_file = |d: &mut Driver| -> std::path::PathBuf {
+        op(d, &["goto", &format!("{url}/effects")]);
+        op(d, &["downloads", "--clear"]);
+        op(d, &["eval", "(location.href = '/file.csv', 1)"]);
+        op(d, &["wait", "--download", "report.csv"]);
+        let list = op(d, &["downloads", "--json"]);
+        std::path::PathBuf::from(list[0]["path"].as_str().unwrap_or_else(|| panic!("no path: {list}")))
+    };
+    let at = |i: usize, name: &str| std::path::absolute(dirs[i].path().join(name)).unwrap();
+    for (d, i) in [(&mut owner, 0), (&mut a, 1), (&mut b, 2)] {
+        op(d, &["downloads", "--dir", dirs[i].path().to_str().unwrap()]);
+    }
+    // The same file name in each session's directory, none numbered.
+    assert_eq!(fetch_file(&mut a), at(1, "report.csv"));
+    assert_eq!(fetch_file(&mut b), at(2, "report.csv"));
+    assert_eq!(fetch_file(&mut owner), at(0, "report.csv"));
+    // `reset --all` keeps the directory: a second file there is numbered.
+    op(&mut a, &["reset", "--all"]);
+    assert_eq!(fetch_file(&mut a), at(1, "report (2).csv"));
+    // A new directory starts the names over.
+    op(&mut a, &["downloads", "--dir", dirs[3].path().to_str().unwrap()]);
+    assert_eq!(fetch_file(&mut a), at(3, "report.csv"));
+    a.session().close();
+    b.session().close();
+    owner.session().close();
+    let _ = site.kill();
+    let _ = site.wait();
+}
+
+#[test]
 fn another_session_attaches_to_one_tab_by_its_endpoint() {
     let Some((mut site, url)) = site() else { return };
     let config = SessionConfig { transport: Some("ws".into()), ..SessionConfig::default() };

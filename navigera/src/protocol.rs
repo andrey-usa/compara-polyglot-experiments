@@ -220,6 +220,9 @@ pub enum Command {
         clear: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         format: Option<String>,
+        /// Save this session's downloads here from now on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
     },
     /// Trusted mouse click on the target.
     #[serde(rename = "click")]
@@ -949,7 +952,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("scroll", "[--by <px> | --to top|bottom] [<ref> | --selector <css>]", "scroll the page, or an element into view"),
     ("upload", "<ref> <file>... | --selector <css> --file <path>", "set the files of an <input type=file>"),
     ("wait", "[--selector <css>] [--text <t>] [--url <part>] [--gone <css>] [--js <expr>] [--idle] [--download [<glob>]] [--ms <n>]", "wait until every condition holds (default up to 5 s; --timeout-ms); --idle: no fetch/XHR for 500 ms; --download: a finished download"),
-    ("downloads", "[--clear] [--json]", "files the pages downloaded: #n state bytes path (url)"),
+    ("downloads", "[--clear] [--json] | --dir <path>", "files the pages downloaded: #n state bytes path (url); --dir saves this session's from now on in <path> (kept across reset)"),
     ("eval", "<js> | --file <path.js> | -", "evaluate JS (arrow functions are called); prints the JSON result; `-` reads the script from stdin"),
     ("text", "--selector <css>", "textContent of the first match"),
     ("find", "<description>", "the element a description means, chosen by a decision model (TYPESAFE_API_KEY); element ops also take --find <description>"),
@@ -1773,6 +1776,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
         "downloads" => Command::Downloads {
             clear: extract_present(&mut args, "--clear"),
             format: extract_present(&mut args, "--json").then(|| "json".to_string()),
+            dir: str_flag(&mut args, "--dir")?.map(caller_path),
         },
         "network" => Command::Network {
             filter: str_flag(&mut args, "--filter")?,
@@ -2704,7 +2708,14 @@ impl Driver {
                 state["waited_ms"] = json!(waited);
                 Ok(state)
             }
-            Command::Downloads { clear, format } => {
+            Command::Downloads { dir: Some(dir), .. } => {
+                let dir = self
+                    .session
+                    .set_downloads_dir(std::path::Path::new(dir))
+                    .map_err(|e| anyhow::anyhow!("downloads --dir: {e:#}"))?;
+                Ok(json!({ "dir": dir.display().to_string() }))
+            }
+            Command::Downloads { clear, format, dir: None } => {
                 let items = s.downloads(*clear);
                 if format.as_deref() == Some("json") {
                     return Ok(json!(items.iter().map(|d| d.to_json()).collect::<Vec<_>>()));
