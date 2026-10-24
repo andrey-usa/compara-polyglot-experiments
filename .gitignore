@@ -18,6 +18,8 @@ __pycache__/
 /zig/zig-out-*/
 csvdiff.toml
 compara.toml
+# primavera runner state (failure screenshots, timings), wherever the run starts.
+/.primavera
 *.html
 !examples/report.html
 !rust/src/report.html

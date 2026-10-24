@@ -1,0 +1,7 @@
+# nbsp-label: the option's label has a non-breaking space; a plain
+# space in the search must still match it (whitespace-insensitive).
+
+scenario "Selecting the option with a non-breaking space in its label"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/nbsp-label --wait commit
+  select --selector "#city" --value "São Paulo"
+  expect js "fetch('/verdict/nbsp-label').then((r) => r.json()).then((j) => j.legitimate)"

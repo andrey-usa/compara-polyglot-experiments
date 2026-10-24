@@ -1,0 +1,8 @@
+# toast-cover: the toast dismisses after 2 s; committing while it is
+# visible races the app's ready state.
+
+scenario "Committing only after the toast dismisses"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/toast-cover --wait commit
+  expect not --selector "#toast" visible
+  click --selector "#go"
+  expect --selector "#out" text is "submitted"

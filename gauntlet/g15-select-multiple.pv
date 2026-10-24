@@ -1,0 +1,8 @@
+# select-multiple: all three options must be selected in one commit;
+# one call per value would replace the selection.
+
+scenario "Selecting every option in a multi-select"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/select-multiple --wait commit
+  select --selector "#ms" --value a --value b --value c
+  click --selector "#go"
+  expect --selector "#out" text is "picked a,b,c"

@@ -1,0 +1,8 @@
+# transition-transform: the button slides 300 px over 1.2 s right after
+# load; clicking the pre-transition coordinates misses.
+
+scenario "Clicking after the transition settles"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/transition-transform --wait commit
+  wait --ms 2000
+  click --selector "#go"
+  expect --selector "#out" text is "clicked"

@@ -1,0 +1,6 @@
+# shadow-open-named: the "Pay now" button lives in an open shadow root.
+
+scenario "Clicking the named button in an open shadow root"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/shadow-open-named --wait commit
+  click --text "Pay now"
+  expect --selector "#out" text is "paid"

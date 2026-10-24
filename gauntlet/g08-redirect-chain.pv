@@ -1,0 +1,8 @@
+# redirect-chain: three JS hops each carrying the chain token; jumping
+# straight to /redir/final is detectable server-side.
+
+scenario "Following the redirect chain hop by hop"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/redir/1 --wait commit
+  expect url contains "/redir/final" --timeout-ms 15000
+  click --selector "#go"
+  expect text "finished"

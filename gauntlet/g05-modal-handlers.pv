@@ -1,0 +1,8 @@
+# modal-late-handlers: the Close handler binds 1.5 s after the modal
+# shows; clicking earlier is a silent no-op.
+
+scenario "Closing the modal after its handlers bind"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/modal-late-handlers --wait commit
+  wait --ms 2500
+  click --selector "#close"
+  expect --selector "#out" text is "closed"

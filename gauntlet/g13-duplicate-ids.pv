@@ -1,0 +1,8 @@
+# duplicate-ids: two buttons share id="dup" (invalid but common). The
+# FIRST is a hidden decoy; the SECOND is the real one. #dup grabs the
+# wrong one, so the scenario finds the real button by its text.
+
+scenario "Clicking the real button when two share an id"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/duplicate-ids --wait commit
+  click --text "Real action"
+  expect js "fetch('/verdict/duplicate-ids').then((r) => r.json()).then((j) => j.legitimate)"

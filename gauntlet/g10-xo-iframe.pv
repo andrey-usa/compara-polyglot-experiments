@@ -1,0 +1,9 @@
+# xo-iframe: the payment form is on the second origin (the XO port);
+# --frame reaches into the cross-origin frame.
+
+scenario "Filling the cross-origin payment frame"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/xo-iframe --wait commit
+  fill --selector "#cardholder" --value "Ada Lovelace" --frame "#pay"
+  fill --selector "#card" --value "4242424242424242" --frame "#pay"
+  click --role button --name "Pay" --frame "#pay"
+  expect text "paid"

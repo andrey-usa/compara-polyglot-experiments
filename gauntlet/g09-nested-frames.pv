@@ -1,0 +1,8 @@
+# nested-iframes: the form lives two frames deep; the commit must come
+# from depth 2, which only the page's own log sees.
+
+scenario "Submitting the form in nested iframes"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/nested-iframes --wait commit
+  fill --selector "#name" --value "Ada" --frame "#outer >> #inner"
+  click --role button --name "Submit" --frame "#outer >> #inner"
+  expect js "fetch('/verdict/nested-iframes').then((r) => r.json()).then((j) => j.legitimate)"
