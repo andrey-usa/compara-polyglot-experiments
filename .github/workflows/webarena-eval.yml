@@ -15,15 +15,17 @@ name: webarena-eval
 #
 # This workflow exists only on experiment-23, which the dispatch API
 # cannot address (it indexes workflows from the default branch), so the
-# smoke fires on pushes to this branch that touch the harness - the
-# smoke slice (10 tasks x 2 tools, $2.50/cell) is the push default. Spend is guarded two
-# ways (bench/agent-eval/openrouter_run.py): each job has a per-cell
-# budget (--max-spend), and before every request the verified spend plus
+# a push to the harness paths fires it - the push default is now the
+# pilot remainder slice (offset 10, 38 tasks x 2 tools, $2.37/cell:
+# the per-cell remainder under the cumulative USD 5 authority after the
+# smoke's computed $0.0582 + $0.1239, rounded down). Spend is guarded
+# two ways (bench/agent-eval/openrouter_run.py): each job has a per-cell
+# budget (--max-spend), and before every request the computed usage cost
+# so far plus retained reservations for unknown-outcome requests plus
 # that request's documented maximum (context ceiling x input price +
-# max_tokens x output price) must fit it, so a cell can never pass its
-# budget; there are no client retries and a request whose charge outcome
-# is unknown keeps its full reservation. Dispatch only: no push trigger,
-# so every run is deliberate.
+# max_tokens x output price) must fit it; there are no client retries
+# and a request whose charge outcome is unknown keeps its full
+# reservation.
 
 on:
   push:
@@ -42,13 +44,13 @@ on:
         default: "deepseek-ai/DeepSeek-V4.1-Flash"
       count:
         description: "pilot tasks per cell"
-        default: "10"
+        default: "38"
       offset:
         description: "start at this index into pilot_tasks.json"
-        default: "0"
+        default: "10"
       max_spend:
         description: "per-cell budget in USD (hard stop; see header)"
-        default: "2.50"
+        default: "2.37"
 
 permissions:
   contents: read
@@ -63,9 +65,9 @@ jobs:
         env:
           TOOLS: ${{ inputs.tools || 'navigera,agent-browser' }}
           MODELS: ${{ inputs.models || 'deepseek-ai/DeepSeek-V4.1-Flash' }}
-          COUNT: ${{ inputs.count || '10' }}
-          OFFSET: ${{ inputs.offset || '0' }}
-          MAX_SPEND: ${{ inputs.max_spend || '2.50' }}
+          COUNT: ${{ inputs.count || '38' }}
+          OFFSET: ${{ inputs.offset || '10' }}
+          MAX_SPEND: ${{ inputs.max_spend || '2.37' }}
         run: |
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
           import json, os
