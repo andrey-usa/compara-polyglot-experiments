@@ -149,11 +149,15 @@ jobs:
           # Chrome process, which stays alive as the browser, so the step
           # would never reach the launch below. The browser version is
           # read from /json/version after launch instead.
+          # Launch directly in the background: cmd.exe /c start silently
+          # launches nothing here (its empty title argument is lost in
+          # translation, so the chrome path becomes the window title and
+          # no browser ever starts). Output goes to a log file, not the
+          # step's pipes, so the step ends when the script ends.
           taskkill //F //IM chrome.exe >/dev/null 2>&1 || true
           sleep 2
-          CHROME_WIN=$(cygpath -w "$CHROME_EXE")
-          PROFILE_WIN=$(cygpath -w "$RUNNER_TEMP/chrome-profile")
-          timeout -k 5 30 cmd.exe /c start '""' "\"$CHROME_WIN\"" --remote-debugging-port="$CDP_PORT" --user-data-dir="\"$PROFILE_WIN\"" --no-first-run about:blank < /dev/null || { echo "CHROME LAUNCH FAILED OR TIMED OUT"; exit 1; }
+          STARTLOG=$(cygpath -u "$RUNNER_TEMP/chrome-start.log")
+          "$CHROME_EXE" --remote-debugging-port="$CDP_PORT" --user-data-dir="$RUNNER_TEMP/chrome-profile" --no-first-run about:blank >"$STARTLOG" 2>&1 &
           up=0
           for i in $(seq 1 60); do
             if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$CDP_PORT/json/version"; then up=1; break; fi
@@ -165,6 +169,8 @@ jobs:
             tasklist //FI "IMAGENAME eq chrome.exe" || true
             echo "--- listeners on $CDP_PORT ---"
             netstat -ano | grep ":$CDP_PORT" || true
+            echo "--- chrome start log ---"
+            cat "$STARTLOG" || true
             exit 1
           fi
           curl -s --max-time 5 -o "$RUNNER_TEMP/chrome-version.json" "http://127.0.0.1:$CDP_PORT/json/version" || { echo "VERSION FETCH FAILED"; exit 1; }
