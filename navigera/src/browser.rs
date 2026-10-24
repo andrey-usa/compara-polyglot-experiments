@@ -1759,10 +1759,10 @@ impl BrowserSession {
         timeout_ms: Option<f64>,
     ) -> Result<serde_json::Value> {
         let (wait, timeout) = self.element_budget(timeout_ms);
-        let generation = self.active_tab().nav_generation();
+        let before = self.active_tab().activity();
         let point = self.active_tab().click(target, opts, wait, timeout)?;
         if point.get("nav").and_then(|v| v.as_bool()) == Some(true) {
-            self.active_tab().navigation_started(generation, NAV_GRACE);
+            self.active_tab().navigation_started_since(before, NAV_GRACE);
         }
         self.settle_for(timeout_ms);
         Ok(point)
@@ -1783,10 +1783,10 @@ impl BrowserSession {
     ) -> Result<serde_json::Value> {
         let (_, timeout) = self.element_budget(timeout_ms);
         let page = self.active_tab();
-        let generation = page.nav_generation();
+        let before = page.activity();
         let r = page.mouse(action, at, button, count, steps, delta, timeout)?;
         if action == "click" {
-            page.navigation_started(generation, NAV_GRACE);
+            page.navigation_started_since(before, NAV_GRACE);
             self.settle_for(timeout_ms);
         }
         Ok(r)
@@ -1971,7 +1971,7 @@ impl BrowserSession {
 
     pub fn press(&self, target: Option<&Target>, key: &str, timeout_ms: Option<f64>) -> Result<()> {
         let (wait, timeout) = self.element_budget(timeout_ms);
-        let generation = self.active_tab().nav_generation();
+        let before = self.active_tab().activity();
         // Modifiers held with `keydown` apply, as on a real keyboard.
         let held = self.held.lock().unwrap().clone();
         let chord = held
@@ -1985,7 +1985,7 @@ impl BrowserSession {
         if may_navigate {
             // Enter in a form submits it (implicit submission); on a link
             // it follows it.
-            self.active_tab().navigation_started(generation, NAV_GRACE);
+            self.active_tab().navigation_started_since(before, NAV_GRACE);
         }
         self.settle_for(timeout_ms);
         Ok(())
