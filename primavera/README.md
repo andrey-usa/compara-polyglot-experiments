@@ -57,6 +57,8 @@ milestones are in agent-guidance `plans/prova.md`.
   JUnit and JSON lines).
 - A default with spaces is one word: quote it whole,
   `"${GREETING:-hello there}"` (words split before `${…}` is filled in).
+- A `set` value can hold `${…}` too (a default, a `--var`, another `set`,
+  a secret, the environment): it is filled in once, when a scenario starts.
 - `save NAME = <command>` keeps a command's result (`get text …`).
 - `flow name(a, b)` at the top level holds steps; `run name x y` runs them
   with `${a}` and `${b}` set. `use other.pv` takes another file's flows
@@ -140,7 +142,8 @@ primavera list [<file.pv|dir>...]
   scenario, FLAKY where it isn't all of them.
 - `--reporter jsonl` prints one JSON object per scenario as it finishes
   (the console moves to stderr); `github` writes workflow annotations on
-  the failing lines (on by itself under GitHub Actions). `--json` prints
+  the failing lines, beside the console (on by itself under GitHub
+  Actions). `--json` prints
   what the scenarios saved, for a pipeline's next step.
 - A failure prints the step, what was expected and seen, where the page
   was, a screenshot (under `.primavera/runs/`), and a note when an earlier

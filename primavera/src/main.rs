@@ -199,7 +199,9 @@ fn parse_args() -> Result<Args, String> {
     if paths.is_empty() {
         paths.push(PathBuf::from("."));
     }
-    if reporters.is_empty() {
+    // Annotations alone say nothing about a passing run: the console stays
+    // on unless the JSON lines take its place.
+    if !reporters.iter().any(|r| r == "console" || r == "jsonl") {
         reporters.push("console".into());
     }
     if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") && !reporters.iter().any(|r| r == "github") {

@@ -1071,7 +1071,7 @@ impl Scope {
         opts: &Options,
         before_all: &BTreeMap<String, String>,
     ) -> Self {
-        Scope {
+        let mut scope = Scope {
             layers: Vec::new(),
             saved: BTreeMap::new(),
             row,
@@ -1085,7 +1085,14 @@ impl Scope {
             noop: None,
             notes: Vec::new(),
             soft: Vec::new(),
-        }
+        };
+        // A `set` value's own `${…}` (a default, `--var`, another `set`, a
+        // secret, the environment) is filled in once, here; one that names
+        // nothing known stays as written. Each value is interpolated once,
+        // so `$$` stays a literal `$`.
+        let raw = scope.file.clone();
+        scope.file = raw.keys().map(|k| (k.clone(), fill_set(&scope, &raw, k, 0))).collect();
+        scope
     }
 
     /// A flow's arguments, then what was saved, the data row, the file's
@@ -1113,6 +1120,18 @@ impl Scope {
             .or_else(|| std::env::var(name).ok())
     }
 
+    /// [`Scope::lookup`] without the file's `set`s and the environment.
+    fn above_file(&self, name: &str) -> Option<String> {
+        self.layers
+            .last()
+            .and_then(|l| l.get(name))
+            .or_else(|| self.saved.get(name))
+            .or_else(|| self.row.get(name))
+            .or_else(|| self.before_all.get(name))
+            .or_else(|| self.run.get(name))
+            .cloned()
+    }
+
     /// Replaces the secrets' values in a text with `***`.
     fn masker(&self) -> impl Fn(&str) -> String {
         let mut values: Vec<String> = self.used_secrets.borrow().iter().filter(|v| v.len() >= 3).cloned().collect();
@@ -1127,6 +1146,26 @@ impl Scope {
     fn words(&self, ws: &[String]) -> Result<Vec<String>, String> {
         ws.iter().map(|w| self.word(w)).collect()
     }
+}
+
+/// A `set` value with its `${…}` filled in: another `set` by its own
+/// filled-in value (unless something above the file names it), anything
+/// else as a scenario would see it.
+fn fill_set(scope: &Scope, raw: &BTreeMap<String, String>, key: &str, depth: u32) -> String {
+    let value = &raw[key];
+    if !value.contains('$') || depth > 8 {
+        return value.clone();
+    }
+    interpolate(value, &|n| {
+        if n == key {
+            None
+        } else if raw.contains_key(n) && scope.above_file(n).is_none() {
+            Some(fill_set(scope, raw, n, depth + 1))
+        } else {
+            scope.lookup(n)
+        }
+    })
+    .unwrap_or_else(|_| value.clone())
 }
 
 /// A failure as the run prints and saves it: secrets used in the scenario

@@ -327,3 +327,23 @@ fn repeat_and_shuffle_hunt_flakes() {
         primavera(&["run", "tests/fixtures/flaky.pv", "--base-url", &site2.1, "--repeat", "3", "--shuffle", "42"]);
     assert_eq!(order(&out), order(&out2), "{out}\n{out2}");
 }
+
+#[test]
+fn set_values_fill_in_their_variables() {
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
+    let (code, out) = primavera(&["run", "tests/fixtures/set-expand.pv", "--base-url", &site.1, "--var", "WHO=ada"]);
+    assert_eq!(code, 0, "{out}");
+    // Annotations don't take the console's place.
+    let (code, out) = primavera(&[
+        "run",
+        "tests/fixtures/set-expand.pv",
+        "--base-url",
+        &site.1,
+        "--var",
+        "WHO=ada",
+        "--reporter",
+        "github",
+    ]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("1 passed, 0 failed"), "{out}");
+}
