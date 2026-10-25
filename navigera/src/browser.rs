@@ -1113,11 +1113,26 @@ impl BrowserSession {
     /// if it was the only tab, remember it is gone.
     pub fn tab_gone(&mut self) {
         self.sync_tabs();
-        if self.pages.len() == 1 && self.closed.is_none() {
-            let target = self.pages[0].target_id().to_string();
-            if self.target_is_gone(&target) {
-                self.closed = Some(target);
+        if self.closed.is_some() {
+            return;
+        }
+        // The session can end a moment before the browser stops listing
+        // its target: give it a second.
+        let target = self.active_tab().target_id().to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !self.target_is_gone(&target) {
+            if std::time::Instant::now() >= deadline {
+                return;
             }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if self.pages.len() == 1 {
+            self.closed = Some(target);
+        } else {
+            // Another tab is left: go on in it, as when the event is read.
+            self.browser.shared().unregister(self.pages[self.active].session_id());
+            self.pages.remove(self.active);
+            self.active = self.active.min(self.pages.len() - 1);
         }
     }
 

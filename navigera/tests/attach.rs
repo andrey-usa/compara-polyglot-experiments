@@ -295,3 +295,43 @@ fn attach_needs_a_session() {
     assert_eq!(r["ok"], false);
     assert!(r["error"].as_str().unwrap().contains("use a session"), "{r}");
 }
+
+#[test]
+fn a_tab_closed_while_an_op_waits_on_it_ends_the_op() {
+    let Some(exe) = chrome() else { return };
+    let (_user, _profile, port) = users_browser(&exe);
+    let id = page_targets(port)
+        .and_then(|t| t.into_iter().find(|(_, url)| url.contains("Mine")))
+        .map(|(id, _)| id)
+        .expect("the user's tab");
+    let s = session_name("midop");
+    ok(&s, &["start", "--attach", &format!("ws://127.0.0.1:{port}/devtools/page/{id}")]);
+    let tabs = ok(&s, &["tab-new", "data:text/html,<title>Second</title>"]);
+    let second = tabs["tabs"][1]["target"].as_str().expect("second tab").to_string();
+    let slow = "new Promise(r => setTimeout(() => r(document.title), 20000))";
+    let close_soon = |target: String| {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            devtools_get(port, &format!("/json/close/{target}"));
+        })
+    };
+
+    // The active tab of two: the op ends when it closes, on the other tab.
+    let closer = close_soon(second);
+    let started = Instant::now();
+    let (success, r) = run(&s, &["eval", slow], &[]);
+    closer.join().unwrap();
+    assert!(!success && r["error"].as_str().unwrap_or("").contains("closed while this ran"), "{r}");
+    assert!(started.elapsed() < Duration::from_secs(10), "waited {:?}", started.elapsed());
+    assert_eq!(ok(&s, &["eval", "document.title"]), "Mine");
+
+    // The only tab: the op ends, and the session knows the tab is gone.
+    let closer = close_soon(id);
+    let started = Instant::now();
+    let (success, r) = run(&s, &["eval", slow], &[]);
+    closer.join().unwrap();
+    assert!(!success && r["error"].as_str().unwrap_or("").contains("the tab is closed"), "{r}");
+    assert!(started.elapsed() < Duration::from_secs(10), "waited {:?}", started.elapsed());
+    assert_eq!(ok(&s, &["status"])["closed"], true);
+    ok(&s, &["quit"]);
+}

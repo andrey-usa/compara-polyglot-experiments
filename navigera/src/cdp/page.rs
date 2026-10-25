@@ -1284,6 +1284,16 @@ fn finder_expr_in(target: &Target, wait_ms: u128, what: &str, mode: TextMode) ->
     }
 }
 
+/// `e` if the tab's session is gone (the caller says so, in its words),
+/// else the caller's own error for what went wrong.
+fn or_gone(e: anyhow::Error, otherwise: impl FnOnce() -> anyhow::Error) -> anyhow::Error {
+    if format!("{e:#}").contains(super::client::SESSION_GONE) {
+        e
+    } else {
+        otherwise()
+    }
+}
+
 /// A finder's "no element … within" (the element isn't there yet).
 fn not_found(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains(": no element")
@@ -1574,12 +1584,12 @@ impl Page {
             };
             self.wait_load(&mut events, timeout, pred, Loader::Is(&loader), want)
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+            .map_err(|e| {
+                or_gone(e, || anyhow::anyhow!(
                     "timed out after {} ms waiting for {} of {url} (a slow subresource? try `goto --wait domcontentloaded`)",
                     timeout.as_millis(),
                     if wait == "domcontentloaded" { "DOMContentLoaded" } else { "load" }
-                )
+                ))
             })?;
             Ok(())
         })
@@ -1606,6 +1616,12 @@ impl Page {
         loop {
             match events.recv().await {
                 Ok(event) => {
+                    // The tab is gone: what we wait for won't come.
+                    if event.get("method").and_then(Value::as_str) == Some("Target.detachedFromTarget")
+                        && event.pointer("/params/sessionId").and_then(Value::as_str) == Some(self.session_id.as_str())
+                    {
+                        bail!("{}: the tab's session ended while waiting", super::client::SESSION_GONE);
+                    }
                     if event.get("sessionId").and_then(Value::as_str) != Some(self.session_id.as_str()) {
                         continue;
                     }
@@ -1731,7 +1747,7 @@ impl Page {
             };
             self.wait_load(&mut events, timeout, pred, Loader::Not(&before), "Page.loadEventFired")
                 .await
-                .map_err(|_| anyhow::anyhow!("timed out waiting for reload"))
+                .map_err(|e| or_gone(e, || anyhow::anyhow!("timed out waiting for reload")))
         })
     }
 
@@ -2150,10 +2166,12 @@ impl Page {
                     timeout,
                 )
                 .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "ref {backend_node_id} not found (stale after navigation or re-render? take a fresh `ax`)"
-                    )
+                .map_err(|e| {
+                    or_gone(e, || {
+                        anyhow::anyhow!(
+                            "ref {backend_node_id} not found (stale after navigation or re-render? take a fresh `ax`)"
+                        )
+                    })
                 })?;
             let object_id = resolved
                 .get("object")
