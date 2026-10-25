@@ -143,12 +143,14 @@ def system_prompt(tool):
 def setup(tool, task, run_id):
     site = task["url"].rstrip("/")
     config_url = f"{site}/config?run_id={run_id}&task_id=v2.{task['task']}&latency=0"
+    diag = []
     tool.start()
-    tool.goto(config_url)
-    tool.goto(f"{site}/finish")
-    out = tool.goto(task["url"])
+    diag.append({"step": "config", "out": tool.goto(config_url)[:200]})
+    diag.append({"step": "config_body", "out": tool.eval("() => document.body.innerText.slice(0, 200)")[:200]})
+    diag.append({"step": "finish_init", "out": tool.goto(f"{site}/finish")[:200]})
+    diag.append({"step": "site", "out": tool.goto(task["url"])[:200]})
     time.sleep(1.0)
-    return out[:200]
+    return diag
 
 def capture_finish(tool, task, out_path):
     site = task["url"].rstrip("/")
@@ -185,7 +187,7 @@ def run_episode(tool, task, model, api_key, ledger, max_spend, max_steps, script
            "wall_s": 0.0, "error": None}
     t0 = time.time()
     try:
-        setup(tool, task, run_id)
+        rec["setup"] = setup(tool, task, run_id)
         if not scripted:
             messages = [{"role": "system", "content": system_prompt(tool)}]
             reprompts = 0
