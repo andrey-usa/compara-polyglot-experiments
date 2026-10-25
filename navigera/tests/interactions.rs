@@ -524,7 +524,20 @@ fn the_mouse_goes_where_it_is_told_on_a_canvas() {
         let row: Vec<u64> = (0..=120).map(|x| s.ok(&["eval", &format!("ink({x}, 20)")]).as_u64().unwrap_or(0)).collect();
         let drawn = s.ok(&["eval", "window.drawn"]);
         let last_stroke = s.ok(&["eval", "window.lastStroke"]);
-        panic!("the line is drawn: events={events:?} row={row:?} drawn={drawn} lastStroke={last_stroke}");
+        // (a) Canvas geometry at failure: a resize clears the bitmap, so
+        // anything but [300, 200, 300, 200] names a resize/reset shape.
+        let canvas_size = s.ok(&["eval", "(function(){var el=document.querySelector('canvas');return [el.width,el.height,el.clientWidth,el.clientHeight];})()"]);
+        // (b) Ink on other rows, same x range, plus the alpha sum over the
+        // whole bitmap in one in-page pass: sum 0 means the whole canvas
+        // is blank; sum > 0 with row y=20 blank means the ink is
+        // somewhere else, not lost outright.
+        let rows_other: Vec<(u32, Vec<u64>)> = [10u32, 30, 100].iter().map(|y| (*y, (0..=120).map(|x| s.ok(&["eval", &format!("ink({x}, {})", *y)]).as_u64().unwrap_or(0)).collect())).collect();
+        let alpha_sum = s.ok(&["eval", "(function(){var el=document.querySelector('canvas');var d=el.getContext('2d').getImageData(0,0,el.width,el.height).data;var s=0;for(var i=3;i<d.length;i+=4)s+=d[i];return s;})()"]);
+        // (c) A second readback of the same pixel, one eval round-trip
+        // after the bulk read: ink here means the first readback was a
+        // transient loss; still 0 means the loss persists across reads.
+        let ink_again = s.ok(&["eval", "ink(60, 20)"]).as_u64().unwrap_or(0);
+        panic!("the line is drawn: events={events:?} row={row:?} drawn={drawn} lastStroke={last_stroke} canvas_size={canvas_size} rows_other={rows_other:?} alpha_sum={alpha_sum} ink_again={ink_again}");
     }
     assert_eq!(s.ok(&["eval", "ink(60, 120)"]), 0, "nothing drawn off the path");
     // Viewport coordinates, a double click, the right button, the wheel.
