@@ -483,6 +483,27 @@ impl Runner {
                 }
                 Ok(())
             }
+            Action::Exec { argv, timeout_ms, dir, steps } => {
+                let argv = scope.words(argv)?;
+                let limit = Duration::from_millis(timeout_ms.unwrap_or(60_000));
+                let (code, out, err) = run_program(&argv, dir, limit, self.opts.base.as_deref())?;
+                scope.saved.insert("exec.exit".into(), code.to_string());
+                scope.saved.insert("exec.stdout".into(), out.trim_end_matches(['\n', '\r']).to_string());
+                scope.saved.insert("exec.stderr".into(), err.trim_end_matches(['\n', '\r']).to_string());
+                let exit = Subject::Var("${exec.exit}".into());
+                let checked = steps.iter().any(|s| matches!(&s.action, Action::Expect(e) if e.subject == exit));
+                if code != 0 && !checked {
+                    let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                    let last = if last.len() > 300 { &last[..last.floor_char_boundary(300)] } else { last };
+                    let said = if last.is_empty() { String::new() } else { format!(": {last}") };
+                    return Err(format!("`{}` exited {code}{said}", shown(&argv)));
+                }
+                for st in steps {
+                    self.action(&st.action, st, scope, suite, depth)
+                        .map_err(|e| format!("under the `exec`, line {} `{}`: {e}", st.line, st.text))?;
+                }
+                Ok(())
+            }
             Action::Optional(inner) => {
                 if let Err(e) = self.action(inner, step, scope, suite, depth) {
                     scope.notes.push(format!("optional step at line {} didn't happen: {e}", step.line));
@@ -1032,6 +1053,71 @@ fn describe(e: &Expect, value: &str, actual: &str, limit: Duration) -> String {
         actual.to_string()
     };
     format!("expected {not}{what}{want} within {} ms; saw {seen:?}", limit.as_millis())
+}
+
+/// Run a program (no shell) in `dir`, reading its output as it comes, and
+/// stop it at `limit`: its exit code (-1 when a signal ended it), stdout and
+/// stderr (the first MB of each). Something it left running that holds the
+/// output open (a server started in the background) doesn't hold the run.
+fn run_program(
+    argv: &[String],
+    dir: &Path,
+    limit: Duration,
+    base: Option<&str>,
+) -> Result<(i32, String, String), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    const CAP: usize = 1 << 20;
+    let (program, args) = argv.split_first().ok_or("exec needs a program")?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if !dir.as_os_str().is_empty() {
+        cmd.current_dir(dir);
+    }
+    if let Some(b) = base {
+        cmd.env("PRIMAVERA_BASE_URL", b);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("exec {program}: {e}"))?;
+    let read = |mut pipe: Box<dyn Read + Send>| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = buf.clone();
+        let reader = std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                let mut b = sink.lock().unwrap_or_else(|e| e.into_inner());
+                let room = CAP.saturating_sub(b.len());
+                b.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        });
+        (buf, reader)
+    };
+    let (out, out_reader) = read(Box::new(child.stdout.take().expect("piped")));
+    let (err, err_reader) = read(Box::new(child.stderr.take().expect("piped")));
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(s) = child.try_wait().map_err(|e| format!("exec {program}: {e}"))? {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("`{}` still ran after {} ms; stopped it", shown(argv), limit.as_millis()));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let grace = Instant::now() + Duration::from_millis(500);
+    while !(out_reader.is_finished() && err_reader.is_finished()) && Instant::now() < grace {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text =
+        |b: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&b.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+    Ok((status.code().unwrap_or(-1), text(&out), text(&err)))
+}
+
+/// A command line as it could be typed again: words with spaces quoted.
+fn shown(argv: &[String]) -> String {
+    let word = |a: &String| if a.is_empty() || a.contains(char::is_whitespace) { format!("{a:?}") } else { a.clone() };
+    argv.iter().map(word).collect::<Vec<_>>().join(" ")
 }
 
 /// A downloads directory nothing landed in, and the evidence directory

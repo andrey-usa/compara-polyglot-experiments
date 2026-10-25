@@ -195,6 +195,19 @@ fn ax_trees_match_partially_and_say_where_they_dont() {
     assert!(out.contains("nearest: `- combobox \"Country\" value=\"Canada\""), "{out}");
 }
 
+#[test]
+fn exec_runs_programs_and_checks_what_they_said() {
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
+    let py = if cfg!(windows) { "PY=python" } else { "PY=python3" };
+    let (code, out) = primavera(&["run", "tests/fixtures/exec.pv", "--base-url", &site.1, "--var", py]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("1 passed, 0 failed"), "{out}");
+    let (code, out) = primavera(&["run", "tests/fixtures/exec-fail.pv", "--var", py]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("exited 2: db down"), "{out}");
+    assert!(out.contains("still ran after 300 ms; stopped it"), "{out}");
+}
+
 /// A GET to the fixture site, its body.
 fn fetch(site: &Site, path: &str) -> String {
     use std::io::{Read, Write};

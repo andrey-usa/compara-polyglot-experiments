@@ -296,7 +296,7 @@ fn parse_inner(words: &[String]) -> Result<Expect, String> {
         };
     }
     let first = words.first().cloned().ok_or(
-        "expect what? (url, title, text, a target, ${var}, js, request, cookie, storage, download, console, no errors)",
+        "expect what? (url, title, text, a target, ${var}, js, request, cookie, storage, download, console, no errors, ax, exit, stdout, stderr)",
     )?;
     // A subject with an optional comparison after it: present/truthy without
     // one, gone with `absent`.
@@ -318,6 +318,15 @@ fn parse_inner(words: &[String]) -> Result<Expect, String> {
     }
     let (subject, matcher, value) = match first.as_str() {
         // `eval` reads as navigera's own command does.
+        // What the last `exec` gave: it doesn't change, so it isn't waited for.
+        "exit" | "stdout" | "stderr" => {
+            timeout_ms = Some(timeout_ms.unwrap_or(0));
+            let (m, v) = match &words[1..] {
+                [n] if first == "exit" && n.parse::<i64>().is_ok() => (Matcher::Is, n.clone()),
+                rest => tail(rest, &first)?,
+            };
+            (Subject::Var(format!("${{exec.{first}}}")), m, v)
+        }
         "ax" => {
             let usage = "expect ax [<target>] matches, then the tree it expects indented under it";
             if words.last().map(String::as_str) != Some("matches") {

@@ -60,6 +60,21 @@ milestones are in agent-guidance `plans/prova.md`.
 - A `set` value can hold `${…}` too (a default, a `--var`, another `set`,
   a secret, the environment): it is filled in once, when a scenario starts.
 - `save NAME = <command>` keeps a command's result (`get text …`).
+- `exec [--timeout-ms <ms>] <program> <args…>` runs a program (no shell:
+  `sh -c "…"` or `pwsh -c "…"` for one) in the `.pv` file's directory,
+  with `PRIMAVERA_BASE_URL` set, for what a browser can't reach: seed a
+  database (`psql`, `sqlplus`), call a script. Its exit code and output
+  become `${exec.exit}`, `${exec.stdout}` and `${exec.stderr}`, and
+  `expect exit 0`, `expect stdout contains SHIPPED`, `expect stderr …`
+  check them. A nonzero exit fails the step, with the last line of its
+  stderr, unless a step indented under it checks `exit`. It is stopped
+  after 60 s.
+
+  ```text
+  exec ./scripts/order-status.sh ${order}
+    expect exit 0
+    expect stdout contains SHIPPED
+  ```
 - `flow name(a, b)` at the top level holds steps; `run name x y` runs them
   with `${a}` and `${b}` set. `use other.pv` takes another file's flows
   and `set`s. A failure inside a flow names the flow's own line.
@@ -107,6 +122,7 @@ milestones are in agent-guidance `plans/prova.md`.
 | `download <file glob>`, `no download …` | a finished download (then `${download.path}`, `${download.name}`: the latest match). Each scenario's downloads go to a directory of its own beside its evidence (`.primavera/runs/<time>/<scenario>/downloads`, kept only when something came), so a name never carries over from another scenario; a second file of the same name in one scenario arrives as `name (2).ext` |
 | `console` + a comparison, `no console "<t>"` | a console message (any level) |
 | `no errors` | no page exceptions or console errors |
+| `exit` [`is`] `<n>`, `stdout`/`stderr` + a comparison | what the last `exec` gave |
 | `ax [<target>] matches` + the tree indented under it | the page's (or the target's) accessibility tree, as `navigera ax` prints it, holds those lines: partially (`button` matches `button "Place order"`) and in order, a line indented under another inside what that one matched, refs ignored, `/regex/` for a name or a value |
 | `not …` | any of them, negated |
 

@@ -51,6 +51,17 @@ pub enum Action {
     /// `handoff [until <expect clause>]`: the browser on screen for a
     /// person (a 2FA prompt, a CAPTCHA), until the clause holds or Enter.
     Handoff(Option<Expect>),
+    /// `exec [--timeout-ms n] <program> <args…>`: a program run (no shell)
+    /// in the `.pv` file's directory; its exit code and output become
+    /// `${exec.exit}`, `${exec.stdout}`, `${exec.stderr}`. The steps
+    /// indented under it run after it; a nonzero exit fails the step unless
+    /// one of them checks `exit`.
+    Exec {
+        argv: Vec<String>,
+        timeout_ms: Option<u64>,
+        dir: PathBuf,
+        steps: Vec<Step>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,14 +85,24 @@ fn nest(flat: Vec<Step>) -> Result<Vec<Step>, (usize, String)> {
                 break;
             }
             if st.indent > indent {
-                return Err((st.line, "indented more than the step before it (only the steps of an `if` are)".into()));
+                return Err((
+                    st.line,
+                    "indented more than the step before it (only the steps of an `if` or `exec` are)".into(),
+                ));
             }
             *i += 1;
             let mut st = st.clone();
-            if let Action::If { steps, .. } = &mut st.action {
+            let line = st.line;
+            let kids = match &mut st.action {
+                Action::If { steps, .. } => Some((steps, true)),
+                Action::Exec { steps, .. } => Some((steps, false)),
+                _ => None,
+            };
+            if let Some((steps, needed)) = kids {
                 match items.get(*i) {
                     Some(next) if next.indent > indent => *steps = level(items, i, next.indent)?,
-                    _ => return Err((st.line, "`if` needs the steps it guards indented under it".into())),
+                    _ if needed => return Err((line, "`if` needs the steps it guards indented under it".into())),
+                    _ => {}
                 }
             }
             out.push(st);
@@ -390,7 +411,10 @@ pub fn unset_vars(suite: &Suite, sc: &Scenario, run_vars: &[String]) -> Vec<(usi
     let mut known: std::collections::BTreeSet<String> = suite.vars.keys().cloned().collect();
     known.extend(run_vars.iter().cloned());
     known.extend(sc.vars.keys().cloned());
-    known.extend(["run.id", "scenario.name", "download.path", "download.name"].map(String::from));
+    known.extend(
+        ["run.id", "scenario.name", "download.path", "download.name", "exec.exit", "exec.stdout", "exec.stderr"]
+            .map(String::from),
+    );
     for st in &suite.before_all {
         if let Action::Save { name, .. } = &st.action {
             known.insert(name.clone());
@@ -404,6 +428,7 @@ pub fn unset_vars(suite: &Suite, sc: &Scenario, run_vars: &[String]) -> Vec<(usi
             Action::Run { args, .. } => args.clone(),
             Action::Optional(inner) => words(inner),
             Action::As(name) => vec![name.clone()],
+            Action::Exec { argv, .. } => argv.clone(),
             Action::Expect(_) | Action::If { .. } | Action::Handoff(_) => Vec::new(),
         }
     }
@@ -747,7 +772,7 @@ pub fn resolve(suites: &mut [Suite]) -> Result<(), ParseError> {
             for st in steps {
                 let action = match &st.action {
                     Action::Optional(a) => a.as_ref(),
-                    Action::If { steps, .. } => {
+                    Action::If { steps, .. } | Action::Exec { steps, .. } => {
                         check(steps, file, suite)?;
                         continue;
                     }
@@ -804,6 +829,17 @@ fn anchor_inputs(action: &mut Action, dir: &Path) {
     let words = match action {
         Action::Command(w) | Action::Save { command: w, .. } => w,
         Action::Optional(inner) => return anchor_inputs(inner, dir),
+        Action::Exec { argv, dir: d, .. } => {
+            // It runs there; a program named by a path is found from there.
+            *d = dir.to_path_buf();
+            if let Some(p) = argv.first_mut().filter(|p| (p.contains('/') || p.contains('\\')) && !p.starts_with("${"))
+            {
+                if Path::new(p.as_str()).is_relative() {
+                    *p = dir.join(p.as_str()).to_string_lossy().into_owned();
+                }
+            }
+            return;
+        }
         _ => return,
     };
     let anchor = |w: &mut String| {
@@ -899,6 +935,20 @@ fn parse_words(words: &[String]) -> Result<Action, String> {
             // A condition looks at the page as it is, unless it says how long.
             cond.timeout_ms = Some(cond.timeout_ms.unwrap_or(0));
             Ok(Action::If { cond, steps: Vec::new() })
+        }
+        Some("exec") => {
+            let usage = "expected `exec [--timeout-ms <ms>] <program> <args…>`";
+            let mut rest = &words[1..];
+            let mut timeout_ms = None;
+            if rest.first().map(String::as_str) == Some("--timeout-ms") {
+                let v = rest.get(1).ok_or(usage)?;
+                timeout_ms = Some(v.parse::<u64>().map_err(|_| format!("--timeout-ms takes milliseconds, not {v:?}"))?);
+                rest = &rest[2..];
+            }
+            if rest.is_empty() {
+                return Err(usage.into());
+            }
+            Ok(Action::Exec { argv: rest.to_vec(), timeout_ms, dir: PathBuf::new(), steps: Vec::new() })
         }
         Some("as") => match words {
             [_, name] => Ok(Action::As(name.clone())),
@@ -1033,6 +1083,33 @@ mod tests {
         assert!(e.message.contains("no steps"), "{e}");
         let e = parse(Path::new("t.pv"), "scenario \"A\"\n  expect url sounds-like x\n").unwrap_err();
         assert_eq!(e.line, 2);
+    }
+
+    #[test]
+    fn exec_takes_its_checks_under_it_and_runs_beside_the_file() {
+        let text = "scenario \"x\"\n  exec --timeout-ms 900 ./seed.sh ${who}\n    expect exit 0\n  exec psql -c \"select 1\"\n  expect ax matches\n    - button \"Go\"\n\n    - link\n  goto /\n";
+        let mut s = parse(Path::new("dir/t.pv"), text).unwrap();
+        resolve(std::slice::from_mut(&mut s)).unwrap();
+        let steps = &s.scenarios[0].steps;
+        match &steps[0].action {
+            Action::Exec { argv, timeout_ms, dir, steps } => {
+                assert_eq!(argv[0], Path::new("dir").join("./seed.sh").to_string_lossy());
+                assert_eq!(argv[1], "${who}");
+                assert_eq!(*timeout_ms, Some(900));
+                assert_eq!(dir, Path::new("dir"));
+                assert_eq!(steps.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(&steps[1].action, Action::Exec { argv, steps, .. } if argv[0] == "psql" && steps.is_empty()));
+        assert!(matches!(
+            &steps[2].action,
+            Action::Expect(Expect { subject: crate::expect::Subject::Ax { tree, .. }, .. }) if tree.len() == 3
+        ));
+        assert!(matches!(&steps[3].action, Action::Command(w) if w[0] == "goto"));
+        assert!(parse(Path::new("t.pv"), "scenario \"x\"\n  exec\n").is_err());
+        assert!(parse(Path::new("t.pv"), "scenario \"x\"\n  if ax matches\n    goto /\n").is_err());
+        assert!(parse(Path::new("t.pv"), "scenario \"x\"\n  expect ax matches\n  goto /\n").is_err());
     }
 
     #[test]
