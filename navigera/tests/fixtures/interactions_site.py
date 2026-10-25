@@ -124,7 +124,9 @@ PAGES["/canvas"] = ("canvas", "body{margin:0;height:3000px}canvas{position:absol
 window.log = [];
 window.drawn = 0;
 window.lastStroke = null;
-const g = c.getContext('2d');
+const g = c.getContext('2d', {willReadFrequently: true});
+c.addEventListener('contextlost', (e) => { log.push('contextlost'); e.preventDefault(); });
+c.addEventListener('contextrestored', () => { log.push('contextrestored'); });
 let last = null;
 const at = (e) => `${Math.round(e.offsetX)} ${Math.round(e.offsetY)}`;
 for (const t of ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu']) {
