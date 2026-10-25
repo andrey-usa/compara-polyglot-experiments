@@ -522,7 +522,9 @@ fn the_mouse_goes_where_it_is_told_on_a_canvas() {
     let ink = s.ok(&["eval", "ink(60, 20)"]).as_u64().unwrap_or(0);
     if ink == 0 {
         let row: Vec<u64> = (0..=120).map(|x| s.ok(&["eval", &format!("ink({x}, 20)")]).as_u64().unwrap_or(0)).collect();
-        panic!("the line is drawn: events={events:?} row={row:?}");
+        let drawn = s.ok(&["eval", "window.drawn"]);
+        let last_stroke = s.ok(&["eval", "window.lastStroke"]);
+        panic!("the line is drawn: events={events:?} row={row:?} drawn={drawn} lastStroke={last_stroke}");
     }
     assert_eq!(s.ok(&["eval", "ink(60, 120)"]), 0, "nothing drawn off the path");
     // Viewport coordinates, a double click, the right button, the wheel.

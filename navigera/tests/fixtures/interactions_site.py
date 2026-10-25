@@ -122,6 +122,8 @@ PAGES["/canvas"] = ("canvas", "body{margin:0;height:3000px}canvas{position:absol
 <canvas id=c width=300 height=200></canvas>
 <script>
 window.log = [];
+window.drawn = 0;
+window.lastStroke = null;
 const g = c.getContext('2d');
 let last = null;
 const at = (e) => `${Math.round(e.offsetX)} ${Math.round(e.offsetY)}`;
@@ -130,7 +132,7 @@ for (const t of ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu']) {
 }
 c.addEventListener('mousemove', (e) => {
   log.push(`move ${at(e)} ${e.buttons}`);
-  if (e.buttons & 1 && last) { g.beginPath(); g.lineWidth = 4; g.moveTo(last[0], last[1]); g.lineTo(e.offsetX, e.offsetY); g.stroke(); }
+  if (e.buttons & 1 && last) { g.beginPath(); g.lineWidth = 4; g.moveTo(last[0], last[1]); g.lineTo(e.offsetX, e.offsetY); g.stroke(); window.drawn++; window.lastStroke = [last[0], last[1], e.offsetX, e.offsetY]; }
   last = [e.offsetX, e.offsetY];
 });
 c.addEventListener('wheel', (e) => { log.push(`wheel ${Math.round(e.deltaX)} ${Math.round(e.deltaY)}`); e.preventDefault(); }, { passive: false });
