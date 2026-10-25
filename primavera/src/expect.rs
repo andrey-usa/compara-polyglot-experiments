@@ -61,6 +61,12 @@ pub enum Subject {
     Download(String),
     /// A console message (any level) compared: `console contains "x"`.
     Console,
+    /// `ax [<target>] matches` and the tree indented under it (see
+    /// [`crate::axtree`]): the lines as written, filled in at run time.
+    Ax {
+        flags: Vec<String>,
+        tree: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -312,6 +318,17 @@ fn parse_inner(words: &[String]) -> Result<Expect, String> {
     }
     let (subject, matcher, value) = match first.as_str() {
         // `eval` reads as navigera's own command does.
+        "ax" => {
+            let usage = "expect ax [<target>] matches, then the tree it expects indented under it";
+            if words.last().map(String::as_str) != Some("matches") {
+                return Err(usage.into());
+            }
+            let flags = words[1..words.len() - 1].to_vec();
+            if !flags.len().is_multiple_of(2) || !flags.iter().step_by(2).all(|f| f.starts_with("--")) {
+                return Err(format!("{usage} (a target like --role form --name Checkout)"));
+            }
+            (Subject::Ax { flags, tree: Vec::new() }, Matcher::Holds, String::new())
+        }
         "js" | "eval" => {
             let code = words.get(1).ok_or("expect js \"<expression>\"")?.clone();
             let (m, v) = optional_tail(&words[2..], "js")?;

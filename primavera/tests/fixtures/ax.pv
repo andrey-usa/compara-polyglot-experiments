@@ -1,0 +1,14 @@
+scenario "The form as its tree"
+  goto /login
+  eval "(document.body.innerHTML = '<h1>Checkout</h1><form aria-label=Checkout><label>Email <input type=email value=ada@example.com></label><select aria-label=Country><option>Mexico</option><option selected>Canada</option></select><button>Place order</button></form>', 1)"
+  expect ax --role form --name Checkout matches
+    - textbox "Email" value=/.+@example\.com/
+    # a select shows its value
+    - combobox "Country" value="Canada"
+    - button "Place order"
+  expect ax matches
+    - heading "Checkout"
+    - form
+      - button
+  expect not ax matches
+    - button "Cancel"

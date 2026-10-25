@@ -864,6 +864,20 @@ impl Runner {
                     Err(err) => (false, err),
                 }
             }
+            Subject::Ax { flags, tree } => {
+                // The whole tree (or the target's): `--limit 0` cuts nothing.
+                let mut words = vec!["ax".to_string(), "--limit".into(), "0".into()];
+                words.extend(scope.words(flags)?);
+                let template = crate::axtree::compile(&scope.words(tree)?)?;
+                match self.command(&words) {
+                    Ok(Value::String(page)) => match crate::axtree::matches(&template, &page) {
+                        Ok(()) => (true, "it matches".into()),
+                        Err(miss) => (false, miss),
+                    },
+                    Ok(other) => (false, other.to_string()),
+                    Err(err) => (false, err),
+                }
+            }
             Subject::Errors => {
                 let v = self.command(&["errors".into(), "--json".into()])?;
                 let list = v.as_array().cloned().unwrap_or_default();
@@ -970,6 +984,10 @@ fn parse(words: &[String]) -> Result<Command, String> {
 
 fn describe(e: &Expect, value: &str, actual: &str, limit: Duration) -> String {
     let not = if e.negate { "not " } else { "" };
+    if let Subject::Ax { flags, .. } = &e.subject {
+        let on = if flags.is_empty() { String::new() } else { format!(" {}", flags.join(" ")) };
+        return format!("expected ax{on} {not}to match the tree under it within {} ms: {actual}", limit.as_millis());
+    }
     let what = match &e.subject {
         Subject::Url => "url".to_string(),
         Subject::Title => "title".to_string(),
@@ -993,6 +1011,8 @@ fn describe(e: &Expect, value: &str, actual: &str, limit: Duration) -> String {
         }
         Subject::Cookie(c) => format!("cookie {c}"),
         Subject::Storage { area, key } => format!("storage {area} {key}"),
+        // Said above.
+        Subject::Ax { .. } => String::new(),
         Subject::Target { flags, prop } => {
             let p = match prop {
                 Prop::State(s) => s.clone(),

@@ -183,6 +183,18 @@ fn if_blocks_look_at_the_page_as_it_is() {
     assert!(out.contains("1 passed, 0 failed"), "{out}");
 }
 
+#[test]
+fn ax_trees_match_partially_and_say_where_they_dont() {
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
+    let (code, out) = primavera(&["run", "tests/fixtures/ax.pv", "--base-url", &site.1]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("1 passed, 0 failed"), "{out}");
+    let (code, out) = primavera(&["run", "tests/fixtures/ax-fail.pv", "--base-url", &site.1]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("expected ax --role form --name Checkout to match the tree under it"), "{out}");
+    assert!(out.contains("nearest: `- combobox \"Country\" value=\"Canada\""), "{out}");
+}
+
 /// A GET to the fixture site, its body.
 fn fetch(site: &Site, path: &str) -> String {
     use std::io::{Read, Write};

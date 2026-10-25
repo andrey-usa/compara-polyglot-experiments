@@ -107,10 +107,23 @@ milestones are in agent-guidance `plans/prova.md`.
 | `download <file glob>`, `no download …` | a finished download (then `${download.path}`, `${download.name}`: the latest match). Each scenario's downloads go to a directory of its own beside its evidence (`.primavera/runs/<time>/<scenario>/downloads`, kept only when something came), so a name never carries over from another scenario; a second file of the same name in one scenario arrives as `name (2).ext` |
 | `console` + a comparison, `no console "<t>"` | a console message (any level) |
 | `no errors` | no page exceptions or console errors |
+| `ax [<target>] matches` + the tree indented under it | the page's (or the target's) accessibility tree, as `navigera ax` prints it, holds those lines: partially (`button` matches `button "Place order"`) and in order, a line indented under another inside what that one matched, refs ignored, `/regex/` for a name or a value |
 | `not …` | any of them, negated |
 
   `--soft` on any `expect` notes a failure and goes on; the scenario fails
   at its end with all of them.
+
+  ```text
+  expect ax --role form --name Checkout matches
+    - textbox "Email" value=/.+@example\.com/
+    - combobox "Country" value="Canada"
+    - button "Place order"
+  ```
+
+  Copy the lines from `navigera ax` and keep the ones that matter. A miss
+  names the first line that has no place and the nearest line of its role
+  (`no line matches \`- combobox "Country" value="Mexico"\`; nearest:
+  \`- combobox "Country" value="Canada"\``).
 
 ## Running
 

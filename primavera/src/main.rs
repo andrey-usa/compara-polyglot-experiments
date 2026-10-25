@@ -1,6 +1,7 @@
 //! primavera: plain-text web tests on real Chrome, run by one native binary
 //! through navigera. See README.md.
 
+mod axtree;
 mod expect;
 mod nearest;
 mod report;

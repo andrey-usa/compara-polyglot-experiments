@@ -283,6 +283,15 @@ pub fn interpolate(word: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Resul
     Ok(out)
 }
 
+/// The tree an `expect ax … matches` step (or `optional` one) holds.
+fn ax_tree(action: &mut Action) -> Option<&mut Vec<String>> {
+    match action {
+        Action::Expect(Expect { subject: crate::expect::Subject::Ax { tree, .. }, .. }) => Some(tree),
+        Action::Optional(inner) => ax_tree(inner),
+        _ => None,
+    }
+}
+
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
@@ -400,10 +409,13 @@ pub fn unset_vars(suite: &Suite, sc: &Scenario, run_vars: &[String]) -> Vec<(usi
     }
     for st in suite.before_each.iter().chain(&sc.steps) {
         // An expect's words are in its text.
-        let ws = match &st.action {
+        let mut ws = match &st.action {
             Action::Expect(_) => tokenize(&st.text).unwrap_or_default(),
             a => words(a),
         };
+        if let Action::Expect(Expect { subject: crate::expect::Subject::Ax { tree, .. }, .. }) = &st.action {
+            ws.extend(tree.iter().cloned());
+        }
         for w in &ws {
             for (name, has_default) in used_vars(w) {
                 let env = std::env::var_os(name.strip_prefix("secret:").unwrap_or(&name)).is_some();
@@ -447,7 +459,13 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
     // Data rows of the scenario being read: (line of `examples`, header, rows).
     let mut rows: BTreeMap<usize, Vec<BTreeMap<String, String>>> = BTreeMap::new();
     let mut table: Option<(usize, Option<Vec<String>>)> = None;
-    for (i, raw) in text.lines().enumerate() {
+    let lines: Vec<&str> = text.lines().collect();
+    // Lines up to here are the tree under an `expect ax … matches`.
+    let mut tree_until = 0;
+    for (i, raw) in lines.iter().copied().enumerate() {
+        if i < tree_until {
+            continue;
+        }
         let line_no = i + 1;
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -484,6 +502,16 @@ pub fn parse(file: &Path, text: &str) -> Result<Suite, ParseError> {
                 }
             }
             let mut step = parse_step(trimmed).map_err(|m| err(line_no, m))?;
+            if let Some(tree) = ax_tree(&mut step) {
+                // The tree: the lines indented under the step.
+                let mut j = i + 1;
+                while j < lines.len() && (lines[j].trim().is_empty() || indent_of(lines[j]) > indent_of(raw)) {
+                    j += 1;
+                }
+                *tree = lines[i + 1..j].iter().map(|l| l.to_string()).collect();
+                crate::axtree::compile(tree).map_err(|m| err(line_no, m))?;
+                tree_until = j;
+            }
             anchor_inputs(&mut step, file.parent().unwrap_or(Path::new(".")));
             let step = Step { line: line_no, text: trimmed.to_string(), action: step, indent: indent_of(raw) };
             match &block {
@@ -865,6 +893,9 @@ fn parse_words(words: &[String]) -> Result<Action, String> {
                 return Err("expected `if <expect clause>` (as after `expect`), then indented steps".into());
             }
             let mut cond = crate::expect::parse(&words[1..])?;
+            if matches!(cond.subject, crate::expect::Subject::Ax { .. }) {
+                return Err("`if` takes its steps indented under it, so not `ax … matches`".into());
+            }
             // A condition looks at the page as it is, unless it says how long.
             cond.timeout_ms = Some(cond.timeout_ms.unwrap_or(0));
             Ok(Action::If { cond, steps: Vec::new() })
@@ -877,6 +908,9 @@ fn parse_words(words: &[String]) -> Result<Action, String> {
             None => Ok(Action::Handoff(None)),
             Some("until") if words.len() > 2 => {
                 let mut cond = crate::expect::parse(&words[2..])?;
+                if matches!(cond.subject, crate::expect::Subject::Ax { .. }) {
+                    return Err("`handoff until` can't wait for `ax … matches`".into());
+                }
                 // A person takes a while: five minutes unless it says.
                 cond.timeout_ms = Some(cond.timeout_ms.unwrap_or(300_000));
                 Ok(Action::Handoff(Some(cond)))
