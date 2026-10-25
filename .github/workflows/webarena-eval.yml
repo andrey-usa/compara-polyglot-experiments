@@ -35,7 +35,7 @@ name: webarena-eval
 
 on:
   push:
-    branches: [experiment-23]
+    branches: [experiment-32]
     paths:
       - bench/webarena/**
       - bench/agent-eval/**
@@ -56,7 +56,7 @@ on:
         default: "0"
       max_spend:
         description: "per-cell budget in USD (hard stop; see header)"
-        default: "3.56"
+        default: "0.65"
 
 permissions:
   contents: read
@@ -69,11 +69,11 @@ jobs:
     steps:
       - id: m
         env:
-          TOOLS: ${{ inputs.tools || 'navigera-exp17' }}
+          TOOLS: ${{ inputs.tools || 'navigera-r' }}
           MODELS: ${{ inputs.models || 'deepseek-ai/DeepSeek-V4.1-Flash' }}
           COUNT: ${{ inputs.count || '48' }}
           OFFSET: ${{ inputs.offset || '0' }}
-          MAX_SPEND: ${{ inputs.max_spend || '3.56' }}
+          MAX_SPEND: ${{ inputs.max_spend || '0.65' }}
         run: |
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
           import json, os
@@ -82,6 +82,10 @@ jobs:
               variant = "v0.5.0"
               if tool == "navigera-exp17":
                   tool, variant = "navigera", "exp17-2033910sk"
+              elif tool == "navigera-r":
+                  tool, variant = "navigera", "ax-r-ab23bf6"
+              elif tool == "navigera-g":
+                  tool, variant = "navigera", "ax-g-185964e"
               for model in [m.strip() for m in os.environ["MODELS"].split(",") if m.strip()]:
                   cells.append({"tool": tool, "model": model, "variant": variant,
                                 "slug": model.replace("/", "-"),
@@ -152,6 +156,28 @@ jobs:
             git log -1 --format='commit %H %s' 89ce1d4
             echo "skill provenance: $(git rev-parse 2033910)"
             git log -1 --format='commit %H %s' 2033910
+            echo "skill sha256: $(sha256sum "$RUNNER_TEMP/nav-build/src/skills/navigera/SKILL.md")"
+            echo "skill bytes: $(wc -c < "$RUNNER_TEMP/nav-build/src/skills/navigera/SKILL.md")"
+            cd "$RUNNER_TEMP/nav-build/src"
+          elif [ "$VARIANT" = "ax-r-ab23bf6" ]; then
+            git fetch --depth 10 origin experiment-29
+            git merge-base --is-ancestor ab23bf6 FETCH_HEAD
+            mkdir -p "$RUNNER_TEMP/nav-build"
+            git archive ab23bf6 navigera | tar -x -C "$RUNNER_TEMP/nav-build"
+            mv "$RUNNER_TEMP/nav-build/navigera" "$RUNNER_TEMP/nav-build/src"
+            echo "build provenance: $(git rev-parse ab23bf6)"
+            git log -1 --format='commit %H %s' ab23bf6
+            echo "skill sha256: $(sha256sum "$RUNNER_TEMP/nav-build/src/skills/navigera/SKILL.md")"
+            echo "skill bytes: $(wc -c < "$RUNNER_TEMP/nav-build/src/skills/navigera/SKILL.md")"
+            cd "$RUNNER_TEMP/nav-build/src"
+          elif [ "$VARIANT" = "ax-g-185964e" ]; then
+            git fetch --depth 10 origin experiment-29
+            git merge-base --is-ancestor 185964e FETCH_HEAD
+            mkdir -p "$RUNNER_TEMP/nav-build"
+            git archive 185964e navigera | tar -x -C "$RUNNER_TEMP/nav-build"
+            mv "$RUNNER_TEMP/nav-build/navigera" "$RUNNER_TEMP/nav-build/src"
+            echo "build provenance: $(git rev-parse 185964e)"
+            git log -1 --format='commit %H %s' 185964e
             echo "skill sha256: $(sha256sum "$RUNNER_TEMP/nav-build/src/skills/navigera/SKILL.md")"
             echo "skill bytes: $(wc -c < "$RUNNER_TEMP/nav-build/src/skills/navigera/SKILL.md")"
             cd "$RUNNER_TEMP/nav-build/src"
