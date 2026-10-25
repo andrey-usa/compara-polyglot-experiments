@@ -1284,6 +1284,17 @@ fn finder_expr_in(target: &Target, wait_ms: u128, what: &str, mode: TextMode) ->
     }
 }
 
+/// `scheme://host[:port]` of an http(s) URL; none for `about:`, `data:`,
+/// `file:` and the like, whose documents belong to the page that made them.
+fn http_origin(url: &str) -> Option<String> {
+    let rest =
+        url.strip_prefix("https://").map(|r| ("https", r)).or_else(|| url.strip_prefix("http://").map(|r| ("http", r)));
+    let (scheme, rest) = rest?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
+    (!host.is_empty()).then(|| format!("{scheme}://{}", host.to_ascii_lowercase()))
+}
+
 /// A finder's "no element … within" (the element isn't there yet).
 fn not_found(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains(": no element")
@@ -3033,12 +3044,16 @@ impl Page {
     /// actionable: elements with a click, mousedown or mouseup listener of
     /// their own (Chrome's `isClickable`), and the outermost element of a
     /// `cursor: pointer` area (a card, a row, an icon in a `<span>`). Only
-    /// elements with a box count. Also `#id` / `.class` for each element,
-    /// to tell apart actionable elements that have no name or text.
+    /// what a user's click could land on counts: an element with a box of
+    /// some size, not `pointer-events: none`, not fully transparent (nor
+    /// inside something that is), in a document of the page's own origin
+    /// (an ad's or a widget's frame is someone else's). Also `#id` /
+    /// `.class` for each element, to tell apart actionable elements that
+    /// have no name or text.
     fn clickables(&self, timeout: Duration) -> ax::Clickables {
         let mut out = ax::Clickables::default();
-        let Ok(snap) = self.send("DOMSnapshot.captureSnapshot", json!({ "computedStyles": ["cursor"] }), timeout)
-        else {
+        let params = json!({ "computedStyles": ["cursor", "pointer-events", "opacity"], "includeDOMRects": true });
+        let Ok(snap) = self.send("DOMSnapshot.captureSnapshot", params, timeout) else {
             return out;
         };
         let strings: Vec<&str> = snap
@@ -3050,8 +3065,14 @@ impl Page {
             .collect();
         let text =
             |i: Option<&Value>| i.and_then(Value::as_u64).and_then(|i| strings.get(i as usize).copied()).unwrap_or("");
-        for doc in snap.get("documents").and_then(Value::as_array).into_iter().flatten() {
+        let documents = snap.get("documents").and_then(Value::as_array).cloned().unwrap_or_default();
+        let page_origin = documents.first().and_then(|d| http_origin(text(d.get("documentURL"))));
+        for doc in &documents {
             let nodes = &doc["nodes"];
+            let foreign = match (&page_origin, http_origin(text(doc.get("documentURL")))) {
+                (Some(page), Some(own)) => *page != own,
+                _ => false,
+            };
             let ints = |key: &str| -> Vec<i64> {
                 nodes
                     .get(key)
@@ -3072,13 +3093,32 @@ impl Page {
                 .filter_map(Value::as_i64)
                 .collect();
             let layout = &doc["layout"];
-            let mut cursor = std::collections::HashMap::new();
+            // Per laid-out node: (cursor, pointer-events, opacity, has an area).
+            let mut boxes = std::collections::HashMap::new();
             let styles = layout.get("styles").and_then(Value::as_array);
+            let bounds = layout.get("bounds").and_then(Value::as_array);
             for (i, node) in layout.get("nodeIndex").and_then(Value::as_array).into_iter().flatten().enumerate() {
-                let style = styles.and_then(|s| s.get(i)).and_then(|s| s.get(0));
-                cursor.insert(node.as_i64().unwrap_or(-1), text(style));
+                let style = |k: usize| text(styles.and_then(|s| s.get(i)).and_then(|s| s.get(k)));
+                let area = bounds
+                    .and_then(|b| b.get(i))
+                    .and_then(Value::as_array)
+                    .map(|r| r.iter().filter_map(Value::as_f64).collect::<Vec<_>>())
+                    .is_some_and(|r| r.len() == 4 && r[2] > 0.0 && r[3] > 0.0);
+                boxes.insert(node.as_i64().unwrap_or(-1), (style(0), style(1), style(2), area));
             }
-            let pointer = |i: i64| cursor.get(&i).is_some_and(|c| *c == "pointer");
+            let pointer = |i: i64| boxes.get(&i).is_some_and(|b| b.0 == "pointer");
+            let transparent = |mut i: i64| {
+                for _ in 0..64 {
+                    if boxes.get(&i).is_some_and(|b| b.2 == "0") {
+                        return true;
+                    }
+                    match parents.get(i as usize) {
+                        Some(&p) if p >= 0 => i = p,
+                        _ => break,
+                    }
+                }
+                false
+            };
             let attributes = nodes.get("attributes").and_then(Value::as_array);
             for (i, &backend) in backends.iter().enumerate() {
                 if types.get(i) != Some(&1) {
@@ -3099,7 +3139,13 @@ impl Page {
                 }
                 let tag = names.get(i).and_then(|&n| strings.get(n as usize)).copied().unwrap_or("");
                 // A label clicks its control, which has a ref of its own.
-                if !cursor.contains_key(&index) || matches!(tag, "HTML" | "BODY" | "LABEL") {
+                let Some(&(_, events, _, area)) = boxes.get(&index) else { continue };
+                if foreign
+                    || matches!(tag, "HTML" | "BODY" | "LABEL")
+                    || events == "none"
+                    || !area
+                    || transparent(index)
+                {
                     continue;
                 }
                 let parent = parents.get(i).copied().unwrap_or(-1);
@@ -3390,6 +3436,15 @@ fn flat_ax(nodes: &[Value], all: bool) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_origin_names_the_site_and_nothing_else() {
+        assert_eq!(super::http_origin("https://Shop.Example:8443/a?b#c").as_deref(), Some("https://shop.example:8443"));
+        assert_eq!(super::http_origin("http://user@127.0.0.1:8000").as_deref(), Some("http://127.0.0.1:8000"));
+        assert_eq!(super::http_origin("about:srcdoc"), None);
+        assert_eq!(super::http_origin("data:text/html,x"), None);
+        assert_eq!(super::http_origin("file:///tmp/x.html"), None);
+    }
+
     use super::*;
 
     #[test]
