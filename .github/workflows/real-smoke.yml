@@ -1,0 +1,82 @@
+name: real-smoke
+
+# REAL (agisdk) scripted self-check: setup -> capture -> judge on one
+# subset task, both tools, zero model spend. Proves the CI browser can
+# reach the hosted demo sites and that the separable judging path works
+# before any paid cell runs. A no-op episode must judge FAILURE.
+#
+# Protocol: bench/real/README.md. Navigera is built from the
+# experiment-17 candidate tree @ e9c1b57 in full (ancestry-checked);
+# agent-browser is npm agent-browser@0.39.1. No model key is needed or
+# used here (the harness runs in --scripted-policy mode).
+
+on:
+  push:
+    branches: [experiment-27]
+    paths:
+      - bench/real/**
+      - .github/workflows/real-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: REAL smoke (${{ matrix.tool }})
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [navigera, agent-browser]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TOOL: ${{ matrix.tool }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        if: matrix.tool == 'navigera'
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: matrix.tool == 'agent-browser'
+        with:
+          node-version: 24
+      - name: Build navigera (release)
+        if: matrix.tool == 'navigera'
+        run: |
+          git fetch --depth 10 origin experiment-17
+          git merge-base --is-ancestor e9c1b57 FETCH_HEAD
+          mkdir -p "$RUNNER_TEMP/nav-build"
+          git archive e9c1b57 navigera | tar -x -C "$RUNNER_TEMP/nav-build"
+          mv "$RUNNER_TEMP/nav-build/navigera" "$RUNNER_TEMP/nav-build/src"
+          echo "candidate provenance: $(git rev-parse e9c1b57)"
+          cd "$RUNNER_TEMP/nav-build/src"
+          cargo build --release --locked --bin navigera
+          echo "NAV_BIN=$RUNNER_TEMP/nav-build/src/target/release/navigera" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/nav-build/src/target/release/navigera" --version
+          "$RUNNER_TEMP/nav-build/src/target/release/navigera" install-skill --dir "$RUNNER_TEMP/skills"
+          echo "NAVIGERA_SKILL_MD=$RUNNER_TEMP/skills/navigera/SKILL.md" >> "$GITHUB_ENV"
+      - name: Install agent-browser
+        if: matrix.tool == 'agent-browser'
+        run: |
+          npm install -g agent-browser@0.39.1
+          echo "AB_BIN=$(npm prefix -g)/bin/agent-browser" >> "$GITHUB_ENV"
+          agent-browser --version
+      - name: Chrome
+        run: google-chrome --version
+      - name: Scripted self-check (dashdish-1, no model)
+        run: |
+          python3 bench/real/real_run.py --tool "$TOOL" --tasks-file bench/real/tasks.json \
+            --count 1 --seeds 1 --scripted-policy --run-id "real-smoke-$TOOL" \
+            --nav-bin "${NAV_BIN:-navigera}" --ab-bin "${AB_BIN:-agent-browser}" --out out/real
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: real-smoke-${{ matrix.tool }}
+          path: out/real/
+          if-no-files-found: ignore

@@ -1,0 +1,219 @@
+[
+ {
+  "task": "dashdish-1",
+  "site": "dashdish",
+  "goal": "Order me some noodles and make sure the final price is under 26$",
+  "url": "https://real-dashdish-1rmq4pjxg-real-sites.vercel.app/",
+  "eval": "eval_dashdish_1.py"
+ },
+ {
+  "task": "dashdish-3",
+  "site": "dashdish",
+  "goal": "DashDish: Its my son\u2019s birthday, please order me a Pizza from anywhere and keep it under $30",
+  "url": "https://real-dashdish-1rmq4pjxg-real-sites.vercel.app/",
+  "eval": "eval_dashdish_3.py"
+ },
+ {
+  "task": "dashdish-4",
+  "site": "dashdish",
+  "goal": "order me any chicken sandwich and make sure the final price is under 25$.",
+  "url": "https://real-dashdish-1rmq4pjxg-real-sites.vercel.app/",
+  "eval": "eval_dashdish_4.py"
+ },
+ {
+  "task": "gocalendar-4",
+  "site": "gocalendar",
+  "goal": "Starting September 20th, make a reminder for Monday through Friday to remind me to work out at the gym from 7:45pm to 8:45pm.",
+  "url": "https://real-gocalendar-n1nw9ran1-real-sites.vercel.app/",
+  "eval": "eval_gocalendar_4.py"
+ },
+ {
+  "task": "gocalendar-6",
+  "site": "gocalendar",
+  "goal": "Remind me to pick up my sister on Wednesday at 11 am",
+  "url": "https://real-gocalendar-n1nw9ran1-real-sites.vercel.app/",
+  "eval": "eval_gocalendar_6.py"
+ },
+ {
+  "task": "gocalendar-8",
+  "site": "gocalendar",
+  "goal": "GoCalendar: Add a task to send an email to Ashley for Monday Morning",
+  "url": "https://real-gocalendar-n1nw9ran1-real-sites.vercel.app/",
+  "eval": "eval_gocalendar_8.py"
+ },
+ {
+  "task": "gomail-1",
+  "site": "gomail",
+  "goal": "Mark all my emails as read and delete all amazon related emails.",
+  "url": "https://real-gomail-1glk4rtaf-real-sites.vercel.app/",
+  "eval": "eval_gomail_1.py"
+ },
+ {
+  "task": "gomail-2",
+  "site": "gomail",
+  "goal": "Clear any uber emails and notifications emails. I am trying to clean up my emails.",
+  "url": "https://real-gomail-1glk4rtaf-real-sites.vercel.app/",
+  "eval": "eval_gomail_2.py"
+ },
+ {
+  "task": "gomail-4",
+  "site": "gomail",
+  "goal": "Write an email to alexa richardson and ask to let me know when the files come in.",
+  "url": "https://real-gomail-1glk4rtaf-real-sites.vercel.app/",
+  "eval": "eval_gomail_4.py"
+ },
+ {
+  "task": "marrisuite-8",
+  "site": "marrisuite",
+  "goal": "I want to stay in Goleta, California next weekend to visit my friend. Show me available hotels.",
+  "url": "https://real-marrisuite-jwg9pwssr-real-sites.vercel.app/",
+  "eval": "eval_marrisuite_8.py"
+ },
+ {
+  "task": "networkin-1",
+  "site": "networkin",
+  "goal": "Follow some popular companies and also make sure to follow microsoft.",
+  "url": "https://real-networkin-mtmzp58l6-real-sites.vercel.app/",
+  "eval": "eval_networkin_1.py"
+ },
+ {
+  "task": "networkin-5",
+  "site": "networkin",
+  "goal": "Find a software engineer I have connected with or not, and ask them if they are interested in working on a side project.",
+  "url": "https://real-networkin-mtmzp58l6-real-sites.vercel.app/",
+  "eval": "eval_networkin_5.py"
+ },
+ {
+  "task": "networkin-6",
+  "site": "networkin",
+  "goal": "Invite someone working in the tech industry living in new york to join my new project.",
+  "url": "https://real-networkin-mtmzp58l6-real-sites.vercel.app/",
+  "eval": "eval_networkin_6.py"
+ },
+ {
+  "task": "omnizon-3",
+  "site": "omnizon",
+  "goal": "Find me headphones above 24$ and below 100$ and order it.",
+  "url": "https://amazon-omnizon-z1-rea-lr9f-agi7-xw2-pq6s-git-b7a192-real-sites.vercel.app/",
+  "eval": "eval_omnizon_3.py"
+ },
+ {
+  "task": "omnizon-9",
+  "site": "omnizon",
+  "goal": "Omnizon: I want to create a gaming collection - buy any gaming device under $100",
+  "url": "https://amazon-omnizon-z1-rea-lr9f-agi7-xw2-pq6s-git-b7a192-real-sites.vercel.app/",
+  "eval": "eval_omnizon_9.py"
+ },
+ {
+  "task": "omnizon-13",
+  "site": "omnizon",
+  "goal": "Omnizon: I need to cook for my friends party, order me a nice cooking pot",
+  "url": "https://amazon-omnizon-z1-rea-lr9f-agi7-xw2-pq6s-git-b7a192-real-sites.vercel.app/",
+  "eval": "eval_omnizon_13.py"
+ },
+ {
+  "task": "opendining-1",
+  "site": "opendining",
+  "goal": "Book me a reservation at an Italian Restaurant for today at 3pm.",
+  "url": "https://real-opendining-fdcw98zrb-real-sites.vercel.app/",
+  "eval": "eval_opendining_1.py"
+ },
+ {
+  "task": "opendining-2",
+  "site": "opendining",
+  "goal": "Reserve me an American restaurant for any time that is available between 7pm to 8pm today for my friend and I as it's his birthday today.",
+  "url": "https://real-opendining-fdcw98zrb-real-sites.vercel.app/",
+  "eval": "eval_opendining_2.py"
+ },
+ {
+  "task": "opendining-4",
+  "site": "opendining",
+  "goal": "Look at the top rated restaurants people are talking about and book a reservation for 9pm tonight for any of them.",
+  "url": "https://real-opendining-fdcw98zrb-real-sites.vercel.app/",
+  "eval": "eval_opendining_4.py"
+ },
+ {
+  "task": "staynb-1",
+  "site": "staynb",
+  "goal": "Show me places with 2 bedrooms in Austria. This trip is for my wife and I along with my 3 year old child for the dates of August 1st to 5th.",
+  "url": "https://real-staynb-jbf17z6s2-real-sites.vercel.app/",
+  "eval": "eval_staynb_1.py"
+ },
+ {
+  "task": "staynb-4",
+  "site": "staynb",
+  "goal": "Show me places in San Francisco with wifi for the dates September 27-29th for 2 people.",
+  "url": "https://real-staynb-jbf17z6s2-real-sites.vercel.app/",
+  "eval": "eval_staynb_4.py"
+ },
+ {
+  "task": "staynb-5",
+  "site": "staynb",
+  "goal": "Show me places in Paris, France with wifi, parking, and AC. This place is for oct 15th to 19th for 3 adults.",
+  "url": "https://real-staynb-jbf17z6s2-real-sites.vercel.app/",
+  "eval": "eval_staynb_5.py"
+ },
+ {
+  "task": "topwork-2",
+  "site": "topwork",
+  "goal": "Invite a backend or full stack developer asking if they are interested in building a fitness app with me.",
+  "url": "https://real-topwork-git-v2-all-real-sites.vercel.app/",
+  "eval": "eval_topwork_2.py"
+ },
+ {
+  "task": "topwork-3",
+  "site": "topwork",
+  "goal": "Invite someone looking for work who has experience in Python to my project.",
+  "url": "https://real-topwork-git-v2-all-real-sites.vercel.app/",
+  "eval": "eval_topwork_3.py"
+ },
+ {
+  "task": "topwork-4",
+  "site": "topwork",
+  "goal": "Invite a full-stack developer to a job.",
+  "url": "https://real-topwork-git-v2-all-real-sites.vercel.app/",
+  "eval": "eval_topwork_4.py"
+ },
+ {
+  "task": "udriver-2",
+  "site": "udriver",
+  "goal": "Add 100$ of UDriver credits to my balance using the card on my account.",
+  "url": "https://real-udriver-3ufk0q1v4-real-sites.vercel.app/",
+  "eval": "eval_udriver_2.py"
+ },
+ {
+  "task": "udriver-3",
+  "site": "udriver",
+  "goal": "Book me a ride from 1001 Castro Street to 1030 Post Street Apartments.",
+  "url": "https://real-udriver-3ufk0q1v4-real-sites.vercel.app/",
+  "eval": "eval_udriver_3.py"
+ },
+ {
+  "task": "udriver-4",
+  "site": "udriver",
+  "goal": "Show me rides from 1000 Chestnut St  to Rooftop 25 and book one of the rides.",
+  "url": "https://real-udriver-3ufk0q1v4-real-sites.vercel.app/",
+  "eval": "eval_udriver_4.py"
+ },
+ {
+  "task": "zilloft-2",
+  "site": "zilloft",
+  "goal": "Request a tour for a 3 bed 2 bath house in long beach.",
+  "url": "https://real-zilloft-46k595h3n-real-sites.vercel.app/",
+  "eval": "eval_zilloft_2.py"
+ },
+ {
+  "task": "zilloft-3",
+  "site": "zilloft",
+  "goal": "Request a tour for a house for July 19th around the Los Angeles area that are under 350,000$ and have 2+ bedrooms and 1+ bathrooms.",
+  "url": "https://real-zilloft-46k595h3n-real-sites.vercel.app/",
+  "eval": "eval_zilloft_3.py"
+ },
+ {
+  "task": "zilloft-5",
+  "site": "zilloft",
+  "goal": "Contact an agent in San Jose, CA to hire.",
+  "url": "https://real-zilloft-46k595h3n-real-sites.vercel.app/",
+  "eval": "eval_zilloft_5.py"
+ }
+]
