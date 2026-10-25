@@ -2,9 +2,12 @@
 #
 # Each run exercises the action exactly as a consumer writes it
 # (uses: andrey-usa/primavera@next) on ubuntu-24.04, macos-14 and
-# windows-latest. Dispatch 3 times for 3 runs per OS. No release exists
-# yet, so every install builds from source; check 3 pins a version that
-# never existed to prove the fallback notice.
+# windows-latest. Push to experiment-35 fires one run (all three OSes);
+# 3 runs total come from 3 pushes. No release exists yet, so every
+# install builds from source; check 3 pins a version that never
+# existed to prove the fallback notice. (A branch-only workflow cannot
+# be dispatched: the API resolves it from the default branch, so the
+# push trigger is the dispatch mechanism here.)
 #
 # The site is a pinned copy of primavera's suite40 site server at next
 # eaeb9b9 (t0073/site/server.py); the .pv files are t0073/pass.pv and
@@ -12,6 +15,8 @@
 # run's jobs API after the fact, not from inside the job.
 name: t0073-action-consumer
 on:
+  push:
+    branches: [experiment-35]
   workflow_dispatch:
 
 permissions:
