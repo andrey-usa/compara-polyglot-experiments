@@ -46,7 +46,7 @@ run_pv() {
   start=$(now_ms); peak=0
   docker run -d --name pvbench --network host "$@" \
     -e GAUNTLET_URL=http://127.0.0.1:18201 \
-    -v "$PWD/$S/pv:/scenarios:ro" -v "$PWD/$outdir:/out" -w /out \
+    -v "$PWD/$S/pv:/scenarios:ro" -v "$PWD/$S/fixtures:/fixtures:ro" -v "$PWD/$outdir:/out" -w /out \
     primavera:local run /scenarios \
     --base-url http://127.0.0.1:18001 --workers "$workers" \
     --junit junit.xml > "$outdir/container.id" 2>&1
@@ -76,8 +76,9 @@ run_pw() {
     -e BASE_URL=http://127.0.0.1:18001 -e GAUNTLET_URL=http://127.0.0.1:18201 \
     -e PW_WORKERS="$workers" \
     pw:local sh -c '
-      SHELL_BIN=$(ls /ms-playwright/chromium_headless_shell-*/chrome-headless-shell* 2>/dev/null | head -1);
-      [ -n "$SHELL_BIN" ] || SHELL_BIN=$(ls /ms-playwright/chromium-*/chrome-linux/chrome 2>/dev/null | head -1);
+      SHELL_BIN=$(find /ms-playwright/chromium_headless_shell-*/ -maxdepth 2 -type f -name chrome-headless-shell 2>/dev/null | head -1);
+      [ -n "$SHELL_BIN" ] || SHELL_BIN=$(find /ms-playwright/chromium-*/chrome-linux -maxdepth 1 -type f -name chrome 2>/dev/null | head -1);
+      [ -x "$SHELL_BIN" ] || { echo "no chrome binary found under /ms-playwright"; exit 1; };
       echo "CHROME_SHELL=$SHELL_BIN";
       CHROME_SHELL="$SHELL_BIN" npx playwright test --workers=$PW_WORKERS'
   > "$outdir/container.id" 2>&1
@@ -103,7 +104,7 @@ cold() {
   start=$(now_ms)
   docker run --rm --network host \
     -e GAUNTLET_URL=http://127.0.0.1:18201 \
-    -v "$PWD/$S/pv:/scenarios:ro" -v "$PWD/out/cold:/out" -w /out \
+    -v "$PWD/$S/pv:/scenarios:ro" -v "$PWD/$S/fixtures:/fixtures:ro" -v "$PWD/out/cold:/out" -w /out \
     primavera:local run /scenarios/s01-cookie-consent.pv \
     --base-url http://127.0.0.1:18001 > out/cold/stdout.log 2>&1
   code=$?
