@@ -38,6 +38,8 @@ jobs:
           cp -r primavera/bench/suite40/pw/tests \
                  primavera/bench/suite40/pw/fixtures.mjs \
                  primavera/bench/suite40/pw/playwright.config.mjs /tmp/pwctx/
+          mkdir -p /tmp/pwctx/fixtures
+          cp primavera/bench/suite40/fixtures/upload.txt /tmp/pwctx/fixtures/
           cat > /tmp/pwctx/Dockerfile <<'DOCKER'
           FROM mcr.microsoft.com/playwright:v1.64.1-noble
           WORKDIR /work
@@ -45,6 +47,7 @@ jobs:
           RUN npm ci --no-audit --no-fund
           COPY tests ./tests
           COPY fixtures.mjs playwright.config.mjs ./
+          COPY fixtures /fixtures
           DOCKER
           docker build -t pw:local /tmp/pwctx
 
