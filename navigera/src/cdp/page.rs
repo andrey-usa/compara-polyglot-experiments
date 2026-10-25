@@ -916,8 +916,6 @@ const WAIT_LOCATOR: &str = r#"async function (spec, ms, what, deep) {
     };
     const matches = (got, want) => { const g = norm(got), w = norm(want); return g === w ? 2 : (w && g.includes(w) ? 1 : 0); };
     const visible = (el) => el.getClientRects().length > 0 && deep.style(el).visibility !== 'hidden';
-    // `locate` asks how one element reads (role, name, label), in these terms.
-    if (spec.describe) return { role: role(spec.describe), name: accName(spec.describe), label: labelText(spec.describe) };
     const end = Date.now() + ms;
     for (;;) {
         let found = [];
@@ -945,79 +943,6 @@ const WAIT_LOCATOR: &str = r#"async function (spec, ms, what, deep) {
         await new Promise((r) => setTimeout(r, 50));
     }
 }"#;
-
-/// `locate`: the locators that find this element again, most stable first
-/// (test id, role and name, label, placeholder, text, CSS), each kept only
-/// when the finder the op would use picks this very element on the page as
-/// it is now. Inside a same-origin frame each one names it with `--frame`;
-/// inside a cross-origin one there is none (`xframe`).
-const LOCATE_EL: &str = r#"async function (el) {
-    const deep = __DEEP__;
-    const byLocator = __WAIT_LOCATOR__;
-    const byText = __WAIT_TEXT__;
-    const byCss = __WAIT_FOR__;
-    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    // (Taken apart: the CDP check reads Domain-dot-name spellings as commands.)
-    const { escape: esc } = window.CSS;
-    const finds = async (p) => { try { return (await p) === el; } catch (_) { return false; } };
-    // A selector unique where the element is: its id, else the path from
-    // the nearest ancestor with one (or <body>), positions where needed.
-    const cssOf = (e) => {
-        const root = e.getRootNode();
-        const unique = (s) => { try { return root.querySelectorAll(s).length === 1; } catch (_) { return false; } };
-        const id = (n) => (n.id && unique('#' + esc(n.id)) ? '#' + esc(n.id) : null);
-        if (id(e)) return id(e);
-        const parts = [];
-        for (let n = e; n && n.nodeType === 1; n = n.parentElement) {
-            if (n !== e && id(n)) { parts.unshift(id(n)); break; }
-            const tag = n.tagName.toLowerCase();
-            if (tag === 'body' || tag === 'html') { parts.unshift(tag); break; }
-            const same = n.parentElement ? [...n.parentElement.children].filter((c) => c.tagName === n.tagName) : [n];
-            parts.unshift(same.length > 1 ? tag + ':nth-of-type(' + (same.indexOf(n) + 1) + ')' : tag);
-        }
-        return parts.join(' > ');
-    };
-    const chain = [];
-    for (let w = el.ownerDocument.defaultView; w && w !== w.top; w = w.parent) {
-        let fe = null;
-        try { fe = w.frameElement; } catch (_) {}
-        if (!fe) return { xframe: true, locators: [] };
-        // A frame by its name or title when that is unique, else by place.
-        const tag = fe.tagName.toLowerCase();
-        const attr = ['name', 'title'].map((a) => [a, fe.getAttribute(a)]).find(([, v]) => v
-            && fe.ownerDocument.querySelectorAll(tag + '[' + a + '="' + esc(v) + '"]').length === 1);
-        chain.unshift(attr ? tag + '[' + attr[0] + '="' + esc(attr[1]) + '"]' : cssOf(fe));
-    }
-    const out = [];
-    const add = async (kind, flags, found) => {
-        if (await found) out.push({ kind, flags: chain.length ? [...flags, '--frame', chain.join(' >> ')] : flags });
-    };
-    const testid = ['data-testid', 'data-test-id', 'data-test', 'data-qa'].map((a) => el.getAttribute(a)).find(Boolean);
-    if (testid) await add('testid', ['--testid', testid], finds(byLocator({ testid }, 0, 'locate', deep)));
-    const d = await byLocator({ describe: el }, 0, 'locate', deep);
-    const name = norm(d.name), label = norm(d.label), placeholder = norm(el.getAttribute('placeholder'));
-    if (d.role && name && name.length <= 80) {
-        await add('role', ['--role', d.role, '--name', name], finds(byLocator({ role: d.role, name }, 0, 'locate', deep)));
-    }
-    if (label && label.length <= 80) await add('label', ['--label', label], finds(byLocator({ label }, 0, 'locate', deep)));
-    if (placeholder) await add('placeholder', ['--placeholder', placeholder], finds(byLocator({ placeholder }, 0, 'locate', deep)));
-    const text = /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) ? '' : norm(el.innerText);
-    if (text && text.length <= 60) await add('text', ['--text', text], finds(byText(text, 0, 'locate', deep, 2)));
-    const css = cssOf(el);
-    await add('css', ['--selector', css], finds(byCss(css, 0, 'locate', () => deep)));
-    return { locators: out };
-}"#;
-
-fn locate_fn() -> &'static str {
-    static F: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    F.get_or_init(|| {
-        LOCATE_EL
-            .replace("__DEEP__", DEEP)
-            .replace("__WAIT_LOCATOR__", WAIT_LOCATOR)
-            .replace("__WAIT_TEXT__", WAIT_TEXT)
-            .replace("__WAIT_FOR__", WAIT_FOR)
-    })
-}
 
 /// Auto-wait by visible text: the best element whose accessible label,
 /// text or value matches `text` — exact (case-insensitive) beats contains,
@@ -1659,10 +1584,19 @@ impl Page {
     pub fn navigate(&self, url: &str, wait: &str, timeout: Duration) -> Result<()> {
         self.block_on(async {
             let mut events = self.client.subscribe();
-            let res = self
-                .send_page_op("Page.navigate", json!({ "url": url }), timeout)
-                .await
-                .with_context(|| format!("navigate to {url}"))?;
+            let res = self.send_page_op("Page.navigate", json!({ "url": url }), timeout).await;
+            // Unanswered (a server that accepts and never responds): cancel
+            // that navigation, or the tab answers nothing while it is pending
+            // and every op after (the failure's screenshot, `url`, `ax`)
+            // waits its whole timeout too. Stalled if even that goes
+            // unanswered (see STALLED_WAIT).
+            if res.as_ref().is_err_and(|e| format!("{e:#}").contains("CDP command timed out")) {
+                let stop = self.client.send("Page.stopLoading", json!({}), Some(&self.session_id), STALLED_WAIT).await;
+                if stop.is_err() {
+                    self.stalled.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let res = res.with_context(|| format!("navigate to {url}"))?;
             if let Some(error) = res.get("errorText").and_then(Value::as_str) {
                 bail!("navigate to {url}: {error}");
             }
@@ -1888,6 +1822,9 @@ impl Page {
     /// If an earlier action started a navigation in this tab, wait (up to
     /// `timeout`) until its new document is parsed. No-op otherwise.
     pub fn settle(&self, timeout: Duration) -> Result<()> {
+        // A stalled tab's load (see STALLED_WAIT) isn't waited for in full.
+        let timeout =
+            if self.stalled.load(std::sync::atomic::Ordering::SeqCst) { timeout.min(STALLED_WAIT) } else { timeout };
         let end = Instant::now() + timeout;
         loop {
             let state = self.shared.nav_state(&self.session_id);
@@ -1972,11 +1909,6 @@ impl Page {
     pub fn title(&self, timeout: Duration) -> Result<String> {
         let value = self.evaluate_raw("document.title", timeout)?;
         Ok(value.as_str().unwrap_or_default().to_string())
-    }
-
-    /// The locators that find `target`'s element again (see LOCATE_EL).
-    pub fn locate(&self, target: &Target, wait: Duration, timeout: Duration) -> Result<Value> {
-        self.on_element(target, "locate", locate_fn(), &[], wait, timeout)
     }
 
     pub fn url(&self, timeout: Duration) -> Result<String> {

@@ -6,18 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-### Added
-
-- `locate <target>`: the locators that find an element again, most stable
-  first (test id, role and name, label, placeholder, text, CSS), each kept
-  only when the finder an op would use picks that element on the page;
-  `--frame` added inside a same-origin frame.
-- `history [--clear]`: the actions a session ran, oldest first; one on a
-  ref carries its element's `locate` from just before it ran. What
-  `primavera from-session` turns into a test.
-
 ### Fixed
 
+- A `goto` to a server that takes the connection and never answers fails
+  at its timeout and cancels that navigation: the tab answers at once again
+  (it had answered nothing while the dead load was pending, so the next
+  `url` or `ax`, and a test runner's failure screenshot, each waited their
+  whole timeout too: one failed step cost 105 s).
 - `get box` of an element inside an iframe is in top-level viewport pixels
   (each frame's offset added), as `mouse` takes them and Playwright's
   `boundingBox()` reports; it was relative to the element's own frame.

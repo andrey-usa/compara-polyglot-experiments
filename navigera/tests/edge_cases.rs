@@ -140,6 +140,33 @@ fn never_ending_page_does_not_wedge_the_session() {
     assert!(took < Duration::from_secs(3), "goto away took {took:?}");
 }
 
+/// A server that takes the connection and never answers: the goto times
+/// out, and the tab is back to answering at once (its navigation cancelled),
+/// not after another full timeout for every op that follows.
+#[test]
+fn a_goto_nobody_answers_leaves_the_tab_usable() {
+    if !chrome_available() {
+        return;
+    }
+    let mute = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = mute.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for c in mute.incoming().flatten() {
+            held.push(c);
+        }
+    });
+    let s = Session::start("mute");
+    let (r, took) = s.run(&["goto", &format!("http://127.0.0.1:{port}/x"), "--timeout-ms", "2000"]);
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(took < Duration::from_secs(8), "goto took {took:?}");
+    for op in [&["url"][..], &["ax"], &["eval", "document.title"]] {
+        let (r, took) = s.run(op);
+        assert_eq!(r["ok"], true, "{op:?}: {r}");
+        assert!(took < Duration::from_secs(2), "{op:?} after the dead goto took {took:?}");
+    }
+}
+
 /// With the default pipe transport, the first command after the browser
 /// dies fails at once and says why.
 #[cfg(target_os = "linux")]

@@ -115,8 +115,6 @@ another process are reachable by ref only.
 | `unroute` | `[<url glob>]` | `{removed}` (all rules without a glob) |
 | `init-script` | `<js>`, `--file <path.js>`, `--clear`; no argument lists them | runs before the page's own scripts in every document of every tab |
 | `status` | — | `{engine, executable, endpoint, attached, version}` + state (`closed: true` once the session's only tab was closed) |
-| `locate` | target (a ref, usually) | `{locators: [{kind, flags}]}`: the flags that find the element again, most stable first (`testid`, `role` + name, `label`, `placeholder`, `text`, `css`), each kept only when the op's own finder picks this element on the page as it is; inside a same-origin frame each has `--frame`; `xframe: true` and none inside a cross-origin one |
-| `history` | `--clear` empties it | `{history: [{command, at, url, locators?}]}`: the actions the session ran (navigation, clicks, typing, selects, uploads, drags, scrolls, tabs, dialogs; not reads, waits or `eval`), oldest first, the last 1000; one on a ref has the `locate` of its element from just before it ran, so `primavera from-session` can write it as a test |
 | `title` / `url` | — | string / state |
 | `back` / `forward` / `reload` | — | state |
 | `screenshot` | `[<path>]` or `--path`; `--full-page` | `{path, bytes}` |

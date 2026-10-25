@@ -6,7 +6,6 @@
 
 pub mod browser;
 pub mod cdp;
-pub mod cli;
 pub mod decide;
 pub mod emulate;
 pub mod mcp;
