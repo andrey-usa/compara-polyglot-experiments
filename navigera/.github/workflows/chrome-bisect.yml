@@ -1,0 +1,112 @@
+name: chrome-bisect
+
+# Reproduce a Chrome-version-specific failure and narrow it down in ONE run:
+# the same test binary against one Chrome for Testing milestone under several
+# environment variants (each repeated), results as one annotation table.
+#
+#   gh workflow run chrome-bisect.yml --ref my-branch -f milestone=151 \
+#     -f variants="baseline;NAVIGERA_CDP_TRANSPORT=ws;NAVIGERA_NO_DISCOVER=1;NAVIGERA_DROP_FLAGS=--no-startup-window"
+#
+# A workflow_dispatch workflow must exist on the default branch, so on a new
+# branch commit `.github/bisect.env` instead (MILESTONE=, KIND=, TEST=,
+# VARIANTS=, REPEAT=); pushing it runs the bisect. Don't merge that file.
+#
+# Knobs: NAVIGERA_CDP_TRANSPORT=ws|pipe, NAVIGERA_NO_DISCOVER=1 (no Target.setDiscoverTargets),
+# NAVIGERA_NO_NETWORK=1 (no Network.enable, so no fetch/XHR wait before ax),
+# NAVIGERA_NO_CLICK_CHECK=1 (don't verify that a click's mouse events arrived),
+# NAVIGERA_DROP_FLAGS=<comma-separated flag prefixes>, NAVIGERA_EXTRA_FLAGS="<flags>".
+
+on:
+  workflow_dispatch:
+    inputs:
+      milestone:
+        description: "Chrome milestone (Chrome for Testing), e.g. 151"
+        required: true
+      kind:
+        description: "chrome or chrome-headless-shell"
+        default: "chrome"
+      test:
+        description: "cargo test arguments"
+        default: "--test serve_roundtrip"
+      variants:
+        description: "semicolon-separated env variants; 'baseline' = no extra env"
+        default: "baseline;NAVIGERA_CDP_TRANSPORT=ws;NAVIGERA_NO_DISCOVER=1"
+      repeat:
+        description: "runs per variant"
+        default: "3"
+  push:
+    branches-ignore: [master]
+    paths: [".github/bisect.env"]
+
+permissions:
+  contents: read
+
+jobs:
+  bisect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - name: Inputs
+        env:
+          IN_MILESTONE: ${{ inputs.milestone }}
+          IN_KIND: ${{ inputs.kind || 'chrome' }}
+          IN_TEST: ${{ inputs.test || '--test serve_roundtrip' }}
+          IN_VARIANTS: ${{ inputs.variants || 'baseline' }}
+          IN_REPEAT: ${{ inputs.repeat || '3' }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          # Values are copied, not interpolated into the script, so an input
+          # can't inject shell; a newline would add a variable, so drop them.
+          for v in MILESTONE KIND TEST VARIANTS REPEAT; do
+            name="IN_$v"
+            printf '%s=%s\n' "$v" "$(printf '%s' "${!name}" | tr -d '\n\r')"
+          done >> "$GITHUB_ENV"
+          if [ "$EVENT" = push ]; then grep -E '^[A-Z]+=' .github/bisect.env >> "$GITHUB_ENV"; fi
+      - name: Download Chrome
+        run: |
+          python3 - "$MILESTONE" "$KIND" > /tmp/url <<'EOF'
+          import json, sys, urllib.request
+          m, kind = sys.argv[1], sys.argv[2]
+          d = json.load(urllib.request.urlopen("https://googlechromelabs.github.io/chrome-for-testing/latest-versions-per-milestone-with-downloads.json"))
+          e = d["milestones"][m]
+          print(next(x["url"] for x in e["downloads"][kind] if x["platform"] == "linux64"))
+          EOF
+          curl -sSfL --retry 3 -o /tmp/b.zip "$(cat /tmp/url)"
+          unzip -q /tmp/b.zip -d /tmp/b
+          exe=$(find /tmp/b -maxdepth 2 -type f \( -name chrome -o -name chrome-headless-shell \) | head -1)
+          echo "CHROME_BIN=$exe" >> "$GITHUB_ENV"
+          "$exe" --version
+      - name: Build tests
+        run: cargo test --locked $TEST --no-run
+      - name: Run variants
+        run: |
+          set +e
+          out=/tmp/bisect.md
+          echo "### Chrome M$MILESTONE ($KIND, $($CHROME_BIN --version)): \`cargo test $TEST\`" > $out
+          echo "" >> $out
+          echo "| variant | passed | first failure | click resends (session logs) |" >> $out
+          echo "|---|---|---|---|" >> $out
+          IFS=';' read -ra VARS <<< "$VARIANTS"
+          for v in "${VARS[@]}"; do
+            pass=0; first=""
+            rm -f /tmp/nv-*.log
+            for i in $(seq $REPEAT); do
+              log=/tmp/run.log; rm -f /tmp/chrome.log
+              if [ "$v" = "baseline" ]; then envs=(); else read -ra envs <<< "$v"; fi
+              env "${envs[@]}" NAVIGERA_CHROME_LOG=/tmp/chrome.log cargo test --locked $TEST > $log 2>&1
+              if [ $? -eq 0 ]; then pass=$((pass+1)); elif [ -z "$first" ]; then
+                first=$( { grep -m1 -E "panicked at|error:" $log; grep -m1 -E "Received signal|Check failed|FATAL" /tmp/chrome.log 2>/dev/null; } | tr '|\n' '/ ' | cut -c1-300)
+                # The whole failure (the scenario's page-state dump) as its own annotation.
+                sed -n '/^---- /,/^test result/p' $log | grep -v -E '^ +[0-9]+: |^ +at ' | tail -c 12000 > /tmp/first-failure.md
+                python3 bench/ladder/annotate.py /tmp/first-failure.md "bisect failure ($v)"
+              fi
+            done
+            resends=$(cat /tmp/nv-*.log 2>/dev/null | grep -c 'did not deliver the mouse events')
+            echo "| \`$v\` | $pass/$REPEAT | $first | $resends |" >> $out
+          done
+          cat $out
+          python3 bench/ladder/annotate.py $out "bisect"

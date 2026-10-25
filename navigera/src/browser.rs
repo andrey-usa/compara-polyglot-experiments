@@ -176,17 +176,26 @@ pub fn download_dir() -> Result<std::path::PathBuf> {
 /// Chrome sends -- and the screen 1920x1080. Navigator's `webdriver` flag
 /// is off in every mode (`--disable-blink-features=AutomationControlled`),
 /// and nothing here passes `--enable-automation`. A windowed browser needs
-/// none of this.
-pub fn natural_flags(exe: &str, headless: bool) -> Vec<String> {
+/// none of this. chrome-headless-shell is refused: it is a different
+/// program, and its client hints, plugins and `window.chrome` say headless
+/// whatever the flags.
+pub fn natural_flags(exe: &str, headless: bool) -> Result<Vec<String>> {
     if !headless {
-        return Vec::new();
+        return Ok(Vec::new());
+    }
+    let stem = Path::new(exe).file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if matches!(stem.as_str(), "chrome-headless-shell" | "headless_shell") {
+        bail!(
+            "--natural needs the full Chrome: {exe} is chrome-headless-shell, which tells a page it is headless \
+             whatever navigera does; point --chromium or $CHROME_BIN at Chrome"
+        );
     }
     let mut flags = vec!["--screen-info={1920x1080}".to_string()];
     match chrome_major(exe) {
         Some(major) => flags.push(format!("--user-agent={}", windowed_user_agent(exe, major))),
         None => crate::timing::log(&format!("[browser] natural: no version from {exe}; user agent left as is")),
     }
-    flags
+    Ok(flags)
 }
 
 /// The user agent Chrome `major` sends with a window on this platform.
@@ -251,11 +260,12 @@ pub fn chrome_major(exe: &str) -> Option<u32> {
 
 /// Chrome refuses to start its sandbox as root (containers, CI images);
 /// `NAVIGERA_NO_SANDBOX=1` turns it off explicitly.
-fn no_sandbox_wanted(root: bool, env: Option<&str>) -> bool {
+pub(crate) fn no_sandbox_wanted(root: bool, env: Option<&str>) -> bool {
     root || env.is_some_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
 
-const NO_SANDBOX_WARNING: &str = "navigera: this machine can't give Chrome its sandbox, so it runs without one \
+pub(crate) const NO_SANDBOX_WARNING: &str =
+    "navigera: this machine can't give Chrome its sandbox, so it runs without one \
      (pages are not isolated from your account). Fix: enable unprivileged user \
      namespaces or Chrome's setuid helper; NAVIGERA_NO_SANDBOX=1 silences this.";
 
@@ -266,7 +276,7 @@ const NO_SANDBOX_WARNING: &str = "navigera: this machine can't give Chrome its s
 /// private session directory and is keyed by the binary's path, size and
 /// modification time and by the boot, so a Chrome update or a reboot (after
 /// which the machine may allow a sandbox) brings the attempt back.
-fn no_sandbox_note(exe: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn no_sandbox_note(exe: &str) -> Option<std::path::PathBuf> {
     exe_note(exe, "no-sandbox", true)
 }
 
@@ -291,7 +301,7 @@ fn exe_note(exe: &str, what: &str, per_boot: bool) -> Option<std::path::PathBuf>
 /// Whether a launch failed because this machine can't give Chrome a
 /// sandbox (no unprivileged user namespaces, a setuid helper that isn't
 /// set up, an AppArmor policy that blocks the namespace).
-fn sandbox_unavailable(error: &str) -> bool {
+pub(crate) fn sandbox_unavailable(error: &str) -> bool {
     [
         "No usable sandbox",
         "Failed to move to new namespace",
@@ -640,7 +650,7 @@ impl BrowserSession {
             };
             let mut flags = chrome_flags();
             if natural() {
-                flags.extend(natural_flags(&exe, headless));
+                flags.extend(natural_flags(&exe, headless)?);
             }
             let note = no_sandbox_note(&exe);
             if !flags.iter().any(|f| f == NO_SANDBOX) && note.as_ref().is_some_and(|n| n.exists()) {
@@ -742,7 +752,7 @@ impl BrowserSession {
                     eprintln!("navigera: {copied}");
                     what = format!("{what}, {copied}");
                 }
-                let extra = if natural() { natural_flags(&exe, *headless) } else { Vec::new() };
+                let extra = if natural() { natural_flags(&exe, *headless)? } else { Vec::new() };
                 let url = cdp::attach::ensure_profile_browser(&exe, &dir, *headless, &extra)?;
                 profile_exe = Some(exe);
                 (url, what)
@@ -1313,6 +1323,12 @@ impl BrowserSession {
         Ok(point)
     }
 
+    /// The locators that find `target`'s element again (`locate`).
+    pub fn locate(&self, target: &Target, timeout_ms: Option<f64>) -> Result<serde_json::Value> {
+        let (wait, timeout) = self.element_budget(timeout_ms);
+        self.active_tab().locate(target, wait, timeout)
+    }
+
     pub fn focus(&self, target: &Target, timeout_ms: Option<f64>) -> Result<bool> {
         let (wait, timeout) = self.element_budget(timeout_ms);
         let v = self.active_tab().on_element(target, "focus", cdp::page_js::FOCUS_EL, &[], wait, timeout)?;
@@ -1765,7 +1781,7 @@ impl BrowserSession {
                             .into_iter()
                             .filter(|r| r.n > requests_before && r.kind == "Document")
                             .filter_map(|r| r.status)
-                            .last();
+                            .next_back();
                         if let Some(code @ (204 | 205)) = status {
                             bail!("{msg}: the server answered {code} (no content), so the browser stays on the page it was on");
                         }

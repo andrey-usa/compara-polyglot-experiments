@@ -1,0 +1,144 @@
+name: webarena-eval
+
+# WebArena-Verified (ServiceNow) Hard-subset pilot: the neutral-ground
+# comparison. Same OpenAI-compatible shell loop as openrouter-eval
+# (bench/webarena/webarena_run.py), but the tasks, the self-hosted sites
+# and the scoring are the suite's own — its Docker images serve the
+# sites in the job, its deterministic evaluators score the agent's
+# response plus the network trace the recording proxy captures.
+# One job per tool x model (4 cells); each job runs its slice of the
+# frozen 48-task pilot (bench/webarena/pilot_tasks.json), resumable via
+# the count/offset inputs. Key: OPENROUTER_API_KEY in the `main`
+# environment.
+#
+# A push to this branch runs only the smoke slice (first 2 pilot tasks,
+# one cell) so the pipeline proves itself before a full dispatch.
+
+on:
+  push:
+    branches: [webarena-eval]
+    paths:
+      - bench/webarena/**
+      - .github/workflows/webarena-eval.yml
+  workflow_dispatch:
+    inputs:
+      tools:
+        description: "comma-separated: navigera,agent-browser"
+        default: "navigera,agent-browser"
+      models:
+        description: "comma-separated OpenRouter model ids"
+        default: "deepseek/deepseek-v4.1-flash,inception/mercury-3"
+      count:
+        description: "pilot tasks per cell"
+        default: "48"
+      offset:
+        description: "start at this index into pilot_tasks.json"
+        default: "0"
+      max_spend:
+        description: "per-cell spend cap in USD"
+        default: "0.70"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          TOOLS: ${{ inputs.tools || 'navigera' }}
+          MODELS: ${{ inputs.models || 'deepseek/deepseek-v4.1-flash' }}
+          COUNT: ${{ inputs.count || '2' }}
+          OFFSET: ${{ inputs.offset || '0' }}
+          MAX_SPEND: ${{ inputs.max_spend || '0.70' }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          cells = []
+          for tool in [t.strip() for t in os.environ["TOOLS"].split(",") if t.strip()]:
+              for model in [m.strip() for m in os.environ["MODELS"].split(",") if m.strip()]:
+                  cells.append({"tool": tool, "model": model,
+                                "slug": model.replace("/", "-"),
+                                "count": os.environ["COUNT"], "offset": os.environ["OFFSET"],
+                                "max_spend": os.environ["MAX_SPEND"]})
+          print("matrix=" + json.dumps(cells))
+          EOF
+
+  eval:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    name: WebArena-Verified (${{ matrix.cell.tool }} × ${{ matrix.cell.slug }})
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 155
+    environment: main
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      TOOL: ${{ matrix.cell.tool }}
+      MODEL: ${{ matrix.cell.model }}
+      COUNT: ${{ matrix.cell.count }}
+      OFFSET: ${{ matrix.cell.offset }}
+      MAX_SPEND: ${{ matrix.cell.max_spend }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The site images are large (GitLab alone is ~22 GB compressed);
+      # hosted runners need the preinstalled bulk gone before pulls.
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: startsWith(matrix.cell.tool, 'agent-browser')
+        with:
+          node-version: 24
+      - name: Build navigera (release)
+        run: |
+          cargo build --release --locked --bin navigera
+          rustup default stable
+      - name: Chrome
+        run: |
+          echo "CHROME_BIN=$(which google-chrome)" >> "$GITHUB_ENV"
+          google-chrome --version
+      # agent-eval.yml's install step and pin: run.py copies the tool's
+      # skill out of the global npm install for skilled runs.
+      - name: Install agent-browser (for skilled runs)
+        if: startsWith(matrix.cell.tool, 'agent-browser')
+        run: |
+          npm install -g agent-browser@0.39.1
+          npm ls -g --depth=0
+      - name: Install the suite's evaluator
+        run: |
+          pip install "webarena-verified==1.2.3"
+          python3 - <<'EOF'
+          from webarena_verified.api import WebArenaVerified
+          wa = WebArenaVerified()
+          print("dataset probe, task 108:", wa.get_task(108).intent)
+          EOF
+          docker version --format 'docker {{.Server.Version}}'
+      - name: WebArena-Verified pilot slice
+        run: |
+          python3 bench/webarena/webarena_run.py --tool "$TOOL" --model "$MODEL" \
+            --offset "$OFFSET" --count "$COUNT" --max-spend "$MAX_SPEND" \
+            --out out/webarena
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: webarena-eval-${{ matrix.cell.tool }}-${{ matrix.cell.slug }}-o${{ matrix.cell.offset }}c${{ matrix.cell.count }}
+          path: out/webarena/
+          if-no-files-found: ignore

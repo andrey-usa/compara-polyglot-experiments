@@ -1,0 +1,77 @@
+name: agent-check
+
+# Natural-language checks: a generic agent (Gemini CLI, free-tier key) is
+# told, in plain words, to buy something with navigera and its skill.
+#
+#   purchase       local Acme Supply shop: cart, coupon, checkout through a
+#                  card iframe; judged from the order the site recorded.
+#                  Runs on Linux and on Windows (the agent's shell is then
+#                  PowerShell; navigera runs its Windows paths: WebSocket
+#                  CDP, loopback-TCP sessions, kill-on-close job object).
+#   purchase-live  Sauce Labs' public demo shop (saucedemo.com, built for
+#                  automation practice; no real payment): log in, cart,
+#                  checkout; judged from the confirmation and total.
+#                  Live internet: informational, never a gate.
+#
+# Runs on master pushes, PRs from this repo and nightly. Needs a Gemini key
+# in the `main` environment; without one it reports that and passes. Each
+# leg reads its own key slot (free quota is per Google Cloud project) and
+# falls back to GEMINI_API_KEY.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "23 9 * * *"   # after the free quota resets (midnight Pacific)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.task }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { task: purchase, os: linux, runner: ubuntu-latest, live: false, key: GEMINI_API_KEY }
+          - { task: purchase, os: windows, runner: windows-latest, live: false, key: GEMINI_API_KEY_2 }
+          - { task: purchase-live, os: linux, runner: ubuntu-latest, live: true, key: GEMINI_API_KEY_3 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    continue-on-error: ${{ matrix.live }}
+    environment: main
+    defaults:
+      run:
+        shell: bash
+    env:
+      HAS_KEY: ${{ secrets[matrix.key] != '' || secrets.GEMINI_API_KEY != '' }}
+      KEY_SLOT: ${{ secrets[matrix.key] != '' && matrix.key || 'GEMINI_API_KEY' }}
+      MODEL: gemini-3.5-flash-lite
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: No key
+        if: env.HAS_KEY != 'true'
+        run: echo "::notice title=agent check::no Gemini key available to this run (fork PR or unset); skipped."
+      - uses: ./.github/actions/agent-setup
+        if: env.HAS_KEY == 'true'
+      - name: Agent run
+        if: env.HAS_KEY == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets[matrix.key] || secrets.GEMINI_API_KEY }}
+        run: |
+          echo "::notice title=agent check key::${{ matrix.task }} (${{ matrix.os }}) used $KEY_SLOT"
+          bash bench/agent-eval/logged.sh "agent run log (${{ matrix.task }}, ${{ matrix.os }})" \
+            python bench/agent-eval/run.py --mode skilled --tools navigera --tasks "${{ matrix.task }}" \
+            --model "$MODEL" --gemini "$GEMINI_BIN" --out out --require-pass
+      - name: Result
+        if: always() && env.HAS_KEY == 'true'
+        run: |
+          python bench/ladder/annotate.py out/table-skilled.md "agent check ${{ matrix.task }} (${{ matrix.os }})"
+          python bench/agent-eval/annotate_runs.py out/summary-skilled.json "agent check json ${{ matrix.task }} (${{ matrix.os }})"

@@ -9,7 +9,7 @@
 //! headless (with `--natural`) while the user keeps working in theirs.
 //!
 //! What is copied: the cookies (`Network/`, older Chromes' `Cookies`), site
-//! storage (`Local Storage`, `IndexedDB`, `WebStorage`, service worker
+//! storage (`Local Storage`, or newer Chromes' `LocalStorage`, `IndexedDB`, `WebStorage`, service worker
 //! registrations), saved logins and autofill (`Login Data`, `Web Data`),
 //! bookmarks and preferences; and `Local State`, which holds the key the
 //! cookies are encrypted with on Windows. Not caches, history, open tabs,
@@ -35,6 +35,10 @@ const COPIED: &[&str] = &[
     "Cookies",
     "Cookies-journal",
     "Local Storage",
+    // Chrome 156+ keeps local storage in one SQLite file instead.
+    "LocalStorage",
+    "LocalStorage-journal",
+    "LocalStorage-wal",
     "IndexedDB",
     "WebStorage",
     "Service Worker/Database",
@@ -332,6 +336,8 @@ mod tests {
         std::fs::write(root.join("Profile 1/Cookies"), "c").unwrap();
         std::fs::write(root.join("Profile 1/Local Storage/leveldb/000003.log"), "ls").unwrap();
         std::fs::write(root.join("Profile 1/Local Storage/leveldb/LOCK"), "").unwrap();
+        // Chrome 156+: one SQLite file.
+        std::fs::write(root.join("Profile 1/LocalStorage"), "SQLite format 3").unwrap();
         std::fs::write(root.join("Profile 1/Cache/Cache_Data/f_000001"), "big").unwrap();
         std::fs::write(root.join("Profile 1/History"), "h").unwrap();
         std::fs::write(
@@ -359,6 +365,7 @@ mod tests {
         assert!(dest.join("Default/Cookies").is_file());
         assert!(dest.join("Default/Local Storage/leveldb/000003.log").is_file());
         assert!(!dest.join("Default/Local Storage/leveldb/LOCK").exists());
+        assert!(dest.join("Default/LocalStorage").is_file());
         assert!(!dest.join("Default/Cache").exists());
         assert!(!dest.join("Default/History").exists());
         let state: Value = serde_json::from_str(&std::fs::read_to_string(dest.join("Local State")).unwrap()).unwrap();

@@ -1,0 +1,29 @@
+name: openrouter-smoke
+
+# One forced tool call per candidate model, to prove the OpenRouter key
+# and both models can drive the agent-eval's shell tool before the
+# head-to-head harness is built on top. Key: OPENROUTER_API_KEY in the
+# `main` environment.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [openrouter-eval]
+    paths:
+      - bench/agent-eval/openrouter_smoke.py
+      - .github/workflows/openrouter-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: OpenRouter tool-calling smoke check
+    runs-on: ubuntu-latest
+    environment: main
+    steps:
+      - uses: actions/checkout@v4
+      - name: Forced tool call to each model
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python3 bench/agent-eval/openrouter_smoke.py

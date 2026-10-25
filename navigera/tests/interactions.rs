@@ -148,6 +148,19 @@ fn locators_reach_into_same_origin_frames() {
     s.ok(&["goto", &format!("{}/srcdoc", site.url)]);
     s.ok(&["click", "--text", "Deep button"]);
     assert_eq!(s.text(&["get", "text", "--selector", "#out"]), "deep clicked");
+    // Its box is where it is on the page, both frames' offsets added.
+    let b = s.ok(&["get", "box", "--text", "Deep button"]);
+    let want = s.ok(&[
+        "eval",
+        "(() => { let x = 0, y = 0, d = document; for (const id of ['host', 'innerframe']) { \
+         const f = id === 'host' ? d.querySelector('#host iframe') : d.getElementById(id); const r = f.getBoundingClientRect(); \
+         x += r.left + f.clientLeft; y += r.top + f.clientTop; d = f.contentDocument; } \
+         const r = d.getElementById('deep').getBoundingClientRect(); return [x + r.x, y + r.y]; })()",
+    ]);
+    for (k, i) in [("x", 0), ("y", 1)] {
+        let (got, want) = (b[k].as_f64().unwrap(), want[i].as_f64().unwrap());
+        assert!((got - want).abs() < 0.5 && want > 20.0, "{k}: {got} vs {want} ({b})");
+    }
 }
 
 #[test]
@@ -517,27 +530,11 @@ fn the_mouse_goes_where_it_is_told_on_a_canvas() {
     assert!(events.contains(&"move 60 20 1".to_string()), "{events:?}");
     assert_eq!(events.last().map(String::as_str), Some("click 110 20 0 0"), "{events:?}");
     assert!(events.contains(&"mouseup 110 20 0 0".to_string()), "{events:?}");
-    // Diagnostics for the line-not-drawn flake: on failure only, print the
-    // full event log and the alpha of row y=20.
-    let ink = s.ok(&["eval", "ink(60, 20)"]).as_u64().unwrap_or(0);
-    if ink == 0 {
-        let row: Vec<u64> = (0..=120).map(|x| s.ok(&["eval", &format!("ink({x}, 20)")]).as_u64().unwrap_or(0)).collect();
-        let drawn = s.ok(&["eval", "window.drawn"]);
-        let last_stroke = s.ok(&["eval", "window.lastStroke"]);
-        // (a) Canvas geometry at failure: a resize clears the bitmap, so
-        // anything but [300, 200, 300, 200] names a resize/reset shape.
-        let canvas_size = s.ok(&["eval", "(function(){var el=document.querySelector('canvas');return [el.width,el.height,el.clientWidth,el.clientHeight];})()"]);
-        // (b) Ink on other rows, same x range, plus the alpha sum over the
-        // whole bitmap in one in-page pass: sum 0 means the whole canvas
-        // is blank; sum > 0 with row y=20 blank means the ink is
-        // somewhere else, not lost outright.
-        let rows_other: Vec<(u32, Vec<u64>)> = [10u32, 30, 100].iter().map(|y| (*y, (0..=120).map(|x| s.ok(&["eval", &format!("ink({x}, {})", *y)]).as_u64().unwrap_or(0)).collect())).collect();
-        let alpha_sum = s.ok(&["eval", "(function(){var el=document.querySelector('canvas');var d=el.getContext('2d').getImageData(0,0,el.width,el.height).data;var s=0;for(var i=3;i<d.length;i+=4)s+=d[i];return s;})()"]);
-        // (c) A second readback of the same pixel, one eval round-trip
-        // after the bulk read: ink here means the first readback was a
-        // transient loss; still 0 means the loss persists across reads.
-        let ink_again = s.ok(&["eval", "ink(60, 20)"]).as_u64().unwrap_or(0);
-        panic!("the line is drawn: events={events:?} row={row:?} drawn={drawn} lastStroke={last_stroke} canvas_size={canvas_size} rows_other={rows_other:?} alpha_sum={alpha_sum} ink_again={ink_again}");
+    // Every segment was drawn; the pixels show it unless the platform lost
+    // the canvas's context meanwhile (macOS under load; it is never restored).
+    assert_eq!(s.ok(&["eval", "drawn"]), 10, "a stroke per move with the button down");
+    if s.ok(&["eval", "lost.length"]) == 0 {
+        assert!(s.ok(&["eval", "ink(60, 20)"]).as_u64().unwrap_or(0) > 0, "the line is drawn");
     }
     assert_eq!(s.ok(&["eval", "ink(60, 120)"]), 0, "nothing drawn off the path");
     // Viewport coordinates, a double click, the right button, the wheel.
@@ -645,4 +642,59 @@ fn a_page_that_stops_answering_costs_one_timeout_not_one_per_command() {
         assert!(std::time::Instant::now() < deadline, "the page never answered again");
     }
     assert_eq!(s.ok(&["eval", "new Promise(r => setTimeout(() => r(7), 4000))"]), 7);
+}
+
+/// The ref of the first `ax` line holding `text`.
+fn ref_of(s: &Session, text: &str) -> String {
+    let tree = s.text(&["ax"]);
+    let line = tree.lines().find(|l| l.contains(text)).unwrap_or_else(|| panic!("no {text:?} in\n{tree}"));
+    line.split("ref=").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).unwrap().to_string()
+}
+
+#[test]
+fn locate_and_history_turn_refs_into_locators() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("history", &[]);
+    s.ok(&["goto", &format!("{}/iframe-form", site.url)]);
+    // Each locator found the element; inside a frame, the frame is named.
+    let email = ref_of(&s, "textbox \"Email\"");
+    let found = s.ok(&["locate", &email]);
+    let flags: Vec<Vec<String>> = found["locators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["flags"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect())
+        .collect();
+    assert_eq!(flags[0], ["--role", "textbox", "--name", "Email", "--frame", "#email-subscribe"], "{found}");
+    assert!(flags.iter().any(|f| f[..2] == ["--selector", "#email"]), "{found}");
+    for f in &flags {
+        let mut args = vec!["get", "value"];
+        args.extend(f.iter().map(String::as_str));
+        s.ok(&args);
+    }
+    // A name two elements share is not offered; a path is.
+    s.ok(&["eval", "(document.body.insertAdjacentHTML('beforeend', '<button>Go</button><button>Go</button>'), 1)"]);
+    let second = s.ok(&["eval", "document.querySelectorAll('button').length"]);
+    assert_eq!(second, 2);
+    let go = s.text(&["ax"]).lines().filter(|l| l.contains("button \"Go\"")).nth(1).unwrap().to_string();
+    let go = go.split("ref=").nth(1).unwrap().trim_end_matches(']').to_string();
+    let found = s.ok(&["locate", &go]);
+    let kinds: Vec<&str> = found["locators"].as_array().unwrap().iter().map(|l| l["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["css"], "{found}");
+    assert_eq!(found["locators"][0]["flags"][1], "body > button:nth-of-type(2)", "{found}");
+    // The actions, a ref's with its locators read before it ran; reads aren't kept.
+    s.ok(&["history", "--clear"]);
+    s.ok(&["fill", &email, "ada@example.com"]);
+    s.ok(&["click", "--text", "Subscribe"]);
+    s.ok(&["get", "text", "--selector", "#msg"]);
+    let h = s.ok(&["history"]);
+    let h = h["history"].as_array().unwrap();
+    assert_eq!(h.len(), 2, "{h:?}");
+    assert_eq!(
+        (h[0]["command"]["op"].as_str(), h[0]["command"]["value"].as_str()),
+        (Some("fill"), Some("ada@example.com"))
+    );
+    assert_eq!(h[0]["locators"][0]["flags"][1], "textbox", "{h:?}");
+    assert_eq!(h[1]["command"]["text"], "Subscribe", "{h:?}");
+    assert!(h[1].get("locators").is_none() && h[1]["url"].as_str().unwrap().ends_with("/iframe-form"), "{h:?}");
 }

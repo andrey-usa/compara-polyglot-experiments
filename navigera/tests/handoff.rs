@@ -5,6 +5,7 @@
 //! looks for.
 
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use serde_json::Value;
@@ -171,6 +172,14 @@ fn natural_mode_shows_no_sign_of_automation() {
     drop(plain);
 
     let natural = Session { name: session_name("natural"), close_browser: false };
+    // chrome-headless-shell can't pass: natural mode says so instead.
+    let exe = chrome().unwrap_or_default();
+    if Path::new(&exe).file_stem().is_some_and(|s| s == "chrome-headless-shell" || s == "headless_shell") {
+        let (success, r) = run(&natural.name, &["start", "--natural"]);
+        let r = if success { run(&natural.name, &["goto", &format!("{}/", site.url)]) } else { (success, r) };
+        assert!(!r.0 && r.1.to_string().contains("--natural needs the full Chrome"), "{r:?}");
+        return;
+    }
     ok(&natural.name, &["start", "--natural"]);
     let after = signals(&natural.name, &format!("{}/", site.url));
     assert!(fired(&after).is_empty(), "natural mode shows {:?}: {after}", fired(&after));

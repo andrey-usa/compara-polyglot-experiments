@@ -183,6 +183,45 @@ pub fn ensure_profile_browser(exe: &str, dir: &Path, headless: bool, extra: &[St
         return Ok(url);
     }
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    // As for navigera's own launches: no sandbox when this machine can't give
+    // Chrome one (root, NAVIGERA_NO_SANDBOX, or a launch of this binary that
+    // already failed for want of one), else a first try that shows it.
+    let note = crate::browser::no_sandbox_note(exe);
+    let mut no_sandbox = crate::browser::no_sandbox_wanted(
+        crate::proc::running_as_root(),
+        std::env::var("NAVIGERA_NO_SANDBOX").ok().as_deref(),
+    ) || note.as_ref().is_some_and(|n| n.exists());
+    loop {
+        match start_profile_browser(exe, dir, headless, extra, no_sandbox)? {
+            Ok(url) => return Ok(url),
+            Err((status, stderr)) if !no_sandbox && crate::browser::sandbox_unavailable(&stderr) => {
+                eprintln!("{}", crate::browser::NO_SANDBOX_WARNING);
+                if let Some(note) = &note {
+                    let _ = std::fs::write(note, format!("{exe}\n"));
+                }
+                crate::timing::log(&format!("[attach] profile browser {exe} exited ({status}) for want of a sandbox"));
+                no_sandbox = true;
+            }
+            // A Chrome already running on this profile without remote
+            // debugging takes the new window over and the launcher exits.
+            Err((status, _)) => bail!(
+                "{exe} exited ({status}) without serving remote debugging on {}: if a browser \
+                 already has this profile open without navigera, close it and run again",
+                dir.display()
+            ),
+        }
+    }
+}
+
+/// One start of the profile browser: its endpoint, or how it exited and
+/// what it said (its stderr goes to `navigera-browser.log` in the profile).
+fn start_profile_browser(
+    exe: &str,
+    dir: &Path,
+    headless: bool,
+    extra: &[String],
+    no_sandbox: bool,
+) -> Result<std::result::Result<String, (std::process::ExitStatus, String)>> {
     // A file left by a crashed browser would be read as the new endpoint.
     let _ = std::fs::remove_file(dir.join("DevToolsActivePort"));
     let mut cmd = Command::new(exe);
@@ -197,8 +236,7 @@ pub fn ensure_profile_browser(exe: &str, dir: &Path, headless: bool, extra: &[St
         cmd.arg("--headless=new").arg("--window-size=1440,900");
     }
     cmd.args(extra);
-    if crate::proc::running_as_root() {
-        // Chrome refuses to start its sandbox as root (containers, CI).
+    if no_sandbox {
         cmd.arg("--no-sandbox");
     }
     // The diagnostic knob that adds flags to every launch (CI uses it for
@@ -206,23 +244,19 @@ pub fn ensure_profile_browser(exe: &str, dir: &Path, headless: bool, extra: &[St
     if let Ok(extra) = std::env::var("NAVIGERA_EXTRA_FLAGS") {
         cmd.args(extra.split_whitespace());
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let log = dir.join("navigera-browser.log");
+    let stderr = std::fs::File::create(&log).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr);
     let mut child =
         crate::proc::spawn_detached(&mut cmd).with_context(|| format!("start {exe} for profile {}", dir.display()))?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(url) = live_endpoint(dir) {
             crate::timing::log(&format!("[attach] started profile browser {exe}: {url}"));
-            return Ok(url);
+            return Ok(Ok(url));
         }
         if let Ok(Some(status)) = child.try_wait() {
-            // A Chrome already running on this profile without remote
-            // debugging takes the new window over and the launcher exits.
-            bail!(
-                "{exe} exited ({status}) without serving remote debugging on {}: if a browser \
-                 already has this profile open without navigera, close it and run again",
-                dir.display()
-            );
+            return Ok(Err((status, std::fs::read_to_string(&log).unwrap_or_default())));
         }
         if Instant::now() >= deadline {
             bail!("the profile browser did not start serving remote debugging within 30 s ({})", dir.display());

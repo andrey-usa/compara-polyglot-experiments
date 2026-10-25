@@ -1,6 +1,6 @@
 [package]
 name = "navigera"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 default-run = "navigera"
 description = "Drive headless Chrome from the shell, one command per step: a native Rust CDP CLI for AI agents (accessibility-tree refs, sessions, tabs, iframes, dialogs) plus a JSON-lines serve mode."

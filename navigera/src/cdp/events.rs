@@ -523,7 +523,7 @@ fn on_event(client: &CdpClient, shared: &Arc<Shared>, event: &Value) {
         }
         _ => {}
     }
-    if method.starts_with("Browser.download") {
+    if matches!(method, "Browser.downloadWillBegin" | "Browser.downloadProgress") {
         // Started by a tab's main frame (its frame id is the tab's target
         // id) or one of its subframes: that tab's scope.
         let frame = params.get("frameId").and_then(Value::as_str).unwrap_or("");

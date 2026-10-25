@@ -1,0 +1,18 @@
+/target
+bench/ladder/contenders/chromiumoxide/target
+bench/ladder/contenders/chromey/target
+bench/ladder/contenders/chromey/Cargo.lock
+.env
+*.log
+/reports/
+/bench/ladder/out/
+/bench/ladder/node_modules/
+/bench/ladder/fixtures/
+__pycache__/
+*.pyc
+# Stray outputs from other tools run in this checkout (cookie jars, reports,
+# page dumps) — never commit them; cookie jars are credentials.
+*cookie*.txt
+*_jar.txt
+/report.json
+/dump-*.html
