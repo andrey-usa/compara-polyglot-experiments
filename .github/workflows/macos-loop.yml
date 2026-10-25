@@ -1,0 +1,208 @@
+name: macOS full-suite loop, two test threads
+
+# Every macOS-only stall so far is a page that stops answering for 35 s or
+# more: a goto/wizard load waited out, a select evaluate stalled 105 s, a
+# tab back as about:blank after show. They appear about once in 10
+# full-suite loops, never in a single test alone, and the earlier loops ran
+# three tests at once on the runner's three cores.
+#
+# This workflow runs the whole macOS test list exactly as the Interactions
+# workflow runs it -- --lib, interactions, handoff, attach, commands, fork,
+# verify_scopes, no-fail-fast -- 10 sequential times on macos-14, against
+# the navigera copy in `navigera/`, with two tests at a time
+# (RUST_TEST_THREADS=2), no retries of failed loops, and no whole-loop
+# retries. Each loop writes its own log under `navigera/runs/`; a watchdog
+# (1500 s per loop) kills and names any test past 60 s. During each loop
+# the 1-minute load average is sampled every 30 s (max and median reported
+# per loop), the suite wall time is recorded per loop, and lines showing a
+# CDP wait of 35 s or more are grepped into a per-loop stalls file.
+# Results are the artifact `macos-full-suite-loop-two-threads`, carrying
+# runs/counts.txt, per-loop logs, load samples, wall times, and stalls
+# files. A watchdog kill stops the loop at once.
+
+on:
+  # No branch filter: this file exists only on the branch it was pushed to,
+  # so a push trigger here fires only for that branch's push.
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  loop:
+    name: "interactions macos-14 full-suite loop, two test threads"
+    runs-on: macos-14
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+        working-directory: navigera
+    env:
+      NAVIGERA_REQUIRE_BROWSER: "1"
+      NAVIGERA_TRACE_EFFECT: "1"
+      RUST_TEST_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Chrome
+        run: |
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version
+      - name: Build tests once
+        run: cargo test --locked --no-run --lib --test interactions --test handoff --test attach --test commands --test fork --test verify_scopes
+      - name: Loop full suite 10 times
+        run: |
+          mkdir -p runs
+          echo "threads: 2" > runs/threads.txt
+          : > runs/summary.tsv
+          : > runs/wall.tsv
+          # A watchdog under the job's timeout: a hung test is killed and named
+          # in the annotation (the job log isn't readable from everywhere).
+          cat > watchdog.py <<'PY'
+          import os, signal, subprocess, sys
+          log, limit, cmd = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+          with open(log, "w", encoding="utf-8", errors="replace") as f:
+              p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, start_new_session=(os.name != "nt"))
+              try:
+                  code = p.wait(timeout=limit)
+              except subprocess.TimeoutExpired:
+                  if os.name != "nt":
+                      os.killpg(p.pid, signal.SIGKILL)
+                  else:
+                      p.kill()
+                  p.wait()
+                  code = 124
+                  f.write(f"\nWATCHDOG: killed after {limit} s\n")
+          sys.stdout.write(open(log, encoding="utf-8", errors="replace").read())
+          sys.exit(code)
+          PY
+          hang=""
+          for i in $(seq -w 1 10); do
+            log="runs/loop-${i}.log"
+            echo "=== loop $i $(date -u +%FT%TZ) ===" > "$log.tmp"
+            # Sample the 1-minute load average every 30 s while the loop runs.
+            ( while true; do
+                echo "$(date -u +%FT%TZ) $(sysctl -n vm.loadavg 2>/dev/null || uptime)"
+                sleep 30
+              done ) > "runs/load-${i}.txt" 2>/dev/null &
+            sampler=$!
+            start=$(date +%s)
+            set +e
+            python3 watchdog.py "$log" 1500 cargo test --locked --no-fail-fast --lib --test interactions --test handoff --test attach --test commands --test fork --test verify_scopes
+            code=$?
+            kill $sampler 2>/dev/null || true
+            wait $sampler 2>/dev/null || true
+            set -e
+            end=$(date +%s)
+            printf '%s\t%s\n' "$i" "$((end - start))" >> runs/wall.tsv
+            # Prepend the loop header (watchdog.py rewrites the log file).
+            { cat "$log.tmp"; cat "$log"; } > "$log.new" && mv "$log.new" "$log" && rm "$log.tmp"
+            printf '%s\t%s\n' "$i" "$code" >> runs/summary.tsv
+            echo "=== loop $i exit $code wall $((end - start)) s ===" >> "$log"
+            # CDP waits of 35 s or more, plus slow-test and watchdog lines.
+            grep -E "[0-9]{5,} ms|running for over [0-9]+ seconds|WATCHDOG" "$log" > "runs/stalls-${i}.txt" || true
+            python3 - "$log" "interactions macos loop $i" <<'PY' || true
+          import re, sys
+          WATCH = {"a_covered_element_is_not_clicked_unless_forced", "locators_reach_into_same_origin_frames",
+                   "downloads_are_saved_and_waited_for", "a_click_waits_for_a_sliding_modal_to_settle"}
+          text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          passed = sum(int(m) for m in re.findall(r"test result: \w+\. (\d+) passed", text))
+          failed = re.findall(r"^test (\S+) \.\.\. FAILED", text, re.M)
+          ran = re.findall(r"^test (\S+) \.\.\. (ok|FAILED)", text, re.M)
+          handoff = [f"{n}: {r}" for n, r in ran if r == "FAILED" or n in WATCH]
+          panics = re.findall(r"panicked at .*?\n(.*?)\n", text, re.S)
+          msg = f"{passed} passed, {len(failed)} failed {failed}\n" + "\n".join(handoff)
+          slow = re.findall(r"^test (\S+) has been running for over \d+ seconds", text, re.M)
+          if slow:
+              msg += "\nslow: " + ", ".join(slow)
+          if "WATCHDOG: killed" in text:
+              msg += "\nWATCHDOG killed the run; last lines:\n" + "\n".join(text.strip().splitlines()[-25:])
+          if panics:
+              msg += "\n" + "\n".join(p[:600] for p in panics[:4])
+          print(f"::notice title={sys.argv[2]}::" + msg[:3800].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          PY
+            if [ "$code" = "124" ]; then
+              hang="$i"
+              echo "HANG in loop $i: watchdog killed the run; stopping the loop" | tee runs/hang.txt
+              break
+            fi
+          done
+          python3 - runs/summary.tsv runs/wall.tsv <<'PY'
+          import re, statistics, sys
+          rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if l.strip()]
+          walls = {}
+          try:
+              for l in open(sys.argv[2]):
+                  if l.strip():
+                      k, v = l.rstrip("\n").split("\t")
+                      walls[k] = int(v)
+          except OSError:
+              pass
+          lines = [f"loops run: {len(rows)}"]
+          total_passed, total_failed = 0, 0
+          for i, _code in rows:
+              try:
+                  text = open(f"runs/loop-{i}.log", encoding="utf-8", errors="replace").read()
+              except OSError:
+                  text = ""
+              passed = sum(int(m) for m in re.findall(r"test result: \w+\. (\d+) passed", text))
+              failed = re.findall(r"^test (\S+) \.\.\. FAILED", text, re.M)
+              total_passed += passed
+              total_failed += len(failed)
+              loads = []
+              try:
+                  for l in open(f"runs/load-{i}.txt", encoding="utf-8", errors="replace"):
+                      m = re.search(r"\{\s*([0-9.]+)\s+[0-9.]+\s+[0-9.]+\s*\}", l)
+                      if m:
+                          loads.append(float(m.group(1)))
+              except OSError:
+                  pass
+              load = f"load max {max(loads):.2f} median {statistics.median(loads):.2f} (n={len(loads)})" if loads else "load n/a"
+              wall = f"wall {walls[i]} s" if i in walls else "wall n/a"
+              try:
+                  stalls = [l.rstrip("\n") for l in open(f"runs/stalls-{i}.txt", encoding="utf-8", errors="replace") if l.strip()]
+              except OSError:
+                  stalls = []
+              # Headline stall count: waits of 35 s or more only (the raw
+              # stalls file keeps the broader 10 s+ grep for inspection).
+              def _is35(s):
+                  m = re.search(r"(\d+)\s*ms", s)
+                  if m and int(m.group(1)) >= 35000:
+                      return True
+                  m = re.search(r"running for over (\d+) seconds", s)
+                  if m and int(m.group(1)) >= 35:
+                      return True
+                  return "WATCHDOG" in s
+              stalls = [s for s in stalls if _is35(s)]
+              lines.append(f"loop {i}: {passed} passed, {len(failed)} failed {failed}, {wall}, {load}, stalls >=35s {len(stalls)}")
+              for s in stalls:
+                  lines.append(f"  stall: {s.strip()[:300]}")
+          lines.append(f"total: {total_passed} passed, {total_failed} failed")
+          open("runs/counts.txt", "w").write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+          cat runs/counts.txt >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$hang" ]; then
+            echo "loop stopped on watchdog hang in loop $hang" >&2
+            exit 124
+          fi
+          test -z "$(awk -F '\t' '$2 != 0' runs/summary.tsv)"
+      - name: Upload run logs and failure screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-full-suite-loop-two-threads
+          path: |
+            navigera/runs/
+            navigera/failure-*.png
+          if-no-files-found: warn
