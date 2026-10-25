@@ -517,7 +517,15 @@ fn the_mouse_goes_where_it_is_told_on_a_canvas() {
     assert!(events.contains(&"move 60 20 1".to_string()), "{events:?}");
     assert_eq!(events.last().map(String::as_str), Some("click 110 20 0 0"), "{events:?}");
     assert!(events.contains(&"mouseup 110 20 0 0".to_string()), "{events:?}");
-    assert!(s.ok(&["eval", "ink(60, 20)"]).as_u64().unwrap_or(0) > 0, "the line is drawn");
+    // Diagnostics for the line-not-drawn flake: on failure only, print the
+    // full event log, the fractional-offset log, and the alpha of row y=20.
+    let ink = s.ok(&["eval", "ink(60, 20)"]).as_u64().unwrap_or(0);
+    if ink == 0 {
+        let frac = s.ok(&["eval", "logf"]);
+        let frac: Vec<String> = frac.as_array().map(|a| a.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default();
+        let row: Vec<u64> = (0..=120).map(|x| s.ok(&["eval", &format!("ink({x}, 20)")]).as_u64().unwrap_or(0)).collect();
+        panic!("the line is drawn: events={events:?} frac={frac:?} row={row:?}");
+    }
     assert_eq!(s.ok(&["eval", "ink(60, 120)"]), 0, "nothing drawn off the path");
     // Viewport coordinates, a double click, the right button, the wheel.
     s.ok(&["mouse", "click", "250", "140", "--count", "2"]);

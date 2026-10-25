@@ -122,14 +122,17 @@ PAGES["/canvas"] = ("canvas", "body{margin:0;height:3000px}canvas{position:absol
 <canvas id=c width=300 height=200></canvas>
 <script>
 window.log = [];
+window.logf = [];
 const g = c.getContext('2d');
 let last = null;
 const at = (e) => `${Math.round(e.offsetX)} ${Math.round(e.offsetY)}`;
+const atf = (e) => `${e.offsetX} ${e.offsetY}`;
 for (const t of ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu']) {
-  c.addEventListener(t, (e) => { log.push(`${t} ${at(e)} ${e.button} ${e.buttons}`); if (t === 'contextmenu') e.preventDefault(); });
+  c.addEventListener(t, (e) => { log.push(`${t} ${at(e)} ${e.button} ${e.buttons}`); logf.push(`${t} ${atf(e)} ${e.button} ${e.buttons}`); if (t === 'contextmenu') e.preventDefault(); });
 }
 c.addEventListener('mousemove', (e) => {
   log.push(`move ${at(e)} ${e.buttons}`);
+  logf.push(`move ${atf(e)} ${e.buttons}`);
   if (e.buttons & 1 && last) { g.beginPath(); g.lineWidth = 4; g.moveTo(last[0], last[1]); g.lineTo(e.offsetX, e.offsetY); g.stroke(); }
   last = [e.offsetX, e.offsetY];
 });
