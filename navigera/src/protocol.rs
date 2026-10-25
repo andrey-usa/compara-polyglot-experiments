@@ -426,6 +426,9 @@ pub enum Command {
         /// Only the subtree of this element.
         #[serde(flatten)]
         scope: TargetArgs,
+        /// Only the lines holding this text (any case), under their ancestors.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grep: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<f64>,
     },
@@ -941,7 +944,7 @@ pub struct ParsedArgs {
 const OPS: &[(&str, &str, &str)] = &[
     ("start", "[--attach [<where>] | --profile <name> [--from <browser> [--from-profile <p>]] [--headless]] [--natural] [--download-dir <dir>]", "spawn a detached session server + headless browser (needs --session); --attach/--profile use a browser that stays open; --from seeds the profile with a copy of your browser's sign-ins"),
     ("goto", "<url> [--wait load|domcontentloaded|commit]", "navigate the active tab (default: wait for load)"),
-    ("ax", "[--selector <css> | <ref>] [--limit <lines>] [--max-depth <n>] [--all] [--refs all] [--format json]", "accessibility snapshot: indented tree, [ref=N] on actionable nodes"),
+    ("ax", "[--selector <css> | <ref>] [--grep <text>] [--limit <lines>] [--max-depth <n>] [--all] [--refs all] [--format json]", "accessibility snapshot: indented tree, [ref=N] on actionable nodes"),
     ("click", "<ref> | --selector <css> | --text <visible text> [--frame <css>] [--button right|middle] [--force]", "trusted mouse click once the element stops moving; refuses an element covered by another (--force: DOM events anyway); waits for any navigation it starts"),
     ("fill", "<ref> <value> | --selector <css> --value <v> [--frame <css>] [--keys]", "set an input/textarea's value; --keys clears it and types the value key by key (for apps that ignore a value set directly)"),
     ("type", "<text> [--selector <css> | --ref <n>]", "type key by key into the target or the focused element"),
@@ -1760,6 +1763,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
             format: Some(str_flag(&mut args, "--format")?.unwrap_or_else(|| "text".into())),
             limit: num_flag(&mut args, "--limit")?.map(|v| v as usize),
             refs: str_flag(&mut args, "--refs")?,
+            grep: str_flag(&mut args, "--grep")?,
             scope: target_args(&mut args, true)?,
             timeout_ms,
         },
@@ -2468,13 +2472,14 @@ impl Driver {
         // its top, and says that acting needs no more of it. Asked for with a
         // limit, a depth or a scope, the tree is what was asked for, and the
         // note still says acting does not need it.
-        if let (Command::Ax { max_depth, all, limit, scope, .. }, Value::String(tree)) = (command, &mut result) {
+        if let (Command::Ax { max_depth, all, limit, scope, grep, .. }, Value::String(tree)) = (command, &mut result) {
             let lines = tree.lines().count();
             if lines > AX_DECIDER_LINES && crate::decide::Decider::from_env().is_some() {
                 let threshold = ax_preview_bytes();
                 let plain = max_depth.is_none()
                     && *all != Some(true)
                     && limit.is_none()
+                    && grep.is_none()
                     && scope.optional("ax").ok().flatten().is_none()
                     && threshold > 0
                     && tree.len() > threshold;
@@ -2502,7 +2507,7 @@ impl Driver {
 
     /// The page as `find` and `check` see it: the whole text tree.
     fn page_tree(&self, timeout_ms: Option<f64>) -> anyhow::Result<String> {
-        let opts = AxOptions { max_depth: None, json: false, all: false, all_refs: false, limit: 20_000, scope: None };
+        let opts = AxOptions { limit: 20_000, ..AxOptions::default() };
         match self.session.ax(&opts, timeout_ms).map_err(|e| anyhow::anyhow!("ax: {e:#}"))? {
             Value::String(tree) => Ok(tree),
             other => Ok(other.to_string()),
@@ -2836,7 +2841,7 @@ impl Driver {
                 let title = s.title().map_err(|e| anyhow::anyhow!("title: {e:#}"))?;
                 Ok(json!(title))
             }
-            Command::Ax { max_depth, all, format, limit, refs, scope, timeout_ms } => {
+            Command::Ax { max_depth, all, format, limit, refs, scope, grep, timeout_ms } => {
                 let json_format = match format.as_deref() {
                     // Serve-protocol clients that predate the text tree get
                     // the JSON list they always got.
@@ -2847,6 +2852,9 @@ impl Driver {
                 if json_format && (scope.selector.is_some() || scope.node_ref.is_some() || scope.text.is_some()) {
                     anyhow::bail!("ax: --selector/ref scoping needs the text tree (drop --format json)");
                 }
+                if json_format && grep.is_some() {
+                    anyhow::bail!("ax: --grep needs the text tree (drop --format json)");
+                }
                 let opts = AxOptions {
                     max_depth: *max_depth,
                     json: json_format,
@@ -2854,6 +2862,7 @@ impl Driver {
                     all_refs: refs.as_deref() == Some("all"),
                     limit: limit.unwrap_or(DEFAULT_AX_LIMIT),
                     scope: scope.optional("ax")?,
+                    grep: grep.clone(),
                 };
                 let mut tree = s.ax(&opts, *timeout_ms).map_err(|e| anyhow::anyhow!("ax: {e:#}"))?;
                 if let (Value::Array(nodes), Some(n)) = (&mut tree, limit) {
@@ -4004,6 +4013,7 @@ mod tests {
                 limit: Some(10),
                 refs: None,
                 scope: TargetArgs { selector: Some("main".into()), ..Default::default() },
+                grep: Some("Total".into()),
                 timeout_ms: None,
             },
             Command::Select {

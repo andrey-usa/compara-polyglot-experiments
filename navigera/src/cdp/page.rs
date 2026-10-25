@@ -1364,6 +1364,8 @@ pub struct AxOptions {
     pub all_refs: bool,
     pub limit: usize,
     pub scope: Option<Target>,
+    /// Only the lines holding this text, under their ancestors.
+    pub grep: Option<String>,
 }
 
 /// Where the mouse is and which buttons it holds (bits: 1 left, 2 right,
@@ -3262,7 +3264,13 @@ impl Page {
             &format!("page {} {url}", serde_json::to_string(&title).unwrap_or_default()),
             &nodes,
             &frames,
-            &ax::Options { all_refs: opts.all_refs, limit: opts.limit, root_backend_id, origin },
+            &ax::Options {
+                all_refs: opts.all_refs,
+                limit: opts.limit,
+                root_backend_id,
+                origin,
+                grep: opts.grep.clone(),
+            },
         );
         let mut text = rendered.text;
         // Lightpanda's tree stops at a shadow root; what is inside is read

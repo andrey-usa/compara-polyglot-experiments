@@ -107,6 +107,9 @@ pub struct Options {
     pub root_backend_id: Option<u64>,
     /// Page origin (`http://host:port`) for shortening same-origin link urls.
     pub origin: String,
+    /// Keep only the lines holding this text (any case), each under the
+    /// lines of its ancestors (`ax --grep`).
+    pub grep: Option<String>,
 }
 
 /// One frame's AX nodes, spliced under the AX node of its owner element
@@ -652,8 +655,11 @@ pub fn render(header: &str, nodes: &[Value], frames: &[Frame], opts: &Options) -
             tree.walk(root, 0, "");
         }
     }
-    let total = tree.lines.len();
     let mut lines = tree.lines;
+    if let Some(needle) = opts.grep.as_deref() {
+        lines = grep_lines(lines, usize::from(!header.is_empty()), needle);
+    }
+    let total = lines.len();
     let mut truncated = 0;
     if opts.limit > 0 && total > opts.limit {
         truncated = total - opts.limit;
@@ -661,6 +667,44 @@ pub fn render(header: &str, nodes: &[Value], frames: &[Frame], opts: &Options) -
         lines.push(format!("… {truncated} more lines (scope with `ax --selector <css>`, or raise `--limit`)"));
     }
     Rendered { lines: lines.len(), text: lines.join("\n"), truncated }
+}
+
+/// `ax --grep`: the lines holding `needle` (any case), each under the lines
+/// of its ancestors (the ones less indented above it), in tree order. The
+/// first `head` lines (the page line) always stay.
+fn grep_lines(lines: Vec<String>, head: usize, needle: &str) -> Vec<String> {
+    let lower = needle.to_lowercase();
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let mut keep = vec![false; lines.len()];
+    keep.iter_mut().take(head).for_each(|k| *k = true);
+    let mut found = false;
+    for (i, line) in lines.iter().enumerate().skip(head) {
+        if !line.to_lowercase().contains(&lower) {
+            continue;
+        }
+        found = true;
+        keep[i] = true;
+        let mut depth = indent(line);
+        for j in (head..i).rev() {
+            if depth == 0 {
+                break;
+            }
+            let d = indent(&lines[j]);
+            if d < depth {
+                if keep[j] {
+                    // Its ancestors are kept already.
+                    break;
+                }
+                keep[j] = true;
+                depth = d;
+            }
+        }
+    }
+    let mut out: Vec<String> = lines.into_iter().zip(keep).filter_map(|(l, k)| k.then_some(l)).collect();
+    if !found {
+        out.push(format!("no line holds {needle:?} (`ax` without --grep shows the whole tree)"));
+    }
+    out
 }
 
 /// Lines for what [`crate::cdp::page`]'s `SHADOW_AX` found inside shadow
@@ -782,6 +826,36 @@ mod tests {
         assert_eq!(out.truncated, 1);
         assert!(out.text.starts_with("- paragraph: Returns"));
         assert!(out.text.contains("1 more lines"));
+    }
+
+    #[test]
+    fn grep_keeps_matching_lines_under_their_ancestors() {
+        let lines: Vec<String> = [
+            "page \"Orders\" /orders",
+            "- navigation:",
+            "  - link \"Orders\" [ref=3]",
+            "- main:",
+            "  - heading \"Recent\"",
+            "  - table:",
+            "    - row: \"100001\" | \"Veronica Costello\" | link \"View\" [ref=9]",
+            "    - row: \"100002\" | \"Alex Smith\" | link \"View\" [ref=12]",
+            "  - button \"Next page\" [ref=15]",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(
+            grep_lines(lines.clone(), 1, "costello").join("\n"),
+            "page \"Orders\" /orders\n- main:\n  - table:\n    - row: \"100001\" | \"Veronica Costello\" | link \"View\" [ref=9]"
+        );
+        // Two matches share their ancestors once; the page line stays.
+        assert_eq!(
+            grep_lines(lines.clone(), 1, "VIEW").join("\n"),
+            "page \"Orders\" /orders\n- main:\n  - table:\n    - row: \"100001\" | \"Veronica Costello\" | link \"View\" [ref=9]\n    - row: \"100002\" | \"Alex Smith\" | link \"View\" [ref=12]"
+        );
+        assert_eq!(
+            grep_lines(lines, 1, "refund").join("\n"),
+            "page \"Orders\" /orders\nno line holds \"refund\" (`ax` without --grep shows the whole tree)"
+        );
     }
 
     #[test]

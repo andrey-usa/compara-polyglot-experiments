@@ -358,6 +358,32 @@ fn ax_json_format_contract() {
     assert_eq!(r["ok"], false, "{r}");
 }
 
+/// `ax --grep` keeps the matching lines under their ancestors, refs and all.
+#[test]
+fn ax_grep_keeps_matches_under_their_ancestors() {
+    if !chrome_available() {
+        return;
+    }
+    let site = start_site();
+    let s = Session::start("axgrep");
+    s.ok(&["goto", &format!("{}/title", site.base)]);
+    s.ok(&[
+        "eval",
+        "(document.body.innerHTML = '<nav><a href=\"/a\">Orders</a></nav><main><h1>Recent</h1><table><tr><th>Order</th><th>Customer</th><th>Action</th></tr>\
+         <tr><td>100001</td><td>Veronica Costello</td><td><a href=\"/v/1\">View</a></td></tr>\
+         <tr><td>100002</td><td>Alex Smith</td><td><a href=\"/v/2\">View</a></td></tr></table></main>', 1)",
+    ]);
+    let tree = s.ok(&["ax", "--grep", "costello"]);
+    let tree = tree.as_str().unwrap_or_default();
+    let lines: Vec<&str> = tree.lines().collect();
+    assert!(lines[0].starts_with("page "), "{tree}");
+    assert!(lines.iter().any(|l| l.contains("Veronica Costello") && l.contains("link \"View\" [ref=")), "{tree}");
+    assert!(lines.iter().any(|l| l.trim_start() == "- table:"), "{tree}");
+    assert!(!tree.contains("Alex Smith") && !tree.contains("Recent"), "{tree}");
+    let (r, _) = s.run(&["ax", "--format", "json", "--grep", "x"]);
+    assert_eq!(r["ok"], false, "{r}");
+}
+
 /// With the pipe transport (default), Chrome reads EOF on its command pipe
 /// and exits when navigera dies, so a killed session server leaks no
 /// browser. (Over a WebSocket port the browser would keep running.)
