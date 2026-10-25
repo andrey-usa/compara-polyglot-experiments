@@ -592,3 +592,38 @@ fn frame_scopes_pick_the_frame_when_ids_repeat() {
     let err = s.fails(&["click", "--text", "Save", "--frame", "#log"]);
     assert!(err.contains("not a frame"), "{err}");
 }
+
+#[test]
+fn what_a_page_made_clickable_has_a_ref_that_clicks() {
+    if !chrome() {
+        return;
+    }
+    let s = Session::start("clickable", &[]);
+    let page = "<title>Inbox</title><style>.thread{cursor:pointer} #bar span{display:inline-block;width:20px;height:20px}</style>\
+        <div id=app><div class=thread><div>Kelcey</div><div>Quisque</div></div><div class=thread><div>Gilli</div><div>Quam.</div></div>\
+        <div id=bar><span id=close-forward></span><span id=send-forward></span></div></div>\
+        <script>for (const t of document.querySelectorAll('.thread')) t.onclick = () => document.title = 'open ' + t.textContent;\
+        for (const id of ['close-forward', 'send-forward']) document.getElementById(id).onclick = () => document.title = id;\
+        document.getElementById('app').addEventListener('click', () => {});</script>";
+    s.ok(&["goto", &format!("data:text/html,{}", page.replace('#', "%23"))]);
+    let ax = s.text(&["ax"]);
+    let ref_of = |line_start: &str| -> String {
+        let line =
+            ax.lines().find(|l| l.trim_start().starts_with(line_start)).unwrap_or_else(|| panic!("{line_start}: {ax}"));
+        line.split("ref=")
+            .nth(1)
+            .and_then(|r| r.split(']').next())
+            .unwrap_or_else(|| panic!("no ref: {line}"))
+            .to_string()
+    };
+    // The row and the icon with no text get refs; the container that only
+    // listens for its children doesn't.
+    let row = ref_of("- clickable [ref=");
+    assert!(ax.contains("Gilli Quam."), "{ax}");
+    let send = ref_of("- clickable #send-forward");
+    assert!(!ax.contains("#app"), "{ax}");
+    s.ok(&["click", &send]);
+    assert_eq!(s.ok(&["title"]), "send-forward");
+    s.ok(&["click", &row]);
+    assert_eq!(s.ok(&["title"]), "open KelceyQuisque");
+}

@@ -18,12 +18,23 @@ use serde_json::{json, Value};
 use super::ax;
 use super::client::CdpClient;
 use super::events::Shared;
+use super::logs::Report;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long, after a navigation commits, ops wait for its DOMContentLoaded
 /// before working on the partly parsed document.
 const POST_COMMIT_WAIT: Duration = Duration::from_secs(5);
+
+/// How often a load wait also looks at the page itself (see `wait_load`).
+const LOAD_LOOK: Duration = Duration::from_secs(2);
+
+/// Which document a load wait is for: the one with this loader id (`""`:
+/// any), or any but this one (a reload).
+enum Loader<'a> {
+    Is(&'a str),
+    Not(&'a str),
+}
 
 /// Default auto-wait for an element when the op carries no `timeout_ms`:
 /// long enough for SPA rendering, short enough that an agent with a wrong
@@ -42,6 +53,10 @@ pub enum Target {
     /// By role and accessible name, label, placeholder, test id, and/or
     /// CSS, optionally the nth match (auto-waits).
     Locator(Locator),
+    /// The target looked for only inside one frame (`--frame <css>`, or a
+    /// chain `#outer >> #inner`): the same element names in two frames no
+    /// longer race.
+    InFrame(String, Box<Target>),
 }
 
 /// `--role/--name/--label/--placeholder/--testid/--nth` (and `--selector`
@@ -87,6 +102,15 @@ impl Locator {
     }
 }
 
+/// How `click` presses: which button, and whether to skip the checks a
+/// user's click passes (`--force`: DOM events on the element, covered or
+/// not).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClickOptions {
+    pub button: String,
+    pub force: bool,
+}
+
 impl Target {
     pub fn label(&self) -> String {
         match self {
@@ -94,17 +118,109 @@ impl Target {
             Target::Ref(r) => format!("ref {r}"),
             Target::Text(t) => format!("text {t:?}"),
             Target::Locator(l) => l.describe(),
+            Target::InFrame(f, t) => format!("{} in frame {f:?}", t.label()),
         }
     }
 }
 
+/// Where element queries look, as a JS expression: the top document first,
+/// then its open shadow roots, then the documents of same-origin frames
+/// (iframes, framesets, `srcdoc`) and their shadow roots. A plain CSS query
+/// stops at a shadow root or a frame; a user's eyes don't. Cross-origin
+/// frames are out of reach here (their elements are in `ax` with refs).
+pub const DEEP: &str = r#"(() => {
+    // Where the search starts: the page, or the frame a `--frame` names
+    // (`__nvStart`, defined around a scoped finder; null while that frame
+    // isn't there yet).
+    const start = () => (typeof __nvStart === 'function' ? __nvStart() : document);
+    const topDocs = () => { const d = start(); return d ? docs(d, []) : []; };
+    const docs = (d, out) => {
+        out.push(d);
+        for (const f of d.querySelectorAll('iframe, frame')) {
+            let cd = null;
+            try { cd = f.contentDocument; } catch (e) {}
+            if (cd && cd.documentElement) docs(cd, out);
+        }
+        return out;
+    };
+    const shadows = (root, out) => {
+        const tw = (root.ownerDocument || root).createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+        for (let n = tw.nextNode(); n; n = tw.nextNode()) {
+            if (n.shadowRoot) { out.push(n.shadowRoot); shadows(n.shadowRoot, out); }
+        }
+        return out;
+    };
+    const roots = () => { const out = []; for (const d of topDocs()) { out.push(d); shadows(d, out); } return out; };
+    return {
+        roots,
+        docs: topDocs,
+        // The top document's own answer first: a plain query costs nothing
+        // extra when the element is where it usually is.
+        first(sel) {
+            const d = start();
+            const el = d && d.querySelector(sel);
+            if (el) return el;
+            for (const r of roots().slice(1)) { const e = r.querySelector(sel); if (e) return e; }
+            return null;
+        },
+        all(sel) { const out = []; for (const r of roots()) out.push(...r.querySelectorAll(sel)); return out; },
+        style: (el) => (el.ownerDocument.defaultView || window).getComputedStyle(el),
+        text() {
+            let t = '';
+            for (const d of topDocs()) {
+                if (d.body) t += '\n' + d.body.innerText;
+                for (const s of shadows(d, [])) t += '\n' + s.textContent;
+            }
+            return t;
+        },
+    };
+})()"#;
+
 /// Scroll the element into view and, if it is visible and actually receives
 /// a pointer event at its centre, return that point for a *trusted* CDP
 /// mouse event (`isTrusted: true`, default actions, focus, user activation
-/// — what real sites expect). Otherwise (no layout, zero size, covered by
-/// another element, or `force`), fall back to DOM-dispatched events and
-/// report it.
-const CLICK_PREP: &str = r#"async function (el, force, settleMs) {
+/// — what real sites expect).
+///
+/// First it lets the element settle: CSS animations and transitions running
+/// on it or an ancestor (a modal sliding in) are allowed to finish, because
+/// a user clicks what has stopped moving, and pages often wire a dialog's
+/// buttons only once it has finished opening. Pages with nothing animating
+/// pay nothing for this.
+///
+/// An element under something else (a toast, an overlay, a sticky header)
+/// is scrolled to other positions, then waited for. If it stays covered,
+/// `strict` returns `{covered}` and nothing is clicked: a user can't reach
+/// it either. Without `strict` (`--force`, or an engine with no layout) the
+/// element gets DOM-dispatched events, reported as `synthetic`. An element
+/// with no box at all always gets those.
+///
+/// With `effects`, it also starts watching what the click will change (see
+/// [`Page::click_effect`]).
+const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button, effects) {
+    const deadline = Date.now() + (force ? 0 : settleMs);
+    // The element's ancestors through shadow hosts: what can move it.
+    const chain = new Set();
+    for (let n = el; n; n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null) chain.add(n);
+    const moving = () => {
+        const d = el.ownerDocument;
+        if (!d.getAnimations) return [];
+        return d.getAnimations().filter((a) => {
+            if (a.playState !== 'running' || !a.effect || !chain.has(a.effect.target)) return false;
+            const t = a.effect.getComputedTiming ? a.effect.getComputedTiming() : {};
+            return Number.isFinite(t.endTime);
+        });
+    };
+    const settle = async () => {
+        const anims = moving();
+        if (!anims.length) return;
+        await Promise.race([
+            Promise.all(anims.map((a) => a.finished.catch(() => null))),
+            new Promise((res) => setTimeout(res, Math.max(0, deadline - Date.now()))),
+        ]);
+        // A frame, but not forever: a renderer that paints nothing (a
+        // starved or hidden page) must not hold the click up to its timeout.
+        await new Promise((res) => { requestAnimationFrame(() => res()); setTimeout(res, 100); });
+    };
     // Mouse events are dispatched in top-level viewport coordinates: add the
     // offsets of every iframe on the way up (null if one is cross-origin).
     const topLevel = (doc, x, y) => {
@@ -119,24 +235,166 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs) {
         return { x, y };
     };
     // Will a click here likely load a new document (link, form submit)?
+    // Only a navigation of the tab's own top document is waited for: a
+    // link saved (`download`) or opened elsewhere (`_blank`, a named
+    // window), or one inside a frame that navigates only the frame, isn't.
+    const here = (target, e) => {
+        const t = (target || '').toLowerCase();
+        if (t === '_top' || t === '_parent') return true;
+        if (t && t !== '_self') return false;
+        const w = e.ownerDocument.defaultView;
+        return !w || w === w.top;
+    };
     const mayNavigate = (e) => {
         const a = e.closest('a[href]');
-        if (a) { const h = a.getAttribute('href') || ''; return !(h.startsWith('#') || h.startsWith('javascript:')); }
+        if (a) {
+            const h = a.getAttribute('href') || '';
+            if (h.startsWith('#') || h.startsWith('javascript:') || a.hasAttribute('download')) return false;
+            return here(a.getAttribute('target'), e);
+        }
         const c = e.closest('button, input');
-        return !!(c && c.form && (c.type === 'submit' || c.type === 'image'));
+        if (!(c && c.form && (c.type === 'submit' || c.type === 'image'))) return false;
+        return here(c.getAttribute('formtarget') || c.form.getAttribute('target'), e);
     };
     // A styled checkbox/radio is often a hidden or covered <input> inside a
     // visible <label>: clicking the label is what a user does and toggles it.
     const labels = (el.labels ? [...el.labels] : []);
     const onLabel = (hit) => labels.some((l) => l === hit || l.contains(hit));
-    const deadline = Date.now() + (force ? 0 : settleMs);
-    let hit = null;
+    // Where to put the element in the viewport: the centre first, then the
+    // edges, which is what uncovers it from a sticky header or footer.
+    const ALIGN = [
+        { block: 'center', inline: 'center' }, { block: 'start', inline: 'nearest' },
+        { block: 'end', inline: 'nearest' }, { block: 'nearest', inline: 'nearest' },
+    ];
+    // A disabled control can't be clicked by a user; wait for it to be
+    // enabled (a form that unlocks Submit once valid), else say so.
+    // What the click changes, to tell a click that did nothing (a control
+    // the page hasn't wired up yet) from one that did something: changes to
+    // the DOM of the page, of the element's document and of the shadow roots
+    // around the element; events a DOM observer can't see (input, change,
+    // submit, toggle, invalid, copy, a scroll, a navigation starting, a
+    // clipboard write); focus moving
+    // elsewhere; form values, the URL or the scroll position a script set.
+    // A field, a <select> and a right or middle click are left out: what
+    // they open isn't in the DOM. `Page::click_effect` reads it, removes it.
+    const armEffects = (w) => {
+        const top = w.top, doc = el.ownerDocument, ctl = el.control || el;
+        const tag = ctl.tagName, type = (ctl.type || '').toLowerCase();
+        const skip = button === 'right' || button === 'middle' || tag === 'SELECT' || tag === 'TEXTAREA'
+            || !!ctl.isContentEditable
+            || (tag === 'INPUT' && !['checkbox', 'radio', 'button', 'submit', 'reset', 'image'].includes(type));
+        const docs = doc === top.document ? [top.document] : [top.document, doc];
+        const fx = { m: 0, e: 0, obs: [], offs: [] };
+        // Every open shadow root too (a button in one component often
+        // changes another): about 0.1 ms per thousand elements.
+        const roots = [...docs], seen = new Set(roots);
+        const add = (r) => { if (r && !seen.has(r)) { seen.add(r); roots.push(r); return true; } return false; };
+        const walk = (scope) => {
+            const all = scope.getElementsByTagName ? scope.getElementsByTagName('*') : scope.querySelectorAll('*');
+            for (let i = 0; i < all.length && roots.length < 1000; i++) {
+                const r = all[i].shadowRoot;
+                if (add(r)) walk(r);
+            }
+        };
+        if (!skip) {
+            for (let r = el.getRootNode(); r && r.host; r = r.host.getRootNode()) add(r);
+            for (const d of docs) walk(d);
+        }
+        const partial = roots.length >= 1000;
+        if (!skip) {
+            for (const r of roots) {
+                const o = new MutationObserver((recs) => { fx.m += recs.length; });
+                o.observe(r, { subtree: true, childList: true, attributes: true, characterData: true });
+                fx.obs.push(o);
+            }
+            const onEvent = (e) => {
+                // Scrolling the element into view lands as a scroll event of
+                // the document or an ancestor a frame later: not the click's.
+                const t = e.target;
+                if (e.type === 'scroll' && (t.nodeType === 9 || (t.contains && t.contains(el)))) return;
+                fx.e++;
+            };
+            const wins = w === top ? [top] : [top, w];
+            for (const v of wins) {
+                for (const t of ['input', 'change', 'submit', 'reset', 'toggle', 'scroll', 'select', 'invalid', 'hashchange',
+                    'play', 'pause', 'copy', 'cut', 'fullscreenchange']) {
+                    v.addEventListener(t, onEvent, true);
+                    fx.offs.push(() => v.removeEventListener(t, onEvent, true));
+                }
+            }
+            const nav = top.navigation;
+            if (nav && nav.addEventListener) {
+                nav.addEventListener('navigate', onEvent);
+                fx.offs.push(() => nav.removeEventListener('navigate', onEvent));
+            }
+            // A clipboard write ("Copy link") changes nothing a page shows.
+            for (const v of wins) {
+                const C = v.Clipboard && v.Clipboard.prototype;
+                if (!C) continue;
+                for (const k of ['writeText', 'write']) {
+                    const orig = C[k];
+                    if (typeof orig !== 'function') continue;
+                    C[k] = { [k](...a) { fx.e++; return orig.apply(this, a); } }[k];
+                    fx.offs.push(() => { C[k] = orig; });
+                }
+            }
+        }
+        const focused = () => {
+            let a = top.document.activeElement;
+            for (;;) {
+                let n = a && a.shadowRoot && a.shadowRoot.activeElement;
+                if (!n && a && (a.tagName === 'IFRAME' || a.tagName === 'FRAME')) { try { n = a.contentDocument && a.contentDocument.activeElement; } catch (_) { n = null; } }
+                if (!n) return a;
+                a = n;
+            }
+        };
+        const state = () => {
+            let s = top.location.href + ' ' + top.history.length + ' ' + top.scrollX + ',' + top.scrollY + ' ' + ctl.checked + ' ' + ctl.value;
+            for (const d of docs) {
+                const cs = d.querySelectorAll('input, textarea, select');
+                for (let i = 0; i < cs.length && i < 300; i++) s += '\u0001' + cs[i].value + (cs[i].checked ? '+' : '-') + cs[i].selectedIndex;
+            }
+            return s;
+        };
+        const before = skip ? '' : state(), focus = focused();
+        // Same-origin frames nobody watched (or too many shadow roots): a
+        // change there would go unseen, so "nothing changed" can't be said.
+        const unwatched = () => partial || docs.some((d) => [...d.querySelectorAll('iframe, frame')].some((f) => {
+            try { const fd = f.contentDocument; return !!(fd && !seen.has(fd) && fd.body && fd.body.childElementCount); } catch (_) { return false; }
+        }));
+        const done = () => {
+            for (const o of fx.obs) o.disconnect();
+            for (const off of fx.offs) off();
+            try { delete top.__nvFx; delete top.__nvSeen; } catch (_) {}
+        };
+        fx.check = (last) => {
+            for (const o of fx.obs) fx.m += o.takeRecords().length;
+            let what = skip ? '' : fx.m ? 'dom' : fx.e ? 'event' : '';
+            if (!what && !skip) {
+                const f = focused();
+                if (f && f !== focus && f !== top.document.body && !(f.contains(el) || el.contains(f))) what = 'focus';
+            }
+            if (!what && !skip && state() !== before) what = 'state';
+            const unsure = !what && !skip && !!last && unwatched();
+            if (what || skip || last) done();
+            return { what, skip, unsure };
+        };
+        Object.defineProperty(top, '__nvFx', { value: fx, configurable: true, enumerable: false, writable: true });
+    };
+    const disabled = () => !!(el.disabled || el.closest('fieldset[disabled]'));
+    while (!force && disabled() && Date.now() < deadline) await new Promise((res) => setTimeout(res, 50));
+    if (!force && strict && disabled()) return { disabled: true };
+    let hit = null, tries = 0;
     while (!force) {
-        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        // Checked on every pass: an element that just appeared may only now
+        // be starting to slide in.
+        await settle();
+        const align = ALIGN[tries++ % ALIGN.length];
+        el.scrollIntoView(Object.assign({ behavior: 'instant' }, align));
         let box = el, r = el.getBoundingClientRect();
         if (!(r.width > 0 && r.height > 0)) {
             const l = labels.find((l) => { const b = l.getBoundingClientRect(); return b.width > 0 && b.height > 0; });
-            if (l) { box = l; l.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); r = l.getBoundingClientRect(); }
+            if (l) { box = l; l.scrollIntoView(Object.assign({ behavior: 'instant' }, align)); r = l.getBoundingClientRect(); }
         }
         const x = r.left + r.width / 2, y = r.top + r.height / 2;
         const root = box.getRootNode(), doc = box.ownerDocument;
@@ -150,24 +408,90 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs) {
                 w.top.__nvSeen = 0;
                 for (const t of ['pointerdown', 'mousedown', 'mouseup', 'click'])
                     w.addEventListener(t, () => { w.top.__nvSeen++; }, { capture: true, once: true });
-                return Object.assign(p, { nav: mayNavigate(el), check: true });
+                if (effects) armEffects(w);
+                return Object.assign(p, { nav: mayNavigate(el), check: true, effects: !!effects });
             }
             // Inside a cross-origin frame: our coordinates are frame-local;
             // the caller asks CDP for the box instead.
             return { xframe: true, nav: mayNavigate(el) };
         }
-        // Covered (a toast, a closing overlay) or not laid out yet: give it a
-        // moment, like a user would, before falling back to DOM events. An
-        // element with no box at all rarely gets one: don't wait long.
-        if (Date.now() >= deadline || (!hit && Date.now() >= deadline - settleMs + 300)) break;
+        // Covered (a toast, a closing overlay) or not laid out yet: try the
+        // other alignments at once, then give it a moment, like a user
+        // would. An element with no box at all rarely gets one, and one
+        // whose own ancestor answers the hit test is hidden on purpose (a
+        // styled control's real input): don't wait long for either.
+        if (hit && tries < ALIGN.length) continue;
+        const hiddenHere = !hit || hit.contains(el);
+        if (Date.now() >= deadline || (hiddenHere && Date.now() >= deadline - settleMs + 300)) break;
         await new Promise((res) => setTimeout(res, 100));
     }
-    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, view: el.ownerDocument.defaultView }));
+    const describe = (n) => {
+        if (!n) return null;
+        let s = n.tagName.toLowerCase() + (n.id ? '#' + n.id : '') + (n.classList && n.classList.length ? '.' + n.classList[0] : '');
+        const t = (n.innerText || n.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        return t ? s + ' ' + JSON.stringify(t.slice(0, 40)) : s;
+    };
+    // What a user would click for a hidden control: its label, or the
+    // nearest ancestor that looks clickable and has a box.
+    const visibleFor = () => {
+        const sized = (n) => { const b = n.getBoundingClientRect(); return b.width >= 4 && b.height >= 4; };
+        const lab = labels.find(sized);
+        if (lab) return lab;
+        const CLICKY = 'a[href],button,label,summary,[role=button],[role=radio],[role=checkbox],[role=option],[role=tab],[role=switch],[role=menuitem],[onclick],[tabindex]';
+        for (let n = el.parentElement || (el.getRootNode() && el.getRootNode().host); n && n !== el.ownerDocument.body; n = n.parentElement || (n.getRootNode() && n.getRootNode().host)) {
+            if (!sized(n)) continue;
+            if (n.matches(CLICKY) || (el.ownerDocument.defaultView || window).getComputedStyle(n).cursor === 'pointer') return n;
+        }
+        return null;
+    };
+    if (!force && strict && (!hit || hit.contains(el))) {
+        // Hidden where it is: zero size, clipped, or under its own wrapper.
+        // A user can't click it; they click what stands for it.
+        return { hidden: true, at: describe(hit), instead: describe(visibleFor()) };
     }
-    const by = hit && hit !== el ? (hit.id ? '#' + hit.id : hit.tagName.toLowerCase() + (hit.className ? '.' + String(hit.className).split(' ')[0] : '')) : null;
-    return { synthetic: true, covered: !!hit && !force, covered_by: by, nav: mayNavigate(el) };
+    if (hit && !force && strict) {
+        // Under something else the whole time: a user would hit that
+        // instead. Nothing was clicked.
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        return { covered: true, covered_by: describe(hit) };
+    }
+    const view = el.ownerDocument.defaultView;
+    const b = button === 'right' ? 2 : button === 'middle' ? 1 : 0;
+    const types = b === 2 ? ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'contextmenu']
+        : b === 1 ? ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'auxclick']
+        : ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+    for (const type of types) {
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, button: b, view }));
+    }
+    return { synthetic: true, covered: !!hit && !force, covered_by: hit && hit !== el ? describe(hit) : null, nav: mayNavigate(el) };
 }"#;
+
+/// A script sent to a document that a navigation then replaced gets this
+/// long after the new document commits to answer (see `Page::send`).
+const ABANDON_AFTER_COMMIT: Duration = Duration::from_secs(1);
+
+/// How long a click that changed nothing yet is watched before `click`
+/// says so (`no_effect`). Effects of a click almost always show within a
+/// frame or two.
+const EFFECT_WINDOW: Duration = Duration::from_millis(200);
+
+/// A click whose only sign is requests that read like reporting
+/// (`/event/…`, `/log`) waits for them to finish, up to this long, then
+/// watches the page for [`AFTER_RESPONSE`] more.
+const REQUEST_WAIT: Duration = Duration::from_millis(1500);
+const AFTER_RESPONSE: Duration = Duration::from_millis(150);
+
+/// What a delivered click did, as far as navigera can see.
+#[derive(Debug, PartialEq)]
+enum Effect {
+    /// Something changed (the usual case, seen in one round trip): what.
+    Changed(String),
+    /// Nothing changed in the page; `requests` it sent, if any (analytics).
+    Nothing { watched_ms: u64, requests: Vec<String> },
+    /// Can't tell: a field, a `<select>`, a right click, frames it didn't
+    /// watch, a request still running, the page gone.
+    Unknown,
+}
 
 /// The second half of a DOM-event double click (the first click's events
 /// were sent by CLICK_PREP).
@@ -181,6 +505,35 @@ const DBLCLICK_REST: &str = r#"function (el) {
 }"#;
 
 /// What `get` reads from an element.
+/// `mouse … <target>`: the point `dx`,`dy` from the element's top-left
+/// corner (its center when `dx` is null), in top-level viewport pixels.
+/// Scrolled into view first when the point isn't in the viewport, as a
+/// click would be. `{ outside }` when it still isn't (an offset beyond the
+/// page), `{ xframe }` inside a cross-origin frame.
+pub const MOUSE_AT: &str = r#"function (el, dx, dy) {
+    const at = () => {
+        const r = el.getBoundingClientRect();
+        let x = r.left + (dx == null ? r.width / 2 : dx), y = r.top + (dy == null ? r.height / 2 : dy);
+        let w = el.ownerDocument.defaultView;
+        while (w && w !== w.top) {
+            const fe = w.frameElement;
+            if (!fe) return null;
+            const fr = fe.getBoundingClientRect();
+            x += fr.left + fe.clientLeft; y += fr.top + fe.clientTop;
+            w = w.parent;
+        }
+        const top = w || window;
+        return { x, y, inside: x >= 0 && y >= 0 && x < top.innerWidth && y < top.innerHeight };
+    };
+    let p = at();
+    if (!p) return { xframe: true };
+    if (!p.inside) {
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        p = at();
+    }
+    return p.inside ? { x: p.x, y: p.y } : { outside: true, x: p.x, y: p.y, width: (window.top || window).innerWidth, height: (window.top || window).innerHeight };
+}"#;
+
 pub const GET_EL: &str = r#"function (el, what, name) {
     switch (what) {
         case 'text': return (el.innerText ?? el.textContent ?? '').trim();
@@ -189,7 +542,7 @@ pub const GET_EL: &str = r#"function (el, what, name) {
         case 'html': return el.innerHTML;
         case 'outer': return el.outerHTML;
         case 'box': { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; }
-        case 'style': return getComputedStyle(el).getPropertyValue(name);
+        case 'style': return (el.ownerDocument.defaultView || window).getComputedStyle(el).getPropertyValue(name);
         case 'checked': return !!el.checked;
         default: throw new Error('get: unknown property ' + what);
     }
@@ -197,7 +550,7 @@ pub const GET_EL: &str = r#"function (el, what, name) {
 
 /// The states `is` answers.
 pub const IS_EL: &str = r#"function (el, state) {
-    const visible = () => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+    const visible = () => el.getClientRects().length > 0 && (el.ownerDocument.defaultView || window).getComputedStyle(el).visibility !== 'hidden';
     const disabled = () => !!(el.disabled || el.closest('fieldset[disabled]') || el.getAttribute('aria-disabled') === 'true');
     switch (state) {
         case 'visible': return visible();
@@ -206,7 +559,7 @@ pub const IS_EL: &str = r#"function (el, state) {
         case 'disabled': return disabled();
         case 'checked': return !!(el.checked || el.getAttribute('aria-checked') === 'true');
         case 'editable': return !disabled() && !el.readOnly && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
-        case 'focused': return el === el.ownerDocument.activeElement || el.contains(el.ownerDocument.activeElement);
+        case 'focused': { const a = el.getRootNode().activeElement || el.ownerDocument.activeElement; return el === a || el.contains(a); }
         default: throw new Error('is: unknown state ' + state + ' (visible, hidden, enabled, disabled, checked, editable, focused)');
     }
 }"#;
@@ -243,17 +596,40 @@ const HOVER_PREP: &str = r#"async function (el, settleMs) {
 
 /// Fill `el` with `value`: native value setter (so React & co. see it) plus
 /// `input`/`change` events. Contenteditable hosts get their text replaced.
-const FILL_EL: &str = r#"function (el, value) {
+/// A field whose centre is under something else (a sticky bar, an
+/// overlapping panel) is scrolled until it isn't, as a user would before
+/// typing; some pages check.
+const FILL_EL: &str = r#"async function (el, value, settleMs) {
+    // A disabled or read-only field takes no typing; wait for it to unlock.
+    const locked = () => !!(el.disabled || el.readOnly || el.closest('fieldset[disabled]'));
+    const end = Date.now() + (settleMs || 0);
+    while (locked() && Date.now() < end) await new Promise((res) => setTimeout(res, 50));
+    if (locked()) throw new Error('fill: the field is ' + (el.readOnly ? 'read-only' : 'disabled') + '; a user can\'t type into it');
+    const covered = () => {
+        const r = el.getBoundingClientRect();
+        if (!(r.width > 0 && r.height > 0)) return false;
+        const hit = (el.getRootNode().elementFromPoint ? el.getRootNode() : el.ownerDocument).elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return !!hit && hit !== el && !el.contains(hit);
+    };
+    if (covered()) {
+        for (const block of ['center', 'start', 'end', 'nearest']) {
+            el.scrollIntoView({ block, inline: 'nearest', behavior: 'instant' });
+            if (!covered()) break;
+        }
+    }
     el.focus();
     if (el.isContentEditable) {
         el.textContent = value;
         el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
         return true;
     }
-    if (el instanceof HTMLSelectElement) throw new Error('fill: this is a <select>; use `select --value`');
+    if (el.tagName === 'SELECT') throw new Error('fill: this is a <select>; use `select --value`');
     if (!('value' in el)) throw new Error('fill: element is not an input, textarea or contenteditable (' + el.tagName.toLowerCase() + ')');
-    const proto = (el instanceof HTMLTextAreaElement) ? HTMLTextAreaElement.prototype
-        : (el instanceof HTMLInputElement) ? HTMLInputElement.prototype : null;
+    // The setter of the element's own window: an element in a frame is
+    // not an instance of this window's classes.
+    const view = el.ownerDocument.defaultView || window;
+    const proto = el.tagName === 'TEXTAREA' ? view.HTMLTextAreaElement.prototype
+        : el.tagName === 'INPUT' ? view.HTMLInputElement.prototype : null;
     const desc = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
     if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; }
     el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
@@ -262,31 +638,108 @@ const FILL_EL: &str = r#"function (el, value) {
 }"#;
 
 /// Choose `<select>` options by value or visible label (exact first, then
-/// case-insensitive), firing input/change like a user would.
-const SELECT_EL: &str = r#"function (el, wanted) {
-    if (!(el instanceof HTMLSelectElement)) {
+/// with whitespace collapsed -- non-breaking spaces count as spaces -- then
+/// case-insensitive), firing input/change like a user would. The chosen
+/// options replace the selection, or join it with `add` (a multiple
+/// select, a user holding Ctrl).
+const SELECT_EL: &str = r#"function (el, wanted, add) {
+    if (el.tagName !== 'SELECT') {
         throw new Error('select: element is ' + el.tagName.toLowerCase() + ', not a <select>; for a custom dropdown, click it and then click the option by ref');
     }
     const opts = Array.from(el.options);
+    const norm = (s) => s.replace(/\s+/g, ' ').trim();
     const pick = (w) => opts.find(o => o.value === w) || opts.find(o => o.label.trim() === w)
-        || opts.find(o => o.label.trim().toLowerCase() === w.toLowerCase());
+        || opts.find(o => norm(o.label) === norm(w)) || opts.find(o => norm(o.value) === norm(w))
+        || opts.find(o => norm(o.label).toLowerCase() === norm(w).toLowerCase());
     const chosen = wanted.map(w => { const o = pick(w); if (!o) throw new Error('select: no option ' + JSON.stringify(w) + ' (have: ' + opts.map(o => JSON.stringify(o.label.trim())).slice(0, 30).join(', ') + ')'); return o; });
     if (!el.multiple && chosen.length > 1) throw new Error('select: single-choice <select>, got ' + chosen.length + ' values');
-    for (const o of opts) o.selected = chosen.includes(o);
+    if (add && !el.multiple) throw new Error('select --add: this <select> takes one option');
+    for (const o of opts) o.selected = chosen.includes(o) || (add && o.selected);
     el.focus();
     el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
-    return chosen.map(o => o.label.trim());
+    return opts.filter(o => o.selected).map(o => norm(o.label));
+}"#;
+
+/// A custom dropdown's parts: whether `el` is (or holds, or sits in) an
+/// ARIA combobox, which element takes keys (it gets focus), whether it is
+/// open, and the listbox it controls.
+pub const COMBO_FOCUS: &str = r#"function (el) {
+    const isCombo = (n) => !!n && n.nodeType === 1 && (n.getAttribute('role') === 'combobox'
+        || n.getAttribute('aria-haspopup') === 'listbox' || n.hasAttribute('aria-expanded'));
+    let box = isCombo(el) ? el : (el.closest('[role=combobox],[aria-haspopup=listbox]') || el.querySelector('[role=combobox],[aria-haspopup=listbox]'));
+    if (!box) return { combobox: false, tag: el.tagName.toLowerCase() };
+    const field = box.matches('input,textarea,[contenteditable=""],[contenteditable=true]') ? box
+        : box.querySelector('input:not([type=hidden]),textarea,[contenteditable=""],[contenteditable=true]');
+    const keys = !!field || box.tabIndex >= 0;
+    (field || box).focus();
+    const expandedOf = (n) => n && n.getAttribute && n.getAttribute('aria-expanded');
+    const expanded = [box, field].some((n) => expandedOf(n) === 'true');
+    const ids = [box, field].map((n) => n && (n.getAttribute('aria-controls') || n.getAttribute('aria-owns'))).filter(Boolean);
+    return { combobox: true, keys, expanded, listbox: ids[0] ? ids[0].split(/\s+/)[0] : null };
+}"#;
+
+/// Find `want` among the options of the open listbox (the one the
+/// combobox names, else any visible one): exact text, then the start, then
+/// anywhere, ignoring case and whitespace. A match is marked with a
+/// one-off attribute so it can be clicked by a trusted click.
+pub const COMBO_PICK: &str = r#"function (want, listboxId, typed, deep) {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const w = norm(want);
+    const shown = (n) => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0 && deep.style(n).visibility !== 'hidden'; };
+    let boxes = [];
+    if (listboxId) for (const r of deep.roots()) { const b = r.getElementById ? r.getElementById(listboxId) : null; if (b) boxes.push(b); }
+    if (!boxes.some(shown)) boxes = deep.all('[role=listbox]');
+    boxes = boxes.filter(shown);
+    const opts = [];
+    for (const b of boxes) opts.push(...b.querySelectorAll('[role=option]'));
+    const live = opts.filter(shown);
+    const label = (o) => norm(o.getAttribute('aria-label') || o.innerText || o.textContent);
+    const hit = live.find((o) => label(o) === w) || live.find((o) => label(o).startsWith(w)) || live.find((o) => label(o).includes(w))
+        || live.find((o) => norm(o.getAttribute('data-value') || o.getAttribute('value')) === w);
+    const options = live.slice(0, 20).map((o) => (o.innerText || o.textContent || '').trim());
+    if (!hit) return { open: boxes.length > 0, picked: false, options };
+    const token = Math.random().toString(36).slice(2, 10);
+    hit.setAttribute('data-nv-pick', token);
+    hit.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+    return { open: true, picked: true, token, label: (hit.innerText || hit.textContent || '').trim(), options };
+}"#;
+
+/// Focus a field and select everything in it, so typing replaces it.
+pub const FOCUS_SELECT_ALL: &str = r#"function (el) {
+    el.scrollIntoView({ block: 'center', behavior: 'instant' });
+    el.focus();
+    if (typeof el.select === 'function') el.select();
+    else if (el.isContentEditable) {
+        const r = el.ownerDocument.createRange();
+        r.selectNodeContents(el);
+        const sel = (el.ownerDocument.defaultView || window).getSelection();
+        sel.removeAllRanges();
+        sel.addRange(r);
+    }
+    const a = el.getRootNode().activeElement || el.ownerDocument.activeElement;
+    return a === el || el.contains(a);
 }"#;
 
 /// Focus an element (for `press`/`type` with a target).
-pub const FOCUS_EL: &str = r#"function (el) { el.scrollIntoView({ block: 'center', behavior: 'instant' }); el.focus(); return document.activeElement === el || el.contains(document.activeElement); }"#;
+pub const FOCUS_EL: &str = r#"function (el) {
+    el.scrollIntoView({ block: 'center', behavior: 'instant' });
+    el.focus();
+    const a = el.getRootNode().activeElement || el.ownerDocument.activeElement;
+    return a === el || el.contains(a);
+}"#;
 
 /// Scroll an element into view (or scroll inside it by `dy`).
-const SCROLL_EL: &str = r#"function (el, dy) {
-    if (dy) { el.scrollBy({ top: dy, behavior: 'instant' }); }
+/// With `to` (`top`/`bottom`) the element's own content scrolls there: a
+/// list that loads more as it reaches its end.
+const SCROLL_EL: &str = r#"function (el, dy, to) {
+    if (to === 'bottom') { el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }); }
+    else if (to === 'top') { el.scrollTo({ top: 0, behavior: 'instant' }); }
+    else if (dy) { el.scrollBy({ top: dy, behavior: 'instant' }); }
     else { el.scrollIntoView({ block: 'center', behavior: 'instant' }); }
-    return { scrollY: Math.round(window.scrollY), scrollHeight: document.documentElement.scrollHeight };
+    const out = { scrollY: Math.round(window.scrollY), scrollHeight: document.documentElement.scrollHeight };
+    if (to || dy) { out.scrollTop = Math.round(el.scrollTop); out.elementScrollHeight = el.scrollHeight; }
+    return out;
 }"#;
 
 /// The element itself (for ops that need its remote object, like upload).
@@ -349,11 +802,28 @@ const DRAG_DROP: &str = r#"function (el) {
 const IDENTITY: &str = "function (el) { return el; }";
 
 /// Auto-wait: resolve the first match for `sel`, polling every 50 ms for up
-/// to `ms` (SPAs render after load; an agent shouldn't have to poll).
-const WAIT_FOR: &str = r#"async function (sel, ms, what) {
+/// to `ms` (SPAs render after load; an agent shouldn't have to poll). The
+/// top document first, then open shadow roots and same-origin frames.
+const WAIT_FOR: &str = r#"async function (sel, ms, what, deepFn) {
     const end = Date.now() + ms;
+    let deep = null;
+    // Somewhere a user could see it: a box, not hidden, not parked at a
+    // negative position no scrolling reaches (a decoy copy of an id).
+    const reachable = (e) => {
+        const r = e.getBoundingClientRect(), w = e.ownerDocument.defaultView || window;
+        return r.width > 0 && r.height > 0 && r.right + w.scrollX > 0 && r.bottom + w.scrollY > 0
+            && w.getComputedStyle(e).visibility !== 'hidden';
+    };
     for (;;) {
-        const el = document.querySelector(sel);
+        // The plain query first: the deep search is built (and compiled)
+        // only when the top document has no match. When the first match is
+        // out of a user's reach and another isn't, the other is the one.
+        const doc = typeof __nvStart === 'function' ? __nvStart() : document;
+        let el = doc && doc.querySelector(sel);
+        if (el && !reachable(el)) {
+            for (const c of doc.querySelectorAll(sel)) if (reachable(c)) { el = c; break; }
+        }
+        el = el || (deep = deep || deepFn()).first(sel);
         if (el) return el;
         if (Date.now() >= end) throw new Error(what + ': no element matches selector ' + JSON.stringify(sel) + ' within ' + ms + ' ms (run `ax` to see the page and act by --ref)');
         await new Promise((r) => setTimeout(r, 50));
@@ -363,12 +833,9 @@ const WAIT_FOR: &str = r#"async function (sel, ms, what) {
 /// Auto-wait by role / accessible name / label / placeholder / test id /
 /// CSS, then pick the nth match. Visible elements come first; text matches
 /// are case-insensitive, exact before contains. Walks open shadow roots.
-const WAIT_LOCATOR: &str = r#"async function (spec, ms, what) {
+const WAIT_LOCATOR: &str = r#"async function (spec, ms, what, deep) {
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    const all = (root, out = []) => {
-        for (const el of root.querySelectorAll('*')) { out.push(el); if (el.shadowRoot) all(el.shadowRoot, out); }
-        return out;
-    };
+    const all = () => { const out = []; for (const r of deep.roots()) out.push(...r.querySelectorAll('*')); return out; };
     const implicitRole = (el) => {
         const t = el.tagName, type = (el.getAttribute('type') || '').toLowerCase();
         switch (t) {
@@ -429,11 +896,11 @@ const WAIT_LOCATOR: &str = r#"async function (spec, ms, what) {
         return el.title || el.getAttribute('placeholder') || '';
     };
     const matches = (got, want) => { const g = norm(got), w = norm(want); return g === w ? 2 : (w && g.includes(w) ? 1 : 0); };
-    const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+    const visible = (el) => el.getClientRects().length > 0 && deep.style(el).visibility !== 'hidden';
     const end = Date.now() + ms;
     for (;;) {
         let found = [];
-        for (const el of (spec.css ? [...document.querySelectorAll(spec.css)] : all(document))) {
+        for (const el of (spec.css ? deep.all(spec.css) : all())) {
             let score = 0, ok = true;
             const need = (s) => { if (!s) ok = false; else score += s; };
             if (spec.testid) need(['data-testid', 'data-test-id', 'data-test', 'data-qa'].some((a) => el.getAttribute(a) === spec.testid) ? 2 : 0);
@@ -462,7 +929,7 @@ const WAIT_LOCATOR: &str = r#"async function (spec, ms, what) {
 /// text or value matches `text` — exact (case-insensitive) beats contains,
 /// actionable elements beat plain ones, visible beats hidden. Walks open
 /// shadow roots.
-const WAIT_TEXT: &str = r#"async function (text, ms, what) {
+const WAIT_TEXT: &str = r#"async function (text, ms, what, deep, mode) {
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const want = norm(text);
     // The longest word is the cheap pre-filter for text nodes.
@@ -470,8 +937,25 @@ const WAIT_TEXT: &str = r#"async function (text, ms, what) {
     const SKIP = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT', 'HEAD', 'TITLE', 'META', 'LINK']);
     const ACTION = 'a,button,input,select,textarea,summary,label,option,[role],[onclick],[tabindex],[contenteditable=""],[contenteditable="true"]';
     const maxLen = want.length * 4 + 40;
-    const label = (el) => norm(el.getAttribute('aria-label') || (el.labels && el.labels[0] && el.labels[0].innerText)
-        || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt'));
+    // How an element reads: what it shows and what names it. A button
+    // showing "Add to cart" whose aria-label is "Add Carbon Gear to cart"
+    // matches "Add to cart" by what it shows, and wins over the product card
+    // around it that merely contains the phrase.
+    const readings = (el) => [el.getAttribute('aria-label'), el.labels && el.labels[0] && el.labels[0].innerText,
+        el.value, el.getAttribute('placeholder'), el.getAttribute('title'), el.getAttribute('alt'),
+        textLen(el) <= maxLen * 2 ? el.innerText : null];
+    // The closest reading: exact, else the shortest that contains the phrase.
+    const match = (el) => {
+        let has = null;
+        for (const raw of readings(el)) {
+            if (typeof raw !== 'string') continue;
+            const l = norm(raw);
+            if (!l || l.length > maxLen) continue;
+            if (l === want) return { exact: true, l };
+            if (l.includes(want) && (!has || l.length < has.l.length)) has = { exact: false, l };
+        }
+        return has;
+    };
     // Candidates without touching layout: parents of text nodes holding the
     // phrase (and a few small ancestors, for text split across inline
     // tags), plus elements whose label comes from attributes or a value.
@@ -485,7 +969,7 @@ const WAIT_TEXT: &str = r#"async function (text, ms, what) {
         return n;
     };
     const fromText = (root, needle, out) => {
-        const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        const tw = (root.ownerDocument || root).createTreeWalker(root, NodeFilter.SHOW_TEXT);
         for (let n = tw.nextNode(); n; n = tw.nextNode()) {
             if (!n.data.replace(/\s+/g, ' ').toLowerCase().includes(needle)) continue;
             let p = n.parentElement;
@@ -497,8 +981,10 @@ const WAIT_TEXT: &str = r#"async function (text, ms, what) {
         for (const el of root.querySelectorAll('*')) if (el.shadowRoot) fromText(el.shadowRoot, needle, out);
         return out;
     };
+    // A frame is where text is, not something to act on by its title.
+    const FRAMES = new Set(['IFRAME', 'FRAME', 'OBJECT', 'EMBED']);
     const fromAttrs = (root, out) => {
-        for (const el of root.querySelectorAll('[aria-label],[placeholder],[title],[alt],input,textarea,select')) out.add(el);
+        for (const el of root.querySelectorAll('[aria-label],[placeholder],[title],[alt],input,textarea,select')) if (!FRAMES.has(el.tagName)) out.add(el);
         for (const el of root.querySelectorAll('*')) if (el.shadowRoot) fromAttrs(el.shadowRoot, out);
         return out;
     };
@@ -512,20 +998,34 @@ const WAIT_TEXT: &str = r#"async function (text, ms, what) {
         if (!(r.width > 0 && r.height > 0)) return false;
         return el.checkVisibility ? el.checkVisibility({ visibilityProperty: true }) : true;
     };
+    // Frames this script can't look into (another origin): an exact match
+    // may be in one of them (a "Pay" button in a payment frame, beside a
+    // "Payment details" heading here).
+    const unreachable = () => deep.docs().some((d) => [...d.querySelectorAll('iframe, frame')].some((f) => {
+        try { return !f.contentDocument; } catch (_) { return true; }
+    }));
+    // mode: 0 = say so (an "inexact" error) when the best match only
+    // contains the text and frames out of reach could hold an exact one;
+    // 1 = exact matches only (looking inside such a frame); 2 = take the
+    // best match.
     const end = Date.now() + ms;
     for (;;) {
-        let best = null, bestScore = -1;
-        const roots = candidates(document.body || document.documentElement);
-        for (const el of roots) {
-            if (SKIP.has(el.tagName) || el.closest('head')) continue;
-            const l = label(el);
-            if (!l || l.length > maxLen) continue;
-            const exact = l === want, has = l.includes(want);
-            if (!exact && !has) continue;
-            // Visible beats everything: an exact match on a hidden element
-            // must not win over the button the agent can see.
-            const score = (visible(el) ? 8 : 0) + (exact ? 4 : 0) + (el.matches(ACTION) ? 2 : 0) - l.length / 1000;
-            if (score > bestScore) { best = el; bestScore = score; }
+        let best = null, bestScore = -1, bestExact = false;
+        // Every document this script reaches; for the same quality of match,
+        // the top one first.
+        deep.docs().forEach((d, di) => {
+            for (const el of candidates(d.body || d.documentElement)) {
+                if (SKIP.has(el.tagName) || FRAMES.has(el.tagName) || el.closest('head')) continue;
+                const m = match(el);
+                if (!m || (mode === 1 && !m.exact)) continue;
+                // Visible beats everything: an exact match on a hidden element
+                // must not win over the button the agent can see.
+                const score = (visible(el) ? 8 : 0) + (m.exact ? 4 : 0) + (el.matches(ACTION) ? 2 : 0) - m.l.length / 1000 - di / 100000;
+                if (score > bestScore) { best = el; bestScore = score; bestExact = m.exact; }
+            }
+        });
+        if (best && !bestExact && mode === 0 && unreachable()) {
+            throw new Error(what + ': inexact match only for ' + JSON.stringify(text));
         }
         // A <label> stands for its control (fill/select/upload need the input).
         if (best && best.tagName === 'LABEL' && best.control) return best.control;
@@ -714,17 +1214,105 @@ fn modifier_bit(name: &str) -> Option<u32> {
 /// own "not found" error wins the race against the transport timeout.
 /// A JS expression awaiting the element `target` names (not for refs,
 /// which resolve through CDP).
+/// How a `--text` finder takes a match that only contains the text (see
+/// WAIT_TEXT): flag it when frames out of reach could hold an exact one,
+/// take exact ones only, or take the best.
+#[derive(Clone, Copy, PartialEq)]
+enum TextMode {
+    FlagInexact = 0,
+    ExactOnly = 1,
+    Best = 2,
+}
+
 fn finder_expr(target: &Target, wait_ms: u128, what: &str) -> String {
+    finder_expr_in(target, wait_ms, what, TextMode::Best)
+}
+
+/// The document a `--frame` chain (`#outer >> #inner`, each an iframe or
+/// frame by CSS in the document before) leads to, or null while it isn't
+/// there. A frame of another origin can't be entered from here: that is an
+/// error naming which step, for the caller to look in that frame itself.
+const FRAME_DOC: &str = r#"function (chain) {
+    const steps = chain.split('>>').map((s) => s.trim()).filter(Boolean);
+    let doc = document;
+    for (let i = 0; i < steps.length; i++) {
+        const f = doc.querySelector(steps[i]);
+        if (!f) return null;
+        if (f.tagName !== 'IFRAME' && f.tagName !== 'FRAME')
+            throw new Error('--frame ' + JSON.stringify(chain) + ': ' + JSON.stringify(steps[i]) + ' is a <' + f.tagName.toLowerCase() + '>, not a frame');
+        let d = null; try { d = f.contentDocument; } catch (_) {}
+        if (!d) throw new Error('--frame ' + JSON.stringify(chain) + ': another origin (navigera:xo ' + i + ' of ' + steps.length + ')');
+        doc = d;
+    }
+    return doc.documentElement ? doc : null;
+}"#;
+
+/// The first frame element of another origin along a `--frame` chain.
+const FRAME_EL: &str = r#"function (chain) {
+    let doc = document;
+    for (const s of chain.split('>>').map((x) => x.trim()).filter(Boolean)) {
+        const f = doc.querySelector(s);
+        if (!f) return null;
+        let d = null; try { d = f.contentDocument; } catch (_) {}
+        if (!d) return f;
+        doc = d;
+    }
+    return null;
+}"#;
+
+fn finder_expr_in(target: &Target, wait_ms: u128, what: &str, mode: TextMode) -> String {
     match target {
-        Target::Selector(sel) => format!("({WAIT_FOR})({}, {wait_ms}, {})", json!(sel), json!(what)),
-        Target::Text(text) => format!("({WAIT_TEXT})({}, {wait_ms}, {})", json!(text), json!(what)),
-        Target::Locator(loc) => format!("({WAIT_LOCATOR})({}, {wait_ms}, {})", json!(loc), json!(what)),
+        // When nothing matches the frame itself, the error says so, not
+        // that the element is missing.
+        Target::InFrame(chain, inner) => format!(
+            "(() => {{ const __nvStart = () => ({FRAME_DOC})({chain}); \
+             return Promise.resolve({}).catch((e) => {{ \
+               let gone = false; try {{ gone = __nvStart() === null; }} catch (_) {{}} \
+               const m = String(e && e.message || e); \
+               if (gone && m.includes(': no element')) \
+                 throw new Error(m.slice(0, m.indexOf(': no element')) + ': no frame matches --frame ' + JSON.stringify({chain}) + ' (the element was not looked for)'); \
+               throw e; }}); }})()",
+            finder_expr_in(inner, wait_ms, what, mode),
+            chain = json!(chain),
+        ),
+        Target::Selector(sel) => format!("({WAIT_FOR})({}, {wait_ms}, {}, () => {DEEP})", json!(sel), json!(what)),
+        Target::Text(text) => {
+            format!("({WAIT_TEXT})({}, {wait_ms}, {}, {DEEP}, {})", json!(text), json!(what), mode as u8)
+        }
+        Target::Locator(loc) => format!("({WAIT_LOCATOR})({}, {wait_ms}, {}, {DEEP})", json!(loc), json!(what)),
         Target::Ref(node) => format!("Promise.reject(new Error('{what}: ref {node} must be resolved through CDP'))"),
     }
 }
 
-fn wait_budget_ms(timeout: Duration) -> u128 {
-    timeout.as_millis().saturating_sub(250).max(1)
+/// A finder's "no element … within" (the element isn't there yet).
+fn not_found(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains(": no element")
+}
+
+/// A `--text` finder's "only an inexact match here, and frames out of
+/// reach" (see WAIT_TEXT).
+fn inexact(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains(": inexact match only for ")
+}
+
+/// The page an evaluate ran in was replaced by a navigation before it
+/// answered.
+fn navigated_away(e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}");
+    ["Inspected target navigated or closed", "Execution context was destroyed", "Cannot find context with specified id"]
+        .iter()
+        .any(|s| m.contains(s))
+}
+
+/// The element wait the page runs: the wait asked for, unless the CDP
+/// command timeout is so close that the page's own "not found" (which
+/// names the element) could lose the race to the transport's timeout.
+fn wait_budget_ms(wait: Duration, timeout: Duration) -> u128 {
+    if timeout >= wait + Duration::from_millis(500) {
+        wait.as_millis().max(1)
+    } else {
+        timeout.as_millis().saturating_sub(250).max(1)
+    }
 }
 
 /// Readable message from a CDP `exceptionDetails` (first lines of the
@@ -736,6 +1324,9 @@ fn exception_message(details: &Value) -> String {
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| details.get("text").and_then(Value::as_str).unwrap_or("exception").to_string());
+    // "Error: " is the class of every page error: the op's own prefix
+    // already says what failed.
+    let description = description.strip_prefix("Error: ").unwrap_or(&description);
     description.lines().filter(|l| !l.trim_start().starts_with("at ")).take(4).collect::<Vec<_>>().join("\n")
 }
 
@@ -757,6 +1348,16 @@ pub struct AxOptions {
     pub scope: Option<Target>,
 }
 
+/// Where the mouse is and which buttons it holds (bits: 1 left, 2 right,
+/// 4 middle). `mouse` moves from here and keeps buttons held across moves;
+/// element clicks, hovers and drags leave it where they went.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Pointer {
+    pub x: f64,
+    pub y: f64,
+    pub buttons: u8,
+}
+
 #[derive(Clone)]
 pub struct Page {
     handle: tokio::runtime::Handle,
@@ -764,6 +1365,10 @@ pub struct Page {
     session_id: String,
     target_id: String,
     shared: Arc<Shared>,
+    /// Isolated worlds navigera made in cross-origin frames: frame id ->
+    /// (the frame's loader, its execution context).
+    worlds: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>>,
+    pointer: Arc<std::sync::Mutex<Pointer>>,
 }
 
 impl Page {
@@ -774,7 +1379,7 @@ impl Page {
         target_id: String,
         shared: Arc<Shared>,
     ) -> Self {
-        Self { handle, client, session_id, target_id, shared }
+        Self { handle, client, session_id, target_id, shared, worlds: Default::default(), pointer: Default::default() }
     }
 
     pub fn target_id(&self) -> &str {
@@ -852,7 +1457,36 @@ impl Page {
     }
 
     fn send(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        self.block_on(self.client.send(method, params, Some(&self.session_id), timeout))
+        if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") {
+            return self.block_on(self.client.send(method, params, Some(&self.session_id), timeout));
+        }
+        // A script still running in a document a navigation replaced is
+        // normally failed by Chrome ("Execution context was destroyed"), and
+        // the op looks again on the new page. Sometimes no answer ever comes
+        // (seen on macOS); don't wait out the whole timeout for one: a second
+        // after the new document committed, give up on the old one the same
+        // way.
+        let generation = self.nav_generation();
+        self.block_on(async {
+            let call = self.client.send(method, params, Some(&self.session_id), timeout);
+            tokio::pin!(call);
+            loop {
+                tokio::select! {
+                    r = &mut call => return r,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        let nav = self.shared.nav_state(&self.session_id);
+                        if nav.generation > generation
+                            && nav.committed_at.is_some_and(|t| t.elapsed() >= ABANDON_AFTER_COMMIT)
+                        {
+                            bail!(
+                                "Inspected target navigated or closed: the page was replaced while {method} ran \
+                                 and the old one never answered"
+                            );
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// Send one CDP command to this tab's session.
@@ -899,13 +1533,7 @@ impl Page {
         self.block_on(async {
             let mut events = self.client.subscribe();
             let res = self
-                .client
-                .send(
-                    "Page.navigate",
-                    json!({ "url": url }),
-                    Some(&self.session_id),
-                    timeout,
-                )
+                .send_page_op("Page.navigate", json!({ "url": url }), timeout)
                 .await
                 .with_context(|| format!("navigate to {url}"))?;
             if let Some(error) = res.get("errorText").and_then(Value::as_str) {
@@ -932,7 +1560,7 @@ impl Page {
             // frameNavigated carries the loaderId Page.navigate returned), so
             // a late load event from the previous document can't end the wait.
             let mut committed = false;
-            self.wait_event(&mut events, timeout, |method, params| {
+            let pred = |method: &str, params: &Value| {
                 if method == "Page.frameNavigated" {
                     let frame = params.get("frame").unwrap_or(&Value::Null);
                     let main = frame.get("parentId").is_none();
@@ -943,7 +1571,8 @@ impl Page {
                     }
                 }
                 committed && method == want
-            })
+            };
+            self.wait_load(&mut events, timeout, pred, Loader::Is(&loader), want)
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
@@ -963,25 +1592,97 @@ impl Page {
         timeout: Duration,
         mut pred: impl FnMut(&str, &Value) -> bool,
     ) -> Result<()> {
-        tokio::time::timeout(timeout, async {
-            loop {
-                match events.recv().await {
-                    Ok(event) => {
-                        if event.get("sessionId").and_then(Value::as_str) != Some(self.session_id.as_str()) {
-                            continue;
-                        }
-                        let method = event.get("method").and_then(Value::as_str).unwrap_or("");
-                        if pred(method, event.get("params").unwrap_or(&Value::Null)) {
-                            return Ok(());
-                        }
+        tokio::time::timeout(timeout, self.next_event(events, &mut pred))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out after {} ms", timeout.as_millis()))?
+    }
+
+    /// The next event of this tab's session that `pred` accepts.
+    async fn next_event(
+        &self,
+        events: &mut tokio::sync::broadcast::Receiver<Value>,
+        pred: &mut impl FnMut(&str, &Value) -> bool,
+    ) -> Result<()> {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if event.get("sessionId").and_then(Value::as_str) != Some(self.session_id.as_str()) {
+                        continue;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(e) => bail!("CDP event stream ended: {e}"),
+                    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+                    if pred(method, event.get("params").unwrap_or(&Value::Null)) {
+                        return Ok(());
+                    }
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => bail!("CDP event stream ended: {e}"),
             }
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out after {} ms", timeout.as_millis()))?
+        }
+    }
+
+    /// [`Page::wait_event`] for a load, and every 2 s a look at the page
+    /// itself: its main frame shows the document `loader` (any but `not`)
+    /// and has reached `want`. An event lost on the way (a lagging event
+    /// stream on a slow machine) then costs 2 s, not the whole timeout.
+    async fn wait_load(
+        &self,
+        events: &mut tokio::sync::broadcast::Receiver<Value>,
+        timeout: Duration,
+        mut pred: impl FnMut(&str, &Value) -> bool,
+        loader: Loader<'_>,
+        want: &str,
+    ) -> Result<()> {
+        let end = Instant::now() + timeout;
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("timed out after {} ms", timeout.as_millis());
+            }
+            if let Ok(done) = tokio::time::timeout(left.min(LOAD_LOOK), self.next_event(events, &mut pred)).await {
+                return done;
+            }
+            if self.load_reached(&loader, want).await {
+                eprintln!("[page] {want} seen on the page itself, not by its event");
+                return Ok(());
+            }
+        }
+    }
+
+    /// The loader id of the main frame's document.
+    async fn main_loader(&self) -> Option<String> {
+        let session = Some(self.session_id.as_str());
+        let tree = self.client.send("Page.getFrameTree", json!({}), session, LOAD_LOOK).await.ok()?;
+        tree.pointer("/frameTree/frame/loaderId").and_then(Value::as_str).map(str::to_string)
+    }
+
+    /// The main frame's document and how far it has loaded.
+    async fn main_document(&self) -> Option<(String, String)> {
+        let session = Some(self.session_id.as_str());
+        let loader = self.main_loader().await?;
+        let state = self
+            .client
+            .send(
+                "Runtime.evaluate",
+                json!({ "expression": "document.readyState", "returnByValue": true }),
+                session,
+                LOAD_LOOK,
+            )
+            .await
+            .ok()?;
+        let state = state.pointer("/result/value").and_then(Value::as_str)?.to_string();
+        Some((loader, state))
+    }
+
+    async fn load_reached(&self, loader: &Loader<'_>, want: &str) -> bool {
+        let Some((now, state)) = self.main_document().await else { return false };
+        let ours = match loader {
+            Loader::Is(id) => id.is_empty() || now == *id,
+            Loader::Not(old) => now != *old,
+        };
+        ours && match want {
+            "Page.domContentEventFired" => state != "loading",
+            _ => state == "complete",
+        }
     }
 
     /// Navigate and return as soon as the navigation commits (no load wait).
@@ -1017,18 +1718,38 @@ impl Page {
 
     pub fn reload(&self, timeout: Duration) -> Result<()> {
         self.block_on(async {
+            // The document before, so a look at the page can tell the new one.
+            let before = self.main_loader().await.unwrap_or_default();
             let mut events = self.client.subscribe();
-            self.client.send("Page.reload", json!({}), Some(&self.session_id), timeout).await?;
+            self.send_page_op("Page.reload", json!({}), timeout).await?;
             let mut committed = false;
-            self.wait_event(&mut events, timeout, |method, params| {
+            let pred = |method: &str, params: &Value| {
                 if method == "Page.frameNavigated" && params.get("frame").is_some_and(|f| f.get("parentId").is_none()) {
                     committed = true;
                 }
                 committed && method == "Page.loadEventFired"
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for reload"))
+            };
+            self.wait_load(&mut events, timeout, pred, Loader::Not(&before), "Page.loadEventFired")
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out waiting for reload"))
         })
+    }
+
+    /// `Page.navigate`/`Page.reload`, again after a moment when the tab's
+    /// frame was between two documents ("Not attached to an active page":
+    /// refused before anything happened, so trying again is safe). Seen once
+    /// in ~700 reloads of a parallel test run.
+    async fn send_page_op(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        let mut tries = 0;
+        loop {
+            match self.client.send(method, params.clone(), Some(&self.session_id), timeout).await {
+                Err(e) if tries < 3 && format!("{e:#}").contains("Not attached to an active page") => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(100 * tries)).await;
+                }
+                other => return other,
+            }
+        }
     }
 
     /// If an earlier action started a navigation in this tab, wait (up to
@@ -1067,12 +1788,29 @@ impl Page {
     /// submissions are scheduled as a task, so the request can trail the
     /// input event's CDP reply — then wait for the new document.
     pub fn navigation_started(&self, since_generation: u64, grace: Duration) -> bool {
+        let others = self.shared.activity(&self.session_id);
+        self.navigation_started_since([since_generation, others[1], others[2], others[3], others[4]], grace)
+    }
+
+    /// What the tab's browser side has seen so far (see
+    /// [`Shared::activity`]): navigations, dialogs, tabs opened, popups,
+    /// downloads.
+    pub fn activity(&self) -> [u64; 5] {
+        self.shared.activity(&self.session_id)
+    }
+
+    /// [`Page::navigation_started`] from an [`Page::activity`] taken before
+    /// the input: a dialog, a new tab or a download that came instead is
+    /// the answer, so the grace isn't waited out (a download link, a
+    /// `target=_blank` link).
+    pub fn navigation_started_since(&self, before: [u64; 5], grace: Duration) -> bool {
         let end = Instant::now() + grace;
         loop {
-            if self.nav_generation() > since_generation {
+            let now = self.activity();
+            if now[0] > before[0] {
                 return true;
             }
-            if Instant::now() >= end {
+            if now[1..] != before[1..] || Instant::now() >= end {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1111,7 +1849,39 @@ impl Page {
     /// Run `function (el, ...args)` on the element `target` names, waiting
     /// up to `wait` for selector/text targets to appear. One round trip for
     /// selector/text; resolve + call + release for refs.
+    ///
+    /// A navigation can replace the page while the op is still looking for
+    /// its element (a reload a click started after a request, a client-side
+    /// redirect). The page's script dies with it; the element is then looked
+    /// for again on the new page, within what is left of the wait. Nothing
+    /// acted yet when that happens: clicks only measure here, and the ops
+    /// that act in the page (fill, select) are the same op again.
     pub(crate) fn on_element(
+        &self,
+        target: &Target,
+        what: &str,
+        function: &str,
+        args: &[Value],
+        wait: Duration,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let started = Instant::now();
+        let mut tries = 0;
+        loop {
+            let left =
+                if tries == 0 { wait } else { wait.saturating_sub(started.elapsed()).max(Duration::from_millis(250)) };
+            match self.on_element_once(target, what, function, args, left, timeout) {
+                Err(e) if tries < 3 && !matches!(target, Target::Ref(_)) && navigated_away(&e) => {
+                    tries += 1;
+                    self.flush_events(Duration::from_millis(100));
+                    let _ = self.settle(left + POST_COMMIT_WAIT);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn on_element_once(
         &self,
         target: &Target,
         what: &str,
@@ -1122,7 +1892,7 @@ impl Page {
     ) -> Result<Value> {
         let arg_list: Vec<String> = args.iter().map(Value::to_string).collect();
         let extra = if arg_list.is_empty() { String::new() } else { format!(", {}", arg_list.join(", ")) };
-        let wait_ms = wait_budget_ms(wait.min(timeout));
+        let wait_ms = wait_budget_ms(wait, timeout);
         let finder = match target {
             Target::Ref(node) => {
                 let fn_on_this = format!(
@@ -1134,8 +1904,230 @@ impl Page {
             }
             other => finder_expr(other, wait_ms, what),
         };
-        let expr = format!("(async () => {{ const el = await {finder}; return ({function})(el{extra}); }})()");
-        self.evaluate_raw(&expr, timeout)
+        let _ = finder;
+        let expr_in = |ms: u128, mode: TextMode| {
+            format!(
+                "(async () => {{ const el = await {}; return ({function})(el{extra}); }})()",
+                finder_expr_in(target, ms, what, mode)
+            )
+        };
+        let expr = |ms: u128| expr_in(ms, TextMode::FlagInexact);
+        if let Target::InFrame(chain, inner) = target {
+            if matches!(**inner, Target::Ref(_) | Target::InFrame(..)) {
+                bail!("{what}: --frame scopes a --selector, --text or locator (a ref already names one element)");
+            }
+            // In the page's own world: the frame and the ones inside it, as
+            // long as they are of this origin; wait there.
+            let e = match self.evaluate_raw(&expr_in(wait_ms, TextMode::Best), timeout) {
+                Err(e) if format!("{e:#}").contains("(navigera:xo ") => e,
+                other => return other,
+            };
+            let m = format!("{e:#}");
+            let step = |key: &str| m.split(key).nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next());
+            let num = |key: &str| step(key).and_then(|v| v.parse::<usize>().ok());
+            if let (Some(i), Some(n)) = (num("(navigera:xo "), num(" of ")) {
+                if i + 1 != n {
+                    bail!("{what}: --frame {chain:?}: a frame of another origin can only be the chain's last step");
+                }
+            }
+            // Of another origin: in a world navigera makes inside it.
+            let context = self.foreign_frame_context(chain, timeout)?;
+            let inner_expr = format!(
+                "(async () => {{ const el = await {}; return ({function})(el{extra}); }})()",
+                finder_expr_in(inner, wait_ms, what, TextMode::Best)
+            );
+            let mut v = self.evaluate_in(context, &inner_expr, timeout)?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("__frame".into(), json!(context));
+                obj.insert("__frame_mode".into(), json!(TextMode::Best as u8));
+            }
+            return Ok(v);
+        }
+        // Most often the element is there: one round trip.
+        match self.evaluate_raw(&expr(0), timeout) {
+            Err(e) if not_found(&e) || inexact(&e) => {}
+            other => return other,
+        }
+        // Not yet. Frames of another origin are out of a page script's
+        // reach; without any, wait in the page as always.
+        let mut frames = self.foreign_frames(timeout);
+        if frames.is_empty() {
+            return self.evaluate_raw(&expr_in(wait_ms, TextMode::Best), timeout);
+        }
+        // With some, look in the page and in each of them until the wait
+        // runs out. A match in a frame says which (`__frame`), for ops that
+        // then need the element's box. Text there must match exactly to win
+        // over a page element that only contains it.
+        let started = Instant::now();
+        let mut polls = 0u32;
+        let in_frames = |frames: &[(String, i64)], mode: TextMode| -> Option<Result<Value>> {
+            for &(_, context) in frames {
+                match self.evaluate_in(context, &expr_in(0, mode), timeout) {
+                    Ok(mut v) => {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("__frame".into(), json!(context));
+                            obj.insert("__frame_mode".into(), json!(mode as u8));
+                        }
+                        return Some(Ok(v));
+                    }
+                    Err(e) if not_found(&e) || navigated_away(&e) => {}
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            None
+        };
+        loop {
+            if let Some(found) = in_frames(&frames, TextMode::ExactOnly) {
+                return found;
+            }
+            let last = match self.evaluate_raw(&expr(0), timeout) {
+                // Nothing in the page: a frame's match that only contains
+                // the text will do.
+                Err(e) if not_found(&e) => {
+                    match matches!(target, Target::Text(_)).then(|| in_frames(&frames, TextMode::Best)).flatten() {
+                        Some(found) => return found,
+                        None => e,
+                    }
+                }
+                // No frame has it exactly: the page's own match it is.
+                Err(e) if inexact(&e) => return self.evaluate_raw(&expr_in(0, TextMode::Best), timeout),
+                other => return other,
+            };
+            if started.elapsed() >= wait {
+                let msg = format!("{last:#}").replace("within 0 ms", &format!("within {} ms", wait.as_millis()));
+                bail!("{msg} (looked in the page and {} cross-origin frame(s))", frames.len());
+            }
+            polls += 1;
+            if polls.is_multiple_of(20) {
+                frames = self.foreign_frames(timeout);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Frames of another origin than the page's, and the frames inside
+    /// them: a page script can't reach into those, so navigera looks there
+    /// from an isolated world of its own in each (invisible to the page).
+    /// navigera's own browsers keep cross-site frames in the page's process,
+    /// so this covers them; frames in other processes (a user's browser
+    /// with `--attach`) are not included.
+    fn foreign_frames(&self, timeout: Duration) -> Vec<(String, i64)> {
+        let Ok(tree) = self.send("Page.getFrameTree", json!({}), timeout) else {
+            return Vec::new();
+        };
+        let root = tree.get("frameTree").cloned().unwrap_or(Value::Null);
+        let origin = |n: &Value| n.pointer("/frame/securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
+        let main = origin(&root);
+        let mut found = Vec::new();
+        fn walk(node: &Value, main: &str, foreign_above: bool, out: &mut Vec<(String, String)>) {
+            for child in node.get("childFrames").and_then(Value::as_array).into_iter().flatten() {
+                let o = child.pointer("/frame/securityOrigin").and_then(Value::as_str).unwrap_or("");
+                let foreign = foreign_above || o != main;
+                if foreign {
+                    if let (Some(id), Some(loader)) = (
+                        child.pointer("/frame/id").and_then(Value::as_str),
+                        child.pointer("/frame/loaderId").and_then(Value::as_str),
+                    ) {
+                        out.push((id.to_string(), loader.to_string()));
+                    }
+                }
+                walk(child, main, foreign, out);
+            }
+        }
+        walk(&root, &main, false, &mut found);
+        let mut out = Vec::new();
+        for (id, loader) in found.into_iter().take(20) {
+            let cached = self.worlds.lock().unwrap().get(&id).filter(|(l, _)| *l == loader).map(|(_, c)| *c);
+            let context = match cached {
+                Some(c) => c,
+                None => match self
+                    .send("Page.createIsolatedWorld", json!({ "frameId": id, "worldName": "navigera" }), timeout)
+                    .ok()
+                    .and_then(|r| r.get("executionContextId").and_then(Value::as_i64))
+                {
+                    Some(c) => {
+                        self.worlds.lock().unwrap().insert(id.clone(), (loader, c));
+                        c
+                    }
+                    None => continue,
+                },
+            };
+            out.push((id, context));
+        }
+        out
+    }
+
+    /// Whether `expression` is true in any cross-origin frame (see
+    /// [`Page::foreign_frames`]).
+    pub fn true_in_a_frame(&self, expression: &str, timeout: Duration) -> bool {
+        self.foreign_frames(timeout).iter().any(|&(_, context)| {
+            self.evaluate_in(context, expression, timeout).ok().and_then(|v| v.as_bool()) == Some(true)
+        })
+    }
+
+    /// An isolated world in the frame of another origin a `--frame` chain
+    /// leads to: its execution context.
+    fn foreign_frame_context(&self, chain: &str, timeout: Duration) -> Result<i64> {
+        let res = self.send(
+            "Runtime.evaluate",
+            json!({ "expression": format!("({FRAME_EL})({})", json!(chain)), "objectGroup": "nv-frame-el" }),
+            timeout,
+        )?;
+        let object = res.pointer("/result/objectId").and_then(Value::as_str).map(str::to_string);
+        let node = object.and_then(|o| self.send("DOM.describeNode", json!({ "objectId": o }), timeout).ok());
+        let _ = self.send("Runtime.releaseObjectGroup", json!({ "objectGroup": "nv-frame-el" }), timeout);
+        let frame = node
+            .and_then(|n| n.pointer("/node/frameId").and_then(Value::as_str).map(str::to_string))
+            .ok_or_else(|| anyhow::anyhow!("--frame {chain:?}: no frame there"))?;
+        let r = self.send("Page.createIsolatedWorld", json!({ "frameId": frame, "worldName": "navigera" }), timeout)?;
+        r.get("executionContextId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("--frame {chain:?}: could not enter the frame"))
+    }
+
+    /// Evaluate in one execution context (a frame's isolated world).
+    fn evaluate_in(&self, context: i64, expression: &str, timeout: Duration) -> Result<Value> {
+        let res = self.send(
+            "Runtime.evaluate",
+            json!({ "expression": expression, "contextId": context, "returnByValue": true, "awaitPromise": true }),
+            timeout,
+        )?;
+        if let Some(details) = res.get("exceptionDetails") {
+            bail!("{}", exception_message(details));
+        }
+        Ok(res.get("result").and_then(|r| r.get("value")).cloned().unwrap_or(Value::Null))
+    }
+
+    /// The centre, in page coordinates, of the element `target` names inside
+    /// a frame's isolated world.
+    /// `found` is what the frame search returned (its `__frame_mode` says
+    /// how the element was matched, so the same one is measured).
+    fn center_in_frame(&self, context: i64, target: &Target, found: &Value, timeout: Duration) -> Option<(f64, f64)> {
+        // Inside the frame, the element is looked for from its own document.
+        let target = match target {
+            Target::InFrame(_, inner) => inner.as_ref(),
+            t => t,
+        };
+        let mode = match found.get("__frame_mode").and_then(Value::as_u64) {
+            Some(1) => TextMode::ExactOnly,
+            Some(0) => TextMode::FlagInexact,
+            _ => TextMode::Best,
+        };
+        let res = self
+            .send(
+                "Runtime.evaluate",
+                json!({ "expression": finder_expr_in(target, 0, "click", mode), "contextId": context,
+                        "awaitPromise": true, "objectGroup": "nv-frame" }),
+                timeout,
+            )
+            .ok()?;
+        let object = res.pointer("/result/objectId").and_then(Value::as_str).map(str::to_string);
+        let quads = object.and_then(|o| self.send("DOM.getContentQuads", json!({ "objectId": o }), timeout).ok());
+        let _ = self.send("Runtime.releaseObjectGroup", json!({ "objectGroup": "nv-frame" }), timeout);
+        let quad: Vec<f64> =
+            quads?.get("quads")?.as_array()?.first()?.as_array()?.iter().filter_map(Value::as_f64).collect();
+        (quad.len() == 8)
+            .then(|| ((quad[0] + quad[2] + quad[4] + quad[6]) / 4.0, (quad[1] + quad[3] + quad[5] + quad[7]) / 4.0))
     }
 
     /// Resolve an `ax` ref (`backendNodeId`) and call `function` on it.
@@ -1206,29 +2198,100 @@ impl Page {
         })
     }
 
-    /// Click: a trusted CDP mouse click at the element's centre, or
-    /// DOM-dispatched events when it has no hittable box (see [`CLICK_PREP`]).
-    /// Returns `{synthetic: true}` when the fallback was used.
-    pub fn click(&self, target: &Target, wait: Duration, timeout: Duration) -> Result<Value> {
+    /// Click: a trusted CDP mouse click at the element's centre once it has
+    /// stopped moving, or DOM-dispatched events when it has no hittable box
+    /// or `force` says so (see [`CLICK_PREP`]). An element that stays under
+    /// another one is an error naming that one, not a click a user couldn't
+    /// make. Returns `{synthetic: true}` when DOM events were used.
+    pub fn click(&self, target: &Target, opts: &ClickOptions, wait: Duration, timeout: Duration) -> Result<Value> {
         let settle = json!(self.hit_settle_ms(wait));
-        let mut point = self.on_element(target, "click", CLICK_PREP, &[json!(false), settle.clone()], wait, timeout)?;
+        let strict = json!(!self.shared.is_single_target());
+        let button = json!(opts.button);
+        let dom = |page: &Self| {
+            page.on_element(
+                target,
+                "click",
+                CLICK_PREP,
+                &[json!(true), settle.clone(), strict.clone(), button.clone()],
+                wait,
+                timeout,
+            )
+        };
+        if opts.force {
+            return dom(self);
+        }
+        // Watch what the click changes (not on Lightpanda: no layout, so its
+        // clicks are DOM events anyway).
+        let effects = !self.shared.is_single_target() && std::env::var_os("NAVIGERA_NO_CLICK_CHECK").is_none();
+        let mut point = self.on_element(
+            target,
+            "click",
+            CLICK_PREP,
+            &[json!(false), settle.clone(), strict.clone(), button.clone(), json!(effects)],
+            wait,
+            timeout,
+        )?;
+        if point.get("disabled").and_then(Value::as_bool) == Some(true) {
+            bail!("the element is disabled (waited {settle} ms for it to be enabled); a user can't click it");
+        }
+        if point.get("hidden").and_then(Value::as_bool) == Some(true) {
+            let instead = point.get("instead").and_then(Value::as_str);
+            bail!(
+                "the element isn't visible where it is ({}): a user can't click it{}. \
+                 `--force` sends DOM events to it anyway",
+                match point.get("at").and_then(Value::as_str) {
+                    Some(at) => format!("a click there lands on {at}"),
+                    None => "no box on screen".to_string(),
+                },
+                instead.map(|i| format!("; click what stands for it: {i}")).unwrap_or_default()
+            );
+        }
+        if point.get("covered").and_then(Value::as_bool) == Some(true)
+            && point.get("synthetic").and_then(Value::as_bool) != Some(true)
+        {
+            bail!(
+                "the element is covered by {} at its centre (waited {} ms; a user would click that instead). \
+                 Close or wait for it; `--force` sends DOM events to the element anyway",
+                point.get("covered_by").and_then(Value::as_str).unwrap_or("another element"),
+                settle
+            );
+        }
         if point.get("xframe").and_then(Value::as_bool) == Some(true) {
             // Inside a cross-origin iframe the page can't see its frame's
             // offset; CDP reports the box in top-level coordinates.
+            let in_frame = point.get("__frame").and_then(Value::as_i64);
             match target {
+                _ if in_frame.is_some() => {
+                    match self.center_in_frame(in_frame.unwrap_or_default(), target, &point, timeout) {
+                        Some((x, y)) => {
+                            point["x"] = json!(x);
+                            point["y"] = json!(y);
+                        }
+                        None => return dom(self),
+                    }
+                }
                 Target::Ref(node) => match self.content_quad_center(*node, timeout) {
                     Some((x, y)) => {
                         point["x"] = json!(x);
                         point["y"] = json!(y);
                     }
-                    None => return self.on_element(target, "click", CLICK_PREP, &[json!(true), settle], wait, timeout),
+                    None => return dom(self),
                 },
-                _ => return self.on_element(target, "click", CLICK_PREP, &[json!(true), settle], wait, timeout),
+                _ => return dom(self),
             }
         }
-        if !self.mouse_click(&point, timeout)? {
-            // Engine without the Input domain: DOM events.
-            return self.on_element(target, "click", CLICK_PREP, &[json!(true), settle], wait, timeout);
+        let armed = point.get("effects").and_then(Value::as_bool) == Some(true);
+        let before = (self.shared.activity(&self.session_id), self.shared.logs.lock().unwrap().requests_started());
+        match self.mouse_click(&point, &opts.button, timeout) {
+            Ok(true) => {}
+            other => {
+                if armed {
+                    self.drop_effects(timeout);
+                }
+                // Engine without the Input domain: DOM events.
+                other?;
+                return dom(self);
+            }
         }
         let check = point.get("check").and_then(Value::as_bool) == Some(true)
             && std::env::var_os("NAVIGERA_NO_CLICK_CHECK").is_none(); // diagnostic knob
@@ -1243,28 +2306,123 @@ impl Page {
             // yet and the browser finds no target for the event. Nothing
             // happened on the page, so sending it again can't double-click.
             self.wait_frame(Duration::from_millis(500));
-            self.mouse_click(&point, timeout)?;
+            self.mouse_click(&point, &opts.button, timeout)?;
             if !self.press_arrived(timeout) {
                 eprintln!("[click] still not delivered; dispatching DOM events");
-                let mut res = self.on_element(target, "click", CLICK_PREP, &[json!(true), settle], wait, timeout)?;
+                if armed {
+                    self.drop_effects(timeout);
+                }
+                let mut res = dom(self)?;
                 res["dropped"] = json!(true);
                 return Ok(res);
             }
             point["redelivered"] = json!(true);
         }
+        if armed {
+            let effect = self.click_effect(&before, timeout);
+            if std::env::var_os("NAVIGERA_TRACE_EFFECT").is_some() {
+                point["effect_trace"] = json!(format!("{effect:?}")); // diagnostic knob
+            }
+            if let Effect::Nothing { watched_ms, requests } = effect {
+                point["no_effect"] = json!({ "watched_ms": watched_ms, "requests": requests });
+            }
+        }
         Ok(point)
     }
 
-    /// How long a click/hover waits for its element to become hittable
-    /// (covered by a closing overlay, not laid out yet) before it falls back
-    /// to DOM events. Lightpanda has no layout that could change: its boxes
+    /// Did a delivered click change anything? Polls what CLICK_PREP set up
+    /// in the page (DOM changes, events, focus, form values, URL, scroll,
+    /// clipboard writes) and what only the browser sees (navigations,
+    /// dialogs, new tabs, downloads, requests) for [`EFFECT_WINDOW`]. Many
+    /// pages report every click: a beacon or an analytics service's request
+    /// isn't an effect, and a first-party one that reads like reporting
+    /// (`/event/…`) is waited for ([`REQUEST_WAIT`]), then judged by what
+    /// the page does with the answer ([`AFTER_RESPONSE`]).
+    fn click_effect(&self, before: &([u64; 5], u64), timeout: Duration) -> Effect {
+        let started = Instant::now();
+        let mut deadline = started + EFFECT_WINDOW;
+        let mut settled: Option<(usize, Instant)> = None; // requests seen, all finished at
+        loop {
+            let now = Instant::now();
+            let requests = self.shared.logs.lock().unwrap().requests_after(&self.session_id, before.1);
+            if let Some(r) = requests.iter().find(|r| r.report == Report::No) {
+                self.drop_effects(timeout);
+                return Effect::Changed(format!("request {}", r.label));
+            }
+            // Reporting that might also be the action (`/events` can be an
+            // app's own API): wait for the answer and what the page does.
+            let maybe: Vec<_> = requests.iter().filter(|r| r.report == Report::Maybe).collect();
+            let pending = maybe.iter().any(|r| !r.done);
+            if pending {
+                settled = None;
+                deadline = deadline.max(now + Duration::from_millis(30));
+            } else if !maybe.is_empty() {
+                let at = match settled {
+                    Some((n, at)) if n == maybe.len() => at,
+                    _ => now,
+                };
+                settled = Some((maybe.len(), at));
+                deadline = deadline.max(at + AFTER_RESPONSE);
+            }
+            let gave_up = pending && now >= started + REQUEST_WAIT;
+            let last = now >= deadline || gave_up;
+            let expr = format!("window.__nvFx ? window.__nvFx.check({last}) : null");
+            let Some(v) = self
+                .send("Runtime.evaluate", json!({ "expression": expr, "returnByValue": true }), timeout)
+                .ok()
+                .and_then(|r| r.pointer("/result/value").cloned())
+                .filter(Value::is_object)
+            else {
+                return Effect::Unknown;
+            };
+            if let Some(what) = v.get("what").and_then(Value::as_str).filter(|w| !w.is_empty()) {
+                return Effect::Changed(what.to_string());
+            }
+            if v.get("skip").and_then(Value::as_bool) == Some(true) {
+                return Effect::Unknown;
+            }
+            if self.shared.activity(&self.session_id) != before.0 {
+                if !last {
+                    self.drop_effects(timeout);
+                }
+                return Effect::Changed(format!(
+                    "browser {:?} -> {:?}",
+                    before.0,
+                    self.shared.activity(&self.session_id)
+                ));
+            }
+            if last {
+                if gave_up || v.get("unsure").and_then(Value::as_bool) == Some(true) {
+                    return Effect::Unknown;
+                }
+                return Effect::Nothing {
+                    watched_ms: started.elapsed().as_millis() as u64,
+                    requests: requests.into_iter().map(|r| r.label).collect(),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    /// Stop watching a click's effects (see [`Page::click_effect`]).
+    fn drop_effects(&self, timeout: Duration) {
+        let _ = self.send(
+            "Runtime.evaluate",
+            json!({ "expression": "window.__nvFx && window.__nvFx.check(true), 0", "returnByValue": true }),
+            timeout,
+        );
+    }
+
+    /// How long a click waits for its element to stop moving and become
+    /// hittable (covered by a closing overlay, not laid out yet): the
+    /// element wait. Lightpanda has no layout that could change: its boxes
     /// are synthetic, and inside shadow roots its hit test never matches,
     /// so waiting there only delays the same DOM-event click.
     fn hit_settle_ms(&self, wait: Duration) -> u64 {
         if self.shared.is_single_target() {
             0
         } else {
-            wait.as_millis().min(3000) as u64
+            wait.as_millis() as u64
         }
     }
 
@@ -1307,13 +2465,19 @@ impl Page {
     /// caller can fall back to DOM events without ever clicking twice; a
     /// failure after the press is an error. No-op (Ok(true)) when the page
     /// already used DOM events.
-    fn mouse_click(&self, point: &Value, timeout: Duration) -> Result<bool> {
+    fn mouse_click(&self, point: &Value, button: &str, timeout: Duration) -> Result<bool> {
         let (Some(x), Some(y)) = (point.get("x").and_then(Value::as_f64), point.get("y").and_then(Value::as_f64))
         else {
             return Ok(true);
         };
+        self.moved_to(x, y);
+        let (button, held) = match button {
+            "right" => ("right", 2),
+            "middle" => ("middle", 4),
+            _ => ("left", 1),
+        };
         for (i, (kind, button, buttons)) in
-            [("mouseMoved", "none", 0), ("mousePressed", "left", 1), ("mouseReleased", "left", 0)]
+            [("mouseMoved", "none", 0), ("mousePressed", button, held), ("mouseReleased", button, 0)]
                 .into_iter()
                 .enumerate()
         {
@@ -1339,10 +2503,38 @@ impl Page {
     /// click is possible.
     pub fn dblclick(&self, target: &Target, wait: Duration, timeout: Duration) -> Result<Value> {
         let settle = json!(self.hit_settle_ms(wait));
-        let mut point =
-            self.on_element(target, "dblclick", CLICK_PREP, &[json!(false), settle.clone()], wait, timeout)?;
+        let strict = json!(!self.shared.is_single_target());
+        let mut point = self.on_element(
+            target,
+            "dblclick",
+            CLICK_PREP,
+            &[json!(false), settle.clone(), strict.clone(), json!("left")],
+            wait,
+            timeout,
+        )?;
+        if point.get("hidden").and_then(Value::as_bool) == Some(true) {
+            bail!(
+                "the element isn't visible where it is; a user can't double-click it{}",
+                point.get("instead").and_then(Value::as_str).map(|i| format!(" (try {i})")).unwrap_or_default()
+            );
+        }
+        if point.get("covered").and_then(Value::as_bool) == Some(true)
+            && point.get("synthetic").and_then(Value::as_bool) != Some(true)
+        {
+            bail!(
+                "the element is covered by {} at its centre; close or wait for it",
+                point.get("covered_by").and_then(Value::as_str).unwrap_or("another element")
+            );
+        }
         if point.get("xframe").and_then(Value::as_bool) == Some(true) {
+            let in_frame = point.get("__frame").and_then(Value::as_i64);
             match target {
+                _ if in_frame.is_some() => {
+                    match self.center_in_frame(in_frame.unwrap_or_default(), target, &point, timeout) {
+                        Some((x, y)) => point = json!({ "x": x, "y": y }),
+                        None => bail!("dblclick: element inside a cross-origin iframe has no box"),
+                    }
+                }
                 Target::Ref(node) => match self.content_quad_center(*node, timeout) {
                     Some((x, y)) => point = json!({ "x": x, "y": y }),
                     None => bail!("dblclick: element is inside a cross-origin iframe without a box"),
@@ -1375,7 +2567,14 @@ impl Page {
             match sent {
                 Ok(_) => {}
                 Err(_) if i == 0 => {
-                    self.on_element(target, "dblclick", CLICK_PREP, &[json!(true), settle.clone()], wait, timeout)?;
+                    self.on_element(
+                        target,
+                        "dblclick",
+                        CLICK_PREP,
+                        &[json!(true), settle.clone(), strict.clone(), json!("left")],
+                        wait,
+                        timeout,
+                    )?;
                     self.on_element(target, "dblclick", DBLCLICK_REST, &[], wait, timeout)?;
                     return Ok(json!({ "synthetic": true }));
                 }
@@ -1414,6 +2613,7 @@ impl Page {
             events.push(("mouseMoved", ax + (bx - ax) * t, ay + (by - ay) * t, "left", 1));
         }
         events.push(("mouseReleased", bx, by, "left", 0));
+        self.moved_to(bx, by);
         for (kind, x, y, button, buttons) in events {
             self.send(
                 "Input.dispatchMouseEvent",
@@ -1422,6 +2622,101 @@ impl Page {
             )?;
         }
         Ok(json!({ "from": { "x": ax, "y": ay }, "to": { "x": bx, "y": by } }))
+    }
+
+    fn moved_to(&self, x: f64, y: f64) {
+        if let Ok(mut p) = self.pointer.lock() {
+            p.x = x;
+            p.y = y;
+        }
+    }
+
+    /// Raw mouse input at viewport coordinates (CSS pixels, as in a
+    /// screenshot at scale 1), for what has no element to aim at: a canvas,
+    /// a map, a game. `move` goes from where the pointer is in `steps` events
+    /// (held buttons stay held, so down, moves, up draws); `down`/`up` press
+    /// and release at the pointer; `click` moves there and presses and
+    /// releases `count` times; `wheel` scrolls by `delta` at the pointer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mouse(
+        &self,
+        action: &str,
+        at: Option<(f64, f64)>,
+        button: &str,
+        count: u32,
+        steps: u32,
+        delta: (f64, f64),
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (name, bit) = match button {
+            "right" => ("right", 2u8),
+            "middle" => ("middle", 4u8),
+            "left" | "" => ("left", 1u8),
+            other => bail!("mouse --button takes left, right or middle, not {other:?}"),
+        };
+        let held = |b: u8| match () {
+            _ if b & 1 != 0 => "left",
+            _ if b & 2 != 0 => "right",
+            _ if b & 4 != 0 => "middle",
+            _ => "none",
+        };
+        let send = |kind: &str, x: f64, y: f64, button: &str, buttons: u8, clicks: u32| {
+            self.send(
+                "Input.dispatchMouseEvent",
+                json!({ "type": kind, "x": x, "y": y, "button": button, "buttons": buttons, "clickCount": clicks }),
+                timeout,
+            )
+        };
+        let mut p = self.pointer.lock().map(|p| *p).unwrap_or_default();
+        if matches!(action, "move" | "click") && at.is_none() {
+            bail!("mouse {action} needs x and y");
+        }
+        // A point: the pointer goes there first (`down`, `up` and `wheel`
+        // over a target go to its center).
+        if let Some((x, y)) = at {
+            let n = steps.max(1);
+            for i in 1..=n {
+                let t = i as f64 / n as f64;
+                send("mouseMoved", p.x + (x - p.x) * t, p.y + (y - p.y) * t, held(p.buttons), p.buttons, 0)?;
+            }
+            p.x = x;
+            p.y = y;
+        }
+        match action {
+            "move" => {}
+            "down" => {
+                p.buttons |= bit;
+                send("mousePressed", p.x, p.y, name, p.buttons, 1)?;
+            }
+            "up" => {
+                p.buttons &= !bit;
+                send("mouseReleased", p.x, p.y, name, p.buttons, 1)?;
+            }
+            "click" => {
+                for c in 1..=count.max(1) {
+                    send("mousePressed", p.x, p.y, name, p.buttons | bit, c)?;
+                    send("mouseReleased", p.x, p.y, name, p.buttons, c)?;
+                }
+            }
+            "wheel" => {
+                self.send(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseWheel", "x": p.x, "y": p.y, "deltaX": delta.0, "deltaY": delta.1,
+                            "button": "none", "buttons": p.buttons }),
+                    timeout,
+                )?;
+            }
+            other => bail!("mouse takes move, down, up, click or wheel, not {other:?}"),
+        }
+        if let Ok(mut slot) = self.pointer.lock() {
+            *slot = p;
+        }
+        let buttons: Vec<&str> = [(1u8, "left"), (2, "right"), (4, "middle")]
+            .iter()
+            .filter(|(b, _)| p.buttons & b != 0)
+            .map(|(_, n)| *n)
+            .collect();
+        Ok(json!({ "x": p.x, "y": p.y, "held": buttons }))
     }
 
     /// Press or release one key (`down`), without the other half.
@@ -1454,8 +2749,9 @@ impl Page {
         let settle = json!(self.hit_settle_ms(wait));
         let mut point = self.on_element(target, "hover", HOVER_PREP, &[settle], wait, timeout)?;
         if point.get("xframe").and_then(Value::as_bool) == Some(true) {
-            let center = match target {
-                Target::Ref(node) => self.content_quad_center(*node, timeout),
+            let center = match (target, point.get("__frame").and_then(Value::as_i64)) {
+                (_, Some(context)) => self.center_in_frame(context, target, &point, timeout),
+                (Target::Ref(node), None) => self.content_quad_center(*node, timeout),
                 _ => None,
             };
             match center {
@@ -1464,6 +2760,7 @@ impl Page {
             }
         }
         if let (Some(x), Some(y)) = (point.get("x").and_then(Value::as_f64), point.get("y").and_then(Value::as_f64)) {
+            self.moved_to(x, y);
             self.send(
                 "Input.dispatchMouseEvent",
                 json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0 }),
@@ -1472,7 +2769,7 @@ impl Page {
             // :hover styles apply on the next frame; let two pass so an `ax`
             // right after sees the opened menu.
             self.evaluate_raw(
-                "new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))",
+                "new Promise((r) => { requestAnimationFrame(() => requestAnimationFrame(() => r(true))); setTimeout(() => r(false), 250); })",
                 timeout,
             )?;
         }
@@ -1481,13 +2778,21 @@ impl Page {
 
     /// Set an input/textarea/contenteditable's value (native setter + events).
     pub fn fill(&self, target: &Target, value: &str, wait: Duration, timeout: Duration) -> Result<()> {
-        self.on_element(target, "fill", FILL_EL, &[json!(value)], wait, timeout)?;
+        let settle = json!(self.hit_settle_ms(wait));
+        self.on_element(target, "fill", FILL_EL, &[json!(value), settle], wait, timeout)?;
         Ok(())
     }
 
     /// Pick `<select>` options by value or label; returns the chosen labels.
-    pub fn select(&self, target: &Target, values: &[String], wait: Duration, timeout: Duration) -> Result<Value> {
-        self.on_element(target, "select", SELECT_EL, &[json!(values)], wait, timeout)
+    pub fn select(
+        &self,
+        target: &Target,
+        values: &[String],
+        add: bool,
+        wait: Duration,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.on_element(target, "select", SELECT_EL, &[json!(values), json!(add)], wait, timeout)
     }
 
     /// Scroll: an element into view (or inside it by `dy`), else the window.
@@ -1500,7 +2805,10 @@ impl Page {
         timeout: Duration,
     ) -> Result<Value> {
         if let Some(target) = target {
-            return self.on_element(target, "scroll", SCROLL_EL, &[json!(dy.unwrap_or(0.0))], wait, timeout);
+            if let Some(to) = to.filter(|t| !matches!(*t, "top" | "bottom")) {
+                bail!("scroll --to takes top|bottom, got {to:?}");
+            }
+            return self.on_element(target, "scroll", SCROLL_EL, &[json!(dy.unwrap_or(0.0)), json!(to)], wait, timeout);
         }
         let action = match to {
             Some("top") => "window.scrollTo({ top: 0, behavior: 'instant' })".to_string(),
@@ -1581,7 +2889,11 @@ impl Page {
     /// keyDown/keyUp per character, so key listeners and autocomplete fire.
     pub fn type_text(&self, target: Option<&Target>, text: &str, wait: Duration, timeout: Duration) -> Result<()> {
         if let Some(target) = target {
-            self.on_element(target, "type", FOCUS_EL, &[], wait, timeout)?;
+            // Keys go to whatever has focus: typing after a focus that didn't
+            // take would land in another field.
+            if self.on_element(target, "type", FOCUS_EL, &[], wait, timeout)? != Value::Bool(true) {
+                bail!("the element did not take focus (disabled, hidden, or not focusable); nothing was typed");
+            }
         }
         for c in text.chars() {
             if c == '\n' {
@@ -1619,7 +2931,7 @@ impl Page {
             Target::Ref(node) => params["backendNodeId"] = json!(node),
             _ => {
                 // Find the element (auto-wait), keep it as a remote object.
-                let finder = finder_expr(target, wait_budget_ms(wait), "upload");
+                let finder = finder_expr(target, wait_budget_ms(wait, timeout), "upload");
                 let res = self.send(
                     "Runtime.evaluate",
                     json!({ "expression": format!("(async () => {{ const el = await {finder}; return ({IDENTITY})(el); }})()"),
@@ -1646,14 +2958,30 @@ impl Page {
     /// First matching element's textContent, if present.
     pub fn text_content(&self, selector: &str, timeout: Duration) -> Result<Option<String>> {
         let sel = serde_json::to_string(selector)?;
-        let value =
-            self.evaluate_raw(&format!("(document.querySelector({sel}) || {{}}).textContent ?? null"), timeout)?;
+        let value = self.evaluate_raw(&format!("({DEEP}.first({sel}) || {{}}).textContent ?? null"), timeout)?;
         Ok(value.as_str().map(str::to_string))
     }
 
     /// One poll of a `wait` condition; true when satisfied.
     pub fn check(&self, js_predicate: &str, timeout: Duration) -> Result<bool> {
         Ok(self.evaluate_raw(js_predicate, timeout)?.as_bool().unwrap_or(false))
+    }
+
+    /// [`Page::check`] with the page's element searches (`DEEP`) scoped to
+    /// the frame a `--frame` chain names; in that frame itself when it is of
+    /// another origin. False while the frame isn't there.
+    pub fn check_in_frame(&self, chain: &str, js_predicate: &str, timeout: Duration) -> Result<bool> {
+        let scoped = format!(
+            "(() => {{ const __nvStart = () => ({FRAME_DOC})({}); return !!({js_predicate}); }})()",
+            json!(chain)
+        );
+        match self.check(&scoped, timeout) {
+            Err(e) if format!("{e:#}").contains("(navigera:xo ") => {
+                let context = self.foreign_frame_context(chain, timeout)?;
+                Ok(self.evaluate_in(context, &format!("!!({js_predicate})"), timeout)?.as_bool() == Some(true))
+            }
+            other => other,
+        }
     }
 
     /// PNG screenshot bytes; `full_page` captures beyond the viewport.
@@ -1706,7 +3034,7 @@ impl Page {
         if let Target::Ref(node) = target {
             return Ok(*node);
         }
-        let finder = finder_expr(target, wait_budget_ms(wait), "ax");
+        let finder = finder_expr(target, wait_budget_ms(wait, timeout), "ax");
         let res = self.send(
             "Runtime.evaluate",
             json!({ "expression": format!("(async () => await {finder})()"), "awaitPromise": true, "objectGroup": "nv-ax" }),
@@ -1993,6 +3321,9 @@ mod tests {
     #[test]
     fn exception_messages_drop_stack_frames() {
         let details = json!({"text": "Uncaught", "exception": {"description": "Error: click: no element\n    at foo (x.js:1:1)\n    at bar"}});
-        assert_eq!(exception_message(&details), "Error: click: no element");
+        assert_eq!(exception_message(&details), "click: no element");
+        // Other classes say something: they stay.
+        let details = json!({"exception": {"description": "TypeError: x is undefined\n    at y"}});
+        assert_eq!(exception_message(&details), "TypeError: x is undefined");
     }
 }

@@ -570,6 +570,12 @@ pub fn start(config: &SessionConfig, name: &str, output: &mut dyn Write) -> Exit
     if config.natural {
         cmd.arg("--natural");
     }
+    if let Some(ms) = config.wait_ms {
+        cmd.arg("--wait-ms").arg(ms.to_string());
+    }
+    if let Some(dir) = &config.download_dir {
+        cmd.arg("--download-dir").arg(dir);
+    }
     cmd.arg("serve").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(log));
     let mut child = match crate::proc::spawn_detached(&mut cmd) {
         Ok(child) => child,

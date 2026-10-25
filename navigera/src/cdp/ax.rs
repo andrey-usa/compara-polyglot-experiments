@@ -107,6 +107,18 @@ pub struct Options {
     pub root_backend_id: Option<u64>,
     /// Page origin (`http://host:port`) for shortening same-origin link urls.
     pub origin: String,
+    /// What the page makes clickable beyond the tree's actionable roles.
+    pub clicks: Clickables,
+}
+
+/// Elements a user could click though the tree gives them no actionable
+/// role (a `<div>` row with a click handler, an icon `<span>`), by backend
+/// node id; and `#id` / `.class` per element, printed for actionable nodes
+/// with no name or text, so `[ref=7]` and `[ref=8]` aren't two blanks.
+#[derive(Clone, Debug, Default)]
+pub struct Clickables {
+    pub nodes: std::collections::HashSet<u64>,
+    pub hints: HashMap<u64, String>,
 }
 
 /// One frame's AX nodes, spliced under the AX node of its owner element
@@ -233,7 +245,32 @@ impl<'a> Tree<'a> {
         }
     }
 
-    fn is_transparent(&self, node: &Value) -> bool {
+    /// A wrapper the page made clickable, that holds nothing else to act on
+    /// (a listener on a container is the page listening for its children).
+    fn is_clickable(&self, node: &'a Value) -> bool {
+        let Some(id) = node.get("backendDOMNodeId").and_then(Value::as_u64) else { return false };
+        self.opts.clicks.nodes.contains(&id)
+            && !INTERACTIVE.contains(&Self::role(node))
+            && !self.holds_actionable(node, 0)
+    }
+
+    fn holds_actionable(&self, node: &'a Value, depth: usize) -> bool {
+        depth < 64
+            && self.children(node).into_iter().any(|child| {
+                let role = Self::role(child);
+                INTERACTIVE.contains(&role)
+                    || child
+                        .get("backendDOMNodeId")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|id| self.opts.clicks.nodes.contains(&id))
+                    || self.holds_actionable(child, depth + 1)
+            })
+    }
+
+    fn is_transparent(&self, node: &'a Value) -> bool {
+        if self.is_clickable(node) {
+            return false;
+        }
         if node.get("ignored").and_then(Value::as_bool).unwrap_or(false) {
             return true;
         }
@@ -263,8 +300,8 @@ impl<'a> Tree<'a> {
         }
     }
 
-    fn wants_ref(&self, node: &Value, role: &str) -> bool {
-        self.opts.all_refs || INTERACTIVE.contains(&role) || truthy(prop(node, "focusable"))
+    fn wants_ref(&self, node: &'a Value, role: &str) -> bool {
+        self.opts.all_refs || INTERACTIVE.contains(&role) || truthy(prop(node, "focusable")) || self.is_clickable(node)
     }
 
     fn states(node: &Value, role: &str) -> Vec<String> {
@@ -347,7 +384,14 @@ impl<'a> Tree<'a> {
         }
         let name = without_options(name, &options);
 
-        let shown_role = if self.is_frame_root(node) { "document" } else { role.as_str() };
+        let clickable = self.is_clickable(node);
+        let shown_role = if self.is_frame_root(node) {
+            "document"
+        } else if clickable && (WRAPPERS.contains(&role.as_str()) || node.get("ignored") == Some(&Value::Bool(true))) {
+            "clickable"
+        } else {
+            role.as_str()
+        };
         let mut line = format!("{indent}- {shown_role}");
         if !name.is_empty() {
             line.push(' ');
@@ -356,6 +400,18 @@ impl<'a> Tree<'a> {
         let mut tags = Self::states(node, &role);
         if let Some(id) = node.get("backendDOMNodeId").and_then(Value::as_u64) {
             if self.wants_ref(node, &role) {
+                // Nothing to read it by (an icon button, an empty `<span>`
+                // with a handler): say which element it is.
+                if name.is_empty() && text_of(node, "value").is_empty() {
+                    let mut text = Vec::new();
+                    self.descendant_text(node, &mut text, 0);
+                    if let (true, Some(hint)) =
+                        (text.iter().all(|t| t.trim().is_empty()), self.opts.clicks.hints.get(&id))
+                    {
+                        line.push(' ');
+                        line.push_str(hint);
+                    }
+                }
                 tags.push(format!("ref={id}"));
             }
         }
@@ -665,6 +721,34 @@ mod tests {
         ];
         let out = render("page \"Shop\"", &nodes, &[], &Options::default());
         assert_eq!(out.text, "page \"Shop\"\n- heading \"Widget\"\n- button \"Add to cart\" [ref=6]");
+    }
+
+    #[test]
+    fn what_the_page_made_clickable_gets_a_ref_and_a_container_does_not() {
+        let nodes = vec![
+            node("1", None, "RootWebArea", "Inbox", &["2"], 1),
+            // #app listens for its children's clicks: not a control itself.
+            node("2", Some("1"), "generic", "", &["3", "6", "7"], 2),
+            node("3", Some("2"), "generic", "", &["4", "5"], 3),
+            node("4", Some("3"), "StaticText", "Gilli", &[], 4),
+            node("5", Some("3"), "StaticText", "Quam.", &[], 5),
+            node("6", Some("2"), "generic", "", &[], 6),
+            node("7", Some("2"), "button", "", &[], 7),
+        ];
+        let clicks = Clickables {
+            nodes: [2, 3, 6].into_iter().collect(),
+            hints: [(2, "#app".to_string()), (6, "#send-forward".to_string()), (7, "#button-1".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let out = render("page \"Inbox\"", &nodes, &[], &Options { clicks, ..Options::default() });
+        assert_eq!(
+            out.text,
+            "page \"Inbox\"\n- clickable [ref=3]: Gilli Quam.\n- clickable #send-forward [ref=6]\n- button #button-1 [ref=7]"
+        );
+        // Without them, the row is bare text and the icon is not there.
+        let out = render("", &nodes, &[], &Options::default());
+        assert_eq!(out.text, "- text: Gilli\n- text: Quam.\n- button [ref=7]");
     }
 
     #[test]

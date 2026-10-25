@@ -7,7 +7,7 @@ name: Interactions
 
 on:
   push:
-    branches: [experiment-17]
+    branches: [experiment-19]
     paths:
       - "navigera/**"
       - ".github/workflows/interactions.yml"

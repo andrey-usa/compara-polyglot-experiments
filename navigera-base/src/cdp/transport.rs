@@ -526,7 +526,8 @@ pub(crate) fn http_get_body(host: &str, port: u16, path: &str) -> Result<String>
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     // NB: Chrome's DevTools HTTP server rejects HTTP/1.0 outright.
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")?;
+    // With the port: Chrome builds the WebSocket URL it returns from it.
+    write!(stream, "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {

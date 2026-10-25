@@ -106,8 +106,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "browser_click",
-            "Click an element with a real mouse event; waits for it to appear and for any navigation it starts.",
-            object(action(json!({})), &[]),
+            "Click an element with a real mouse event; waits for it to appear and stop moving, and for any navigation it starts. Fails, naming it, if something covers the element.",
+            object(action(json!({"button": {"type": "string", "enum": ["left", "right", "middle"]}})), &[]),
             false,
         ),
         tool(
@@ -135,6 +135,25 @@ fn tools() -> Vec<Value> {
             false,
         ),
         tool("browser_hover", "Move the mouse over an element (hover menus).", object(action(json!({})), &[]), false),
+        tool(
+            "browser_mouse",
+            "Raw mouse at a point, for what has no element to aim at (a canvas, a map, a game): move, down, up, \
+             click, wheel. x/y are viewport CSS pixels (as in a screenshot), or from the target's top-left corner \
+             when one is given; for wheel they are the scroll deltas. The pointer stays where it went and held \
+             buttons stay held, so down, moves, up drags or draws.",
+            object(
+                action(json!({
+                    "action": {"type": "string", "enum": ["move", "down", "up", "click", "wheel"]},
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                    "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                    "count": {"type": "integer", "description": "Clicks (2: a double click)"},
+                    "steps": {"type": "integer", "description": "Moves in between, for a smooth path"},
+                })),
+                &["action"],
+            ),
+            false,
+        ),
         tool(
             "browser_scroll",
             "Scroll the page by pixels or to top/bottom (loads more of infinite lists), or bring an element into view.",
@@ -349,6 +368,7 @@ fn plan(name: &str, arguments: &Value) -> Result<Plan, String> {
             single("select", args)
         }
         "browser_hover" => single("hover", args),
+        "browser_mouse" => single("mouse", args),
         "browser_scroll" => single("scroll", args),
         "browser_wait_for" => single("wait", args),
         "browser_find" => {

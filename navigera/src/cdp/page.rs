@@ -3029,6 +3029,87 @@ impl Page {
         frames
     }
 
+    /// What a user could click that the accessibility tree doesn't call
+    /// actionable: elements with a click, mousedown or mouseup listener of
+    /// their own (Chrome's `isClickable`), and the outermost element of a
+    /// `cursor: pointer` area (a card, a row, an icon in a `<span>`). Only
+    /// elements with a box count. Also `#id` / `.class` for each element,
+    /// to tell apart actionable elements that have no name or text.
+    fn clickables(&self, timeout: Duration) -> ax::Clickables {
+        let mut out = ax::Clickables::default();
+        let Ok(snap) = self.send("DOMSnapshot.captureSnapshot", json!({ "computedStyles": ["cursor"] }), timeout)
+        else {
+            return out;
+        };
+        let strings: Vec<&str> = snap
+            .get("strings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect();
+        let text =
+            |i: Option<&Value>| i.and_then(Value::as_u64).and_then(|i| strings.get(i as usize).copied()).unwrap_or("");
+        for doc in snap.get("documents").and_then(Value::as_array).into_iter().flatten() {
+            let nodes = &doc["nodes"];
+            let ints = |key: &str| -> Vec<i64> {
+                nodes
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.as_i64().unwrap_or(-1))
+                    .collect()
+            };
+            let (parents, types, backends, names) =
+                (ints("parentIndex"), ints("nodeType"), ints("backendNodeId"), ints("nodeName"));
+            let listening: std::collections::HashSet<i64> = nodes
+                .get("isClickable")
+                .and_then(|c| c.get("index"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_i64)
+                .collect();
+            let layout = &doc["layout"];
+            let mut cursor = std::collections::HashMap::new();
+            let styles = layout.get("styles").and_then(Value::as_array);
+            for (i, node) in layout.get("nodeIndex").and_then(Value::as_array).into_iter().flatten().enumerate() {
+                let style = styles.and_then(|s| s.get(i)).and_then(|s| s.get(0));
+                cursor.insert(node.as_i64().unwrap_or(-1), text(style));
+            }
+            let pointer = |i: i64| cursor.get(&i).is_some_and(|c| *c == "pointer");
+            let attributes = nodes.get("attributes").and_then(Value::as_array);
+            for (i, &backend) in backends.iter().enumerate() {
+                if types.get(i) != Some(&1) {
+                    continue;
+                }
+                let index = i as i64;
+                let backend = backend as u64;
+                let attrs = attributes.and_then(|a| a.get(i)).and_then(Value::as_array);
+                let attr = |name: &str| {
+                    let pairs = attrs.map(|a| a.as_slice()).unwrap_or(&[]);
+                    pairs.chunks(2).find(|p| text(p.first()) == name).map(|p| text(p.get(1)).trim().to_string())
+                };
+                if let Some(id) = attr("id").filter(|id| !id.is_empty()) {
+                    out.hints.insert(backend, format!("#{id}"));
+                } else if let Some(class) = attr("class").and_then(|c| c.split_whitespace().next().map(str::to_string))
+                {
+                    out.hints.insert(backend, format!(".{class}"));
+                }
+                let tag = names.get(i).and_then(|&n| strings.get(n as usize)).copied().unwrap_or("");
+                if !cursor.contains_key(&index) || matches!(tag, "HTML" | "BODY") {
+                    continue;
+                }
+                let parent = parents.get(i).copied().unwrap_or(-1);
+                if listening.contains(&index) || (pointer(index) && !pointer(parent)) {
+                    out.nodes.insert(backend);
+                }
+            }
+        }
+        out
+    }
+
     /// Backend node id of the element `target` names (for `ax --selector`).
     fn backend_id(&self, target: &Target, wait: Duration, timeout: Duration) -> Result<u64> {
         if let Target::Ref(node) = target {
@@ -3193,6 +3274,8 @@ impl Page {
             return Ok(flat_ax(&nodes, opts.all));
         }
         let frames = self.frame_trees(timeout);
+        // Lightpanda has no DOMSnapshot; its tree is printed as it comes.
+        let clicks = if self.shared.is_single_target() { ax::Clickables::default() } else { self.clickables(timeout) };
         let root = nodes.iter().find(|n| n.get("parentId").is_none());
         let title = root.map(|n| ax_str(n, "name").to_string()).unwrap_or_default();
         let url = root
@@ -3213,7 +3296,7 @@ impl Page {
             &format!("page {} {url}", serde_json::to_string(&title).unwrap_or_default()),
             &nodes,
             &frames,
-            &ax::Options { all_refs: opts.all_refs, limit: opts.limit, root_backend_id, origin },
+            &ax::Options { all_refs: opts.all_refs, limit: opts.limit, root_backend_id, origin, clicks },
         );
         let mut text = rendered.text;
         // Lightpanda's tree stops at a shadow root; what is inside is read
