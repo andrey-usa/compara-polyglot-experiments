@@ -114,9 +114,10 @@ page "Checkout — Acme" http://shop.test/checkout
   tabs) is **not** in the tree until you open it: click the toggle or
   `hover` the menu, then `ax` again.
 - Big page: `ax --selector "#results"` or `ax 57` (a ref), `--limit <lines>`
-  (default 2000).
-- Many items: one `eval` that returns JSON:
-  `navigera -s work --raw eval "() => [...document.querySelectorAll('.item')].map(e => e.innerText)"`
+  (default 2000). One thing on it: `ax --grep "Costello"` (matching lines
+  under their row and section, refs included), not `ax | grep` or `eval`.
+- Many items: a table row is one line, so `ax --selector table` reads a
+  grid; `eval` returning JSON only for values the tree doesn't show.
 
 ## Acting
 
