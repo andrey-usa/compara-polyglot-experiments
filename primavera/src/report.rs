@@ -248,11 +248,223 @@ pub fn junit(results: &[ScenarioResult], ms: f64) -> String {
     out
 }
 
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Screenshots up to this size go into the report itself; bigger ones are
+/// linked, so a run with many failures still opens quickly.
+const EMBED_MAX: u64 = 2 * 1024 * 1024;
+
+fn failure_html(out: &mut String, f: &Failure, title: &str) {
+    let _ = write!(
+        out,
+        "<div class=failure><div class=what>{} line {}: <code>{}</code></div>",
+        esc(title),
+        f.line,
+        esc(&f.text)
+    );
+    let _ = write!(out, "<pre>{}</pre>", esc(&f.message));
+    if let Some((url, page)) = &f.at {
+        let _ = write!(out, "<div>at <code>{}</code> {}</div>", esc(url), esc(&format!("{page:?}")));
+    }
+    if !f.nearest.is_empty() {
+        out.push_str("<div>nearest on the page:</div><ol>");
+        for (shown, locator, score) in &f.nearest {
+            let _ = write!(out, "<li>{} <code>{}</code> {score:.2}</li>", esc(shown), esc(locator));
+        }
+        out.push_str("</ol>");
+    }
+    if let Some(h) = &f.hint {
+        let _ = write!(out, "<div class=note>note: {}</div>", esc(h));
+    }
+    out.push_str("</div>");
+}
+
+fn screenshot_html(out: &mut String, f: &Failure) {
+    if let Some(s) = &f.screenshot {
+        let small = std::fs::metadata(s).map(|m| m.len() <= EMBED_MAX).unwrap_or(false);
+        match std::fs::read(s) {
+            Ok(png) if small => {
+                let _ = write!(
+                    out,
+                    "<img alt=\"screenshot at the failure\" src=\"data:image/png;base64,{}\">",
+                    base64(&png)
+                );
+            }
+            _ => {
+                let _ = write!(out, "<div>screenshot <code>{}</code></div>", esc(&rel(s)));
+            }
+        }
+    }
+}
+
+/// The whole run as one HTML file that needs nothing else to open: a
+/// summary, then each scenario with its steps and times, failures (and
+/// how a flaky one failed first) open, with their screenshot in the page.
+pub fn html(results: &[ScenarioResult], ms: f64) -> String {
+    let mut out = String::new();
+    let sum = summary(results, ms);
+    let _ = write!(
+        out,
+        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\">\
+         <title>primavera: {}</title><style>{CSS}</style></head><body><h1>{}</h1>",
+        esc(&sum),
+        esc(&sum)
+    );
+    // Failed first, then flaky, then passed; within each, the order they ran.
+    let rank = |r: &ScenarioResult| {
+        if !r.passed() {
+            0
+        } else if r.flaky() {
+            1
+        } else {
+            2
+        }
+    };
+    let mut order: Vec<&ScenarioResult> = results.iter().collect();
+    order.sort_by_key(|r| rank(r));
+    for r in order {
+        let (class, mark) = match rank(r) {
+            0 => ("fail", "FAIL"),
+            1 => ("flaky", "FLAKY"),
+            _ => ("pass", "PASS"),
+        };
+        let open = if rank(r) < 2 { " open" } else { "" };
+        let tries = if r.attempt > 1 { format!(", try {}", r.attempt) } else { String::new() };
+        let tags: String = r.tags.iter().map(|t| format!(" <span class=tag>@{}</span>", esc(t))).collect();
+        let _ = write!(
+            out,
+            "<details class={class}{open}><summary><b>{mark}</b> {} <span class=dim>{}:{} · {}{tries} · worker {}</span>{tags}</summary>",
+            esc(&r.name),
+            esc(&rel(&r.file)),
+            r.line,
+            secs(r.ms),
+            r.worker
+        );
+        if let Some(f) = &r.failure {
+            failure_html(&mut out, f, "failed at");
+        }
+        for (i, f) in r.retried.iter().enumerate() {
+            failure_html(&mut out, f, &format!("try {} failed at", i + 1));
+        }
+        if !r.steps.is_empty() {
+            out.push_str("<table><tr><th>line</th><th>step</th><th>time</th></tr>");
+            for s in &r.steps {
+                let _ = write!(
+                    out,
+                    "<tr class={}><td>{}</td><td><code>{}</code></td><td>{}</td></tr>",
+                    if s.ok { "ok" } else { "bad" },
+                    s.line,
+                    esc(&s.text),
+                    secs(s.ms)
+                );
+            }
+            out.push_str("</table>");
+        }
+        if let Some(f) = &r.failure {
+            screenshot_html(&mut out, f);
+        }
+        for n in &r.notes {
+            let _ = write!(out, "<div class=note>{}</div>", esc(n));
+        }
+        if !r.saved.is_empty() {
+            out.push_str("<div>saved:</div><ul>");
+            for (k, v) in &r.saved {
+                let _ = write!(out, "<li><code>{}</code> = <code>{}</code></li>", esc(k), esc(v));
+            }
+            out.push_str("</ul>");
+        }
+        out.push_str("</details>");
+    }
+    out.push_str("</body></html>\n");
+    out
+}
+
+const CSS: &str = "body{font:14px/1.4 system-ui,sans-serif;margin:16px;color:#1b1b1b;background:#fff}\
+h1{font-size:18px}details{border:1px solid #ccc;border-radius:4px;margin:6px 0;padding:4px 8px}\
+details.fail{border-left:4px solid #c62828}details.flaky{border-left:4px solid #e0a000}details.pass{border-left:4px solid #2e7d32}\
+summary{cursor:pointer}.dim{color:#666}.tag{color:#555;font-size:12px}code,pre{font:12px ui-monospace,monospace}\
+pre{white-space:pre-wrap;background:#f6f6f6;padding:6px}table{border-collapse:collapse;margin:6px 0}\
+td,th{border-bottom:1px solid #eee;padding:2px 8px;text-align:left;vertical-align:top}tr.bad td{background:#fdecea}\
+.failure{margin:6px 0}.note{color:#555}img{max-width:min(100%,640px);border:1px solid #ccc;margin-top:6px}\
+@media (prefers-color-scheme:dark){body{color:#e6e6e6;background:#121212}pre{background:#1e1e1e}\
+details{border-color:#444}td,th{border-color:#333}tr.bad td{background:#3a1d1d}.dim,.tag,.note{color:#aaa}}";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runner::{Failure, ScenarioResult};
     use std::path::PathBuf;
+
+    #[test]
+    fn base64_matches_the_standard() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"M"), "TQ==");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert_eq!(base64(&[0xff, 0xfe, 0x00, 0x01]), "//4AAQ==");
+    }
+
+    #[test]
+    fn html_puts_failures_first_escapes_and_needs_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("pv-html-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shot = dir.join("shot.png");
+        std::fs::write(&shot, b"\x89PNG fake").unwrap();
+        let pass = ScenarioResult {
+            file: PathBuf::from("/x/shop.pv"),
+            name: "Adds <one>".into(),
+            line: 3,
+            tags: vec!["smoke".into()],
+            ms: 412.0,
+            steps: vec![crate::runner::StepResult { line: 4, text: "goto /cart".into(), ms: 30.0, ok: true }],
+            failure: None,
+            attempt: 1,
+            retried: vec![],
+            saved: Default::default(),
+            notes: vec![],
+            worker: 0,
+            rep: 0,
+        };
+        let fail = ScenarioResult {
+            name: "Total & tax".into(),
+            failure: Some(Failure {
+                line: 12,
+                text: "expect text \"<b>\"".into(),
+                message: "saw \"$40.00\"".into(),
+                at: Some(("http://shop/cart".into(), "Cart".into())),
+                hint: None,
+                screenshot: Some(shot.clone()),
+                nearest: vec![("button \"Pay\"".into(), "--role button --name Pay".into(), 0.8)],
+            }),
+            ..pass.clone()
+        };
+        let h = html(&[pass, fail], 1000.0);
+        assert!(h.find("Total &amp; tax").unwrap() < h.find("Adds &lt;one&gt;").unwrap(), "failed first");
+        assert!(h.contains("expect text &quot;&lt;b&gt;&quot;"), "{h}");
+        assert!(h.contains(&format!("data:image/png;base64,{}", base64(b"\x89PNG fake"))), "{h}");
+        assert!(h.contains("<details class=fail open>") && h.contains("<details class=pass>"), "{h}");
+        assert!(h.contains("@smoke") && h.contains("goto /cart"), "{h}");
+        assert!(!h.contains("http-equiv") && !h.contains("<script") && !h.contains("src=\"http"), "{h}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn junit_escapes_and_counts() {

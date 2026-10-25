@@ -43,6 +43,7 @@ run options:
   --reporter <name>     console (default), jsonl (one JSON object per scenario on stdout), github
                         (workflow annotations; on by itself under GitHub Actions); repeatable
   --junit <file>        also write JUnit XML
+  --html <file>         also write the run as one HTML page (steps, times, failures with their screenshot)
   --json                print what the scenarios saved, as one JSON object, at the end
   --timeout-ms <ms>     how long an expect retries (default 5000)
   --wait-ms <ms>        how long a step waits for its element (navigera's default 5000)
@@ -59,6 +60,7 @@ struct Args {
     paths: Vec<PathBuf>,
     opts: runner::Options,
     junit: Option<PathBuf>,
+    html: Option<PathBuf>,
     workers: usize,
     retries: u32,
     fail_on_flaky: bool,
@@ -93,6 +95,7 @@ fn parse_args() -> Result<Args, String> {
         auth: Default::default(),
     };
     let mut junit = None;
+    let mut html = None;
     let mut base_flag = None;
     let mut workers = 1usize;
     let mut retries = 0u32;
@@ -131,6 +134,7 @@ fn parse_args() -> Result<Args, String> {
             "--grep" => opts.grep = Some(val("--grep")?),
             "--tag" => opts.tags.push(val("--tag")?.trim_start_matches('@').to_string()),
             "--junit" => junit = Some(PathBuf::from(val("--junit")?)),
+            "--html" => html = Some(PathBuf::from(val("--html")?)),
             "--timeout-ms" => {
                 let v = val("--timeout-ms")?;
                 opts.expect_ms = v.parse().map_err(|_| format!("--timeout-ms takes milliseconds, not {v:?}"))?;
@@ -212,6 +216,7 @@ fn parse_args() -> Result<Args, String> {
         paths,
         opts,
         junit,
+        html,
         workers,
         retries,
         fail_on_flaky,
@@ -493,6 +498,15 @@ fn run(args: Args) -> ExitCode {
         }
         if let Err(e) = std::fs::write(path, report::junit(&results, ms)) {
             eprintln!("could not write {}: {e}", path.display());
+        }
+    }
+    if let Some(path) = &args.html {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match std::fs::write(path, report::html(&results, ms)) {
+            Ok(()) => eprintln!("report {}", path.display()),
+            Err(e) => eprintln!("could not write {}: {e}", path.display()),
         }
     }
     let failed = results.iter().any(|r| !r.passed()) || (args.fail_on_flaky && results.iter().any(|r| r.flaky()));

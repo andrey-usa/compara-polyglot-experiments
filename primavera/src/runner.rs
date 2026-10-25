@@ -57,8 +57,7 @@ pub struct Options {
     pub auth: Arc<AuthCache>,
 }
 
-/// Kept for the JSON-lines and HTML reporters (M1).
-#[allow(dead_code)]
+/// One step that ran, for the HTML report.
 #[derive(Debug, Clone)]
 pub struct StepResult {
     pub line: usize,
@@ -89,7 +88,6 @@ pub struct ScenarioResult {
     pub line: usize,
     pub tags: Vec<String>,
     pub ms: f64,
-    #[allow(dead_code)]
     pub steps: Vec<StepResult>,
     pub failure: Option<Failure>,
     /// 1 for the first try; more when `--retries` ran it again.
@@ -307,6 +305,9 @@ impl Runner {
         let mask = scope.masker();
         result.saved = scope.saved.into_iter().map(|(k, v)| (k, mask(&v))).collect();
         result.notes = scope.notes.iter().map(|n| mask(n)).collect();
+        for step in result.steps.iter_mut() {
+            step.text = mask(&step.text);
+        }
         if let Some(f) = result.failure.as_mut() {
             mask_failure(f, &mask);
         }

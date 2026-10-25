@@ -118,7 +118,7 @@ milestones are in agent-guidance `plans/prova.md`.
 primavera run [<file.pv|dir>...] [--base-url <url>] [--var k=v] [--grep <text>] [--tag <tag>]
               [--workers <n|auto>] [--isolation context|browser] [--retries <n>] [--fail-on-flaky] [--shard <i/n>]
               [--repeat <n>] [--shuffle [<seed>]]
-              [--reporter console|jsonl|github] [--junit <file>] [--json]
+              [--reporter console|jsonl|github] [--junit <file>] [--html <file>] [--json]
               [--timeout-ms <ms>] [--wait-ms <ms>] [--headed] [--chromium <path>]
               [--secrets <file>] [--pause-on-failure]
 primavera lint [<file.pv|dir>...]
@@ -132,6 +132,12 @@ primavera list [<file.pv|dir>...]
   each in a browser context of one shared browser (about 40% less memory
   at 4 workers than a browser each; `--isolation browser` gives each its
   own); the longest (from `.primavera/timings.json`) start first.
+- `--html report.html` writes the run as one page that needs nothing
+  else to open: failed scenarios first and open, each with its steps and
+  their times, the failure (message, where the page was, what came
+  closest, the note) and its screenshot in the page (up to 2 MB; a
+  bigger one is linked); flaky ones show how their first try failed.
+  Secrets are masked as in the console.
 - `--retries n` runs a failing scenario again; one that passes then is
   reported FLAKY with how its first try failed. `--fail-on-flaky` fails
   the run on one. `--shard i/n` takes every n-th scenario, for CI matrix
