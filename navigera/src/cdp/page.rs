@@ -3098,7 +3098,8 @@ impl Page {
                     out.hints.insert(backend, format!(".{class}"));
                 }
                 let tag = names.get(i).and_then(|&n| strings.get(n as usize)).copied().unwrap_or("");
-                if !cursor.contains_key(&index) || matches!(tag, "HTML" | "BODY") {
+                // A label clicks its control, which has a ref of its own.
+                if !cursor.contains_key(&index) || matches!(tag, "HTML" | "BODY" | "LABEL") {
                     continue;
                 }
                 let parent = parents.get(i).copied().unwrap_or(-1);

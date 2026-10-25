@@ -602,6 +602,7 @@ fn what_a_page_made_clickable_has_a_ref_that_clicks() {
     let page = "<title>Inbox</title><style>.thread{cursor:pointer} #bar span{display:inline-block;width:20px;height:20px}</style>\
         <div id=app><div class=thread><div>Kelcey</div><div>Quisque</div></div><div class=thread><div>Gilli</div><div>Quam.</div></div>\
         <div id=bar><span id=close-forward></span><span id=send-forward></span></div></div>\
+        <label for=f style=cursor:pointer>Attachment</label><input type=file id=f>\
         <script>for (const t of document.querySelectorAll('.thread')) t.onclick = () => document.title = 'open ' + t.textContent;\
         for (const id of ['close-forward', 'send-forward']) document.getElementById(id).onclick = () => document.title = id;\
         document.getElementById('app').addEventListener('click', () => {});</script>";
@@ -622,6 +623,8 @@ fn what_a_page_made_clickable_has_a_ref_that_clicks() {
     assert!(ax.contains("Gilli Quam."), "{ax}");
     let send = ref_of("- clickable #send-forward");
     assert!(!ax.contains("#app"), "{ax}");
+    // A label clicks its control, which is listed itself.
+    assert!(!ax.lines().any(|l| l.contains("clickable") && l.contains("Attachment")), "{ax}");
     s.ok(&["click", &send]);
     assert_eq!(s.ok(&["title"]), "send-forward");
     s.ok(&["click", &row]);

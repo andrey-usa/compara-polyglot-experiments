@@ -251,6 +251,7 @@ impl<'a> Tree<'a> {
         let Some(id) = node.get("backendDOMNodeId").and_then(Value::as_u64) else { return false };
         self.opts.clicks.nodes.contains(&id)
             && !INTERACTIVE.contains(&Self::role(node))
+            && Self::role(node) != "LabelText"
             && !self.holds_actionable(node, 0)
     }
 
