@@ -470,6 +470,14 @@ const CLICK_PREP: &str = r#"async function (el, force, settleMs, strict, button,
 /// long after the new document commits to answer (see `Page::send`).
 const ABANDON_AFTER_COMMIT: Duration = Duration::from_secs(1);
 
+/// How long a command waits on a tab whose last command went unanswered
+/// for its whole timeout (a script holding the page's thread, a hung
+/// renderer): the rest of the op, its clean-up and the next op fail in
+/// seconds instead of each waiting the full timeout again (three in a row
+/// made one click take 105 s on a loaded macOS runner). The first command
+/// that is answered lifts it.
+const STALLED_WAIT: Duration = Duration::from_secs(3);
+
 /// How long a click that changed nothing yet is watched before `click`
 /// says so (`no_effect`). Effects of a click almost always show within a
 /// frame or two.
@@ -1379,6 +1387,8 @@ pub struct Page {
     /// (the frame's loader, its execution context).
     worlds: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>>,
     pointer: Arc<std::sync::Mutex<Pointer>>,
+    /// Set while the tab's last command timed out (see [`STALLED_WAIT`]).
+    stalled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Page {
@@ -1389,7 +1399,16 @@ impl Page {
         target_id: String,
         shared: Arc<Shared>,
     ) -> Self {
-        Self { handle, client, session_id, target_id, shared, worlds: Default::default(), pointer: Default::default() }
+        Self {
+            handle,
+            client,
+            session_id,
+            target_id,
+            shared,
+            worlds: Default::default(),
+            pointer: Default::default(),
+            stalled: Default::default(),
+        }
     }
 
     pub fn target_id(&self) -> &str {
@@ -1467,6 +1486,18 @@ impl Page {
     }
 
     fn send(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        use std::sync::atomic::Ordering;
+        let timeout = if self.stalled.load(Ordering::SeqCst) { timeout.min(STALLED_WAIT) } else { timeout };
+        let res = self.send_once(method, params, timeout);
+        match &res {
+            Ok(_) => self.stalled.store(false, Ordering::SeqCst),
+            Err(e) if format!("{e:#}").contains("CDP command timed out") => self.stalled.store(true, Ordering::SeqCst),
+            Err(_) => {}
+        }
+        res
+    }
+
+    fn send_once(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") {
             return self.block_on(self.client.send(method, params, Some(&self.session_id), timeout));
         }

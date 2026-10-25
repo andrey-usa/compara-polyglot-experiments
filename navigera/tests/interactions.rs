@@ -592,3 +592,34 @@ fn frame_scopes_pick_the_frame_when_ids_repeat() {
     let err = s.fails(&["click", "--text", "Save", "--frame", "#log"]);
     assert!(err.contains("not a frame"), "{err}");
 }
+
+#[test]
+fn a_page_that_stops_answering_costs_one_timeout_not_one_per_command() {
+    if !chrome() {
+        return;
+    }
+    let s = Session::start("stalled", &["--timeout-ms", "10000"]);
+    // The button's mousedown holds the page's thread for 25 s.
+    let page = "<title>Busy</title><button onmousedown=\"const e = Date.now() + 25000; while (Date.now() < e);\">Hold</button>";
+    s.ok(&["goto", &format!("data:text/html,{page}")]);
+    let started = std::time::Instant::now();
+    let err = s.fails(&["click", "--text", "Hold"]);
+    let click = started.elapsed();
+    assert!(err.contains("timed out"), "{err}");
+    // One 10 s timeout for the press, then seconds for the clean-up (it
+    // took two full timeouts, 20 s, when every command waited 10 s).
+    assert!(click < std::time::Duration::from_secs(17), "click took {click:?}");
+    let started = std::time::Instant::now();
+    s.fails(&["title"]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(7), "title took {:?}", started.elapsed());
+    // Once the page answers again, commands get their whole timeout back.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (ok, _) = s.run(&["title"]);
+        if ok {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the page never answered again");
+    }
+    assert_eq!(s.ok(&["eval", "new Promise(r => setTimeout(() => r(7), 4000))"]), 7);
+}
