@@ -208,6 +208,19 @@ fn exec_runs_programs_and_checks_what_they_said() {
     assert!(out.contains("still ran after 300 ms; stopped it"), "{out}");
 }
 
+#[test]
+fn http_calls_share_cookies_with_the_browser() {
+    let (Some(_turn), Some(site)) = (chrome(), own_site()) else { return };
+    let secrets = secrets_file();
+    let (code, out) = primavera(&["run", "tests/fixtures/http.pv", "--base-url", &site.1, "--secrets", &secrets]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("1 passed, 0 failed"), "{out}");
+    let (code, out) = primavera(&["run", "tests/fixtures/http-fail.pv", "--base-url", &site.1]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("/api/fail answered 500: db down"), "{out}");
+    assert!(out.contains("GET http://127.0.0.1:9/: "), "{out}");
+}
+
 /// A GET to the fixture site, its body.
 fn fetch(site: &Site, path: &str) -> String {
     use std::io::{Read, Write};

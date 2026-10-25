@@ -75,6 +75,26 @@ milestones are in agent-guidance `plans/prova.md`.
     expect exit 0
     expect stdout contains SHIPPED
   ```
+- `http <METHOD> <url> [--json <text> | --body <text> | --json-file <f> |
+  --body-file <f>] [--header "Name: value"]… [--timeout-ms <ms>]` makes a
+  request outside the page (an API to set up or check what the UI did; a
+  relative URL takes the base URL). The scenario's cookies go with it and
+  the cookies it sets come back to the browser, so an API sign-in signs
+  the page in. Its answer is `${http.status}` and `${http.body}`; `expect
+  status 201`, `expect json $.role is shopper`, `expect header Location
+  ends-with /u/1`, `expect body contains …` check it, and `save id = json
+  $.id` (or `header <name>`) keeps a value. A 4xx or 5xx fails the step,
+  with the start of the body, unless a step indented under it checks
+  `status`. It goes through `curl` (on every supported OS), its options on
+  curl's stdin, so a secret in a header or body stays out of the process
+  list.
+
+  ```text
+  http POST /api/users --json '{"email": "${email}", "role": "shopper"}'
+    expect status 201
+    expect json $.role is shopper
+  save user = json $.id
+  ```
 - `flow name(a, b)` at the top level holds steps; `run name x y` runs them
   with `${a}` and `${b}` set. `use other.pv` takes another file's flows
   and `set`s. A failure inside a flow names the flow's own line.
@@ -123,6 +143,7 @@ milestones are in agent-guidance `plans/prova.md`.
 | `console` + a comparison, `no console "<t>"` | a console message (any level) |
 | `no errors` | no page exceptions or console errors |
 | `exit` [`is`] `<n>`, `stdout`/`stderr` + a comparison | what the last `exec` gave |
+| `status` [`is`] `<n>`, `body` + a comparison, `json <$.path>` [+ a comparison], `header <name>` [+ a comparison] | the last `http` answer |
 | `ax [<target>] matches` + the tree indented under it | the page's (or the target's) accessibility tree, as `navigera ax` prints it, holds those lines: partially (`button` matches `button "Place order"`) and in order, a line indented under another inside what that one matched, refs ignored, `/regex/` for a name or a value |
 | `not …` | any of them, negated |
 

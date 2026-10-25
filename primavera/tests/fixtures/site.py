@@ -2,6 +2,7 @@
 and passes after, `/late` shows its text after `?ms=`, `/m1` has what the
 newer expect subjects read, `/login` signs in (counted at `/logins`), and
 `/note?x=` records what `before/after all` did (`/notes`)."""
+import json
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,12 +52,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def answer(self, status, text):
+        data = text.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_POST(self):
         u = urlparse(self.path)
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
         if u.path == "/api/order":
             ORDERS[0] += 1
             return self.raw('{"id": "ORD-7", "items": [{"sku": "sku-1", "qty": 2}], "total": 36}', "application/json")
+        if u.path == "/api/users":
+            if self.headers.get("Content-Type") != "application/json":
+                return self.answer(415, '{"error": "send JSON"}')
+            got = json.loads(body)
+            return self.answer(201, json.dumps({"id": "u-1", "email": got["email"], "role": got["role"]}))
         if u.path == "/session":
             if body == "hunter22":
                 LOGINS[0] += 1
@@ -80,6 +94,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.raw("id,name\n1,Ada\n", "text/csv", [("Content-Disposition", 'attachment; filename="report-2026.csv"')])
         if u.path == "/login":
             return self.page(LOGIN)
+        if u.path == "/api/me":
+            sid = next((c.split("=", 1)[1] for c in (self.headers.get("Cookie") or "").split("; ") if c.startswith("sid=")), None)
+            return self.answer(200, json.dumps({"sid": sid})) if sid else self.answer(401, '{"error": "signed out"}')
+        if u.path == "/api/fail":
+            return self.answer(500, "db down")
         if u.path == "/account":
             signed = "sid=abc" in (self.headers.get("Cookie") or "")
             return self.page("<h1>Account</h1><p>Signed in</p>" if signed else "<h1>Sign in first</h1>")

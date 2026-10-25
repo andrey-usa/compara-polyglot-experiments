@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use navigera::protocol::{parse_args, Command, Driver, SessionConfig};
 use serde_json::Value;
 
-use crate::expect::{compare, Expect, Matcher, Prop, RequestRead, Subject};
+use crate::expect::{compare, Expect, HttpRead, Matcher, Prop, RequestRead, Subject};
 use crate::suite::{interpolate, Action, Scenario, Step, Suite};
 
 /// The state each `auth` block saved this run (or an earlier one within
@@ -451,6 +451,17 @@ impl Runner {
                 });
                 Ok(())
             }
+            Action::Save { name, command }
+                if matches!(command.first().map(String::as_str), Some("json" | "header")) =>
+            {
+                // `save id = json $.id`, `save to = header Location`: from the last `http`.
+                let what = scope.word(command.get(1).ok_or("save NAME = json <$.path> | header <name>")?)?;
+                let read = if command[0] == "json" { HttpRead::Json(what) } else { HttpRead::Header(what) };
+                let v = http_read(&read, scope)?
+                    .ok_or_else(|| format!("the last http answer has no {}", command.join(" ")))?;
+                scope.saved.insert(name.clone(), v);
+                Ok(())
+            }
             Action::Save { name, command } => {
                 let words = scope.words(command)?;
                 let v = self.command(&words)?;
@@ -501,6 +512,73 @@ impl Runner {
                 for st in steps {
                     self.action(&st.action, st, scope, suite, depth)
                         .map_err(|e| format!("under the `exec`, line {} `{}`: {e}", st.line, st.text))?;
+                }
+                Ok(())
+            }
+            Action::Http { method, url, headers, body, body_file, json, timeout_ms, steps } => {
+                let mut url = scope.word(url)?;
+                if url.starts_with('/') {
+                    let base = self.opts.base.as_deref().ok_or_else(|| {
+                        format!("{url} is relative: give the run a base URL (`base <url>` in the file or --base-url)")
+                    })?;
+                    url = format!("{}{url}", base.trim_end_matches('/'));
+                }
+                let mut headers = scope.words(headers)?;
+                let body = match (body, body_file) {
+                    (Some(b), _) => Some(scope.word(b)?),
+                    (None, Some(f)) => {
+                        let f = scope.word(f)?;
+                        Some(std::fs::read_to_string(&f).map_err(|e| format!("http body file {f}: {e}"))?)
+                    }
+                    (None, None) => None,
+                };
+                let has = |hs: &[String], name: &str| {
+                    hs.iter().any(|h| h.split(':').next().is_some_and(|k| k.trim().eq_ignore_ascii_case(name)))
+                };
+                if *json && !has(&headers, "content-type") {
+                    headers.push("Content-Type: application/json".into());
+                }
+                // The scenario's cookies go with it, unless it sets its own.
+                if !has(&headers, "cookie") {
+                    let jar = self.command(&["cookies".into(), "--url".into(), url.clone(), "--json".into()])?;
+                    let pairs: Vec<String> = jar
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|c| Some(format!("{}={}", c.get("name")?.as_str()?, c.get("value")?.as_str()?)))
+                        .collect();
+                    if !pairs.is_empty() {
+                        headers.push(format!("Cookie: {}", pairs.join("; ")));
+                    }
+                }
+                let limit = Duration::from_millis(timeout_ms.unwrap_or(self.opts.expect_ms.max(30_000)));
+                let r = crate::http::request(method, &url, &headers, body.as_deref(), limit)?;
+                // And what it sets comes back to the browser.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                for (k, v) in &r.headers {
+                    if k.eq_ignore_ascii_case("set-cookie") {
+                        if let Some(words) = crate::http::cookie_words(v, &url, now) {
+                            self.command(&words)?;
+                        }
+                    }
+                }
+                scope.saved.insert("http.status".into(), r.status.to_string());
+                scope.saved.insert("http.body".into(), r.body.clone());
+                scope.http_headers = r.headers.clone();
+                let status = Subject::Var("${http.status}".into());
+                let checked = steps.iter().any(|s| matches!(&s.action, Action::Expect(e) if e.subject == status));
+                if r.status >= 400 && !checked {
+                    let said = r.body.trim();
+                    let said = if said.len() > 200 { &said[..said.floor_char_boundary(200)] } else { said };
+                    let said = if said.is_empty() { String::new() } else { format!(": {said}") };
+                    return Err(format!("{method} {url} answered {}{said}", r.status));
+                }
+                for st in steps {
+                    self.action(&st.action, st, scope, suite, depth)
+                        .map_err(|e| format!("under the `http`, line {} `{}`: {e}", st.line, st.text))?;
                 }
                 Ok(())
             }
@@ -899,6 +977,11 @@ impl Runner {
                     Err(err) => (false, err),
                 }
             }
+            Subject::Http(read) => match http_read(read, scope)? {
+                Some(actual) if e.matcher == Matcher::Holds => (actual != "null", actual),
+                Some(actual) => (compare(&actual, e.matcher, value), actual),
+                None => (false, "absent".into()),
+            },
             Subject::Errors => {
                 let v = self.command(&["errors".into(), "--json".into()])?;
                 let list = v.as_array().cloned().unwrap_or_default();
@@ -1034,6 +1117,8 @@ fn describe(e: &Expect, value: &str, actual: &str, limit: Duration) -> String {
         Subject::Storage { area, key } => format!("storage {area} {key}"),
         // Said above.
         Subject::Ax { .. } => String::new(),
+        Subject::Http(HttpRead::Json(p)) => format!("json {p}"),
+        Subject::Http(HttpRead::Header(h)) => format!("header {h}"),
         Subject::Target { flags, prop } => {
             let p = match prop {
                 Prop::State(s) => s.clone(),
@@ -1114,6 +1199,29 @@ fn run_program(
     Ok((status.code().unwrap_or(-1), text(&out), text(&err)))
 }
 
+/// A value of the last `http` answer: in its JSON (`$.items[0].sku`), or a
+/// header; `None` when it isn't there.
+fn http_read(read: &HttpRead, scope: &Scope) -> Result<Option<String>, String> {
+    let body = scope.saved.get("http.body").ok_or("no `http` answer yet: an `http` step goes first")?;
+    Ok(match read {
+        HttpRead::Json(path) => {
+            let path = crate::expect::json_path(&scope.word(path)?)?;
+            let v: Value = serde_json::from_str(body).map_err(|e| format!("the answer isn't JSON ({e})"))?;
+            crate::expect::json_at(&v, &path)
+        }
+        HttpRead::Header(name) => {
+            let name = scope.word(name)?;
+            let found: Vec<&str> = scope
+                .http_headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .map(|(_, v)| v.as_str())
+                .collect();
+            (!found.is_empty()).then(|| found.join(", "))
+        }
+    })
+}
+
 /// A command line as it could be typed again: words with spaces quoted.
 fn shown(argv: &[String]) -> String {
     let word = |a: &String| if a.is_empty() || a.contains(char::is_whitespace) { format!("{a:?}") } else { a.clone() };
@@ -1168,6 +1276,8 @@ struct Scope {
     notes: Vec<String>,
     /// `--soft` expectations that didn't hold, and why.
     soft: Vec<(Step, String)>,
+    /// The last `http` answer's headers.
+    http_headers: Vec<(String, String)>,
 }
 
 impl Scope {
@@ -1192,6 +1302,7 @@ impl Scope {
             noop: None,
             notes: Vec::new(),
             soft: Vec::new(),
+            http_headers: Vec::new(),
         };
         // A `set` value's own `${…}` (a default, `--var`, another `set`, a
         // secret, the environment) is filled in once, here; one that names

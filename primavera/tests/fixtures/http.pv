@@ -1,0 +1,19 @@
+scenario "API calls and the browser share one set of cookies"
+  http POST /session --body ${secret:PV_TEST_PW}
+    expect status 200
+    expect header set-cookie contains sid=abc
+  goto /account
+  expect text "Signed in"
+  # The browser's cookie goes with the next call.
+  http GET /api/me
+  expect json $.sid is abc
+  http POST /api/users --json '{"email": "ada@example.com", "role": "shopper"}'
+    expect status 201
+    expect json $.role is shopper
+  save user = json $.id
+  expect ${user} is u-1
+  http GET /api/me --header "Cookie: sid=other"
+  expect json $.sid is other
+  http POST /api/users --body "{}"
+    expect status 415
+    expect body contains "send JSON"

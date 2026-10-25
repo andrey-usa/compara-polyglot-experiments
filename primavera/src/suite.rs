@@ -62,6 +62,22 @@ pub enum Action {
         dir: PathBuf,
         steps: Vec<Step>,
     },
+    /// `http <METHOD> <url> [--json <text> | --body <text> | --json-file f |
+    /// --body-file f] [--header "Name: value"]… [--timeout-ms n]`: a request
+    /// outside the page, sharing the scenario's cookies both ways. Its
+    /// answer is `${http.status}`, `${http.body}`, `expect status|body|json
+    /// <$.path>|header <name>`; a 4xx or 5xx fails the step unless one of
+    /// the steps indented under it checks `status`.
+    Http {
+        method: String,
+        url: String,
+        headers: Vec<String>,
+        body: Option<String>,
+        body_file: Option<String>,
+        json: bool,
+        timeout_ms: Option<u64>,
+        steps: Vec<Step>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,7 +103,7 @@ fn nest(flat: Vec<Step>) -> Result<Vec<Step>, (usize, String)> {
             if st.indent > indent {
                 return Err((
                     st.line,
-                    "indented more than the step before it (only the steps of an `if` or `exec` are)".into(),
+                    "indented more than the step before it (only the steps of an `if`, `exec` or `http` are)".into(),
                 ));
             }
             *i += 1;
@@ -95,7 +111,7 @@ fn nest(flat: Vec<Step>) -> Result<Vec<Step>, (usize, String)> {
             let line = st.line;
             let kids = match &mut st.action {
                 Action::If { steps, .. } => Some((steps, true)),
-                Action::Exec { steps, .. } => Some((steps, false)),
+                Action::Exec { steps, .. } | Action::Http { steps, .. } => Some((steps, false)),
                 _ => None,
             };
             if let Some((steps, needed)) = kids {
@@ -412,8 +428,18 @@ pub fn unset_vars(suite: &Suite, sc: &Scenario, run_vars: &[String]) -> Vec<(usi
     known.extend(run_vars.iter().cloned());
     known.extend(sc.vars.keys().cloned());
     known.extend(
-        ["run.id", "scenario.name", "download.path", "download.name", "exec.exit", "exec.stdout", "exec.stderr"]
-            .map(String::from),
+        [
+            "run.id",
+            "scenario.name",
+            "download.path",
+            "download.name",
+            "exec.exit",
+            "exec.stdout",
+            "exec.stderr",
+            "http.status",
+            "http.body",
+        ]
+        .map(String::from),
     );
     for st in &suite.before_all {
         if let Action::Save { name, .. } = &st.action {
@@ -429,6 +455,9 @@ pub fn unset_vars(suite: &Suite, sc: &Scenario, run_vars: &[String]) -> Vec<(usi
             Action::Optional(inner) => words(inner),
             Action::As(name) => vec![name.clone()],
             Action::Exec { argv, .. } => argv.clone(),
+            Action::Http { url, headers, body, .. } => {
+                std::iter::once(url).chain(headers).chain(body).cloned().collect()
+            }
             Action::Expect(_) | Action::If { .. } | Action::Handoff(_) => Vec::new(),
         }
     }
@@ -772,7 +801,7 @@ pub fn resolve(suites: &mut [Suite]) -> Result<(), ParseError> {
             for st in steps {
                 let action = match &st.action {
                     Action::Optional(a) => a.as_ref(),
-                    Action::If { steps, .. } | Action::Exec { steps, .. } => {
+                    Action::If { steps, .. } | Action::Exec { steps, .. } | Action::Http { steps, .. } => {
                         check(steps, file, suite)?;
                         continue;
                     }
@@ -837,6 +866,12 @@ fn anchor_inputs(action: &mut Action, dir: &Path) {
                 if Path::new(p.as_str()).is_relative() {
                     *p = dir.join(p.as_str()).to_string_lossy().into_owned();
                 }
+            }
+            return;
+        }
+        Action::Http { body_file: Some(f), .. } => {
+            if !f.starts_with("${") && Path::new(f.as_str()).is_relative() {
+                *f = dir.join(f.as_str()).to_string_lossy().into_owned();
             }
             return;
         }
@@ -949,6 +984,45 @@ fn parse_words(words: &[String]) -> Result<Action, String> {
                 return Err(usage.into());
             }
             Ok(Action::Exec { argv: rest.to_vec(), timeout_ms, dir: PathBuf::new(), steps: Vec::new() })
+        }
+        Some("http") => {
+            let usage = "expected `http <METHOD> <url> [--json <text> | --body <text> | --json-file <f> | --body-file <f>] [--header \"Name: value\"]… [--timeout-ms <ms>]`";
+            let method = words.get(1).ok_or(usage)?.to_uppercase();
+            let url = words.get(2).ok_or(usage)?.clone();
+            if method.starts_with('-') || url.starts_with("--") {
+                return Err(usage.into());
+            }
+            let (mut headers, mut body, mut body_file, mut json, mut timeout_ms) =
+                (Vec::new(), None, None, false, None);
+            let mut rest = words[3..].iter();
+            while let Some(flag) = rest.next() {
+                let v = rest.next().ok_or_else(|| format!("{flag} needs a value"))?.clone();
+                match flag.as_str() {
+                    "--header" => {
+                        if !v.contains(':') {
+                            return Err(format!("--header takes \"Name: value\", not {v:?}"));
+                        }
+                        headers.push(v);
+                    }
+                    "--json" | "--body" | "--json-file" | "--body-file" => {
+                        if body.is_some() || body_file.is_some() {
+                            return Err("one body: --json, --body, --json-file or --body-file".into());
+                        }
+                        json = flag.starts_with("--json");
+                        if flag.ends_with("-file") {
+                            body_file = Some(v);
+                        } else {
+                            body = Some(v);
+                        }
+                    }
+                    "--timeout-ms" => {
+                        timeout_ms =
+                            Some(v.parse::<u64>().map_err(|_| format!("--timeout-ms takes milliseconds, not {v:?}"))?)
+                    }
+                    other => return Err(format!("{usage} (got {other:?})")),
+                }
+            }
+            Ok(Action::Http { method, url, headers, body, body_file, json, timeout_ms, steps: Vec::new() })
         }
         Some("as") => match words {
             [_, name] => Ok(Action::As(name.clone())),

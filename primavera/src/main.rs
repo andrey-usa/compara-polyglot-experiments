@@ -3,6 +3,7 @@
 
 mod axtree;
 mod expect;
+mod http;
 mod nearest;
 mod report;
 mod runner;
