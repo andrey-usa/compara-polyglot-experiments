@@ -48,13 +48,15 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
+      # chrome.exe --version never returns on Windows: it starts the browser
+      # and prints nothing, which hung the first Windows leg (run 40217625025)
+      # on this step. Read the version from the file instead (lead note
+      # 20261025T184434Z).
       - name: Chrome
+        shell: pwsh
         run: |
-          if [ -x "/c/Program Files/Google/Chrome/Application/chrome.exe" ]; then
-            "/c/Program Files/Google/Chrome/Application/chrome.exe" --version
-          else
-            where chrome || where chrome.exe
-          fi
+          $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+          if (Test-Path $chrome) { (Get-Item $chrome).VersionInfo.ProductVersion } else { where.exe chrome }
       - name: Build tests once
         run: cargo test --locked --no-run --lib --test interactions --test handoff --test attach --test commands --test fork --test verify_scopes
       - name: Loop full suite 3 times
