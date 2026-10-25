@@ -74,11 +74,11 @@ fn active_port(dir: &Path, within: Duration) -> Option<(u16, String)> {
     None
 }
 
-/// Page targets (url list) of the browser serving DevTools on `port`.
-fn page_urls(port: u16) -> Option<Vec<String>> {
+/// The body of a GET on the DevTools HTTP endpoint at `port`.
+fn devtools_get(port: u16, path: &str) -> Option<String> {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    write!(s, "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").ok()?;
+    write!(s, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").ok()?;
     // Chrome keeps the connection open: read exactly Content-Length bytes.
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -99,14 +99,24 @@ fn page_urls(port: u16) -> Option<Vec<String>> {
             }
         }
     };
-    let json: Value = serde_json::from_str(&body).ok()?;
+    Some(body)
+}
+
+/// Page targets (id, url) of the browser serving DevTools on `port`.
+fn page_targets(port: u16) -> Option<Vec<(String, String)>> {
+    let json: Value = serde_json::from_str(&devtools_get(port, "/json/list")?).ok()?;
     Some(
         json.as_array()?
             .iter()
             .filter(|t| t["type"] == "page")
-            .map(|t| t["url"].as_str().unwrap_or("").to_string())
+            .map(|t| (t["id"].as_str().unwrap_or("").to_string(), t["url"].as_str().unwrap_or("").to_string()))
             .collect(),
     )
+}
+
+/// Page targets (url list) of the browser serving DevTools on `port`.
+fn page_urls(port: u16) -> Option<Vec<String>> {
+    Some(page_targets(port)?.into_iter().map(|(_, url)| url).collect())
 }
 
 struct Browser(Child);
@@ -118,16 +128,14 @@ impl Drop for Browser {
     }
 }
 
-#[test]
-fn attach_never_closes_the_users_browser() {
-    let Some(exe) = chrome() else { return };
-    // The user's own browser, with one tab of theirs open. A CI Windows
-    // runner sometimes starts Chrome without it ever writing its
-    // DevToolsActivePort: a second launch, on a fresh profile, gets one.
+/// The user's own browser, with one tab of theirs open. A CI Windows
+/// runner sometimes starts Chrome without it ever writing its
+/// DevToolsActivePort: a second launch, on a fresh profile, gets one.
+fn users_browser(exe: &str) -> (Browser, tempfile::TempDir, u16) {
     let launch = || {
         let profile = tempfile::tempdir().unwrap();
         let mut user = Browser(
-            Command::new(&exe)
+            Command::new(exe)
                 .args(["--headless=new", "--no-sandbox", "--no-first-run", "--remote-debugging-port=0"])
                 .arg(format!("--user-data-dir={}", profile.path().display()))
                 .arg("data:text/html,<title>Mine</title>users%20own%20tab")
@@ -145,7 +153,13 @@ fn attach_never_closes_the_users_browser() {
             }
         }
     };
-    let (mut user, profile, port) = launch().or_else(launch).expect("DevToolsActivePort");
+    launch().or_else(launch).expect("DevToolsActivePort")
+}
+
+#[test]
+fn attach_never_closes_the_users_browser() {
+    let Some(exe) = chrome() else { return };
+    let (mut user, profile, port) = users_browser(&exe);
     let dir = profile.path().display().to_string();
     let s = session_name("user");
 
@@ -168,6 +182,44 @@ fn attach_never_closes_the_users_browser() {
     assert_eq!(ok(&s, &["tab-list"])["tabs"].as_array().map(Vec::len), Some(1), "only navigera's own tab");
     ok(&s, &["quit"]);
     assert!(user.0.try_wait().unwrap().is_none(), "still running after the second session");
+}
+
+#[test]
+fn a_tab_closed_under_an_attached_session_is_named_and_replaced() {
+    let Some(exe) = chrome() else { return };
+    let (_user, _profile, port) = users_browser(&exe);
+    let id = page_targets(port)
+        .and_then(|t| t.into_iter().find(|(_, url)| url.contains("Mine")))
+        .map(|(id, _)| id)
+        .expect("the user's tab");
+    let s = session_name("closed");
+    ok(&s, &["start", "--attach", &format!("ws://127.0.0.1:{port}/devtools/page/{id}")]);
+    assert_eq!(ok(&s, &["eval", "document.title"]), "Mine");
+
+    // The user closes the tab.
+    devtools_get(port, &format!("/json/close/{id}")).expect("close the tab");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while page_targets(port).is_some_and(|t| t.iter().any(|(t, _)| *t == id)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Every op that needs the tab says it is gone, not a raw CDP error.
+    for args in [&["eval", "document.title"][..], &["goto", "data:text/html,x"][..]] {
+        let (success, r) = run(&s, args, &[]);
+        let error = r["error"].as_str().unwrap_or("");
+        assert!(!success && error.contains("the tab is closed") && error.contains("tab-new"), "{args:?}: {r}");
+    }
+    assert_eq!(ok(&s, &["status"])["closed"], true);
+    let tabs = ok(&s, &["tab-list"]);
+    assert_eq!(tabs["tabs"][0]["closed"], true, "{tabs}");
+
+    // A new tab takes its place; the closed one is gone from the list.
+    let tabs = ok(&s, &["tab-new", "data:text/html,<title>Again</title>"]);
+    assert_eq!(tabs["tabs"].as_array().map(Vec::len), Some(1), "{tabs}");
+    assert!(tabs["tabs"][0].get("closed").is_none(), "{tabs}");
+    assert_eq!(ok(&s, &["eval", "document.title"]), "Again");
+    assert!(ok(&s, &["status"]).get("closed").is_none());
+    ok(&s, &["quit"]);
 }
 
 #[test]

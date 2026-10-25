@@ -533,6 +533,11 @@ pub struct BrowserSession {
     /// Connected to a browser navigera doesn't own (`--attach`,
     /// `--profile`): closing only disconnects.
     attached: bool,
+    /// The target id of the session's only tab, once that tab was closed
+    /// (by the page, or by the user in an attached browser). The tab stays
+    /// in `pages`, since every op acts on one, until `tab-new` or `reset`
+    /// replaces it.
+    closed: Option<String>,
     /// The user data directory of a `--profile` browser, and the browser
     /// binary that runs it.
     profile_dir: Option<std::path::PathBuf>,
@@ -691,6 +696,7 @@ impl BrowserSession {
             context: None,
             owner: true,
             attached: false,
+            closed: None,
             profile_dir: None,
             profile_exe: None,
             downloads_dir: None,
@@ -768,6 +774,7 @@ impl BrowserSession {
             context: None,
             owner: true,
             attached: true,
+            closed: None,
             profile_dir,
             profile_exe,
             downloads_dir: None,
@@ -905,6 +912,7 @@ impl BrowserSession {
         self.apply_init_scripts(&page);
         self.pages.push(page);
         self.active = self.pages.len() - 1;
+        self.forget_closed();
         Ok(self.active)
     }
 
@@ -950,6 +958,7 @@ impl BrowserSession {
         }
         self.pages.push(page);
         self.active = 0;
+        self.closed = None;
         if let Some(old) = self.context.replace(context) {
             let _ = self.browser.dispose_context(&old);
         }
@@ -985,6 +994,7 @@ impl BrowserSession {
             timeout_ms: self.timeout_ms,
             abandoned: std::sync::Mutex::new(None),
             attached: self.attached,
+            closed: None,
             profile_dir: None,
             profile_exe: None,
             downloads_dir: None,
@@ -1075,20 +1085,63 @@ impl BrowserSession {
         let destroyed =
             if forked { shared.take_destroyed_by(|t| mine.iter().any(|m| m == t)) } else { shared.take_destroyed() };
         for target_id in destroyed {
+            let Some(index) = self.pages.iter().position(|p| p.target_id() == target_id) else { continue };
             if self.pages.len() <= 1 {
-                break;
-            }
-            if let Some(index) = self.pages.iter().position(|p| p.target_id() == target_id) {
-                shared.unregister(self.pages[index].session_id());
-                self.pages.remove(index);
-                if self.active >= self.pages.len() {
-                    self.active = self.pages.len() - 1;
-                } else if index < self.active {
-                    self.active -= 1;
+                if self.target_is_gone(&target_id) {
+                    self.closed = Some(target_id);
                 }
+                continue;
+            }
+            shared.unregister(self.pages[index].session_id());
+            self.pages.remove(index);
+            if self.active >= self.pages.len() {
+                self.active = self.pages.len() - 1;
+            } else if index < self.active {
+                self.active -= 1;
             }
         }
         adopted
+    }
+
+    /// The target id of the session's only tab, if it was closed.
+    pub fn closed_tab(&self) -> Option<&str> {
+        self.closed.as_deref()
+    }
+
+    /// An op failed because Chrome no longer knows the tab's session: the
+    /// tab closed and its event may not have been read yet. Catch up and,
+    /// if it was the only tab, remember it is gone.
+    pub fn tab_gone(&mut self) {
+        self.sync_tabs();
+        if self.pages.len() == 1 && self.closed.is_none() {
+            let target = self.pages[0].target_id().to_string();
+            if self.target_is_gone(&target) {
+                self.closed = Some(target);
+            }
+        }
+    }
+
+    /// The browser no longer lists the tab. Asked before a session gives
+    /// up on its only tab, so that an event for a tab that lives on (a
+    /// target swapped mid-navigation) can't strand the session; when the
+    /// browser can't say, the tab is taken to be there.
+    fn target_is_gone(&self, target_id: &str) -> bool {
+        !self.lightpanda && self.browser.tab_targets().is_ok_and(|tabs| !tabs.iter().any(|(id, _)| id == target_id))
+    }
+
+    /// Drop the closed tab once another one is open.
+    fn forget_closed(&mut self) {
+        let Some(target) = self.closed.take() else { return };
+        if self.pages.len() <= 1 {
+            return;
+        }
+        if let Some(index) = self.pages.iter().position(|p| p.target_id() == target) {
+            self.browser.shared().unregister(self.pages[index].session_id());
+            self.pages.remove(index);
+            if index < self.active {
+                self.active -= 1;
+            }
+        }
     }
 
     /// Lightpanda keeps one tab: a page it opened with `target=_blank` or

@@ -2083,6 +2083,9 @@ impl Driver {
             "url": url,
             "title": title,
         });
+        if self.session.closed_tab().is_some() {
+            state["closed"] = json!(true);
+        }
         // The page is still being parsed (we stopped waiting for it): the
         // agent should `wait` for what it needs rather than trust `ax`.
         if self.session.is_loading() {
@@ -2275,12 +2278,19 @@ impl Driver {
 
     fn tabs_json(&self) -> Value {
         let active = self.session.active_page();
+        let closed = self.session.closed_tab();
         let tabs: Vec<Value> = self
             .session
             .page_targets()
             .into_iter()
             .enumerate()
-            .map(|(index, target)| json!({ "index": index, "target": target, "active": index == active }))
+            .map(|(index, target)| {
+                let mut tab = json!({ "index": index, "target": target, "active": index == active });
+                if closed == Some(target.as_str()) {
+                    tab["closed"] = json!(true);
+                }
+                tab
+            })
             .collect();
         json!({ "tabs": tabs, "active": active, "url": self.session.url() })
     }
@@ -2293,6 +2303,26 @@ impl Driver {
     /// Run one op, reporting dialogs answered and tabs opened along the way.
     pub fn run_op(&mut self, command: &Command) -> anyhow::Result<Outcome> {
         let mut new_tabs = self.session.sync_tabs();
+        // The session's only tab is gone: say so, rather than let the op
+        // fail on a CDP session Chrome has forgotten. What doesn't need the
+        // tab still runs, and `tab-new`/`reset` give the session a new one.
+        if let Some(target) = self.session.closed_tab() {
+            let needs_tab = !matches!(
+                command,
+                Command::Quit { .. }
+                    | Command::Status {}
+                    | Command::TabList {}
+                    | Command::TabNew { .. }
+                    | Command::Reset { .. }
+                    | Command::Downloads { .. }
+                    | Command::Console { .. }
+                    | Command::Errors { .. }
+                    | Command::Network { .. }
+            );
+            if needs_tab {
+                anyhow::bail!("{}", tab_closed_message(target));
+            }
+        }
         // A navigation an earlier op started (link click, JS redirect) must
         // finish before we read or act on the page — bounded by this op's
         // own timeout, and never fatal: a page that never finishes loading
@@ -2387,6 +2417,23 @@ impl Driver {
                 e
             }
         });
+        // The tab closed while the op ran, or before its event was read.
+        let result = match result {
+            Err(e) if format!("{e:#}").contains("Session with given id not found") => {
+                let before = self.session.page_targets().get(self.session.active_page()).cloned();
+                self.session.tab_gone();
+                let now = self.session.page_targets().get(self.session.active_page()).cloned();
+                match self.session.closed_tab() {
+                    Some(target) => Err(anyhow::anyhow!("{}", tab_closed_message(target))),
+                    None if before != now => Err(anyhow::anyhow!(
+                        "the tab closed while this ran; tab {} is active now (`tab-list` shows them)",
+                        self.session.active_page()
+                    )),
+                    None => Err(e),
+                }
+            }
+            r => r,
+        };
         let mut notes = if result.is_ok() { self.session.follow_popups(op_timeout_ms(command)) } else { Vec::new() };
         // Uncaught exceptions while this op ran (a handler that crashed is
         // why a click "did nothing"): one line, `errors` has the rest.
@@ -3284,6 +3331,15 @@ impl Command {
         }
         c
     }
+}
+
+/// What every op says once the session's only tab has closed.
+fn tab_closed_message(target: &str) -> String {
+    let short: String = target.chars().take(8).collect();
+    format!(
+        "the tab is closed (target {short}…, closed by the page or in the browser); \
+         `tab-new [url]` opens another, `quit` ends the session"
+    )
 }
 
 fn op_timeout_ms(command: &Command) -> Option<f64> {
