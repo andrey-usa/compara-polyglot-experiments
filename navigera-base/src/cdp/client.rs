@@ -20,6 +20,13 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 type Responder = oneshot::Sender<Result<Value, String>>;
 
+/// What Chrome answers a command sent to a tab that is gone, and what a
+/// command still waiting when its tab's session ends fails with.
+pub const SESSION_GONE: &str = "Session with given id not found";
+
+/// A command waiting for its answer, and the tab session it went to.
+type Pending = HashMap<u64, (Option<String>, Responder)>;
+
 pub struct CdpClient {
     inner: Arc<Inner>,
 }
@@ -29,7 +36,7 @@ struct Inner {
     /// Shared with the pump task so responses dispatched from the read loop
     /// reach the `send` caller: every `send` inserts its responder here and the
     /// pump removes it in `dispatch`.
-    pending: Arc<Mutex<HashMap<u64, Responder>>>,
+    pending: Arc<Mutex<Pending>>,
     /// Outgoing JSON texts for the pump task. `shutdown` takes it, which
     /// makes the pump's `rx.recv()` return `None` and the task exits,
     /// closing the websocket.
@@ -44,10 +51,10 @@ struct Inner {
 }
 
 /// Mark the connection closed and fail every request still waiting.
-fn close_all(closed: &AtomicBool, pending: &Mutex<HashMap<u64, Responder>>) {
+fn close_all(closed: &AtomicBool, pending: &Mutex<Pending>) {
     closed.store(true, Ordering::SeqCst);
     let mut pending = pending.lock().unwrap();
-    for (_, responder) in pending.drain() {
+    for (_, (_, responder)) in pending.drain() {
         let _ = responder.send(Err("CDP connection closed".to_string()));
     }
 }
@@ -76,7 +83,7 @@ impl CdpClient {
         let (mut sink, mut stream) = ws.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let (event_tx, _) = broadcast::channel::<Value>(512);
-        let pending: Arc<Mutex<HashMap<u64, Responder>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<Pending>> = Arc::new(Mutex::new(HashMap::new()));
         let pending_pump = Arc::clone(&pending);
         let event_tx_pump = event_tx.clone();
         let events_sent = Arc::new(AtomicU64::new(0));
@@ -138,7 +145,7 @@ impl CdpClient {
             tokio::net::unix::pipe::Sender::from_owned_fd(to_browser).context("CDP pipe (us -> browser)")?;
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let (event_tx, _) = broadcast::channel::<Value>(512);
-        let pending: Arc<Mutex<HashMap<u64, Responder>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<Pending>> = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
 
         let (closed_w, pending_w) = (Arc::clone(&closed), Arc::clone(&pending));
@@ -209,7 +216,7 @@ impl CdpClient {
         if self.inner.closed.load(Ordering::SeqCst) {
             anyhow::bail!("CDP connection closed during {method}");
         }
-        self.inner.pending.lock().unwrap().insert(id, tx);
+        self.inner.pending.lock().unwrap().insert(id, (session_id.map(str::to_string), tx));
         // The transport may have closed (and drained `pending`) between the
         // check and the insert.
         if self.inner.closed.load(Ordering::SeqCst) {
@@ -322,13 +329,13 @@ fn shape(value: &Value, depth: usize) -> Value {
     }
 }
 
-fn dispatch(text: &str, pending: &Mutex<HashMap<u64, Responder>>, events: &broadcast::Sender<Value>, sent: &AtomicU64) {
+fn dispatch(text: &str, pending: &Mutex<Pending>, events: &broadcast::Sender<Value>, sent: &AtomicU64) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return;
     };
     if let Some(id) = value.get("id").and_then(Value::as_u64) {
         let responder = pending.lock().unwrap().remove(&id);
-        if let Some(responder) = responder {
+        if let Some((_, responder)) = responder {
             if let Some(error) = value.get("error") {
                 let _ = responder.send(Err(error.to_string()));
             } else {
@@ -338,7 +345,21 @@ fn dispatch(text: &str, pending: &Mutex<HashMap<u64, Responder>>, events: &broad
         }
         return;
     }
-    if value.get("method").and_then(Value::as_str).is_some() {
+    if let Some(method) = value.get("method").and_then(Value::as_str) {
+        // The tab closed (or was detached): Chrome never answers what was
+        // still waiting on it, so it fails now rather than at its timeout.
+        if method == "Target.detachedFromTarget" {
+            if let Some(gone) = value.pointer("/params/sessionId").and_then(Value::as_str) {
+                let mut pending = pending.lock().unwrap();
+                let ids: Vec<u64> =
+                    pending.iter().filter(|(_, (s, _))| s.as_deref() == Some(gone)).map(|(id, _)| *id).collect();
+                for id in ids {
+                    if let Some((_, responder)) = pending.remove(&id) {
+                        let _ = responder.send(Err(format!("{SESSION_GONE}: the tab's session ended while this ran")));
+                    }
+                }
+            }
+        }
         sent.fetch_add(1, Ordering::SeqCst);
         let _ = events.send(value);
     }

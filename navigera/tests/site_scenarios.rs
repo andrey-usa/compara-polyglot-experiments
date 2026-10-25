@@ -171,7 +171,11 @@ impl Drop for Agent {
 fn find_ref(ax: &str, needle: &str) -> String {
     let line =
         ax.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no line with {needle:?} in ax:\n{ax}"));
-    let start = line.find("ref=").unwrap_or_else(|| panic!("no ref on {line:?}")) + 4;
+    // The ref that follows the text: a table row is one line with a ref
+    // per cell.
+    let at = line.find(needle).unwrap_or(0);
+    let start =
+        line[at..].find("ref=").map(|i| at + i).unwrap_or_else(|| panic!("no ref after {needle:?} on {line:?}")) + 4;
     line[start..].chars().take_while(char::is_ascii_digit).collect()
 }
 

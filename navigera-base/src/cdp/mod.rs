@@ -18,6 +18,7 @@ pub mod attach;
 pub mod ax;
 mod browser;
 mod client;
+pub mod downloads;
 mod events;
 pub mod import;
 pub mod logs;
@@ -27,10 +28,10 @@ mod profile;
 pub(crate) mod transport;
 
 pub use browser::{Browser, LaunchOptions};
-pub use events::{DialogPolicy, Route, RouteAction};
-pub use page::{AxOptions, Locator, Page, Target, DEFAULT_ELEMENT_WAIT};
+pub use events::{glob_match, DialogPolicy, Route, RouteAction};
+pub use page::{AxOptions, ClickOptions, Locator, Page, Target, DEEP, DEFAULT_ELEMENT_WAIT};
 
 /// Element functions shared with the session layer.
 pub(crate) mod page_js {
-    pub(crate) use super::page::{FOCUS_EL, GET_EL, IS_EL};
+    pub(crate) use super::page::{COMBO_FOCUS, COMBO_PICK, FOCUS_EL, FOCUS_SELECT_ALL, GET_EL, IS_EL, MOUSE_AT};
 }

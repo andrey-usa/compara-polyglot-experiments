@@ -9,7 +9,7 @@ name: navigera A/B
 
 on:
   push:
-    branches: [experiment-17]
+    branches: [experiment-29]
     paths:
       - "navigera-base/**"
       - "navigera-ab/ab.py"

@@ -244,7 +244,7 @@ impl Browser {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("attachToTarget: no sessionId"))?
                 .to_string();
-            self.shared.register(&session_id, &target_id);
+            self.shared.register(&session_id, &target_id, "");
             let page = Page::new(
                 self.handle.clone(),
                 self.client.clone(),
@@ -264,6 +264,39 @@ impl Browser {
         self.shared.caught_up(&self.client, Duration::from_millis(250))
     }
 
+    /// Report downloads (`Browser.downloadWillBegin`/`downloadProgress`),
+    /// saving them in `dir`, or where the browser would (no `dir`: a browser
+    /// that is the user's own keeps its own setting).
+    pub fn enable_downloads(&self, dir: Option<&std::path::Path>) -> Result<()> {
+        self.enable_downloads_in(dir, None)
+    }
+
+    /// [`Browser::enable_downloads`] for one browser context (the default
+    /// one without `context`).
+    pub fn enable_downloads_in(&self, dir: Option<&std::path::Path>, context: Option<&str>) -> Result<()> {
+        let mut params = match dir {
+            Some(d) => {
+                json!({ "behavior": "allowAndName", "downloadPath": d.display().to_string(), "eventsEnabled": true })
+            }
+            None => json!({ "behavior": "default", "eventsEnabled": true }),
+        };
+        if let Some(context) = context {
+            params["browserContextId"] = json!(context);
+        }
+        self.block_on(self.client.send("Browser.setDownloadBehavior", params, None, CMD_TIMEOUT))?;
+        let mut downloads = self.shared.downloads.lock().unwrap();
+        match (context, dir) {
+            (None, dir) => downloads.dir = dir.map(std::path::Path::to_path_buf),
+            (Some(c), Some(d)) => {
+                downloads.dirs.insert(c.to_string(), d.to_path_buf());
+            }
+            (Some(c), None) => {
+                downloads.dirs.remove(c);
+            }
+        }
+        Ok(())
+    }
+
     /// Grant a permission (e.g. `geolocation`) to every origin.
     pub fn grant_permission(&self, permission: &str) -> Result<()> {
         self.block_on(self.client.send(
@@ -280,9 +313,10 @@ impl Browser {
         &self.shared
     }
 
-    /// How dialogs are answered from now on.
-    pub fn set_dialog_policy(&self, policy: DialogPolicy) {
-        *self.shared.policy.lock().unwrap() = policy;
+    /// How dialogs in `scope` (a session's browser context, "" for the
+    /// default one) are answered from now on.
+    pub fn set_dialog_policy(&self, scope: &str, policy: DialogPolicy) {
+        self.shared.policy.lock().unwrap().insert(scope.to_string(), policy);
         if self.shared.is_single_target() {
             let sessions: Vec<String> = self.shared.sessions.lock().unwrap().keys().cloned().collect();
             for session in sessions {
@@ -292,8 +326,9 @@ impl Browser {
     }
 
     /// Attach to a page target the browser opened on its own (a popup) and
-    /// enable it like a tab we created.
-    pub fn attach_page(&self, target_id: &str) -> Result<Page> {
+    /// enable it like a tab we created. `scope`: the browser context of the
+    /// session it belongs to ("" for the default one).
+    pub fn attach_page(&self, target_id: &str, scope: &str) -> Result<Page> {
         self.block_on(async {
             let session = self
                 .client
@@ -305,7 +340,7 @@ impl Browser {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("attachToTarget: no sessionId"))?
                 .to_string();
-            self.shared.register(&session_id, target_id);
+            self.shared.register(&session_id, target_id, scope);
             let page = Page::new(
                 self.handle.clone(),
                 self.client.clone(),
@@ -351,9 +386,49 @@ impl Browser {
     /// [`Browser::new_page`] in a window of its own: in a user's browser
     /// the agent works beside their tabs, not among them.
     pub fn new_page_in(&self, url: Option<&str>, new_window: bool) -> Result<Page> {
+        self.new_page_with(url, new_window, None)
+    }
+
+    /// A new browser context: its own cookies, storage and cache, as a
+    /// fresh incognito profile has.
+    pub fn create_context(&self) -> Result<String> {
+        let r = self.block_on(self.client.send("Target.createBrowserContext", json!({}), None, CMD_TIMEOUT))?;
+        r.get("browserContextId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("createBrowserContext: no browserContextId"))
+    }
+
+    /// Every cookie of a browser context (the default one without
+    /// `context`). Asked of the browser itself: a page's session may not
+    /// name a context.
+    pub fn context_cookies(&self, context: Option<&str>) -> Result<Value> {
+        let params = match context {
+            Some(c) => json!({ "browserContextId": c }),
+            None => json!({}),
+        };
+        self.block_on(self.client.send("Storage.getCookies", params, None, CMD_TIMEOUT))
+    }
+
+    /// Close a context made by [`Browser::create_context`] and its tabs.
+    pub fn dispose_context(&self, id: &str) -> Result<()> {
+        self.block_on(self.client.send(
+            "Target.disposeBrowserContext",
+            json!({ "browserContextId": id }),
+            None,
+            CMD_TIMEOUT,
+        ))
+        .map(|_| ())
+    }
+
+    /// A tab, in a window of its own or not, in a context or the default one.
+    pub fn new_page_with(&self, url: Option<&str>, new_window: bool, context: Option<&str>) -> Result<Page> {
         let mut params = json!({ "url": url.unwrap_or("about:blank") });
         if new_window {
             params["newWindow"] = json!(true);
+        }
+        if let Some(context) = context {
+            params["browserContextId"] = json!(context);
         }
         self.block_on(async {
             let target = self
@@ -376,7 +451,7 @@ impl Browser {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("attachToTarget: no sessionId"))?
                 .to_string();
-            self.shared.register(&session_id, &target_id);
+            self.shared.register(&session_id, &target_id, context.unwrap_or(""));
             let page = Page::new(
                 self.handle.clone(),
                 self.client.clone(),
@@ -416,10 +491,24 @@ impl Browser {
         Ok(())
     }
 
+    /// Bring a tab to the front, as best it can be: on a busy macOS machine
+    /// the browser sometimes takes the whole command timeout to answer (the
+    /// window it activates never comes forward), and a `reset` or
+    /// `tab-select` failed with it. A few seconds, then on without it: the
+    /// tab is the one the session acts on either way.
     pub fn activate_target(&self, target_id: &str) -> Result<()> {
         self.block_on(async {
-            self.client.send("Target.activateTarget", json!({ "targetId": target_id }), None, CMD_TIMEOUT).await?;
-            Ok(())
+            match self
+                .client
+                .send("Target.activateTarget", json!({ "targetId": target_id }), None, Duration::from_secs(3))
+                .await
+            {
+                Err(e) if format!("{e:#}").contains("timed out") => {
+                    eprintln!("[browser] activating tab {target_id} took over 3 s; going on");
+                    Ok(())
+                }
+                other => other.map(|_| ()),
+            }
         })
     }
 

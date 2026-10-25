@@ -390,6 +390,16 @@ impl<'a> Tree<'a> {
             return;
         }
 
+        // A table row of plain cells (text, or one control each): one line,
+        // cells apart by ` | `, so a grid reads a row per line, not a line
+        // per cell.
+        if role == "row" {
+            if let Some(cells) = self.row_cells(&kids) {
+                line.push_str(&format!(": {}", cells.join(" | ")));
+                self.lines.push(line);
+                return;
+            }
+        }
         // Unnamed node holding only text: inline it (`- paragraph: …`).
         let child_cover = if name.is_empty() { covered.to_string() } else { name.clone() };
         if !kids.is_empty() && kids.iter().all(|k| Self::role(k) == "StaticText") {
@@ -492,6 +502,64 @@ impl<'a> Tree<'a> {
             }
             self.walk(child, depth, cover);
         }
+    }
+
+    /// A row's cells, each as it reads on one line: `"text"` for a cell of
+    /// text (`""` when empty), the control for a cell holding just one
+    /// (`link "View" [ref=7] url=…`, `checkbox [checked, ref=9]`). None
+    /// when a cell holds more than that: the row is drawn as a tree.
+    fn row_cells(&self, kids: &[&'a Value]) -> Option<Vec<String>> {
+        let mut cells = Vec::new();
+        for cell in kids {
+            if !matches!(Self::role(cell), "cell" | "gridcell" | "columnheader" | "rowheader") {
+                return None;
+            }
+            let mut inner = Vec::new();
+            self.effective_children(cell, &mut inner);
+            let controls: Vec<&Value> = inner.iter().copied().filter(|k| Self::role(k) != "StaticText").collect();
+            match controls.as_slice() {
+                [] => {
+                    let text: Vec<String> =
+                        inner.iter().map(|k| text_of(k, "name")).filter(|t| !t.is_empty()).collect();
+                    let text = if text.is_empty() { self.name(cell) } else { text.join(" ") };
+                    cells.push(quote(&clip(&squash(&text), 150)));
+                }
+                [only] => {
+                    let role = Self::role(only).to_string();
+                    let mut grand = Vec::new();
+                    self.effective_children(only, &mut grand);
+                    // A select lists its options inline: it keeps the tree.
+                    if !INTERACTIVE.contains(&role.as_str())
+                        || matches!(role.as_str(), "combobox" | "listbox")
+                        || grand.iter().any(|g| Self::role(g) != "StaticText")
+                    {
+                        return None;
+                    }
+                    // Text beside the control that isn't its name stays.
+                    let name = self.name(only);
+                    let extra: Vec<String> = inner
+                        .iter()
+                        .filter(|k| Self::role(k) == "StaticText")
+                        .map(|k| text_of(k, "name"))
+                        .filter(|t| !t.trim().is_empty() && t.trim() != name.trim())
+                        .collect();
+                    if !extra.is_empty() {
+                        return None;
+                    }
+                    let mut shown = self.describe(only, &role);
+                    if !name.is_empty() {
+                        shown.insert_str(role.len(), &format!(" {}", quote(&clip(&name, 150))));
+                    }
+                    let value = if CHECKABLE.contains(&role.as_str()) { String::new() } else { text_of(only, "value") };
+                    if !value.is_empty() && value != name {
+                        shown.push_str(&format!(" value={}", quote(&clip(&value, 150))));
+                    }
+                    cells.push(shown);
+                }
+                _ => return None,
+            }
+        }
+        (!cells.is_empty()).then_some(cells)
     }
 
     /// `role [tags] url=…` for a child inlined after its same-named parent.
@@ -665,6 +733,38 @@ mod tests {
         ];
         let out = render("page \"Shop\"", &nodes, &[], &Options::default());
         assert_eq!(out.text, "page \"Shop\"\n- heading \"Widget\"\n- button \"Add to cart\" [ref=6]");
+    }
+
+    #[test]
+    fn a_row_of_plain_cells_is_one_line() {
+        let nodes = vec![
+            node("1", None, "RootWebArea", "", &["2"], 1),
+            node("2", Some("1"), "table", "", &["3", "10", "20"], 2),
+            node("3", Some("2"), "row", "", &["4", "6", "8"], 3),
+            node("4", Some("3"), "cell", "100000", &["5"], 4),
+            node("5", Some("4"), "link", "100000", &[], 5),
+            node("6", Some("3"), "cell", "$7.00", &["7"], 6),
+            node("7", Some("6"), "StaticText", "$7.00", &[], 7),
+            node("8", Some("3"), "cell", "", &[], 8),
+            // A cell holding a control and other text: drawn as a tree.
+            node("10", Some("2"), "row", "", &["11"], 10),
+            node("11", Some("10"), "cell", "", &["12", "13"], 11),
+            node("12", Some("11"), "StaticText", "Qty", &[], 12),
+            node("13", Some("11"), "spinbutton", "", &[], 13),
+            // A control keeps its value.
+            node("20", Some("2"), "row", "", &["21"], 20),
+            node("21", Some("20"), "cell", "Qty", &["22", "23"], 21),
+            node("22", Some("21"), "StaticText", "Qty", &[], 22),
+            json!({"nodeId": "23", "parentId": "21", "ignored": false, "role": {"value": "spinbutton"},
+                   "name": {"value": "Qty"}, "value": {"value": "2"}, "childIds": [], "backendDOMNodeId": 23}),
+        ];
+        let out = render("", &nodes, &[], &Options::default());
+        assert_eq!(
+            out.text,
+            "- table:\n  - row: link \"100000\" [ref=5] | \"$7.00\" | \"\"\n  - row:\n    - cell:\n      - text: Qty\n      - spinbutton [ref=13]\n  - row: spinbutton \"Qty\" [ref=23] value=\"2\"",
+            "{}",
+            out.text
+        );
     }
 
     #[test]
