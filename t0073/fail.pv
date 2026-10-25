@@ -1,0 +1,5 @@
+# T-0073 check 2: a scenario that must fail, so the action's annotation
+# and failure screenshot can be checked. The failing step is line 5.
+scenario "Consumer action fail: element that is not there"
+  goto /shop --wait commit
+  expect --selector "#no-such-element" visible

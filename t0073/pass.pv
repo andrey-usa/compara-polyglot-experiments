@@ -1,0 +1,6 @@
+# T-0073 checks 1 and 3: a scenario that must pass.
+scenario "Consumer action pass: cookie banner dismisses"
+  goto /shop --wait commit
+  expect --selector "#cookie" visible
+  click --selector "#cookie-accept"
+  expect not --selector "#cookie" visible

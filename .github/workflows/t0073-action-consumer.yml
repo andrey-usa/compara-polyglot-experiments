@@ -1,0 +1,110 @@
+# T-0073: primavera's GitHub Action as a consumer uses it.
+#
+# Each run exercises the action exactly as a consumer writes it
+# (uses: andrey-usa/primavera@next) on ubuntu-24.04, macos-14 and
+# windows-latest. Dispatch 3 times for 3 runs per OS. No release exists
+# yet, so every install builds from source; check 3 pins a version that
+# never existed to prove the fallback notice.
+#
+# The site is a pinned copy of primavera's suite40 site server at next
+# eaeb9b9 (t0073/site/server.py); the .pv files are t0073/pass.pv and
+# t0073/fail.pv. Step timings (install vs run) are harvested from the
+# run's jobs API after the fact, not from inside the job.
+name: t0073-action-consumer
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  consumer:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the suite site
+        shell: bash
+        run: |
+          PY=$(command -v python3 || command -v python)
+          "$PY" t0073/site/server.py --port 8931 > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8931/; then break; fi
+            sleep 1
+          done
+          curl -fsS -o /dev/null http://127.0.0.1:8931/ || { cat server.log; exit 1; }
+
+      # Check 1: a passing scenario; the evidence output must be `ev`.
+      - name: Check 1 - passing scenario via the action
+        id: pass
+        continue-on-error: true
+        uses: andrey-usa/primavera@next
+        with:
+          paths: t0073/pass.pv
+          base-url: http://127.0.0.1:8931
+          args: --junit report.xml --evidence ev
+
+      - name: Verify check 1
+        if: always()
+        shell: bash
+        run: |
+          test "${{ steps.pass.outcome }}" = "success"
+          test "${{ steps.pass.outputs.evidence }}" = "ev"
+          test -f report.xml
+          grep -q "cookie banner" report.xml
+
+      # Check 2: a failing scenario; the step must fail, the annotation
+      # must land on fail.pv line 5 (checked from the job log at harvest),
+      # and a screenshot must sit under the evidence output.
+      - name: Check 2 - failing scenario via the action
+        id: fail
+        continue-on-error: true
+        uses: andrey-usa/primavera@next
+        with:
+          paths: t0073/fail.pv
+          base-url: http://127.0.0.1:8931
+          args: --junit report-fail.xml --evidence ev-fail
+
+      - name: Verify check 2
+        if: always()
+        shell: bash
+        run: |
+          test "${{ steps.fail.outcome }}" = "failure"
+          test "${{ steps.fail.outputs.evidence }}" = "ev-fail"
+          test -f report-fail.xml
+          grep -q "failure" report-fail.xml
+          find ev-fail -name "screenshot.png" | grep -q .
+
+      # Check 3: a version that never existed falls back to the source
+      # build with a notice (checked from the job log at harvest).
+      - name: Check 3 - unknown version via the action
+        id: nope
+        continue-on-error: true
+        uses: andrey-usa/primavera@next
+        with:
+          paths: t0073/pass.pv
+          base-url: http://127.0.0.1:8931
+          version: v0.0.0-nope
+          args: --junit report-nope.xml --evidence ev-nope
+
+      - name: Verify check 3
+        if: always()
+        shell: bash
+        run: |
+          test "${{ steps.nope.outcome }}" = "success"
+          test "${{ steps.nope.outputs.evidence }}" = "ev-nope"
+          test -f report-nope.xml
+          grep -q "cookie banner" report-nope.xml
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "pass=${{ steps.pass.outcome }} fail=${{ steps.fail.outcome }} nope=${{ steps.nope.outcome }}"
+          echo "evidence pass=${{ steps.pass.outputs.evidence }} fail=${{ steps.fail.outputs.evidence }} nope=${{ steps.nope.outputs.evidence }}"
