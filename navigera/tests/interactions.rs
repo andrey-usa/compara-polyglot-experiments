@@ -601,7 +601,9 @@ fn a_page_that_stops_answering_costs_one_timeout_not_one_per_command() {
     let s = Session::start("stalled", &["--timeout-ms", "10000"]);
     // The button's mousedown holds the page's thread for 25 s.
     let page = "<title>Busy</title><button onmousedown=\"const e = Date.now() + 25000; while (Date.now() < e);\">Hold</button>";
-    s.ok(&["goto", &format!("data:text/html,{page}")]);
+    // The short session timeout is for the stall; loading the page on a
+    // loaded CI runner gets the usual one (a data URL took 12 s on macOS).
+    s.ok(&["goto", &format!("data:text/html,{page}"), "--timeout-ms", "35000"]);
     let started = std::time::Instant::now();
     let err = s.fails(&["click", "--text", "Hold"]);
     let click = started.elapsed();
