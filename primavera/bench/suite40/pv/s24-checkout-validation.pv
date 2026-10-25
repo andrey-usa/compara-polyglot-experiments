@@ -1,0 +1,28 @@
+# Checkout step 1 validates name/country/speed; the card frame validates the card.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "Checkout validates shipping and card inputs"
+  goto /shop/p/101 --wait commit
+  click --selector "#detail-add"
+  expect --selector "#cart-count" text is 1
+  goto /checkout --wait commit
+  click --selector "#continue"
+  expect --selector "#err1" text contains "Full name is required."
+  expect --selector "#err1" text contains "Choose a country."
+  expect --selector "#err1" text contains "Choose a shipping speed."
+  fill --selector "#name" --value "Ada Lovelace"
+  click --selector "#continue"
+  expect --selector "#err1" text is "Choose a country. Choose a shipping speed."
+  select --selector "#country" --value "Canada"
+  click --selector 'input[name="speed"][value="express"]'
+  click --selector "#continue"
+  expect --selector "#step2" visible
+  click --selector "#place"
+  expect --selector "#err2" text contains "Card details are incomplete"

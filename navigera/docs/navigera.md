@@ -42,7 +42,11 @@ and `new_tabs` (tabs the page opened, now in the tab list). The exit code is
 - a ref from `ax` as the first argument (`click 12`; `@12`, `e12` and
   `ref=12` also work) or `--ref 12`;
 - `--selector <css>`: the first match a user could reach (when the first
-  one is parked off the page and another isn't, the other);
+  one is parked off the page and another isn't, the other). `host >>>
+  inner` crosses shadow roots: `inner` inside the open shadow root of an
+  element `host` matches (or a shadow root under it), as in `"#app >>>
+  x-card:nth-of-type(2) >>> button"`; `locate` writes one for an element
+  in a shadow root;
 - `--text "<visible text>"`: the best match by accessible label, text or
   value. An exact match beats a partial one, actionable elements beat plain
   ones, and a `<label>` stands for its control.
@@ -52,6 +56,11 @@ and `new_tabs` (tabs the page opened, now in the tab list). The exit code is
   (case-insensitive, exact before contains, visible first, open shadow
   roots included); `--nth <i>` picks among their matches or `--selector`'s
   (0-based, `-1` = the last).
+- `--near <text>` with any of them: the match whose own part of the page
+  (its card, row or section: the largest ancestor holding no other match)
+  shows the text: `click --role button --name "Add to cart" --near "Brass
+  Widget"`. It holds when items reorder, where `--nth` doesn't; `locate`
+  writes it when a role and name match more than one element.
 - `--frame <css>` with any of them: look only inside that iframe or frame
   (`"#outer >> #inner"` for one inside another), of this origin or another,
   when two frames hold the same element (two address forms, two payment
@@ -76,8 +85,8 @@ another process are reachable by ref only.
 | command | args | result |
 |---|---|---|
 | `start` | (with `-s`) | `{session, socket, log, pid}`; detached server + browser; `already_running` if it exists |
-| `goto` | `<url>` or `--url`; `--wait load\|domcontentloaded\|commit`; `--timeout-ms` | state `{tab, tabs, url, title}`. `example.com` → `https://`, `localhost:3000` → `http://` |
-| `ax` (`snapshot`) | `[<ref> \| --selector <css> \| --text t]` scope; `--limit <lines>` (2000); `--refs all`; `--format json` (old flat list); `--all` | text tree (below) |
+| `goto` | `<url>` or `--url`; `--wait load\|domcontentloaded\|commit`; `--timeout-ms` | state `{tab, tabs, url, title}`; a URL that downloads leaves the page where it was and adds `download` (the file) and a `note`. `example.com` → `https://`, `localhost:3000` → `http://` |
+| `ax` (`snapshot`) | `[<ref> \| --selector <css> \| --text t]` scope; `--limit <lines>` (2000); `--refs all`; `--format json` (old flat list: `{ref, role, name, value?, url?}`; with `--all` `{id, role, name, backendNodeId}`); `--all` | text tree (below) |
 | `click` | target; `--button right\|middle`; `--force` | state; fails naming the element that covers the target; `synthetic_click` note if a DOM click was used (`--force`, an element with no box); `no_effect` note if the page did nothing in response |
 | `fill` | target, `<value>` or `--value`; `--keys` selects what the field holds and types the value key by key (apps that keep only typed input, observable-model forms) | state |
 | `type` | `<text>` or `--value`; optional `--selector/--ref/--text` to focus first | state |
@@ -85,10 +94,10 @@ another process are reachable by ref only.
 | `select` | target, option label(s)/value(s) (positional or repeated `--value`; labels match with whitespace collapsed); `--add` keeps what a multiple select already has. On a custom dropdown (an ARIA combobox: react-select and the like) it does what a user does: focuses it, opens it (ArrowDown, else a click), finds the option by its text in the listbox that opened (a portal at the end of `<body>` included), types to filter when it isn't listed, and clicks it | state + `selected` |
 | `hover` | target | state; `synthetic_hover` note if the element could not be hovered |
 | `mouse` | `move <x> <y> [--steps n]`, `down`, `up`, `click <x> <y> [--count n]`, `wheel <dx> <dy>`; `--button left\|right\|middle`; an optional target makes x/y relative to its top-left corner, scrolling it into view when that point is out of it (`down`, `up` and `wheel` with a target go to its center; a target in a cross-origin frame is refused). A `click` at viewport coordinates outside the viewport is refused; a `move` may leave it (a drag out of the window) | state, plus `mouse: {x, y, held}` (viewport CSS pixels, the buttons still held) |
-| `scroll` | `--by <px>` (default 800) or `--to top\|bottom`; or a target to scroll into view (`--by` and `--to` scroll inside it: a list that loads more at its end) | `{scrollY, scrollHeight, viewport}`, plus the element's `scrollTop` |
+| `scroll` | `--by <px>` (default 800) or `--to top\|bottom`; or a target to scroll into view (`--by` and `--to` scroll inside it: a list that loads more at its end) | `{scrollY, scrollHeight, viewport}`; with a target `{scrollY, scrollHeight}` of the page, plus the element's `scrollTop` and `elementScrollHeight` when `--by`/`--to` scrolled inside it |
 | `upload` | target, file path(s) (positional or `--file`) | `{files}` |
-| `wait` | any of `--selector <css>` (visible), `--text <t>`, `--url <part>`, `--gone <css>`, `--js <expr>`, `--idle` (no fetch/XHR for 500 ms; also `--load networkidle`), `--download [<glob>]` (a finished download whose file name matches), `--ms <n>`; `--timeout-ms` | state + `waited_ms` (+ `download`) |
-| `downloads` | `--clear`, `--json`, `--dir <path>` | `#n state bytes path (url)` per file the pages downloaded, saved under `--download-dir` with the name the page gave it (`report (2).csv` if taken). With `--attach` the browser keeps its own download folder and `path` is empty. `--dir` saves this session's downloads in `<path>` from now on (created if missing; kept across `reset`), apart from other sessions' |
+| `wait` | any of `--selector <css>` (visible), `--text <t>`, `--url <part>`, `--gone <css>`, `--js <expr>`, `--idle` (no fetch/XHR for 500 ms; also `--load networkidle`), `--download [<glob>]` (a finished download whose file name matches), `--ms <n>`; `--timeout-ms` | state + `waited_ms` (+ `download`); `--ms` alone: `{waited_ms}` |
+| `downloads` | `--clear`, `--json`, `--dir <path>` | `#n state bytes path (url)` per file the pages downloaded, saved under `--download-dir` with the name the page gave it (`report (2).csv` if taken). With `--attach` the browser keeps its own download folder and `path` is empty. `--dir` saves this session's downloads in `<path>` from now on (created if missing; kept across `reset`), apart from other sessions' and returns `{dir}` |
 | `eval` (`evaluate`) | `<js>`, `--expression <js>`, `--file <path.js>`, or `-` (read the script from stdin) | the JSON value (an arrow function is called; promises are awaited) |
 | `text` | `--selector <css>` | `textContent` or `null` |
 | `find` | `<description>` | `{ref, element, in, p, confidence, others, sure}`: the element a decision model chose ([below](#decisions-find-and-check)) |
@@ -104,7 +113,7 @@ another process are reachable by ref only.
 | `errors` | `--limit`, `--clear`, `--json` | `console --level error` |
 | `network` | `--filter <text>`, `--type fetch\|xhr\|document\|…`, `--failed`, `--since <n>` (only requests after #n), `--limit <n>` (100), `--clear`; `--har <file>` | `#n METHOD STATUS type url size time` per line (same-origin URLs as paths); `--har` writes HAR 1.2 |
 | `network <n>` | `--body-file <file>` | one request in full: headers, post data, response body (8 KB shown; the file gets all of it) |
-| `cookies` | `[--all] [--url <u>] [--json]`; `set <name> <value> [--url <u> \| --domain <d>] [--path] [--expires <unix s>] [--http-only] [--secure] [--same-site Lax\|Strict\|None]`; `delete <name>`; `clear` | one cookie per line (`--all`: every cookie in the browser) |
+| `cookies` | `[--all] [--url <u>] [--json]`; `set <name> <value> [--url <u> \| --domain <d>] [--path] [--expires <unix s>] [--http-only] [--secure] [--same-site Lax\|Strict\|None]`; `delete <name>`; `clear` | one cookie per line (`--all`: every cookie in the browser); `set` → `{set}`, `delete` → `{deleted}`, `clear` → `{cleared: true}` |
 | `storage` | `[local\|session] [get [<key>] \| set <key> <value> \| remove <key> \| clear]` | the value, or the whole store as an object |
 | `state` | `save\|load <file.json>` | every cookie (HttpOnly too) and the open tabs' localStorage to a file, or back: `{saved\|loaded, cookies, origins}`. The file is Playwright's `storageState` format, so either tool reads the other's. `load` sets the cookies at once and gives each origin's keys to documents of that origin that lack them |
 | `show` / `hide` | — | the session's browser on screen, or off it, with the same tabs (the active one stays active) and sign-ins: a `--profile` browser restarts on its profile, which keeps everything; one navigera launched is replaced by one carrying its cookies and the open tabs' storage. For a step only a person can do (a login, 2FA, a CAPTCHA). `show` needs a display. Not for `--attach`, which is already on screen | state + `visible` |
@@ -113,20 +122,26 @@ another process are reachable by ref only.
 | `set` | `viewport <w> <h> [--scale <dpr>] [--mobile]`, `device <name>` (iPhone 15, iPhone 15 Pro Max, iPhone SE, Pixel 8, Galaxy S24, iPad Mini, iPad Pro 11, Laptop, Desktop), `media dark\|light\|print\|reduced-motion\|forced-colors`, `geo <lat> <lon> [--accuracy <m>]`, `offline on\|off`, `headers 'Name: value'…` (or a JSON object), `ua <string>`, `locale <tag>`, `timezone <zone>`, `credentials <user> <password>`; `off` resets one | what was set. Applies to every tab and to tabs opened later |
 | `route` | `<url glob>` (`*`, `?` over the whole URL), then `--abort` (default) or `--status <n> [--body <text> \| --body-file <f>] [--content-type <t>] [--header 'Name: value']…`; no argument lists the rules with their hit counts | `{route, action}`. Only matching URLs are intercepted |
 | `unroute` | `[<url glob>]` | `{removed}` (all rules without a glob) |
-| `init-script` | `<js>`, `--file <path.js>`, `--clear`; no argument lists them | runs before the page's own scripts in every document of every tab |
+| `init-script` | `<js>`, `--file <path.js>`, `--clear`; no argument lists them | runs before the page's own scripts in every document of every tab; adding returns `{init_scripts: n}`, `--clear` `{removed}` |
 | `status` | — | `{engine, executable, endpoint, attached, version}` + state (`closed: true` once the session's only tab was closed) |
+| `locate` | target (a ref, usually) | `{locators: [{kind, flags}]}`: the flags that find the element again, most stable first (`testid`, `role` + name, `label`, `placeholder`, `text`, `css`), each kept only when the op's own finder picks this element on the page as it is; inside a frame each has `--frame` (a cross-origin frame named from the page that holds it); `secret: true` for a password field (`type=password`, `autocomplete` current/new-password or one-time-code) |
+| `history` | `--clear` empties it | `{history: [{command, at, url, page, locators?}]}` (`page`: the title, the visible `h1` and the status/alert messages showing after the action): the actions the session ran (navigation, clicks, typing, selects, uploads, drags, scrolls, tabs, dialogs, and the waits between; not reads or `eval`), oldest first, the last 1000; one on a ref has the `locate` of its element from just before it ran (and `secret: true` for a password field), so `primavera from-session` can write it as a test |
 | `title` / `url` | — | string / state |
 | `back` / `forward` / `reload` | — | state |
 | `screenshot` | `[<path>]` or `--path`; `--full-page` | `{path, bytes}` |
 | `reset` | | `{tabs, active, url}`: a new browser context (no cookies, storage or cache from before) with one blank tab, in the same browser (about 40 ms); the old tabs close; `set`, routes, credentials, init scripts, the dialog answer and the `downloads --dir` stay (`reset --all` drops them, as in a new session). Chrome only |
 | `tab-new` | `[<url>]` | `{tabs:[{index,target,active}], active, url}`; a tab that was closed under the session (the user closed it, or the page did) shows `closed: true` until `tab-new` replaces it, and ops that need it say so |
 | `tab-list` | — | same |
-| `tab-select` | `<index>` or a `target` id (or its first characters) from `tab-list`, which stays right when tabs open and close | state |
+| `tab-select` | `<index>` (or `--index <n>`) or a `target` id (or its first characters) from `tab-list`, which stays right when tabs open and close | state |
 | `tab-close` | `[<index>]` (default: active) | state |
 | `dialog` | `--accept [--prompt-text t]` or `--dismiss` | `{dialogs: "accept"\|"dismiss"}` |
 | `quit` (`close`) | — | `{bye: true}`; a session server and its browser exit |
 | `skill` | — | prints the agent guide (SKILL.md) |
 | `install-skill` | `[--dir <skills dir>] [--claude \| --continue] [--global]` | writes `<dir>/navigera/SKILL.md` (default `./.agents/skills`, read by Cline and Kilo; `--claude`: `.claude/skills`; `--continue`: `.continue/skills`; `--global`: under your home directory) |
+
+Other names the parser takes, for agents used to Playwright's: `navigate`
+(`goto`), `drag-drop` (`drag`), `cookie` (`cookies`), `emulate` (`set`),
+`addinitscript` (`init-script`), `close-page` (`tab-close`).
 
 ### The `ax` tree
 
@@ -371,6 +386,11 @@ it behaves exactly like the CLI. The browser starts on the first tool call.
 | `browser_run` | several ops in one call (`[{"op":"fill","ref":21,"value":"Ada"}, {"op":"click","ref":30}]`), stopping at the first failure, ending with a snapshot |
 | `browser_close` | close the browser; the next call starts a fresh one |
 
+An MCP client may have no shell of its own, so the browser is not its way to
+the disk: `file:` pages are refused, and `browser_file_upload` takes only
+files inside the working directory (the project the client opened).
+`NAVIGERA_MCP_ALLOW_FILES=1` lifts both limits.
+
 Every action takes `snapshot: true` to return the updated tree in the same
 call. The whole tool list (23 tools) is about 14 KB (~3,600 tokens), against
 ~20 KB for Playwright MCP 0.0.83 and ~26 KB for Chrome DevTools MCP 1.10.1.
@@ -413,6 +433,14 @@ MCP Registry, as `io.github.andrey-usa/navigera`.
 
   Brave and Edge work via `--chromium`. chrome-headless-shell starts
   faster than full Chrome: it has no browser UI to bring up.
+- **Browser flags.** Chrome runs without its sandbox as root, or when a
+  first launch shows this machine can't give it one (the warning says so
+  once); `NAVIGERA_NO_SANDBOX=1` turns it off up front and silences the
+  warning. `NAVIGERA_EXTRA_FLAGS` (space-separated) adds Chrome flags;
+  `NAVIGERA_DROP_FLAGS` (comma-separated prefixes) removes navigera's own.
+  `NAVIGERA_EXTRA_FLAGS` reaches `--profile` browsers too. `NAVIGERA_PROFILE_DIR=<dir>` is
+  where throwaway profiles go (default `/dev/shm` when it is tmpfs with room,
+  else the system temp directory).
 - **CDP transport.** `--remote-debugging-pipe` by default on Linux/macOS:
   no TCP port, and the browser exits when navigera dies. `--transport ws`
   (or `$NAVIGERA_CDP_TRANSPORT=ws`) opens a DevTools WebSocket port instead, for
@@ -501,6 +529,13 @@ machine without a GPU still reports a software renderer).
 - `NAVIGERA_CDP_TRACE=<file>` records every CDP command sent; CI checks it with
   `tools/cdp_check.py`.
 - `NAVIGERA_VERBOSE=1` turns on launch logs.
+- `NAVIGERA_CHROME_LOG=<file>` appends the browser's own stderr there.
+- `NAVIGERA_RSS_REPORT=1` prints navigera's peak memory when a `serve` ends.
+- Off switches, for telling a navigera behaviour from the page's:
+  `NAVIGERA_NO_NETWORK=1` (no Network domain: `network` stays empty and ops
+  don't wait for data), `NAVIGERA_NO_CLICK_CHECK=1` (clicks don't watch what
+  they changed: no `no_effect`), `NAVIGERA_NO_DISCOVER=1` (popups aren't
+  adopted as tabs).
 
 ## Playwright CLI / agent-browser → navigera
 

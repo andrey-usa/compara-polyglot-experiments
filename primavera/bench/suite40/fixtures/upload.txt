@@ -1,0 +1,1 @@
+plain-text upload fixture for the support-form scenario

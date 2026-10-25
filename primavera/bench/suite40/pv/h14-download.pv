@@ -1,0 +1,12 @@
+# download: a real download the server counts (Content-Disposition);
+# the verdict endpoint is the server's ground truth.
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+scenario "Downloading the report is a real download"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/download --wait commit
+  click --selector "#dl"
+  wait --download "*.csv" --timeout-ms 30000
+  expect download "report*.csv"
+  expect ${download.name} is "report.csv"
+  expect js "fetch('/verdict/download-seen').then((r) => r.json()).then((j) => j.seen)"

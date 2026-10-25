@@ -1,0 +1,9 @@
+# remount: the button is destroyed and recreated every 1.5 s; a snapshot
+# taken too early clicks a stale node and misses.
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+scenario "Clicking the live mount of a re-mounted button"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/remount --wait commit
+  click --selector "#target"
+  expect --selector "#pos" text starts-with "committed gen"

@@ -1323,6 +1323,12 @@ impl BrowserSession {
         Ok(point)
     }
 
+    /// The locators that find `target`'s element again (`locate`).
+    pub fn locate(&self, target: &Target, timeout_ms: Option<f64>) -> Result<serde_json::Value> {
+        let (wait, timeout) = self.element_budget(timeout_ms);
+        self.active_tab().locate(target, wait, timeout)
+    }
+
     pub fn focus(&self, target: &Target, timeout_ms: Option<f64>) -> Result<bool> {
         let (wait, timeout) = self.element_budget(timeout_ms);
         let v = self.active_tab().on_element(target, "focus", cdp::page_js::FOCUS_EL, &[], wait, timeout)?;

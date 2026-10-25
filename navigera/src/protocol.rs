@@ -108,6 +108,10 @@ pub struct TargetArgs {
     /// `data-testid` (or `data-test-id`, `data-test`, `data-qa`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub testid: Option<String>,
+    /// The match whose own part of the page (its card, row, section) shows
+    /// this text, with any of the above or `selector`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near: Option<String>,
     /// Which match (0-based; -1 = the last), with any of the above or `selector`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nth: Option<i64>,
@@ -162,7 +166,12 @@ impl TargetArgs {
         if self.find.is_some() {
             anyhow::bail!("{op}: --find was not resolved to an element");
         }
-        if self.locator() || self.nth.is_some() {
+        if self.near.is_some() && !self.locator() && self.selector.is_none() {
+            anyhow::bail!(
+                "{op}: --near narrows --role/--name, --label, --placeholder, --testid or --selector to the match in the part of the page that shows the text"
+            );
+        }
+        if self.locator() || self.nth.is_some() || self.near.is_some() {
             if self.nth.is_some() && !self.locator() && self.selector.is_none() {
                 anyhow::bail!(
                     "{op}: --nth picks among the matches of --selector, --role, --label, --placeholder or --testid"
@@ -175,6 +184,7 @@ impl TargetArgs {
                 placeholder: self.placeholder.clone(),
                 testid: self.testid.clone(),
                 css: self.selector.clone(),
+                near: self.near.clone(),
                 nth: self.nth,
             })));
         }
@@ -680,6 +690,24 @@ pub enum Command {
     /// tabs, active URL.
     #[serde(rename = "status")]
     Status {},
+    /// The locators that find an element again, most stable first (test
+    /// id, role and name, label, placeholder, text, CSS), each checked on
+    /// the page as it is.
+    #[serde(rename = "locate")]
+    Locate {
+        #[serde(flatten)]
+        target: TargetArgs,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<f64>,
+    },
+    /// The actions this session ran, oldest first; one on a ref carries the
+    /// locators that found its element again just before it ran.
+    #[serde(rename = "history")]
+    History {
+        /// Empty it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clear: bool,
+    },
     /// PNG screenshot to disk; result is the written path + byte length.
     #[serde(rename = "screenshot")]
     Screenshot {
@@ -969,7 +997,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("route", "[<url glob> [--abort | --status <n> [--body <text> | --body-file <f>] [--content-type <t>] [--header 'Name: value']]]", "fail or answer requests whose URL matches (* and ? globs); no flags = fail; no pattern = list the rules"),
     ("unroute", "[<url glob>]", "remove one route rule, or all"),
     ("init-script", "[<js> | --file <path.js> | --clear]", "run a script before the page's own in every document of every tab; no argument lists them"),
-    ("get", "text|value|html|outer|box|checked|attr <name>|style <prop> <target> | count <css> | title | url", "read one property of an element (target: ref, --selector, --text, --role/--name, --label, --placeholder, --testid, --nth; --frame <css> to look only inside that frame)"),
+    ("get", "text|value|html|outer|box|checked|attr <name>|style <prop> <target> | count <css> | title | url", "read one property of an element (target: ref, --selector, --text, --role/--name, --label, --placeholder, --testid, --near <text>, --nth; --frame <css> to look only inside that frame)"),
     ("is", "visible|hidden|enabled|disabled|checked|editable|focused <target>", "true/false; a missing element is not visible"),
     ("dblclick", "<target>", "trusted double click"),
     ("drag", "<from> <to> | --from-text <t> --to-text <t>", "drag one element onto another (each a ref or CSS selector): HTML5 drag and drop for a draggable source, a held mouse moved across otherwise"),
@@ -981,6 +1009,8 @@ const OPS: &[(&str, &str, &str)] = &[
     ("insert-text", "<text> [<target>]", "insert text at the caret in one go (paste/IME), no key events"),
     ("url", "", "active tab state {tab, tabs, url, title}"),
     ("status", "", "the session's engine, browser executable, CDP endpoint and tab state"),
+    ("locate", "<target>", "the locators that find an element again, most stable first, each checked on the page (for turning refs into tests)"),
+    ("history", "[--clear]", "the actions this session ran, a ref's with the locators of its element (`primavera from-session` reads it)"),
     ("back", "", "history back"),
     ("forward", "", "history forward"),
     ("reload", "", "reload the page"),
@@ -1260,6 +1290,7 @@ fn target_args(args: &mut Args, positional_target: bool) -> Result<TargetArgs, A
         label: str_flag(args, "--label")?,
         placeholder: str_flag(args, "--placeholder")?,
         testid: str_flag(args, "--testid")?,
+        near: str_flag(args, "--near")?,
         nth: match str_flag(args, "--nth")? {
             Some(raw) => Some(raw.parse::<i64>().map_err(|_| {
                 ArgsError::Invalid(format!("--nth takes an index (0, 1, -1 for the last), got {raw:?}"))
@@ -1655,6 +1686,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
                             | "--label"
                             | "--placeholder"
                             | "--testid"
+                            | "--near"
                             | "--nth"
                             | "--frame"
                     )
@@ -1901,6 +1933,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Result<ParsedArgs,
         }
         "url" => Command::Url {},
         "status" => Command::Status {},
+        "locate" => Command::Locate { target: target_args(&mut args, true)?, timeout_ms },
+        "history" => Command::History { clear: extract_present(&mut args, "--clear") },
         // Mostly for sessions (`--session s quit` stops the server); as a
         // one-shot it just launches and closes.
         "quit" | "close" => Command::Quit { close_browser: extract_present(&mut args, "--close-browser") },
@@ -2028,7 +2062,23 @@ fn ax_preview(tree: &str, keep: usize) -> (String, usize) {
 
 pub struct Driver {
     session: BrowserSession,
+    /// What `history` returns (the newest [`HISTORY_MAX`]).
+    history: Vec<Value>,
 }
+
+/// Actions `history` keeps.
+const HISTORY_MAX: usize = 1000;
+
+/// A history entry's `page`: the visible top heading and the status or
+/// alert messages showing, each one line of up to 120 characters.
+const PAGE_SAYS: &str = "(() => {
+  const line = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+  const shown = (e) => e.getClientRects().length > 0;
+  const h1 = [...document.querySelectorAll('h1')].find(shown);
+  const said = [...document.querySelectorAll('[role=status],[role=alert],[aria-live=polite],[aria-live=assertive],output')]
+    .filter(shown).map(line).filter(Boolean);
+  return { title: document.title, h1: line(h1), status: [...new Set(said)].slice(0, 3) };
+})()";
 
 /// One op's result plus side effects the agent should know about.
 pub struct Outcome {
@@ -2047,7 +2097,7 @@ impl Driver {
         if let Some(target) = config.attach_target() {
             let session = BrowserSession::attach(&target, config.timeout_ms)
                 .map_err(|e| anyhow::anyhow!("could not connect to the browser: {e:#}"))?;
-            return Ok(Self { session });
+            return Ok(Self { session, history: Vec::new() });
         }
         let session = BrowserSession::launch_with(
             &config.engine,
@@ -2059,7 +2109,7 @@ impl Driver {
         .map_err(|e| {
             anyhow::anyhow!("browser launch failed (engine={}, headed={}): {e:#}", config.engine, config.headed)
         })?;
-        Ok(Self { session })
+        Ok(Self { session, history: Vec::new() })
     }
 
     /// The active page (tab) this driver's ops target.
@@ -2071,7 +2121,7 @@ impl Driver {
     /// (see [`BrowserSession::fork`]): one browser for several sessions at
     /// once.
     pub fn fork(&self) -> anyhow::Result<Self> {
-        Ok(Self { session: self.session.fork()? })
+        Ok(Self { session: self.session.fork()?, history: Vec::new() })
     }
 
     /// Active tab state the model needs after every op.
@@ -2408,6 +2458,18 @@ impl Driver {
             }
             None => command,
         };
+        // An action goes in `history`; one on a ref with the locators of its
+        // element, read now (the action may take the element away).
+        let at =
+            || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let mut entry = command.recorded().then(|| json!({ "command": command, "at": at() }));
+        if let (Some(e), Some(r)) = (entry.as_mut(), command.clone().target_mut().and_then(|t| t.node_ref)) {
+            let found = self.session.locate(&Target::Ref(r), Some(2000.0)).ok();
+            if found.as_ref().is_some_and(|v| v["secret"] == true) {
+                e["secret"] = json!(true);
+            }
+            e["locators"] = found.and_then(|v| v.get("locators").cloned()).unwrap_or_else(|| json!([]));
+        }
         let result = self.dispatch(command).map_err(|e| {
             let msg = format!("{e:#}");
             if msg.contains("CDP connection closed") || msg.contains("CDP client is shut down") {
@@ -2434,6 +2496,18 @@ impl Driver {
             }
             r => r,
         };
+        if let (Ok(_), Some(mut e)) = (&result, entry) {
+            e["url"] = json!(self.session.url());
+            // What the page says after it: its heading, and messages it
+            // announces (what a test would check next).
+            if let Ok(page) = self.session.evaluate_with_timeout::<Value>(PAGE_SAYS, Some(1000.0)) {
+                e["page"] = page;
+            }
+            if self.history.len() >= HISTORY_MAX {
+                self.history.remove(0);
+            }
+            self.history.push(e);
+        }
         let mut notes = if result.is_ok() { self.session.follow_popups(op_timeout_ms(command)) } else { Vec::new() };
         // Uncaught exceptions while this op ran (a handler that crashed is
         // why a click "did nothing"): one line, `errors` has the rest.
@@ -3192,6 +3266,14 @@ impl Driver {
                 Ok(self.state_json())
             }
             Command::Url {} => Ok(self.state_json()),
+            Command::Locate { target, timeout_ms } => {
+                let t = target.target("locate")?;
+                s.locate(&t, *timeout_ms).map_err(|e| anyhow::anyhow!("locate {}: {e:#}", t.label()))
+            }
+            Command::History { clear } => {
+                let all = Value::Array(if *clear { std::mem::take(&mut self.history) } else { self.history.clone() });
+                Ok(json!({ "history": all }))
+            }
             Command::Status {} => {
                 let mut state = self.state_json();
                 state["engine"] = json!(if self.session.is_lightpanda() { "lightpanda" } else { "chrome" });
@@ -3315,6 +3397,39 @@ impl Command {
             Command::Ax { scope, .. } => Some(scope),
             _ => None,
         }
+    }
+
+    /// An action `history` keeps, and the waits between (reads and evals aren't).
+    fn recorded(&self) -> bool {
+        matches!(
+            self,
+            Command::Open { .. }
+                | Command::Goto { .. }
+                | Command::Back {}
+                | Command::Forward {}
+                | Command::Reload {}
+                | Command::Click { .. }
+                | Command::Dblclick { .. }
+                | Command::Fill { .. }
+                | Command::Type { .. }
+                | Command::InsertText { .. }
+                | Command::Press { .. }
+                | Command::KeyDown { .. }
+                | Command::KeyUp { .. }
+                | Command::Hover { .. }
+                | Command::Mouse { .. }
+                | Command::Select { .. }
+                | Command::SetChecked { .. }
+                | Command::Upload { .. }
+                | Command::Drag { .. }
+                | Command::Scroll { .. }
+                | Command::Dialog { .. }
+                | Command::TabNew { .. }
+                | Command::TabSelect { .. }
+                | Command::TabClose { .. }
+                // What the agent waited for is when the test may go on.
+                | Command::Wait { .. }
+        )
     }
 
     /// The description given with `--find`, if any.

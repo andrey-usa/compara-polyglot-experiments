@@ -1,0 +1,17 @@
+# Sign in with the demo account; 25 seeded orders paginate 10 per page.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "Signing in shows the order history"
+  run sign-in demo@acme.test hunter2
+  expect url ends-with "/account"
+  expect text "Signed in as"
+  expect text "demo@acme.test"
+  expect --selector "#pageinfo" text is "Page 1 of 3"
+  expect cookie sid

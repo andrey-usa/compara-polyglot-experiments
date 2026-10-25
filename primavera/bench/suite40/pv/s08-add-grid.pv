@@ -1,0 +1,15 @@
+# Add to cart from the grid; the toast confirms.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "Adding a product from the grid counts it in the cart"
+  expect --selector ".card" count is 12
+  click --text "Add to cart"
+  expect --selector "#cart-count" text is 1
+  expect text "Added to cart"

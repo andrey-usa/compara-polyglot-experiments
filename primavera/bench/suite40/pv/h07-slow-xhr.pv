@@ -1,0 +1,11 @@
+# slow-xhr: the XHR takes a seeded 2-4 s; reading #out before it resolves
+# reads stale content. Seed 7 resolves the value "seed-7-result".
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+scenario "Using the result only after the slow XHR resolves"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/slow-xhr --wait commit
+  click --selector "#load"
+  expect --selector "#use" enabled --timeout-ms 15000
+  click --selector "#use"
+  expect --selector "#done" text is "used: seed-7-result"

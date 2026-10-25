@@ -1,0 +1,10 @@
+set greeting = "${G:-hello there}"
+set who = ${WHO}
+set both = "${greeting}, ${who}"
+set literal = "$${greeting}"
+
+scenario "Set values are filled in"
+  expect ${greeting} is "hello there"
+  expect ${who} is ada
+  expect ${both} is "hello there, ada"
+  expect ${literal} is "$${greeting}"

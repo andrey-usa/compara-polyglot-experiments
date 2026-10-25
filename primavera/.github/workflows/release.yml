@@ -1,0 +1,126 @@
+name: release
+
+# Prebuilt binaries for static Linux (musl) x86_64/aarch64, macOS
+# arm64/x86_64 and Windows x64, each with its SHA-256, attached to a GitHub
+# release v<version> (what the GitHub Action and an install fetch).
+#
+# Releasing (the owner): Actions -> release -> Run workflow with the version
+# from Cargo.toml and the navigera tag or commit it is built against. The
+# run checks the version, builds every target, tags v<version> on this
+# commit and creates the release. With `publish` off it is a dry run: build
+# and smoke-test only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version to release, as in Cargo.toml (e.g. 0.3.0); tags this commit v<version>"
+        required: true
+      navigera:
+        description: "navigera tag or commit to build against (e.g. v0.6.0)"
+        required: true
+      publish:
+        description: "publish (off = dry run: build and smoke-test only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.p.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: p
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          tag="v${INPUT_VERSION#v}"
+          have=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$have" = "$tag" ] || { echo "::error title=release::$tag does not match Cargo.toml version $have"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: primavera
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: primavera
+      - uses: actions/checkout@v7
+        with:
+          repository: andrey-usa/navigera
+          ref: ${{ inputs.navigera }}
+          path: navigera
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          cache: false
+      - name: musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke test (native targets)
+        if: "!contains(matrix.target, 'x86_64-apple') || runner.arch == 'X64'"
+        run: |
+          bin=target/${{ matrix.target }}/release/primavera
+          "$bin" --version
+          "$bin" skill | head -3
+      - name: Package
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          tar -C target/${{ matrix.target }}/release -czf dist/primavera-${{ matrix.target }}.tar.gz primavera
+          (cd dist && shasum -a 256 primavera-${{ matrix.target }}.tar.gz > primavera-${{ matrix.target }}.tar.gz.sha256)
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $zip = "dist/primavera-${{ matrix.target }}.zip"
+          Compress-Archive -Path target/${{ matrix.target }}/release/primavera.exe -DestinationPath $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "$hash  primavera-${{ matrix.target }}.zip" | Out-File -Encoding ascii -NoNewline "$zip.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: primavera/dist/
+
+  publish:
+    needs: [plan, build]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          NAVIGERA: ${{ inputs.navigera }}
+        run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "primavera $TAG" --notes "Built against navigera $NAVIGERA."

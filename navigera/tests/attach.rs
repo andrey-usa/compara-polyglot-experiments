@@ -146,7 +146,17 @@ fn users_browser(exe: &str) -> (Browser, tempfile::TempDir, u16) {
                 .expect("start the user's browser"),
         );
         match active_port(profile.path(), Duration::from_secs(20)) {
-            Some((port, _)) => Some((user, profile, port)),
+            Some((port, _)) => {
+                // The port can be up before the start-up tab is listed (a
+                // loaded runner: the tests then found no "Mine").
+                let end = std::time::Instant::now() + Duration::from_secs(10);
+                while std::time::Instant::now() < end
+                    && !page_urls(port).is_some_and(|u| u.iter().any(|u| u.contains("Mine")))
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Some((user, profile, port))
+            }
             None => {
                 eprintln!("no DevToolsActivePort after 20 s (exited: {:?}); launching again", user.0.try_wait());
                 None

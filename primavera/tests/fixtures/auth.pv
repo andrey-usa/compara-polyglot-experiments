@@ -1,0 +1,38 @@
+auth shopper
+  goto /login
+  fill --label Password ${secret:PV_TEST_PW}
+  click --role button --name "Sign in"
+  expect text "Signed in"
+
+auth keeper ttl 1h
+  goto /login
+  fill --label Password ${secret:PV_TEST_PW}
+  click --role button --name "Sign in"
+  expect text "Signed in"
+
+before all
+  save token = eval "'tok-' + 42"
+  goto /note?x=setup
+
+after all
+  goto /note?x=teardown
+
+scenario "Signed in ${n}"
+  examples
+    | n |
+    | 1 |
+    | 2 |
+    | 3 |
+  as shopper
+  goto /account
+  expect text "Signed in"
+  expect ${token} is tok-42
+
+scenario "Kept across runs"
+  as keeper
+  goto /account
+  expect text "Signed in"
+
+scenario "Not signed in"
+  goto /account
+  expect text "Sign in first"

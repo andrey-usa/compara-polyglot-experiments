@@ -1,0 +1,5 @@
+scenario "A tree that isn't on the page"
+  goto /login
+  eval "(document.body.innerHTML = '<form aria-label=Checkout><select aria-label=Country><option>Mexico</option><option selected>Canada</option></select></form>', 1)"
+  expect ax --role form --name Checkout matches --timeout-ms 300
+    - combobox "Country" value="Mexico"

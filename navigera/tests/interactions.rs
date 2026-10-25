@@ -643,3 +643,112 @@ fn a_page_that_stops_answering_costs_one_timeout_not_one_per_command() {
     }
     assert_eq!(s.ok(&["eval", "new Promise(r => setTimeout(() => r(7), 4000))"]), 7);
 }
+
+/// The ref of the first `ax` line holding `text`.
+fn ref_of(s: &Session, text: &str) -> String {
+    let tree = s.text(&["ax"]);
+    let line = tree.lines().find(|l| l.contains(text)).unwrap_or_else(|| panic!("no {text:?} in\n{tree}"));
+    line.split("ref=").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).unwrap().to_string()
+}
+
+#[test]
+fn locate_and_history_turn_refs_into_locators() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("history", &[]);
+    s.ok(&["goto", &format!("{}/iframe-form", site.url)]);
+    // Each locator found the element; inside a frame, the frame is named.
+    let email = ref_of(&s, "textbox \"Email\"");
+    let found = s.ok(&["locate", &email]);
+    let flags: Vec<Vec<String>> = found["locators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["flags"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect())
+        .collect();
+    assert_eq!(flags[0], ["--role", "textbox", "--name", "Email", "--frame", "#email-subscribe"], "{found}");
+    assert!(flags.iter().any(|f| f[..2] == ["--selector", "#email"]), "{found}");
+    for f in &flags {
+        let mut args = vec!["get", "value"];
+        args.extend(f.iter().map(String::as_str));
+        s.ok(&args);
+    }
+    // A name two elements share is not offered; a path is.
+    s.ok(&["eval", "(document.body.insertAdjacentHTML('beforeend', '<button>Go</button><button>Go</button>'), 1)"]);
+    let second = s.ok(&["eval", "document.querySelectorAll('button').length"]);
+    assert_eq!(second, 2);
+    let go = s.text(&["ax"]).lines().filter(|l| l.contains("button \"Go\"")).nth(1).unwrap().to_string();
+    let go = go.split("ref=").nth(1).unwrap().trim_end_matches(']').to_string();
+    let found = s.ok(&["locate", &go]);
+    let kinds: Vec<&str> = found["locators"].as_array().unwrap().iter().map(|l| l["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["css"], "{found}");
+    assert_eq!(found["locators"][0]["flags"][1], "body > button:nth-of-type(2)", "{found}");
+    // The same name in two cards: the one near its card's heading.
+    s.ok(&["eval", "(document.body.insertAdjacentHTML('beforeend', '<div><h3>Nickel Widget</h3><p>$5</p><button onclick=\"window.added=1\">Add to cart</button></div><div><h3>Brass Widget</h3><p>$7</p><button onclick=\"window.added=2\">Add to cart</button></div>'), 1)"]);
+    let brass = s.text(&["ax"]).lines().filter(|l| l.contains("button \"Add to cart\"")).nth(1).unwrap().to_string();
+    let brass = brass.split("ref=").nth(1).unwrap().trim_end_matches(']').to_string();
+    let found = s.ok(&["locate", &brass]);
+    assert_eq!(found["locators"][0]["kind"], "near", "{found}");
+    let flags: Vec<String> =
+        found["locators"][0]["flags"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect();
+    assert_eq!(flags, ["--role", "button", "--name", "Add to cart", "--near", "Brass Widget"], "{found}");
+    let mut click = vec!["click"];
+    click.extend(flags.iter().map(String::as_str));
+    s.ok(&click);
+    assert_eq!(s.ok(&["eval", "window.added"]), 2);
+    // --near on its own is refused: it narrows a locator.
+    let (ok, r) = s.run(&["click", "--near", "Brass Widget"]);
+    assert!(!ok && r.to_string().contains("--near narrows"), "{r}");
+    // A select inside its label is named by the label's words, not its options.
+    s.ok(&["eval", "(document.body.insertAdjacentHTML('beforeend', '<label>Size <select><option>Small</option><option>Large</option></select></label>'), 1)"]);
+    let size = ref_of(&s, "combobox \"Size\"");
+    let found = s.ok(&["locate", &size]);
+    assert_eq!(found["locators"][0]["flags"], serde_json::json!(["--role", "combobox", "--name", "Size"]), "{found}");
+    s.ok(&["select", "--label", "Size", "Large"]);
+    // A password field says so, whatever it is called.
+    s.ok(&["eval", "(document.body.insertAdjacentHTML('beforeend', '<label>Token <input type=password></label>'), 1)"]);
+    let token = ref_of(&s, "textbox \"Token\"");
+    assert_eq!(s.ok(&["locate", &token])["secret"], true);
+    assert!(s.ok(&["locate", &size]).get("secret").is_none());
+    // The actions, a ref's with its locators read before it ran; reads aren't kept.
+    s.ok(&["history", "--clear"]);
+    s.ok(&["fill", &email, "ada@example.com"]);
+    s.ok(&["click", "--text", "Subscribe"]);
+    s.ok(&["get", "text", "--selector", "#msg"]);
+    s.ok(&["wait", "--text", "Thanks"]);
+    let h = s.ok(&["history"]);
+    let h = h["history"].as_array().unwrap();
+    assert_eq!(h.len(), 3, "reads aren't kept, the wait is: {h:?}");
+    assert_eq!(h[2]["command"]["op"], "wait", "{h:?}");
+    assert_eq!(
+        (h[0]["command"]["op"].as_str(), h[0]["command"]["value"].as_str()),
+        (Some("fill"), Some("ada@example.com"))
+    );
+    assert_eq!(h[0]["locators"][0]["flags"][1], "textbox", "{h:?}");
+    assert_eq!(h[1]["command"]["text"], "Subscribe", "{h:?}");
+    assert!(h[1].get("locators").is_none() && h[1]["url"].as_str().unwrap().ends_with("/iframe-form"), "{h:?}");
+}
+
+#[test]
+fn an_element_in_a_shadow_root_is_located_through_its_hosts() {
+    let (true, Some(site)) = (chrome(), site()) else { return };
+    let s = Session::start("shadow-hosts", &[]);
+    s.ok(&["goto", &format!("{}/iframe-form", site.url)]);
+    // Two cards inside an app, each with an icon button and no name for it.
+    s.ok(&[
+        "eval",
+        r#"(customElements.define('x-card', class extends HTMLElement { connectedCallback() { if (!this.shadowRoot) this.attachShadow({ mode: 'open' }).innerHTML = '<span>card</span><button onclick="window.picked = this.getRootNode().host.title"><svg width=12 height=12></svg></button>'; } }),
+           customElements.define('x-app', class extends HTMLElement { connectedCallback() { if (!this.shadowRoot) this.attachShadow({ mode: 'open' }).innerHTML = '<x-card title=Nickel></x-card><x-card title=Brass></x-card>'; } }),
+           document.body.insertAdjacentHTML('beforeend', '<button>Decoy</button><x-app id=app></x-app>'), 1)"#,
+    ]);
+    assert_eq!(s.ok(&["get", "count", "#app >>> x-card >>> button"]), 2);
+    assert_eq!(s.ok(&["get", "count", "#app >>> button"]), 2, "a shadow root under the host's counts");
+    assert_eq!(s.ok(&["get", "count", "#app >>> nothing"]), 0);
+    let found = s.ok(&["locate", "--selector", "#app >>> x-card:nth-of-type(2) >>> button"]);
+    assert_eq!(
+        found["locators"],
+        serde_json::json!([{"kind": "css", "flags": ["--selector", "#app >>> x-card:nth-of-type(2) >>> button"]}]),
+        "{found}"
+    );
+    s.ok(&["click", "--selector", "#app >>> x-card:nth-of-type(2) >>> button"]);
+    assert_eq!(s.ok(&["eval", "window.picked"]), "Brass");
+}

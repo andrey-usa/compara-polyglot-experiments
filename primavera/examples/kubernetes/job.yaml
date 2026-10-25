@@ -1,0 +1,52 @@
+# primavera as a Kubernetes (or OpenShift) Job: the tests from a ConfigMap,
+# the app at a Service in the cluster, JUnit on stdout's last lines and in
+# the pod's /work/out. The image: `docker build -f primavera/Dockerfile`
+# (see primavera's README), pushed where the cluster pulls from.
+#
+#   kubectl create configmap pv-tests --from-file=tests/
+#   kubectl apply -f job.yaml && kubectl logs -f job/primavera
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: primavera
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: primavera
+          image: registry.example.com/primavera:latest
+          args: ["run", "/tests", "--base-url", "http://shop.default.svc:8080", "--workers", "2",
+                 "--junit", "/work/out/junit.xml", "--evidence", "/work/out/evidence"]
+          env:
+            # The root filesystem is read-only: Chrome's caches go here.
+            - { name: HOME, value: /tmp }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits: { memory: 2Gi }
+          volumeMounts:
+            - { name: tests, mountPath: /tests, readOnly: true }
+            - { name: work, mountPath: /work }
+            - { name: tmp, mountPath: /tmp }
+            # Chrome's shared memory: the default 64 MB is too small.
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: tests
+          configMap: { name: pv-tests }
+        - name: work
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 512Mi }

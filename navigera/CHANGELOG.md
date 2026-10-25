@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `--near <text>` with a locator: the match whose own part of the page
+  (its card, row or section) shows the text. `locate` writes it when a
+  role and name match more than one element, before falling back to a CSS
+  path.
+- `locate <target>`: the locators that find an element again, most stable
+  first (test id, role and name, label, placeholder, text, CSS), each kept
+  only when the finder an op would use picks that element on the page;
+  `--frame` added inside a frame (a cross-origin one named from the page
+  that holds it); `secret: true` for a password field. An element in a
+  shadow root gets its hosts' path: `--selector "#app >>> x-card >>> button"`.
+- `--selector "host >>> inner"`: `inner` inside the open shadow root of an
+  element `host` matches (or a shadow root under it), for every op,
+  `wait --selector` and `get count`.
+- `history [--clear]`: the actions a session ran and its waits, oldest first; one on a
+  ref carries its element's `locate` from just before it ran, and each
+  what the page said after it (title, heading, status messages). What
+  `primavera from-session` turns into a test.
+
 ### Fixed
 
 - A `goto` to a server that takes the connection and never answers fails
@@ -13,12 +33,25 @@ All notable changes to this project are documented here. The format follows
   (it had answered nothing while the dead load was pending, so the next
   `url` or `ax`, and a test runner's failure screenshot, each waited their
   whole timeout too: one failed step cost 105 s).
+- A control inside its `<label>` (a select, a textarea) is named by the
+  label's own words for `--label`/`--name`, not with its options' text.
 - `get box` of an element inside an iframe is in top-level viewport pixels
   (each frame's offset added), as `mouse` takes them and Playwright's
   `boundingBox()` reports; it was relative to the element's own frame.
 - `--natural` with chrome-headless-shell as the browser (`--chromium`,
   `$CHROME_BIN`) is refused with a message instead of starting a browser
   that still tells pages it is headless.
+- `--from` copies Chrome 156's local storage, which is one `LocalStorage`
+  SQLite file there (with its journal) instead of a `Local Storage`
+  directory: sign-ins kept in local storage came over empty.
+- A `--profile` browser falls back to no sandbox the way navigera's own
+  launches do (as root, with `NAVIGERA_NO_SANDBOX`, or after a first start
+  that failed for want of one); it had exited and the profile could not
+  be used on such a machine.
+
+### Security
+
+- tokio 1.54 (RUSTSEC-2026-0386).
 
 ## [0.6.0] - 2026-10-24
 

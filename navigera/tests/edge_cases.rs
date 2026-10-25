@@ -293,6 +293,35 @@ fn cross_origin_iframe_ref_click_is_trusted() {
     assert!(after.contains("clicked trusted=true"), "{after}");
 }
 
+/// A ref inside a cross-origin iframe is located from inside the frame,
+/// the frame named from the page that holds it; the locator finds it again.
+#[test]
+fn a_ref_in_a_cross_origin_frame_is_located_with_its_frame() {
+    if !chrome_available() {
+        return;
+    }
+    let site = start_site();
+    let s = Session::start("xlocate");
+    s.ok(&["goto", &format!("{}/xframe", site.base)]);
+    s.ok(&["wait", "--ms", "300"]);
+    let ax = s.ok(&["ax"]).as_str().unwrap_or_default().to_string();
+    let line = ax.lines().find(|l| l.contains("Pay now")).unwrap_or_else(|| panic!("no Pay now in:\n{ax}"));
+    let r = line.split("ref=").nth(1).unwrap().chars().take_while(char::is_ascii_digit).collect::<String>();
+    let found = s.ok(&["locate", &r]);
+    let first: Vec<String> = found["locators"][0]["flags"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no locator: {found}"))
+        .iter()
+        .map(|f| f.as_str().unwrap().to_string())
+        .collect();
+    assert!(first.iter().any(|f| f == "--frame"), "{found}");
+    let mut click = vec!["click"];
+    click.extend(first.iter().map(String::as_str));
+    s.ok(&click);
+    let after = s.ok(&["ax"]).as_str().unwrap_or_default().to_string();
+    assert!(after.contains("clicked trusted=true"), "{after}");
+}
+
 /// A relative upload path means the caller's directory, not the session
 /// server's; screenshots report where they were written.
 #[test]

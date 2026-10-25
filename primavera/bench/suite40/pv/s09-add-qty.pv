@@ -1,0 +1,15 @@
+# Add to cart from the detail page with a chosen quantity.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "The detail page adds the chosen quantity"
+  goto /shop/p/101 --wait commit
+  fill --selector "#qty" --value "3"
+  click --selector "#detail-add"
+  expect --selector "#cart-count" text is 3

@@ -1,0 +1,15 @@
+# The header Docs link is target=_blank.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "The docs link opens in a new tab"
+  click --role link --name "Docs"
+  tab-select 1
+  expect url contains "/docs"
+  expect text "Returns FAQ"

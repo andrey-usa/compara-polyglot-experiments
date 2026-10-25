@@ -1,0 +1,59 @@
+name: primavera
+description: Run plain-text web tests (.pv and .feature files) with primavera on the runner's Chrome.
+author: andrey-usa
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  paths:
+    description: ".pv/.feature files or directories, separated by spaces"
+    default: "."
+  base-url:
+    description: "where relative URLs (goto /cart) point; else `base` in the file or primavera.toml"
+    default: ""
+  args:
+    description: "more `primavera run` options, separated by spaces (e.g. --workers auto --retries 1 --junit report.xml)"
+    default: ""
+  working-directory:
+    description: "where to run (paths are relative to it)"
+    default: "."
+  version:
+    description: "a primavera release tag (v0.3.0), latest, or source (a build from this action's own commit)"
+    default: "latest"
+  navigera-ref:
+    description: "the navigera branch or commit a source build uses"
+    default: "session-history"
+
+outputs:
+  evidence:
+    description: "the run's evidence directory (failure screenshots, traces, downloads)"
+    value: ${{ steps.run.outputs.evidence }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install primavera
+      shell: bash
+      env:
+        PV_VERSION: ${{ inputs.version }}
+        PV_NAVIGERA_REF: ${{ inputs.navigera-ref }}
+        PV_ACTION: ${{ github.action_path }}
+      run: bash "$PV_ACTION/action/install.sh"
+    - name: Run
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PV_PATHS: ${{ inputs.paths }}
+        PV_BASE_URL: ${{ inputs.base-url }}
+        PV_ARGS: ${{ inputs.args }}
+      run: |
+        read -ra paths <<< "$PV_PATHS"
+        read -ra extra <<< "$PV_ARGS"
+        set -- run "${paths[@]}"
+        [ -n "$PV_BASE_URL" ] && set -- "$@" --base-url "$PV_BASE_URL"
+        evidence="$RUNNER_TEMP/primavera-evidence"
+        case " $PV_ARGS " in *" --evidence "*) ;; *) set -- "$@" --evidence "$evidence" ;; esac
+        echo "evidence=$evidence" >> "$GITHUB_OUTPUT"
+        primavera "$@" "${extra[@]}"

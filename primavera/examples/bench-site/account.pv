@@ -1,0 +1,25 @@
+set email = demo@acme.test
+
+scenario "Signing in shows the orders"
+  goto /login
+  fill --label Email ${email}
+  fill --label Password ${PASSWORD:-hunter2}
+  click --role button --name "Sign in"
+  expect url ends-with /account
+  expect text "Signed in as"
+  expect --selector "#pageinfo" text starts-with "Page 1 of"
+  expect no errors
+
+scenario "A wrong password stays on the sign-in page"
+  goto /login
+  fill --label Email ${email}
+  fill --label Password wrong
+  click --role button --name "Sign in"
+  expect --role alert text contains "Wrong email or password"
+  expect title contains "Sign in"
+
+scenario "The returns FAQ opens"
+  goto /docs
+  click --text "Returns FAQ"
+  expect text "days from delivery"
+  expect --selector "#returns-faq" attr open is ""
