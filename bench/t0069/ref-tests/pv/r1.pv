@@ -1,0 +1,7 @@
+before each
+  goto /shop --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "adding from the grid counts in the cart"
+  click --role button --name "Add Nickel Hinge to cart"
+  expect --selector "#cart-count" text is 1

@@ -1,0 +1,7 @@
+before each
+  goto /shop --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "renamed button still adds"
+  click --role button --name "Add Nickel Hinge to basket"
+  expect --selector "#cart-count" text is 1

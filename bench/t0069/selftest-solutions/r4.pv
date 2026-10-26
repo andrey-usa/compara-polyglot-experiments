@@ -1,0 +1,9 @@
+before each
+  goto /shop --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "shadow search still narrows"
+  fill --selector "#q" "copper hinge"
+  press Enter
+  expect --role status text contains "1 of 1"
+  expect --role link --name "Copper Hinge" visible

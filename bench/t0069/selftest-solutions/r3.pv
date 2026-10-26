@@ -1,0 +1,16 @@
+scenario "checkout past the overlay"
+  goto /shop/p/101 --wait commit
+  click --selector "#cookie-accept"
+  click --selector "#detail-add"
+  goto /checkout --wait commit
+  click --selector "#cookie-accept"
+  fill --selector "#name" --value "Ada Lovelace"
+  select --selector "#country" --value "United States"
+  click --selector 'input[name="speed"][value="standard"]'
+  click --selector "#continue"
+  fill --selector "#card" --value "4242424242424242" --frame "#payframe"
+  fill --selector "#exp" --value "12/30" --frame "#payframe"
+  fill --selector "#cvc" --value "123" --frame "#payframe"
+  dialog --accept
+  click --selector "#place"
+  expect --selector "#order-id" visible

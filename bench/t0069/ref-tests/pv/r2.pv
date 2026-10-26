@@ -1,0 +1,8 @@
+before each
+  goto /shop --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "open the product detail"
+  click --role link --name "Nickel Hinge"
+  expect --role heading --name "Nickel Hinge" visible
+  expect --selector "#detail-add" visible

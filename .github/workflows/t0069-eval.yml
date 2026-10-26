@@ -1,0 +1,183 @@
+# T-0069 primavera M3 exit eval (experiment-38). PAID RUN: workflow_dispatch only;
+# one explicit dispatch per approved run. Owner authorization for uncapped spend
+# within this finite 72-trial scope was given on the owner's own channel (recorded
+# in the private board notes); this file documents scope, it does not grant it.
+# The harness WAL (reserve/settle/unknown) accounts every request.
+#
+# PRIVACY MODEL (public repo: Actions logs and artifacts are world-visible):
+# - Job logs carry status lines only. Harness stdout/stderr (scores, costs,
+#   prompts, episodes, ledgers) is redirected to files and NEVER printed.
+# - Results travel as an ENCRYPTED artifact (encrypt-then-MAC): a unique
+#   unpredictable 512-bit per-bundle key (independent 256-bit AES-256-CBC data
+#   key + 256-bit HMAC-SHA256 key), HMAC computed over wrapped-key || bundle,
+#   the bundle key RSA-OAEP-SHA256-wrapped to bench/t0069/ci-results-pub.pem.
+#   The private unwrap key lives only in the private board repo. No decryption
+#   material, no board-write credential, and no repo secret beyond the existing
+#   `main` environment's SILICONFLOW_API_KEY ever exists in CI. Anyone
+#   downloading the public artifact gets ciphertext + tag only.
+# - SILICONFLOW_API_KEY isolation: the harness pops it from its environment at
+#   startup, never puts it in any child env (including the site server), and
+#   every model-generated shell command plus every scoring run of model-written
+#   code executes as the dedicated unprivileged user `benchr`
+#   (sudo -n -u benchr env -i ...), so no credential-bearing process is
+#   reachable from model code. Env filtering alone is NOT treated as
+#   sufficient: same-uid /proc/<pid>/environ would otherwise expose the key.
+# - The zero-spend `preflight` job runs the seeded-solution self-test through
+#   the exact restricted-user path on both arms and gates all paid jobs.
+# - Checkouts use persist-credentials: false; workflow permissions are read-only.
+name: T-0069 M3 exit eval
+permissions:
+  contents: read
+on:
+  workflow_dispatch:
+    inputs:
+      slice_mod:
+        description: "deterministic slices per arm (matrix must match)"
+        default: "2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: andrey-usa/primavera, ref: 3aa36db15c8ba6ad38dd839a87a8e941c5f69178, path: primavera, persist-credentials: false }
+      - uses: actions/checkout@v4
+        with: { repository: andrey-usa/navigera, ref: cc300d30f2fa72896c522fadc50293db7a38bdc7, path: navigera, persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { shared-key: t0069 }
+      - name: build primavera (navigera is compiled in) at pinned commits
+        run: |
+          cd navigera && cargo build --release && cd ../primavera && cargo build --release
+          ./primavera/target/release/primavera --version
+          sha256sum primavera/target/release/primavera
+      - uses: actions/upload-artifact@v4
+        with: { name: primavera-bin, path: primavera/target/release/primavera, retention-days: 1 }
+
+  preflight:
+    # Zero model spend: seeded-solution self-test through the full toolchain,
+    # including restricted-user execution, on both arms. Gates the paid eval.
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [primavera, playwright]
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: experiments, persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: primavera-bin, path: bin }
+      - run: chmod +x bin/primavera
+      - name: create restricted bench user
+        run: sudo useradd benchr || true
+      - name: arm B toolchain (playwright, shared browser path)
+        if: matrix.arm == 'playwright'
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+        run: |
+          sudo mkdir -p /opt/pw-browsers && sudo chmod 777 /opt/pw-browsers
+          mkdir -p pw && cd pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null 2>&1
+          sudo chmod -R a+rX /opt/pw-browsers
+          echo "pw ready: $(npx playwright --version)"
+      - name: self-test via restricted user (stdout to file; status lines only)
+        env:
+          ARM: ${{ matrix.arm }}
+          PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+        run: |
+          cd experiments/bench/t0069
+          python3 harness-t0069_run.py --arm "$ARM" --self-test \
+            --as-user benchr \
+            --primavera-bin "$GITHUB_WORKSPACE/bin/primavera" --pw-dir "$GITHUB_WORKSPACE/pw" \
+            --out out/preflight-$ARM > "out/preflight-$ARM.log" 2>&1
+          tail -2 "out/preflight-$ARM.log"
+      - name: gate on expected self-test scores
+        run: python3 experiments/bench/t0069/preflight-check.py --arm ${{ matrix.arm }} --out experiments/bench/t0069/out
+
+  eval:
+    needs: [build, preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    environment: main
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [primavera, playwright]
+        slice: [0, 1]
+    env:
+      SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+      SLICE_MOD: ${{ github.event.inputs.slice_mod || '2' }}
+      PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: experiments, persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: primavera-bin, path: bin }
+      - run: chmod +x bin/primavera
+      - name: create restricted bench user
+        run: sudo useradd benchr || true
+      - name: arm B toolchain (playwright, shared browser path)
+        if: matrix.arm == 'playwright'
+        run: |
+          sudo mkdir -p /opt/pw-browsers && sudo chmod 777 /opt/pw-browsers
+          mkdir -p pw && cd pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null 2>&1
+          sudo chmod -R a+rX /opt/pw-browsers
+          echo "pw ready: $(npx playwright --version)"
+      - name: run slice (stdout/stderr to files only)
+        env:
+          ARM: ${{ matrix.arm }}
+          SLICE: ${{ matrix.slice }}
+        run: |
+          cd experiments/bench/t0069
+          RUNTAG="ci-${{ github.run_id }}-${{ matrix.arm }}-s${{ matrix.slice }}"
+          mkdir -p "out/$RUNTAG"
+          set +e
+          python3 harness-t0069_run.py --arm "$ARM" --trials 3 \
+            --slice-mod "$SLICE_MOD" --slice-index "$SLICE" \
+            --as-user benchr \
+            --primavera-bin "$GITHUB_WORKSPACE/bin/primavera" --pw-dir "$GITHUB_WORKSPACE/pw" \
+            --out "out/$RUNTAG" --uncapped \
+            > "out/$RUNTAG/harness-stdout.log" 2>&1
+          RC=$?
+          set -e
+          echo "$RC" > "out/$RUNTAG/exit-code.txt"
+          echo "RUNTAG=$RUNTAG" >> "$GITHUB_ENV"
+          echo "slice finished: arm=$ARM slice=$SLICE (detail stays off the public log)"
+      - name: encrypt results (encrypt-then-MAC; public key only, no secrets here)
+        if: always()
+        run: |
+          cd experiments/bench/t0069
+          mkdir -p /tmp/upload
+          tar czf "/tmp/${RUNTAG}.tar.gz" "out/${RUNTAG}"
+          head -c 64 /dev/urandom > /tmp/symkey.bin
+          ENCKEYHEX=$(head -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
+          MACKEYHEX=$(tail -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
+          head -c16 /dev/urandom > /tmp/iv.bin
+          IVHEX=$(od -An -tx1 /tmp/iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$ENCKEYHEX" -iv "$IVHEX" \
+            -in "/tmp/${RUNTAG}.tar.gz" -out /tmp/cipher.bin
+          cat /tmp/iv.bin /tmp/cipher.bin > "/tmp/upload/${RUNTAG}.tar.gz.enc"
+          openssl pkeyutl -encrypt -pubin -inkey ci-results-pub.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/symkey.bin -out "/tmp/upload/${RUNTAG}.symkey.enc"
+          cat "/tmp/upload/${RUNTAG}.symkey.enc" "/tmp/upload/${RUNTAG}.tar.gz.enc" \
+            | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$MACKEYHEX" -binary \
+            > "/tmp/upload/${RUNTAG}.mac"
+          shred -u /tmp/symkey.bin /tmp/iv.bin /tmp/cipher.bin "/tmp/${RUNTAG}.tar.gz"
+          echo "results encrypted (ciphertext + tag only leave this runner)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.arm }}-s${{ matrix.slice }}
+          path: /tmp/upload/
+          retention-days: 1
+      - name: propagate recorded benchmark result
+        if: always()
+        run: |
+          RC=$(cat "experiments/bench/t0069/out/${RUNTAG}/exit-code.txt" 2>/dev/null || echo 99)
+          echo "slice exit code: $RC (decrypted results carry the detail)"
+          exit "$RC"

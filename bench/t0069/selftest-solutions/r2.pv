@@ -1,0 +1,8 @@
+before each
+  goto /shop --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "card button opens detail"
+  click --selector ".card-open"
+  expect --role heading --name "Nickel Hinge" visible
+  expect --selector "#detail-add" visible
