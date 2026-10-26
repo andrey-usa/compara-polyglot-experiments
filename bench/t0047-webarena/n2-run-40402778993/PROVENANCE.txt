@@ -1,0 +1,6 @@
+cell: n2
+tool: navigera variant: exp19-axclick
+model: deepseek-ai/DeepSeek-V4.1-Flash; tasks: 48 from offset 0; cell guard $0.65
+run: 40402778993 (attempt 1)
+branch commit: 844f5c56536d80150ffb67f9811e39dc8e5f3739
+navigera tree: 7625acc0967e564126b0b1467ddec7790b172b15
