@@ -1,5 +1,5 @@
 ---
-title: llms.txt
+title: navigera llms.txt
 description: "Install: curl -fsSL https://raw.githubusercontent.com/andrey-usa/navigera/master/install.sh | sh (Windows PowerShell: irm https://raw.githubusercontent.com/andr"
 ---
 # navigera

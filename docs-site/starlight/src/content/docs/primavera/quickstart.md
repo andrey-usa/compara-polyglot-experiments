@@ -1,5 +1,5 @@
 ---
-title: Quick start
+title: Quick start primavera
 description: "One copy-paste path from a built binary to a first passing scenario. Run in CI on every push."
 ---
 
@@ -8,11 +8,15 @@ description: "One copy-paste path from a built binary to a first passing scenari
 One path, start to finish. It builds primavera (with navigera beside
 it, as [Install](/primavera/install/) describes), writes one scenario
 against a public page, and runs it. This exact sequence is run in CI on
-every push to the site branch, on the runner's Chrome.
+every push to the site branch, on the runner's Chrome. Note the
+navigera branch: primavera's CI builds against `session-history`, and
+navigera `master` does not currently compile against primavera `next`
+(see [Install](/primavera/install/) for the details) — so the quick
+start pins `session-history` deliberately.
 
 ```sh
 mkdir work && cd work
-git clone https://github.com/andrey-usa/navigera.git
+git clone --branch session-history https://github.com/andrey-usa/navigera.git
 git clone --branch next https://github.com/andrey-usa/primavera.git
 cd primavera && cargo build --release && cd ..
 mkdir -p tests

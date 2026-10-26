@@ -1,5 +1,5 @@
 ---
-title: Changelog
+title: compara changelog
 description: "All notable changes to this project are documented here. The format follows"
 ---
 # Changelog

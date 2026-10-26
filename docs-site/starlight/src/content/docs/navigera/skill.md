@@ -1,5 +1,5 @@
 ---
-title: Agent skill
+title: navigera agent skill
 description: "A single native binary that drives Chrome over the DevTools Protocol. Use it"
 ---
 # navigera

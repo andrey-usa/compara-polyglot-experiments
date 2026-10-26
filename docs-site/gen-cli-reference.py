@@ -22,7 +22,12 @@ def run(args, timeout=60):
     except Exception as e:
         return None
     out = (r.stdout or "") + (r.stderr or "")
-    return out.strip() if r.returncode == 0 and out.strip() else None
+    out = out.strip()
+    # Some CLIs (primavera) print usage on stderr / with a non-zero exit
+    # for unknown flags; usage text is still the reference.
+    if out and (r.returncode == 0 or "usage:" in out):
+        return out
+    return None
 
 
 def discover_subcommands(top_help, binary):
@@ -59,9 +64,13 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--title", default="CLI reference")
     ap.add_argument("--source", default="")
+    ap.add_argument("--no-subcommands", action="store_true",
+                    help="top level only: the CLI prints its whole reference "
+                         "in one usage text (primavera), so discovered "
+                         "'subcommands' from prose would be junk")
     args = ap.parse_args()
     binary = args.bin
-    top = run([binary, "--help"]) or run([binary, "help"]) or ""
+    top = run([binary, "--help"]) or run([binary, "help"]) or run([binary]) or ""
     version = run([binary, "--version"]) or ""
     if not top:
         print(f"no --help output from {binary}", file=sys.stderr)
@@ -73,7 +82,7 @@ def main():
     if version:
         parts.append(f"\nBinary reports: `{version.splitlines()[0]}`.")
     parts.append("\n## Top level\n\n```text\n" + top + "\n```\n")
-    for cmd in discover_subcommands(top, binary):
+    for cmd in ([] if args.no_subcommands else discover_subcommands(top, binary)):
         text = run([binary, cmd, "--help"]) or run([binary, "help", cmd])
         if text and text != top:
             parts.append(f"\n## `{cmd}`\n\n```text\n{text}\n```\n")

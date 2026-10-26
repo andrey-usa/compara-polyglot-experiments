@@ -1,5 +1,5 @@
 ---
-title: Install
+title: Install compara
 description: "Every way to install compara, from the README."
 ---
 

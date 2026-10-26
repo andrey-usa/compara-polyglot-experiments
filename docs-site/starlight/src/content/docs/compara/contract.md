@@ -1,5 +1,5 @@
 ---
-title: Report JSON contract
+title: compara report JSON contract
 description: "The --json summary schema (docs/contract.schema.json):"
 ---
 # Report JSON contract

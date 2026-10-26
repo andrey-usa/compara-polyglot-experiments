@@ -1,5 +1,5 @@
 ---
-title: Contributing
+title: compara contributing
 description: "Bug reports and pull requests are welcome. For anything larger than a fix,"
 ---
 # Contributing to compara

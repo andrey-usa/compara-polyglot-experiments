@@ -1,5 +1,5 @@
 ---
-title: Guides
+title: Guides navigera
 description: "Task-oriented guides for navigera — read a page, act on it, wait, capture, hand a session over."
 ---
 

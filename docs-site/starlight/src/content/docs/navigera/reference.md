@@ -1,5 +1,5 @@
 ---
-title: Reference
+title: navigera reference
 description: "navigera drives a real Chrome over the DevTools Protocol from one native"
 ---
 # `navigera` reference

@@ -8,6 +8,8 @@ export default defineConfig({
 		starlight({
 			title: 'Docs',
 			description: 'Documentation for navigera, compara and primavera.',
+			// Site a11y fixes for Starlight's own chrome (see public/a11y.js).
+			head: [{ tag: 'script', attrs: { src: '/a11y.js', defer: true } }],
 			social: [
 				{ icon: 'github', label: 'navigera on GitHub', href: 'https://github.com/andrey-usa/navigera' },
 				{ icon: 'github', label: 'compara on GitHub', href: 'https://github.com/andrey-usa/compara' },

@@ -1,5 +1,5 @@
 ---
-title: Install
+title: Install navigera
 description: "Every way to install navigera, from the README."
 ---
 

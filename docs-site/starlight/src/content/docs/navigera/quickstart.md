@@ -1,5 +1,5 @@
 ---
-title: Quick start
+title: Quick start navigera
 description: "One copy-paste path from install to a driven browser session. Run in CI on every push."
 ---
 

@@ -1,5 +1,5 @@
 ---
-title: Install
+title: Install primavera
 description: "Every way to install primavera, from the README. Pre-release: no package-manager release yet."
 ---
 
@@ -22,6 +22,17 @@ work/
 $ cd primavera && cargo build --release
 $ ./target/release/primavera --version
 ```
+
+Pin the navigera checkout to `session-history`: that is what
+primavera's own CI builds against (`NAVIGERA_REF`, default
+`session-history`, in its `ci.yml`). Navigera `master` does not
+currently compile against primavera `next` — at primavera `next`
+`fa3fe34` against navigera `master` `ba37ede` the build fails with 18
+errors (missing `cli` module, `in_working_dir`, `locate_js`, private
+MCP items, and others). Until the repos re-align, treat
+`session-history` as the pairing the docs promise, and `master` as a
+known docs gap (proposed README fix: name the navigera ref in the
+Building section).
 
 ## GitHub Action
 

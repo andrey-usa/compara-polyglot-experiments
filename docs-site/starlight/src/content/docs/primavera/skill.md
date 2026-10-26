@@ -1,5 +1,5 @@
 ---
-title: Agent skill
+title: primavera agent skill
 description: "One native binary runs .pv scenario files on Chrome through navigera,"
 ---
 # primavera

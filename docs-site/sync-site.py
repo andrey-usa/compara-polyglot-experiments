@@ -193,29 +193,29 @@ def main():
 
     # navigera
     sync("navigera", "README.md", "navigera/index.md", "navigera")
-    sync("navigera", "docs/navigera.md", "navigera/reference.md", "Reference")
-    sync("navigera", "docs/multi-model.md", "navigera/multi-model.md", "Multi-model")
-    sync("navigera", "skills/navigera/SKILL.md", "navigera/skill.md", "Agent skill")
-    sync("navigera", "CHANGELOG.md", "navigera/changelog.md", "Changelog")
-    sync("navigera", "llms.txt", "navigera/llms.md", "llms.txt")
-    sync("navigera", "CONTRIBUTING.md", "navigera/contributing.md", "Contributing")
+    sync("navigera", "docs/navigera.md", "navigera/reference.md", "navigera reference")
+    sync("navigera", "docs/multi-model.md", "navigera/multi-model.md", "navigera multi-model")
+    sync("navigera", "skills/navigera/SKILL.md", "navigera/skill.md", "navigera agent skill")
+    sync("navigera", "CHANGELOG.md", "navigera/changelog.md", "navigera changelog")
+    sync("navigera", "llms.txt", "navigera/llms.md", "navigera llms.txt")
+    sync("navigera", "CONTRIBUTING.md", "navigera/contributing.md", "navigera contributing")
     # compara
     sync("compara", "README.md", "compara/index.md", "compara")
-    sync("compara", "CHANGELOG.md", "compara/changelog.md", "Changelog")
-    sync("compara", "CONTRIBUTING.md", "compara/contributing.md", "Contributing")
+    sync("compara", "CHANGELOG.md", "compara/changelog.md", "compara changelog")
+    sync("compara", "CONTRIBUTING.md", "compara/contributing.md", "compara contributing")
     readme = (src["compara"] / "README.md").read_text(encoding="utf-8")
     guides = extract_sections(readme, ["Cloud and containers", "Speed", "Engines"])
     guides = fix_links(guides, "compara", site_pages["compara"], report["links"])
     guides = fix_table_headers(guides, report["headers"])
-    report["pages"].append(write_page("compara/guides.md", "Guides", guides))
+    report["pages"].append(write_page("compara/guides.md", "compara guides", guides))
     schema = (src["compara"] / "docs/contract.schema.json").read_text(encoding="utf-8")
     report["pages"].append(write_page(
-        "compara/contract.md", "Report JSON contract",
+        "compara/contract.md", "compara report JSON contract",
         "# Report JSON contract\n\nThe `--json` summary schema "
         "(`docs/contract.schema.json`):\n\n```json\n" + schema + "```\n"))
     # primavera (no CHANGELOG.md in repo: the changelog page is hand-written)
     sync("primavera", "README.md", "primavera/index.md", "primavera")
-    sync("primavera", "skills/primavera/SKILL.md", "primavera/skill.md", "Agent skill")
+    sync("primavera", "skills/primavera/SKILL.md", "primavera/skill.md", "primavera agent skill")
     print(json.dumps(report, indent=2))
     return 0
 

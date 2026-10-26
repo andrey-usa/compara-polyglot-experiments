@@ -1,5 +1,5 @@
 ---
-title: Multi-model
+title: navigera multi-model
 description: "An agent that browses spends most of its tokens reading pages. A single"
 ---
 # Several models, one browser

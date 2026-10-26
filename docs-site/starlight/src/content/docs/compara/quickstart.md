@@ -1,5 +1,5 @@
 ---
-title: Quick start
+title: Quick start compara
 description: "One copy-paste path from install to a first comparison. Run in CI on every push."
 ---
 

@@ -1,5 +1,5 @@
 ---
-title: Guides
+title: compara guides
 description: "Any file argument can be a URL, and so can -o, --json and"
 ---
 ## Cloud and containers
