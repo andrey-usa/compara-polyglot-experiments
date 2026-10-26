@@ -1,0 +1,11 @@
+base ${BASE_URL}
+
+before each
+  goto /shop --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "search narrows the product list"
+  fill --label "Search products" Hinge
+  press Enter
+  expect --role status text is "Showing 6 of 6 products"
+  expect --role link --name "Nickel Hinge" visible

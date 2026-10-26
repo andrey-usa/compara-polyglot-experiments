@@ -12,9 +12,9 @@ ap.add_argument("--arm", required=True, choices=["primavera", "playwright"])
 ap.add_argument("--out", required=True)
 a = ap.parse_args()
 
-expected = {"R1": 1, "R2": 1, "R3": 1, "R4": 1}
-if a.arm == "primavera":
-    expected["W3"] = 1  # seeded cross-task write-task solution (pv arm only)
+# T-0091: every task has a seeded reference solution in both arms; all must be
+# green (pass clean, fail broken) before any paid request runs.
+expected = {f"{k}{n}": 1 for k in ("W", "R") for n in (1, 2, 3, 4, 5, 6, 7, 8) if not (k == "R" and n > 4)}
 
 recs = []
 for p in glob.glob(os.path.join(a.out, "**", "t0069-episodes-*.jsonl"), recursive=True):

@@ -1,0 +1,14 @@
+base ${BASE_URL}
+
+before each
+  goto /shop --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "a valid coupon shows a discount and lowers the total"
+  click --role button --name "Add Nickel Hinge to cart"
+  goto /cart
+  fill --label "Coupon code" SAVE10
+  click --role button --name "Apply coupon"
+  expect text "Discount (SAVE10): −$3.42"
+  goto /checkout
+  expect text "Order total before shipping: $30.77"

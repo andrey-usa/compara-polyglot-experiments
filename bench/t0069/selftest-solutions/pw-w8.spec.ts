@@ -1,0 +1,20 @@
+import { test, expect } from '@playwright/test';
+test('placing an order end to end shows an order id', async ({ page }) => {
+  page.on('dialog', (d) => d.accept());
+  await page.goto('/shop');
+  await page.getByRole('button', { name: 'Accept all' }).click().catch(() => {});
+  await page.getByRole('button', { name: 'Add Nickel Hinge to cart' }).click();
+  await page.goto('/cart');
+  await page.getByRole('button', { name: 'Proceed to checkout' }).click();
+  await page.getByLabel('Full name').fill('Sam Doe');
+  await page.getByLabel('Country').selectOption({ label: 'Canada' });
+  await page.getByRole('radio', { name: /Standard/ }).check();
+  await page.getByRole('button', { name: 'Continue to payment' }).click();
+  const frame = page.frameLocator('#payframe');
+  await frame.getByLabel('Card number').fill('4242424242424242');
+  await frame.getByLabel('Expiry (MM/YY)').fill('12/29');
+  await frame.getByLabel('CVC').fill('123');
+  await page.getByRole('button', { name: 'Place order' }).click();
+  await expect(page.getByText('is confirmed.')).toBeVisible();
+  await expect(page.locator('#order-id')).toHaveText('A-2001');
+});

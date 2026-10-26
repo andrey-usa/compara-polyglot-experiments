@@ -1,0 +1,11 @@
+base ${BASE_URL}
+
+before each
+  goto /shop --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "price low to high lists cheapest first"
+  select --label "Sort by" "Price: low to high"
+  expect --role status text contains "60 products"
+  expect js "document.querySelector('#grid .card h3').textContent.trim()" is "Nickel Spring"
+  expect js "document.querySelector('#grid .card .price').textContent.trim()" is "$3.04"

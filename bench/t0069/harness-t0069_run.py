@@ -19,8 +19,8 @@ Model-executed shell never sees *_API_KEY. Prompt gate pins each arm's
 manual bytes (primavera `skill` output / playwright-skill.md) before the
 first paid request.
 
-Self-test (no model, zero spend):
-  python3 harness-t0069_run.py --arm primavera --self-test --tasks R1,W1,W3
+Self-test (no model, zero spend; T-0091: every task seeded in both arms):
+  python3 harness-t0069_run.py --arm primavera --self-test
 """
 import argparse, glob, hashlib, json, os, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request
 
@@ -73,6 +73,18 @@ TASKS = {
     "R4": ("repair", "its original intent: searching narrows the product list",
            "search", "r4", [], "r4.pv"),
 }
+
+
+# T-0091: seeded reference solution for EVERY task in both arms; the preflight
+# gate requires all of them green (pass clean, fail broken) before a paid run.
+PV_SELFTEST = {"R1": "r1.pv", "R2": "r2.pv", "R3": "r3.pv", "R4": "r4.pv",
+               "W1": "ref-w1.pv", "W2": "ref-w2.pv", "W3": "ref-r1.pv",
+               "W4": "ref-w4.pv", "W5": "ref-w5.pv", "W6": "ref-w6.pv",
+               "W7": "ref-w7.pv", "W8": "ref-w8.pv"}
+PW_SELFTEST = {"R1": "pw-r1.spec.ts", "R2": "pw-r2.spec.ts", "R3": "pw-r3.spec.ts",
+               "R4": "pw-r4.spec.ts", "W1": "pw-w1.spec.ts", "W2": "pw-w2.spec.ts",
+               "W3": "pw-w3.spec.ts", "W4": "pw-w4.spec.ts", "W5": "pw-w5.spec.ts",
+               "W6": "pw-w6.spec.ts", "W7": "pw-w7.spec.ts", "W8": "pw-w8.spec.ts"}
 
 class BudgetStop(Exception):
     pass
@@ -361,6 +373,68 @@ def task_prompt(task_id, arm):
             f"run against a build where that feature is broken, and it must FAIL there.\n{facts}\n"
             f"When the test passes, reply with the single command: {DONE_CMD}")
 
+
+def reprompt_text(arm, attempt):
+    """T-0091 stall recovery: attempt 1 is the generic contract reminder;
+    attempt 2 repeats the tool's command contract and one minimal worked example."""
+    base = ("Your reply contained no shell command. Reply with EXACTLY ONE shell "
+            "command in a single fenced block and nothing else.")
+    if attempt < 2:
+        return base
+    if arm == "primavera":
+        contract = ("The primavera binary is on PATH. Run a test with: "
+                    "primavera run solution.pv --base-url $BASE_URL")
+        example = ('cat > solution.pv <<\'EOF\'\n'
+                   'base $BASE_URL\n\n'
+                   'scenario "shop loads"\n'
+                   '  goto /shop\n'
+                   '  expect text "Acme Supply"\n'
+                   'EOF')
+    else:
+        contract = ("Playwright Test is installed. Run a test with: "
+                    "npx playwright test solution.spec.ts (the config reads $BASE_URL). "
+                    "Write specs as solution.spec.ts.")
+        example = ('cat > solution.spec.ts <<\'EOF\'\n'
+                   "import { test, expect } from \'@playwright/test\';\n"
+                   "test(\'shop loads\', async ({ page }) => {\n"
+                   "  await page.goto(\'/shop\');\n"
+                   "  await expect(page.getByText(\'Acme Supply\')).toBeVisible();\n"
+                   '});\n'
+                   'EOF')
+    return (base + "\n" + contract + "\nOne minimal worked example of a single-turn "
+            "command (write your real test the same way, then run it):\n```sh\n"
+            + example + "\n```")
+
+
+_HEREDOC_RE = re.compile(r"<<-?\s*[\'\"]?(\w+)[\'\"]?\n(.*?)\n\1", re.S)
+_WRITE_TARGET_RE = re.compile(
+    r"(?:>|>>|tee\s+(?:-a\s+)?)[\s\'\"]*(?:\./)?({sol})(?:[\'\"]|\s|$)")
+
+def salvage_partial_solution(arm, workdir, commands):
+    """T-0091: when the agent never produced a runnable solution file (turn budget
+    exhausted, or no-command termination), materialize the most recent solution
+    content the model tried to write (heredoc body or redirect target) so scoring
+    sees the attempt. Never overwrites an existing non-empty solution file.
+    Returns the source turn number, or None."""
+    sol = solution_name(arm)
+    path = os.path.join(workdir, sol)
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return None
+    target = re.compile(r"(?:>|>>|tee\s+(?:-a\s+)?)[\s\'\"]*(?:\./)?"
+                        + re.escape(sol) + r"(?:[\'\"]|\s|$)")
+    for entry in reversed(commands):
+        cmd = entry.get("cmd")
+        if not cmd:
+            continue
+        m = _HEREDOC_RE.search(cmd)
+        if m and target.search(cmd):
+            body = m.group(2)
+            if body.strip():
+                with open(path, "w") as f:
+                    f.write(body + "\n")
+                return entry.get("turn")
+    return None
+
 def run_trial(arm, task_id, trial, args, ledger, site):
     kind, intent, broken, change, fx, seed = TASKS[task_id]
     rec = {"task": task_id, "kind": kind, "arm": arm, "trial": trial, "turns": 0,
@@ -382,11 +456,7 @@ def run_trial(arm, task_id, trial, args, ledger, site):
         site.start(change=change)
         base_url = site.url()
         if args.self_test:
-            pv_map = {"R1": "r1.pv", "R2": "r2.pv", "R3": "r3.pv", "R4": "r4.pv",
-                      "W1": "ref-r4.pv", "W3": "ref-r1.pv"}
-            pw_map = {"R1": "pw-r1.spec.ts", "R2": "pw-r2.spec.ts",
-                      "R3": "pw-r3.spec.ts", "R4": "pw-r4.spec.ts"}
-            st = (pv_map if arm == "primavera" else pw_map).get(task_id)
+            st = (PV_SELFTEST if arm == "primavera" else PW_SELFTEST).get(task_id)
             if not st:
                 rec["error"] = "self-test: no seeded solution for this task"
                 return rec
@@ -414,9 +484,7 @@ def run_trial(arm, task_id, trial, args, ledger, site):
                     if reprompts < 2:
                         reprompts += 1
                         messages.append({"role": "assistant", "content": text})
-                        messages.append({"role": "user", "content":
-                            "Your reply contained no shell command. Reply with EXACTLY ONE shell command "
-                            "in a single fenced block and nothing else."})
+                        messages.append({"role": "user", "content": reprompt_text(arm, reprompts)})
                         continue
                     rec["error"] = f"model produced no command after 2 re-prompts (last: {kind_r})"
                     break
@@ -439,6 +507,17 @@ def run_trial(arm, task_id, trial, args, ledger, site):
                 messages.append({"role": "assistant", "content": text})
                 messages.append({"role": "user", "content":
                     f"Command output (truncated):\n{(r.stdout + r.stderr)[:3000]}"})
+        # T-0091: if the agent left no runnable solution file, materialize the most
+        # recent attempted write so scoring sees the attempt. The episode records
+        # where the scored solution came from (agent file vs salvaged partial) -
+        # a salvaged partial is the model's own un-run content, not a harness edit.
+        if not args.self_test:
+            salv = salvage_partial_solution(arm, workdir, rec.get("commands", []))
+            rec["solution_origin"] = (f"salvaged-partial-turn-{salv}" if salv else
+                                      ("missing" if salv is None and not (
+                                          os.path.exists(os.path.join(workdir, solution_name(arm)))
+                                          and os.path.getsize(os.path.join(workdir, solution_name(arm))) > 0)
+                                       else "agent-file"))
         # Scoring (harness-side; no model): pass on the trial's site config, then
         # must FAIL with the task's feature broken on top of the same config.
         ok1, tail1 = run_solution(arm, workdir, base_url, args.primavera_bin, args)

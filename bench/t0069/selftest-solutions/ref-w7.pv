@@ -1,0 +1,13 @@
+base ${BASE_URL}
+
+before each
+  goto /support --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "support request with an attachment confirms a ticket id"
+  exec /bin/sh -c "printf 'delivery photo\n' > w7-note.txt"
+  select --label "Category" "Orders"
+  fill --label "Message" "Order A-1042 never arrived."
+  upload --label "Attachment (optional)" --file w7-note.txt
+  click --role button --name "Submit request"
+  expect text "Your ticket T-501 was created."

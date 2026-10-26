@@ -1,0 +1,11 @@
+base ${BASE_URL}
+
+scenario "signing in shows the order history"
+  goto /login --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+  fill --label "Email" demo@acme.test
+  fill --label "Password" hunter2
+  click --role button --name "Sign in"
+  expect text "Your orders"
+  expect text "Signed in as demo@acme.test"
+  expect text "A-1060"

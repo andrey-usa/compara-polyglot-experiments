@@ -1,0 +1,13 @@
+base ${BASE_URL}
+
+before each
+  goto /shop --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "cart lists line items and a consistent subtotal"
+  click --role button --name "Add Nickel Hinge to cart"
+  click --role button --name "Add Nickel Widget to cart"
+  goto /cart
+  expect text "Nickel Hinge"
+  expect text "Nickel Widget"
+  expect --selector "#subtotal" text is "$49.55"

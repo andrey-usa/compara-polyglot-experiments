@@ -1,0 +1,21 @@
+base ${BASE_URL}
+
+before each
+  goto /shop --wait commit
+  optional click --selector "#cookie-accept" --timeout-ms 2000
+
+scenario "placing an order end to end shows an order id"
+  click --role button --name "Add Nickel Hinge to cart"
+  goto /cart
+  click --role button --name "Proceed to checkout"
+  fill --label "Full name" "Sam Doe"
+  select --label "Country" "Canada"
+  check --role radio --name "Standard (5–8 days) — $5.00"
+  click --role button --name "Continue to payment"
+  fill --label "Card number" "4242424242424242"
+  fill --label "Expiry (MM/YY)" "12/29"
+  fill --label "CVC" "123"
+  dialog --accept
+  click --role button --name "Place order"
+  expect text "is confirmed."
+  expect --selector "#order-id" text is "A-2001"
