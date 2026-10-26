@@ -53,10 +53,10 @@ jobs:
         with: { repository: andrey-usa/navigera, ref: cc300d30f2fa72896c522fadc50293db7a38bdc7, path: navigera, persist-credentials: false }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with: { shared-key: t0069 }
+        with: { shared-key: t0069, workspaces: primavera }
       - name: build primavera (navigera is compiled in) at pinned commits
         run: |
-          cd navigera && cargo build --release && cd ../primavera && cargo build --release
+          cargo build --release --manifest-path primavera/Cargo.toml
           ./primavera/target/release/primavera --version
           sha256sum primavera/target/release/primavera
       - uses: actions/upload-artifact@v4
