@@ -25,7 +25,7 @@ base https://example.com
 
 scenario "The example page loads"
   goto /
-  expect text "Example Domain"
+  expect title is "Example Domain"
 EOF
 ./primavera/target/release/primavera run tests
 ```
@@ -35,6 +35,14 @@ a line like `PASS tests/smoke.pv:3 The example page loads`. Add
 `--html report.html` to get the run as one page that needs nothing else
 to open. A failing scenario prints the step, what was expected and
 seen, where the page was, and a screenshot under `.primavera/runs/`.
+
+Why the title, not the text: example.com's visible text changed in
+2026 — its "Example Domain" heading is gone (the page is now
+paragraphs in several languages, and it asks not to be relied on for
+testing). The title is still "Example Domain", so the title check is
+the stable expectation; an earlier draft of this page used
+`expect text "Example Domain"` and failed on the live page for exactly
+that reason.
 
 Next: the [agent skill](/primavera/skill/) is the guide to hand an
 agent that writes tests, and [Reference](/primavera/cli-reference/) lists

@@ -116,6 +116,6 @@ jobs:
 
           scenario "The example page loads"
             goto /
-            expect text "Example Domain"
+            expect title is "Example Domain"
           EOF
           ./primavera/target/release/primavera run tests

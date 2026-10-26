@@ -19,9 +19,10 @@ navigera -s qs quit
 
 What you should see: `ax --raw` prints the page as an indented tree,
 starting with a line like `page "Example Domain" https://example.com/`
-and a `heading "Example Domain"` node. If Chrome is not found, set
-`$CHROME_BIN` to your Chrome or Chromium binary and run the same
-commands again.
+followed by the page's paragraphs (example.com's "Example Domain"
+heading is gone in its current version — the title is what remains
+stable). If Chrome is not found, set `$CHROME_BIN` to your Chrome or
+Chromium binary and run the same commands again.
 
 Next: the [agent skill](/navigera/skill/) is the version-matched guide
 to hand an agent, and [Reference](/navigera/reference/) lists every
