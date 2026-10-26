@@ -105,9 +105,11 @@ jobs:
           compara compare a.csv b.csv -k id -o report.html
           test $? -eq 1
           test -s report.html
-      - name: primavera quick start (as written on the site page)
+      - name: primavera quick start, build (as written on the site page)
+        run: cd work/primavera && cargo build --release
+      - name: primavera quick start, run (as written on the site page)
         run: |
-          cd work/primavera && cargo build --release && cd ..
+          cd work
           mkdir -p tests
           cat > tests/smoke.pv << 'EOF'
           base https://example.com
