@@ -1,5 +1,5 @@
-# T-0069 primavera M3 exit eval (experiment-38). PAID RUN: workflow_dispatch only;
-# one explicit dispatch per approved run. Owner authorization for uncapped spend
+# T-0069 primavera M3 exit eval (experiment-38). PAID RUN: armed only by pushing the bench/t0069/RUN
+# sentinel; one sentinel push per approved run. Owner authorization for uncapped spend
 # within this finite 72-trial scope was given on the owner's own channel (recorded
 # in the private board notes); this file documents scope, it does not grant it.
 # The harness WAL (reserve/settle/unknown) accounts every request.
@@ -28,7 +28,14 @@
 name: T-0069 M3 exit eval
 permissions:
   contents: read
+# NOTE: workflow_dispatch only resolves workflows on the DEFAULT branch; this
+# orphan branch's workflow is therefore armed by a push that touches
+# bench/t0069/RUN (the sentinel). One sentinel push = one explicit paid run;
+# ordinary code pushes to this branch do NOT trigger the eval.
 on:
+  push:
+    branches: [experiment-38]
+    paths: [bench/t0069/RUN]
   workflow_dispatch:
     inputs:
       slice_mod:
