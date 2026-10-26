@@ -1,0 +1,108 @@
+name: miniwob-eval-t0047
+
+# T-0047, cell 1 of 3 (agent fb): one navigera cell on this branch's
+# `navigera/` - the 0.6 candidate with clickable refs in `ax` - run with
+# T-0046's harness bytes, model, skill, seeds and task set unchanged, so the
+# only changed variable against T-0046's canonical navigera cell
+# (CI run 40247958643, 285/336 strict, $1.286792 computed) is the binary.
+#
+# Prompt gates: the harness pins the navigera manual sha256
+# (7e08896c...3572) and refuses paid work unless the installed skill matches
+# byte-for-byte; this branch's navigera/skills/navigera/SKILL.md is that blob
+# (verified before the push).
+#
+# Provider: SiliconFlow global, key = repo environment `main` secret.
+# Spend: T-0047's brief caps the whole task at $3.50 computed; this cell is
+# guarded at $1.80, leaving room for the two WebArena cells.
+#
+# Results are committed back to the branch (CI artifacts can't be downloaded
+# by the agents who write the report): summary.md + episodes.tsv land in
+# bench/t0047-miniwob/, outside the trigger paths below, and the commit
+# carries [skip ci].
+
+on:
+  push:
+    branches: [experiment-44]
+    paths:
+      - "bench/miniwob/**"
+      - ".github/workflows/miniwob-eval-t0047.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eval:
+    name: "MiniWoB++ (navigera[ax-clickable] x V4.1-Flash)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 155
+    environment: main
+    env:
+      SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+      MODEL: deepseek-ai/DeepSeek-V4.1-Flash
+      MAX_SPEND: "1.80"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Build navigera from this branch's navigera/
+        run: |
+          echo "branch commit: $(git rev-parse HEAD)"
+          echo "navigera tree: $(git rev-parse HEAD:navigera)"
+          git log -1 --format='last commit: %H %s'
+          cd navigera
+          cargo build --release --locked --bin navigera
+          echo "NAV_BIN=$PWD/target/release/navigera" >> "$GITHUB_ENV"
+          ./target/release/navigera --version
+          ./target/release/navigera install-skill --dir "$RUNNER_TEMP/skills"
+          echo "NAVIGERA_SKILL_MD=$RUNNER_TEMP/skills/navigera/SKILL.md" >> "$GITHUB_ENV"
+          echo "skill sha256: $(sha256sum "$RUNNER_TEMP/skills/navigera/SKILL.md")"
+          echo "skill bytes: $(wc -c < "$RUNNER_TEMP/skills/navigera/SKILL.md")"
+      - name: Chrome
+        run: google-chrome --version
+      - name: MiniWoB++ suite (pinned)
+        run: |
+          git clone https://github.com/Farama-Foundation/miniwob-plusplus "$RUNNER_TEMP/miniwob-plusplus"
+          git -C "$RUNNER_TEMP/miniwob-plusplus" checkout 33c3b4ddef8c6eb67c57a29663d844b1eda7e614
+          git -C "$RUNNER_TEMP/miniwob-plusplus" log -1 --format='suite commit %H %s'
+          echo "SUITE_COMMIT=$(git -C "$RUNNER_TEMP/miniwob-plusplus" rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: MiniWoB++ 112 tasks x 3 seeds (navigera cell)
+        run: |
+          python3 bench/miniwob/miniwob_run.py --tool navigera --model "$MODEL" \
+            --tasks-file bench/miniwob/tasks.txt --offset 0 --count 112 \
+            --seeds 3 --max-spend "$MAX_SPEND" \
+            --nav-bin "$NAV_BIN" --miniwob-dir "$RUNNER_TEMP/miniwob-plusplus" \
+            --out out/miniwob
+      - name: Summarize and publish to the branch
+        if: always()
+        run: |
+          python3 bench/miniwob/t0047_summary.py out/miniwob --dest bench/t0047-miniwob \
+            --provenance "run: $GITHUB_RUN_ID (attempt $GITHUB_RUN_ATTEMPT)" \
+            --provenance "branch: experiment-44" \
+            --provenance "branch commit: $(git rev-parse HEAD)" \
+            --provenance "navigera tree: $(git rev-parse HEAD:navigera)" \
+            --provenance "suite commit: ${SUITE_COMMIT:-unknown}" \
+            --provenance "model: $MODEL; seeds 3; tasks 112; cell guard \$$MAX_SPEND" \
+            || echo "no episodes to summarize"
+          test -f bench/t0047-miniwob/summary.md && cat bench/t0047-miniwob/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+          git config user.name "andrey-usa"
+          git config user.email "62624421+andrey-usa@users.noreply.github.com"
+          git add -f bench/t0047-miniwob
+          git commit -m "T-0047 miniwob cell 1 results: run $GITHUB_RUN_ID [skip ci]" || echo "nothing to commit"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          retention-days: 3
+          name: miniwob-eval-t0047-axclick-o0c112s3
+          path: out/miniwob/
+          if-no-files-found: ignore
