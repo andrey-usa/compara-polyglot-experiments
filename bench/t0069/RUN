@@ -1,1 +1,1 @@
-run-arm: 20261026T1233Z scope: DIAGNOSTICS ONLY (owner-approved 2026-10-26 08:32 ET): eval job removed, no model secret present; bench relocated to /opt/t0069, traversal/exec forensics + encrypted diagnostics on any outcome
+run-arm: 20261026T1306Z scope: PAID 72-trial eval (owner-approved 2026-10-26 09:05 ET, single attempt): eval job restored on verified /opt/t0069 layout; preflight gate required first; WAL reserve/settle accounting; no auto-retry after failure
