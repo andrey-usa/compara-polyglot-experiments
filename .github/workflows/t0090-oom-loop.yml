@@ -22,7 +22,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
-      RUNS: "150"
+      RUNS: "300"
       CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
       CARGO_PROFILE_RELEASE_STRIP: none
     steps:
@@ -59,19 +59,26 @@ jobs:
           sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%p >/dev/null
           nproc; uname -m; ldd --version | head -1
           bin="$PWD/target/release/compara"
-          declare -A tally
-          for i in $(seq 1 "$RUNS"); do
-            for mb in 8 6 4 2; do
-              code=0
-              RUST_BACKTRACE=1 bash -c "ulimit -c unlimited; ulimit -d $((mb * 1024)); exec $bin compare /tmp/a.csv /tmp/b.csv -k account_id,txn_id -o /tmp/out/r.html" \
-                >/dev/null 2>/tmp/out/err.txt || code=$?
-              tally["$mb MB exit $code"]=$(( ${tally["$mb MB exit $code"]:-0} + 1 ))
-              if [ "$code" != 2 ]; then
-                cp /tmp/out/err.txt "/tmp/out/fail-$i-${mb}mb-exit$code.txt"
-              fi
+          # Busy cores, as when the rest of the test suite runs beside it.
+          hogs=()
+          for c in $(seq 1 "$(nproc)"); do (while :; do :; done) & hogs+=($!); done
+          worker() {
+            w=$1
+            for i in $(seq 1 "$RUNS"); do
+              for mb in 8 6 4 2; do
+                code=0
+                RUST_BACKTRACE=1 bash -c "ulimit -c unlimited; ulimit -d $((mb * 1024)); exec $bin compare /tmp/a.csv /tmp/b.csv -k account_id,txn_id -o /tmp/out/r-$w.html" \
+                  >/dev/null 2>"/tmp/out/err-$w.txt" || code=$?
+                echo "$mb MB exit $code" >> "/tmp/out/codes-$w.txt"
+                if [ "$code" != 2 ]; then cp "/tmp/out/err-$w.txt" "/tmp/out/fail-$w-$i-${mb}mb-exit$code.txt"; fi
+              done
             done
-          done
-          for k in "${!tally[@]}"; do echo "$k: ${tally[$k]}"; done | sort | tee /tmp/out/tally.txt
+          }
+          workers=()
+          for w in 1 2 3 4; do worker $w & workers+=($!); done
+          wait "${workers[@]}" || true
+          kill "${hogs[@]}" 2>/dev/null || true
+          sort /tmp/out/codes-*.txt | uniq -c | tee /tmp/out/tally.txt
           n=0
           for core in /tmp/cores/core.*; do
             [ -e "$core" ] || continue
