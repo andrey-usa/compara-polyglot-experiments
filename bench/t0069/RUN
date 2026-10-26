@@ -1,1 +1,1 @@
-run-arm: 20261026T1155Z scope: DIAGNOSTICS ONLY (owner-approved 2026-10-26 07:54 ET): eval job removed, no model secret present, preflight self-test + bench-user browser probes + encrypted diagnostics on any outcome
+run-arm: 20261026T1210Z scope: DIAGNOSTICS ONLY (owner-approved 2026-10-26 08:08 ET): eval job removed, no model secret present; chmod 755 + absolute --out fixes + exec/path forensics probes + encrypted diagnostics on any outcome
