@@ -31,17 +31,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: andrey-usa/navigera
-          ref: ba37ede
+          ref: ba37ede25b5c588b50262bc2fd19fbece5990546
           path: product-repos/navigera
       - uses: actions/checkout@v4
         with:
           repository: andrey-usa/compara
-          ref: f3274c7
+          ref: f3274c759d55d5658a2136a103db1282c132849a
           path: product-repos/compara
       - uses: actions/checkout@v4
         with:
           repository: andrey-usa/primavera
-          ref: fa3fe34
+          ref: fa3fe34a7646ec8f6ba6c3f9054bfb560b286bc0
           path: product-repos/primavera
       - name: Sync content and verify it matches the branch
         run: |
