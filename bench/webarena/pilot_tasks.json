@@ -1,0 +1,401 @@
+{
+ "suite": "WebArena-Verified (ServiceNow) \u2014 official Hard subset, 258 tasks",
+ "selection": "Hard tasks whose sites are all CI-runnable (shopping, shopping_admin, reddit, gitlab): 233 of 258. 25 tasks excluded: 17 need map+wikipedia, 6 wikipedia only, 2 map only (wikipedia data ~100GB, map data ~60GB \u2014 beyond GitHub-hosted runner disk). Stratified by primary site proportional to the 233-task pool (gitlab 67, shopping 61, shopping_admin 55, reddit 50), even stride within each site bucket. Execution order groups by primary site, ascending image size.",
+ "quotas": {
+  "gitlab": 14,
+  "shopping": 13,
+  "shopping_admin": 11,
+  "reddit": 10
+ },
+ "tasks": [
+  {
+   "task_id": 11,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Get the total number of reviews that our store received so far that mention term \"disappointed\""
+  },
+  {
+   "task_id": 65,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Get customer email(s) who completed the fifth most number of orders in the entire history"
+  },
+  {
+   "task_id": 116,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Return the customer nickname(s) who gave a rating of 3 stars or below for tanks products"
+  },
+  {
+   "task_id": 186,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Give me the product names and the sizes of the products that have 2-3 units left. Return a list of objects with keys \"name\" and \"size\"."
+  },
+  {
+   "task_id": 204,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Get the product name and final price (low to high) of the most recent completed order.Return a list of objects with keys \"name\" (product name) and \"price\" (as number, e.g., 10.99) only, without any additional details"
+  },
+  {
+   "task_id": 488,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Change the page title of \"Home Page\" page on my site to \"This is the home page!! Leave here!!\"."
+  },
+  {
+   "task_id": 502,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Mark all Gobi HeatTec Tee as out of stock"
+  },
+  {
+   "task_id": 549,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Add a new size XXXL to green Minerva LumaTech V-Tee"
+  },
+  {
+   "task_id": 696,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Add a simple product named \"FancyBoy Man Causal Jeans\" with 42 in stock, available in size 34 and color Blue, priced at $169.99 using the appropriate attribute set."
+  },
+  {
+   "task_id": 707,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Show the sales order report for for last year (today is March 15, 2023)."
+  },
+  {
+   "task_id": 774,
+   "primary_site": "shopping_admin",
+   "sites": [
+    "shopping_admin"
+   ],
+   "intent": "Delete all pending reviews with less than 4 stars"
+  },
+  {
+   "task_id": 28,
+   "primary_site": "reddit",
+   "sites": [
+    "reddit"
+   ],
+   "intent": "In the Worcester forum, get the username and post title of the most recent post, and count the number of comments on that post that are not from the author and have more downvotes than upvotes. Return a list of objects with keys \"username\", \"post_title\", and \"count\"."
+  },
+  {
+   "task_id": 68,
+   "primary_site": "reddit",
+   "sites": [
+    "reddit"
+   ],
+   "intent": "Among the top 10 hottest posts in the \"Books\" forum, get the author names and book titles, exactly as they appear in the post description, from those that recommend exactly one book. Return a list of objects with keys \"book\" and \"author\"."
+  },
+  {
+   "task_id": 408,
+   "primary_site": "reddit",
+   "sites": [
+    "reddit"
+   ],
+   "intent": "Upvote the newest post in explain like im 5 forum"
+  },
+  {
+   "task_id": 584,
+   "primary_site": "reddit",
+   "sites": [
+    "reddit"
+   ],
+   "intent": "Create a new forum with name and title \"Karaoke\", description \"Place for Karaoke lovers\", and sidebar \"*devices*, setup\""
+  },
+  {
+   "task_id": 610,
+   "primary_site": "reddit",
+   "sites": [
+    "reddit"
+   ],
+   "intent": "Post a review of my recent reading, titled \"To Kill a Mockingbird by Harper Lee\" in f/books and then comment \"good book!\" on the created post"
+  },
+  {
+   "task_id": 625,
+   "primary_site": "reddit",
+   "sites": [
+    "reddit"
+   ],
+   "intent": "Create a discussion post titled \"the effectiveness of deep learning\" in a relevant forum and ask users for their opinions with the simple prompt, \"your opinion\""
+  },
+  {
+   "task_id": 644,
+   "primary_site": "reddit",
+   "sites": [
+    "reddit"
+   ],
+   "intent": "Post a notice in games forum titled \"Tears of Kingdom Meet up!\". Set post details to \"virtual meetup for Tears of Kingdom on Dec 15th\""
+  },
+  {
+   "task_id": 681,
+   "primary_site": "reddit",
+   "sites": [
+    "reddit",
+    "gitlab"
+   ],
+   "intent": "Find a GitLab repository related to gan implementation and create a new post in the discussion forum with the URL of the repository to the most relevant forum. Use the repository path as the post title and \"<number of commits> commit(s) already!\" as the post body."
+  },
+  {
+   "task_id": 686,
+   "primary_site": "reddit",
+   "sites": [
+    "reddit",
+    "gitlab"
+   ],
+   "intent": "Promote auth0/angular-storage in the discussion forum technology by creating a post with the project description as the title."
+  },
+  {
+   "task_id": 724,
+   "primary_site": "reddit",
+   "sites": [
+    "reddit"
+   ],
+   "intent": "Like all submissions created by Hrekires in forum news"
+  },
+  {
+   "task_id": 21,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Get name(s) of reviewer(s) who mention ear cups being small for the product on the current page"
+  },
+  {
+   "task_id": 124,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "What is the price range of wireless earphone in the One Stop Market?. Return an object with keys \"min\" and \"max\" (as numbers, e.g., 10.99) only, without any additional details."
+  },
+  {
+   "task_id": 148,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Get the color of the picture frame I bought Sep 2022."
+  },
+  {
+   "task_id": 191,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Get the total cost of my latest order marked as \"processing\". "
+  },
+  {
+   "task_id": 269,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Open the \"women shoes\" category page filtered to under $25"
+  },
+  {
+   "task_id": 301,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Open the order details page for the most recent processing order"
+  },
+  {
+   "task_id": 327,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Pull up the page with all \"iphone 12 phone case\" listings sorted by name alphabetically."
+  },
+  {
+   "task_id": 338,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Return the date I last ordered my toothpaste. Return the date in YYYY-MM-DD format or null if not available, without any additional details."
+  },
+  {
+   "task_id": 435,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Add the product with the lowest per unit price from my open tabs to the shopping cart"
+  },
+  {
+   "task_id": 519,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Add the product on the current page to my wishlist"
+  },
+  {
+   "task_id": 529,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Fill out the contact us form with this refund message for the Stereo Sound System bought Feb 2023: \"I need a refund. Order: <order_id>. Amount: <amount>. Reason: It broke after three days of use.\" Leave the filled form ready for review and do not submit it."
+  },
+  {
+   "task_id": 586,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping"
+   ],
+   "intent": "Rate my recently purchased Jiffy Mix with 4 stars using my nickname ShoppingEmma, with the summary \"Good purchase\" and review \"I like it\""
+  },
+  {
+   "task_id": 674,
+   "primary_site": "shopping",
+   "sites": [
+    "shopping",
+    "reddit"
+   ],
+   "intent": "Create a post in the game related discussion forum about Doc and Pies Arcade Factory Cocktail Arcade Machine to report customer reviews with 3 stars and less rating from the OneStopShop with the post title \"real user feedback on Doc and Pies Arcade Factory Cocktail Arcade Machine\". Format the post body as a bullet point list in the same order they appear (md format: - \"<review title>\")."
+  },
+  {
+   "task_id": 44,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Open my todos page"
+  },
+  {
+   "task_id": 170,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Get the project ID(s) of my personal project(s) that received the least stars"
+  },
+  {
+   "task_id": 296,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Get the URL to clone the best GAN python implementation with SSH. Return the URL only, without any additional details."
+  },
+  {
+   "task_id": 316,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Get the email addresses of the top 3 contributors (by commit count) to facebook\"s guide on building react apps repo"
+  },
+  {
+   "task_id": 397,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Fork MetaSeq."
+  },
+  {
+   "task_id": 417,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Reply on the merge request assigned to me for 404 link: if the last comment is from the author, reply \"Thank you\"; otherwise tag the author (e.g., @user) as a reminder."
+  },
+  {
+   "task_id": 446,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Assign the issue regarding 404 errors in a11yproject to Roshanjossey."
+  },
+  {
+   "task_id": 525,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Star the top four most stared repos in Gitlab"
+  },
+  {
+   "task_id": 555,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab",
+    "reddit"
+   ],
+   "intent": "Use the Web IDE to create a folder named funny_pic in gimmiethat.space repo. Within it, create a file named urls.json that contains the full URLs of the 5 most recent posts from the memes forum on the discussion forum as a JSON object with a \"urls\" array. Write them in order from newest to oldest. Commit the changes to the default branch."
+  },
+  {
+   "task_id": 566,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab",
+    "reddit"
+   ],
+   "intent": "Create a private repository named Do it myself with a README file containing links to the 8 most active DIY posts from the DIY forum. Use the Web IDE to create the README. Structure it with the repository name as the main heading, \"Most Active DIY Threads\" as a subheading, and a bulleted list of the posts as markdown links (using their titles as link text) in the same order they appear on the forum. Commit to the default branch."
+  },
+  {
+   "task_id": 590,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Create a milestone in the current repo with title \"product launch\" for the upcoming event of product launch starting on January 16, 2023 and ending on January 30, 2023"
+  },
+  {
+   "task_id": 660,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Create an issue in my dotfiles repo with title \"add support for oh-my-zsh\". Assign the issue to Abishek (you can invite users to the project if needed). Set due date to be July 18 2033"
+  },
+  {
+   "task_id": 786,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "Get the number of commits of the contributor who has the most commits to branch master in the current repository"
+  },
+  {
+   "task_id": 801,
+   "primary_site": "gitlab",
+   "sites": [
+    "gitlab"
+   ],
+   "intent": "create a new group \"crew\" with members ASWATFZLLC, patrickhlauke, westurner, linkmatrix"
+  }
+ ]
+}

@@ -1,0 +1,116 @@
+{
+  "tasks": [
+    {
+      "id": "lookup",
+      "title": "Find a product's price and stock",
+      "prompt": "On the shop, find the product \"Titanium Widget\". What is its price and how many units are in stock? Answer in the form: price=$<price> stock=<units>",
+      "check": {
+        "answer_product": "Titanium Widget"
+      }
+    },
+    {
+      "id": "purchase",
+      "title": "Cart, coupon, checkout through an iframe",
+      "prompt": "Buy 2 × \"Brass Sprocket\" and 1 × \"Titanium Widget\" (nothing else). Apply the coupon code SAVE10 in the cart, then check out: full name Ada Lovelace, country Canada, Express shipping, test card 4242 4242 4242 4242, expiry 12/30, CVC 123. Place the order and report the order number.",
+      "check": {
+        "order": {
+          "items": {
+            "Brass Sprocket": 2,
+            "Titanium Widget": 1
+          },
+          "coupon": "SAVE10",
+          "country": "Canada",
+          "speed": "express",
+          "name": "Ada Lovelace"
+        }
+      }
+    },
+    {
+      "id": "account",
+      "title": "Log in, find an order in a paginated table",
+      "prompt": "Sign in with email demo@acme.test and password hunter2, then find the status of order A-1042 in your order history. Answer with the status text exactly as shown.",
+      "check": {
+        "answer_contains": [
+          "Awaiting pickup"
+        ],
+        "login": "demo@acme.test"
+      }
+    },
+    {
+      "id": "docs",
+      "title": "Read docs in a new tab, expand a collapsed FAQ",
+      "prompt": "Using the shop's Docs (linked in the site header), find how many days customers have to return an item and what restocking fee applies to opened items. Answer in the form: days=<n> fee=<fee>",
+      "check": {
+        "answer_contains": [
+          "37",
+          "8%"
+        ]
+      }
+    },
+    {
+      "id": "support",
+      "title": "Support form inside an iframe",
+      "prompt": "Open a support request on the shop's Support page with category Billing, priority High and the message: Charged twice for order A-1042. Submit it and report the ticket id.",
+      "check": {
+        "ticket": {
+          "category": "Billing",
+          "priority": "high",
+          "message_contains": "Charged twice"
+        }
+      }
+    },
+    {
+      "id": "preferences",
+      "title": "Change four settings on a long preferences form",
+      "prompt": "On the shop's Preferences page (in the Account menu), turn on price-drop alerts, turn off the weekly newsletter, set the currency to EUR and the number of orders per page in the order history to 50, and save. Leave everything else as it is. When the page confirms the preferences were saved, answer: saved",
+      "check": {
+        "preferences": {
+          "price_drop": true,
+          "newsletter": false,
+          "currency": "EUR",
+          "history_page_size": "50"
+        },
+        "answer_contains": [
+          "saved"
+        ]
+      }
+    },
+    {
+      "id": "purchase-live",
+      "title": "Live web: log in and check out on a public demo shop",
+      "live": true,
+      "url": "https://www.saucedemo.com",
+      "prompt": "This is Sauce Labs' public demo shop for testing automation (no real payment). Log in with username standard_user and password secret_sauce, add the \"Sauce Labs Backpack\" to the cart, check out with first name Ada, last name Lovelace and postal code 10001, and finish the order. Report the confirmation heading shown after finishing and the order total from the overview page. Answer in the form: confirmation=<heading> total=$<total>",
+      "check": {
+        "answer_contains": [
+          "thank you for your order",
+          "32.39"
+        ]
+      }
+    },
+    {
+      "id": "python-docs-live",
+      "title": "Live web: navigate a large docs index to one parameter's default",
+      "live": true,
+      "url": "https://docs.python.org/3/library/index.html",
+      "prompt": "Starting from that page, open the documentation of Python's json module by clicking links (do not type or edit URLs), and find the default value of the indent parameter of json.dumps. Answer in the form: indent=<value>",
+      "check": {
+        "answer_contains": [
+          "indent=None"
+        ]
+      }
+    },
+    {
+      "id": "mdn-live",
+      "title": "Live web: navigate MDN's element index to one API method",
+      "live": true,
+      "url": "https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements",
+      "prompt": "Starting from that page, open MDN's reference page for the <dialog> element by clicking links (do not type or edit URLs), and find the name of the method that opens a dialog as a modal. Answer in the form: method=<name>",
+      "check": {
+        "answer_contains": [
+          "showModal"
+        ]
+      }
+    }
+  ]
+}

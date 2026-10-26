@@ -1,0 +1,155 @@
+name: webarena-eval-t0047
+
+# T-0047, cells 2 and 3 of 3 (agent fb): two navigera cells on this branch's
+# `navigera/` - the 0.6 candidate with clickable refs in `ax` - run with
+# T-0029's harness, task set and settings unchanged as T-0043 uses them
+# (harness bytes copied from experiment-23 c230e33: bench/webarena/* and
+# bench/agent-eval/*, all byte-identical). The comparison target is T-0043's
+# three skill-trim cells (solves 19-23/48, cost $0.389-$0.445); two cells
+# here give the same build a two-run spread.
+#
+# Provider: SiliconFlow global, key = repo environment `main` secret.
+# Spend: T-0047's brief caps the whole task at $3.50 computed; each cell is
+# guarded at $0.65, the per-cell cap T-0043 used.
+#
+# Results are committed back to the branch (CI artifacts can't be downloaded
+# by the agents who write the report): each cell publishes its harness
+# table.md and runs.jsonl under bench/t0047-webarena/, outside the trigger
+# paths below, and the commit carries [skip ci].
+
+on:
+  push:
+    branches: [experiment-44]
+    paths:
+      - "bench/webarena/**"
+      - "bench/agent-eval/**"
+      - ".github/workflows/webarena-eval-t0047.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json
+          cells = [{"cell": "n1", "tool": "navigera", "variant": "exp19-axclick",
+                    "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+                    "slug": "deepseek-ai-DeepSeek-V4.1-Flash",
+                    "count": "48", "offset": "0", "max_spend": "0.65"},
+                   {"cell": "n2", "tool": "navigera", "variant": "exp19-axclick",
+                    "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+                    "slug": "deepseek-ai-DeepSeek-V4.1-Flash",
+                    "count": "48", "offset": "0", "max_spend": "0.65"}]
+          print("matrix=" + json.dumps(cells))
+          EOF
+
+  eval:
+    needs: plan
+    name: "WebArena-Verified (${{ matrix.cell.cell }} ${{ matrix.cell.tool }}[${{ matrix.cell.variant }}] x V4.1-Flash)"
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: main
+    env:
+      SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+      CELL: ${{ matrix.cell.cell }}
+      TOOL: ${{ matrix.cell.tool }}
+      VARIANT: ${{ matrix.cell.variant }}
+      MODEL: ${{ matrix.cell.model }}
+      COUNT: ${{ matrix.cell.count }}
+      OFFSET: ${{ matrix.cell.offset }}
+      MAX_SPEND: ${{ matrix.cell.max_spend }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Build navigera from this branch's navigera/
+        run: |
+          echo "branch commit: $(git rev-parse HEAD)"
+          echo "navigera tree: $(git rev-parse HEAD:navigera)"
+          git log -1 --format='last commit: %H %s'
+          cd navigera
+          cargo build --release --locked --bin navigera
+          rustup default stable
+          echo "NV_BIN_DIR=$PWD/target/release" >> "$GITHUB_ENV"
+          ./target/release/navigera --version
+      - name: Chrome
+        run: |
+          echo "CHROME_BIN=$(which google-chrome)" >> "$GITHUB_ENV"
+          google-chrome --version
+      - name: Install the suite's evaluator
+        run: |
+          pip install "webarena-verified==1.2.3"
+          python3 - <<'EOF'
+          from webarena_verified.api import WebArenaVerified
+          wa = WebArenaVerified()
+          print("dataset probe, task 108:", wa.get_task(108).intent)
+          EOF
+          docker version --format 'docker {{.Server.Version}}'
+      - name: WebArena-Verified pilot slice
+        run: |
+          python3 bench/webarena/webarena_run.py --tool "$TOOL" --model "$MODEL" \
+            --offset "$OFFSET" --count "$COUNT" --max-spend "$MAX_SPEND" \
+            --deadline-minutes 340 \
+            --nv-bin-dir "$NV_BIN_DIR" --out out/webarena
+      - name: Publish the cell results to the branch
+        if: always()
+        run: |
+          dest="bench/t0047-webarena/${CELL}-run-${GITHUB_RUN_ID}"
+          mkdir -p "$dest"
+          for f in table.md runs.jsonl summary.json; do
+            [ -f "out/webarena/$f" ] && cp "out/webarena/$f" "$dest/" || true
+          done
+          {
+            echo "cell: $CELL"
+            echo "tool: $TOOL variant: $VARIANT"
+            echo "model: $MODEL; tasks: $COUNT from offset $OFFSET; cell guard \$$MAX_SPEND"
+            echo "run: $GITHUB_RUN_ID (attempt $GITHUB_RUN_ATTEMPT)"
+            echo "branch commit: $(git rev-parse HEAD)"
+            echo "navigera tree: $(git rev-parse HEAD:navigera)"
+          } > "$dest/PROVENANCE.txt"
+          cat "$dest/table.md" 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          git config user.name "andrey-usa"
+          git config user.email "62624421+andrey-usa@users.noreply.github.com"
+          git add -f "$dest"
+          git commit -m "T-0047 webarena cell $CELL results: run $GITHUB_RUN_ID [skip ci]" || echo "nothing to commit"
+          for i in 1 2 3 4 5; do
+            git fetch -q origin "$GITHUB_REF_NAME" || true
+            git rebase -q "origin/$GITHUB_REF_NAME" 2>/dev/null || git rebase --abort 2>/dev/null || true
+            if git push -q origin "HEAD:refs/heads/$GITHUB_REF_NAME"; then echo "pushed on attempt $i"; break; fi
+            echo "push attempt $i lost the race; retrying"
+            sleep $((i * 7))
+          done
+      - name: Upload the raw results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          retention-days: 3
+          name: webarena-eval-t0047-${{ matrix.cell.cell }}-o${{ matrix.cell.offset }}c${{ matrix.cell.count }}
+          path: out/webarena/
+          if-no-files-found: ignore
