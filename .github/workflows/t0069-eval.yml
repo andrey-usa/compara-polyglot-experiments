@@ -96,6 +96,7 @@ jobs:
           PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
         run: |
           cd experiments/bench/t0069
+          mkdir -p out
           python3 harness-t0069_run.py --arm "$ARM" --self-test \
             --as-user benchr \
             --primavera-bin "$GITHUB_WORKSPACE/bin/primavera" --pw-dir "$GITHUB_WORKSPACE/pw" \
