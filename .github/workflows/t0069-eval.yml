@@ -86,7 +86,7 @@ jobs:
         with: { path: experiments, persist-credentials: false }
       - uses: actions/download-artifact@v4
         with: { name: primavera-bin, path: bin }
-      - run: chmod +x bin/primavera
+      - run: chmod 755 bin bin/primavera
       - name: create restricted bench user
         run: sudo useradd benchr || true
       - name: arm B toolchain (playwright, shared browser path)
@@ -99,6 +99,19 @@ jobs:
           npx playwright install --with-deps chromium >/dev/null 2>&1
           sudo chmod -R a+rX /opt/pw-browsers
           echo "pw ready: $(npx playwright --version)"
+      - name: binary + path forensics as the bench user (tests the EACCES hypothesis directly)
+        run: |
+          echo "== modes of binary and its directory =="
+          stat -c '%a %U:%G %n' bin bin/primavera || true
+          echo "== every path component =="
+          namei -l "$GITHUB_WORKSPACE/bin/primavera" || true
+          echo "== mount options for the workspace filesystem (noexec check) =="
+          findmnt -T "$GITHUB_WORKSPACE" -o TARGET,OPTIONS || true
+          echo "== trivial workspace script as benchr (exec-from-workspace, artifact-independent) =="
+          printf '#!/bin/sh\necho benchr-workspace-exec-ok\n' > bin/probe.sh && chmod 755 bin/probe.sh
+          sudo -n -u benchr env -i HOME=/tmp TERM=dumb LANG=C.UTF-8 "$GITHUB_WORKSPACE/bin/probe.sh" 2>&1 || true
+          echo "== the actual downloaded primavera binary as benchr =="
+          sudo -n -u benchr env -i HOME=/tmp TERM=dumb LANG=C.UTF-8 "$GITHUB_WORKSPACE/bin/primavera" --version 2>&1 | tail -3 || true
       - name: browser facts (non-sensitive; identifies the shared-layer failure class)
         run: |
           echo "== runner chrome candidates =="
@@ -126,7 +139,7 @@ jobs:
           python3 harness-t0069_run.py --arm "$ARM" --self-test \
             --as-user benchr \
             --primavera-bin "$GITHUB_WORKSPACE/bin/primavera" --pw-dir "$GITHUB_WORKSPACE/pw" \
-            --out out/preflight-$ARM > "out/preflight-$ARM.log" 2>&1
+            --out "$GITHUB_WORKSPACE/experiments/bench/t0069/out/preflight-$ARM" > "out/preflight-$ARM.log" 2>&1
           tail -2 "out/preflight-$ARM.log"
       - name: gate on expected self-test scores
         run: python3 experiments/bench/t0069/preflight-check.py --arm ${{ matrix.arm }} --out experiments/bench/t0069/out
