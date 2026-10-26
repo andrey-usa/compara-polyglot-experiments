@@ -1,0 +1,3 @@
+scenario "Nothing to hand off"
+  goto /
+  handoff until text Home

@@ -1,0 +1,37 @@
+name: jev-relay
+description: >
+  Starts bench/decide/relay.py in front of TypeSafe's API, checks it with one
+  tiny request, and sets DECIDER_URL and DECIDER_LOG for the later steps. The
+  key stays in the relay's own environment: sessions and agents only get the
+  local URL.
+inputs:
+  key:
+    description: the TypeSafe API key
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Start the relay
+      shell: bash
+      env:
+        TYPESAFE_API_KEY: ${{ inputs.key }}
+      run: |
+        if [ -z "$TYPESAFE_API_KEY" ]; then
+          echo "::error title=jev relay::TYPESAFE_API_KEY is not set in the main environment"
+          exit 1
+        fi
+        log="$RUNNER_TEMP/jev.jsonl"
+        nohup python bench/decide/relay.py --port 8792 --log "$log" > "$RUNNER_TEMP/relay.out" 2>&1 &
+        for _ in $(seq 50); do grep -q LISTENING "$RUNNER_TEMP/relay.out" && break; sleep 0.2; done
+        url=$(sed -n 's/^LISTENING //p' "$RUNNER_TEMP/relay.out")
+        if [ -z "$url" ]; then cat "$RUNNER_TEMP/relay.out"; exit 1; fi
+        # A bad key or an outage shows here, not as failed tasks.
+        reply=$(curl -sS -X POST "$url" -H 'Content-Type: application/json' -d \
+          '{"model":"jev-latest","state":"The sky is blue today.","questions":{"q":{"type":"noul","instructions":"The text says the sky is blue."}}}')
+        if ! echo "$reply" | python -c 'import json, sys; r = json.load(sys.stdin); print("jev smoke:", r.get("model"), r["answers"]["q"], r.get("usage"))'; then
+          echo "::error title=jev relay::TypeSafe API smoke request failed: $(echo "$reply" | head -c 300)"
+          exit 1
+        fi
+        : > "$log"  # the smoke request belongs to no run
+        echo "DECIDER_URL=$url" >> "$GITHUB_ENV"
+        echo "DECIDER_LOG=$log" >> "$GITHUB_ENV"

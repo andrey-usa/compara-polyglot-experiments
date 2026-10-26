@@ -1,0 +1,279 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  # Weekly: a new Chrome Stable/Beta must not break agents before we notice.
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Tests (unit + browser e2e on the runner's Chrome, CDP traced)
+        env:
+          NAVIGERA_CDP_TRACE: ${{ runner.temp }}/cdp-trace.jsonl
+          NAVIGERA_REQUIRE_BROWSER: "1"
+        run: |
+          set -o pipefail
+          if ! cargo test --locked --no-fail-fast 2>&1 | tee /tmp/test.log; then
+            # Surface the failure through the checks API, not just the log.
+            sed -n '/^---- /,/^test result/p' /tmp/test.log | grep -v -E '^ +[0-9]+: |^ +at ' | tail -c 30000 > /tmp/test-tail.log || true
+            python3 bench/ladder/annotate.py /tmp/test-tail.log "cargo test failure"
+            exit 1
+          fi
+
+      - name: CDP protocol check (every command/param/enum the tests sent vs this Chrome's /json/protocol)
+        run: |
+          set -o pipefail
+          google-chrome --version
+          bash tools/protocol_dump.sh google-chrome "$RUNNER_TEMP/protocol.json"
+          rc=0
+          python3 tools/cdp_check.py --protocol "$RUNNER_TEMP/protocol.json" \
+            --trace "$RUNNER_TEMP/cdp-trace.jsonl" --label "$(google-chrome --version)" \
+            --markdown "$RUNNER_TEMP/cdp-check.md" || rc=$?
+          python3 bench/ladder/annotate.py "$RUNNER_TEMP/cdp-check.md" "cdp check"
+          exit $rc
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Harness syntax check
+        run: |
+          python3 -m py_compile bench/ladder/*.py bench/ladder/contenders/*.py \
+            bench/site/server.py tests/fixtures/*.py tools/*.py bench/agent-eval/*.py bench/ide-eval/*.py bench/decide/*.py packaging/*.py
+          node --check bench/ladder/contenders/contender_playwright.mjs
+          node --check bench/ladder/contenders/contender_puppeteer.mjs
+
+  # The Lightpanda engine: its end-to-end tests on the pinned release and
+  # on the nightly (a nightly regression is reported, not merged-blocking).
+  lightpanda:
+    name: lightpanda (${{ matrix.release }})
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["1.0.1", nightly]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: ${{ matrix.release == 'nightly' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - name: Lightpanda ${{ matrix.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/lp"
+          gh release download "${{ matrix.release }}" --repo lightpanda-io/browser \
+            --pattern lightpanda-x86_64-linux --dir "$RUNNER_TEMP/lp"
+          chmod +x "$RUNNER_TEMP/lp/lightpanda-x86_64-linux"
+          echo "LIGHTPANDA_BIN=$RUNNER_TEMP/lp/lightpanda-x86_64-linux" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/lp/lightpanda-x86_64-linux" version
+      - name: Tests (Lightpanda e2e; no X server)
+        env:
+          NAVIGERA_REQUIRE_LIGHTPANDA: "1"
+          LIGHTPANDA_DISABLE_TELEMETRY: "1"
+        run: |
+          set -o pipefail
+          unset DISPLAY
+          if ! cargo test --locked --test lightpanda --test commands 2>&1 | tee /tmp/test.log; then
+            sed -n '/^---- /,/^test result/p' /tmp/test.log | grep -v -E '^ +[0-9]+: |^ +at ' | tail -c 30000 > /tmp/test-tail.log || true
+            python3 bench/ladder/annotate.py /tmp/test-tail.log "lightpanda ${{ matrix.release }} test failure"
+            exit 1
+          fi
+
+  # Known-vulnerable dependencies (RustSec advisory database).
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny warnings
+
+  # The oldest Rust that builds navigera (rust-version in Cargo.toml).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: cargo check --locked --all-targets
+
+  # Windows: the same unit + e2e tests on the runner's Chrome, through the
+  # Windows code paths (WebSocket CDP, loopback-TCP sessions with a token,
+  # kill-on-close job object).
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Tests (unit + browser e2e on the runner's Chrome, CDP traced)
+        env:
+          NAVIGERA_CDP_TRACE: ${{ runner.temp }}/cdp-trace.jsonl
+          NAVIGERA_REQUIRE_BROWSER: "1"
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/test.log"
+          if ! cargo test --locked --no-fail-fast 2>&1 | tee "$log"; then
+            sed -n '/^---- /,/^test result/p' "$log" | grep -v -E '^ +[0-9]+: |^ +at ' | tail -c 30000 > "$RUNNER_TEMP/test-tail.log" || true
+            python bench/ladder/annotate.py "$RUNNER_TEMP/test-tail.log" "cargo test failure (windows)"
+            exit 1
+          fi
+          # Which tests ran (a skipped e2e test would show up as missing).
+          grep -E '^     Running|^test .* \.\.\. |^test result' "$log" | grep -v '^test cdp::\|^test protocol::' > "$RUNNER_TEMP/test-summary.log" || true
+          python bench/ladder/annotate.py "$RUNNER_TEMP/test-summary.log" "cargo test summary (windows)"
+      - name: Clippy
+        if: success() || failure()
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  # The install path agents actually take: `curl install.sh | sh` (a
+  # release binary, or the cargo fallback while there is no release), and
+  # `irm install.ps1 | iex` on Windows.
+  install:
+    name: install (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      # A source build (no release yet) builds the commit under test.
+      NAVIGERA_GIT_REV: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - name: install.sh as an agent runs it
+        if: runner.os != 'Windows'
+        run: |
+          rustup default stable
+          cd "$RUNNER_TEMP"
+          NAVIGERA_INSTALL_DIR="$RUNNER_TEMP/bin" sh "$GITHUB_WORKSPACE/install.sh" 2>&1 | tail -5 | tee /tmp/install.log
+          "$RUNNER_TEMP/bin/navigera" --version || { python3 "$GITHUB_WORKSPACE/bench/ladder/annotate.py" /tmp/install.log "install.sh failure"; exit 1; }
+          "$RUNNER_TEMP/bin/navigera" skill | head -3
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        if: runner.os == 'Windows'
+        with:
+          python-version: "3.12"
+      - name: install.ps1 as an agent runs it
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup default stable
+          Set-Location $env:RUNNER_TEMP
+          $env:NAVIGERA_INSTALL_DIR = "$env:RUNNER_TEMP\bin"
+          $log = "$env:RUNNER_TEMP\install.log"
+          # The repo's script (the published URL serves master's copy).
+          try {
+            Get-Content -Raw "$env:GITHUB_WORKSPACE\install.ps1" | Invoke-Expression *>&1 |
+              ForEach-Object { "$_" } | Tee-Object -FilePath $log
+          } catch {
+            "THROWN: $($_ | Out-String)" | Tee-Object -FilePath $log -Append
+          }
+          $exe = "$env:RUNNER_TEMP\bin\navigera.exe"
+          if (-not (Test-Path $exe)) {
+            Get-Content $log -Tail 40 | Set-Content "$env:RUNNER_TEMP\install-tail.log"
+            python "$env:GITHUB_WORKSPACE\bench\ladder\annotate.py" "$env:RUNNER_TEMP\install-tail.log" "install.ps1 failure"
+            exit 1
+          }
+          & $exe --version
+          & $exe skill | Select-Object -First 3
+          # Installed for this session too: the bare name resolves.
+          (Get-Command navigera).Source
+
+  # Chrome for Testing builds: the current Stable and three milestones back,
+  # chrome-headless-shell, and Beta (non-blocking early warning).
+  browsers:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - id: pick
+        run: python3 tools/cft_matrix.py >> "$GITHUB_OUTPUT"
+
+  compat:
+    needs: browsers
+    name: chrome ${{ matrix.browser.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.browser.channel == 'beta' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: ${{ fromJson(needs.browsers.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - name: Download ${{ matrix.browser.kind }} ${{ matrix.browser.version }}
+        run: |
+          curl -sSfL --retry 3 -o /tmp/browser.zip "${{ matrix.browser.url }}"
+          unzip -q /tmp/browser.zip -d /tmp/browser
+          echo "CHROME_BIN=/tmp/browser/${{ matrix.browser.exe }}" >> "$GITHUB_ENV"
+      - name: e2e tests (CDP traced)
+        env:
+          NAVIGERA_CDP_TRACE: ${{ runner.temp }}/cdp-trace.jsonl
+          NAVIGERA_REQUIRE_BROWSER: "1"
+          NAVIGERA_CHROME_LOG: ${{ runner.temp }}/chrome.log
+        run: |
+          set -o pipefail
+          "$CHROME_BIN" --version || true
+          if ! cargo test --locked --no-fail-fast 2>&1 | tee /tmp/test.log; then
+            sed -n '/^---- /,/^test result/p' /tmp/test.log | grep -v -E '^ +[0-9]+: |^ +at ' | tail -c 30000 > /tmp/test-tail.log || true
+            python3 bench/ladder/annotate.py /tmp/test-tail.log "cargo test failure (${{ matrix.browser.label }})"
+            { grep -E -m 20 'FATAL|Check failed|Received signal|DCHECK|NOTREACHED|crash' "$NAVIGERA_CHROME_LOG"; echo '---'; \
+              grep -v -E 'dbus|Fontconfig|^#[0-9]|^ +[a-z0-9]+: |^$' "$NAVIGERA_CHROME_LOG" | tail -c 4000; } > /tmp/chrome-tail.log || true
+            python3 bench/ladder/annotate.py /tmp/chrome-tail.log "chrome stderr (${{ matrix.browser.label }})"
+            exit 1
+          fi
+      - name: CDP protocol check
+        run: |
+          if ! bash tools/protocol_dump.sh "$CHROME_BIN" "$RUNNER_TEMP/protocol.json" > /tmp/dump.log 2>&1; then
+            python3 bench/ladder/annotate.py /tmp/dump.log "protocol dump failure (${{ matrix.browser.label }})"
+            exit 1
+          fi
+          rc=0
+          python3 tools/cdp_check.py --protocol "$RUNNER_TEMP/protocol.json" \
+            --trace "$RUNNER_TEMP/cdp-trace.jsonl" --label "${{ matrix.browser.label }} (${{ matrix.browser.version }})" \
+            --markdown "$RUNNER_TEMP/cdp-check.md" || rc=$?
+          python3 bench/ladder/annotate.py "$RUNNER_TEMP/cdp-check.md" "cdp check ${{ matrix.browser.label }}"
+          exit $rc

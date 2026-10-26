@@ -1,0 +1,156 @@
+name: openrouter-eval
+
+# The agent eval (bench/agent-eval/run.py) with the driver swapped:
+# openrouter_run.py runs the same skilled tasks through a
+# chat-completions loop on OpenRouter, alternating the two models so
+# neither always goes first, and reports pass/turns/tokens/cost per run.
+# One job per tool variant (the matrix below); each job runs both models.
+# Keys: OPENROUTER_API_KEY in the `main` environment; the +jev variants
+# also use TYPESAFE_API_KEY, held by the decider relay
+# (.github/actions/jev-relay) so the agent's shell never sees it.
+# The agent-browser variants install that tool from npm (agent-eval.yml's
+# pin) and run it with its own skill, like the Gemini eval's skilled legs.
+
+on:
+  push:
+    branches: [openrouter-eval]
+    paths:
+      - bench/agent-eval/openrouter_run.py
+      - .github/workflows/openrouter-eval.yml
+  workflow_dispatch:
+    inputs:
+      tools:
+        description: "comma-separated: navigera,navigera-lightpanda,navigera-shell,navigera+jev,navigera-lightpanda+jev,navigera-shell+jev,agent-browser,agent-browser-lightpanda"
+        default: "navigera,navigera-lightpanda,navigera-shell,navigera+jev,navigera-lightpanda+jev,navigera-shell+jev,agent-browser,agent-browser-lightpanda"
+      tasks:
+        description: "comma-separated task ids (lookup,purchase,account,docs,support,preferences) or all"
+        default: "lookup,purchase,account,docs,support,preferences"
+      reps:
+        description: "repetitions per model x task"
+        default: "2"
+      models:
+        description: "comma-separated OpenRouter model ids"
+        default: "deepseek/deepseek-v4.1-flash,inception/mercury-3"
+      lightpanda:
+        description: "Lightpanda release tag for the navigera-lightpanda tools (e.g. 1.0.1, nightly)"
+        default: "1.0.1"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          TOOLS: ${{ inputs.tools || 'navigera,navigera-lightpanda,navigera-shell,navigera+jev,navigera-lightpanda+jev,navigera-shell+jev,agent-browser,agent-browser-lightpanda' }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          known = ["navigera", "navigera-lightpanda", "navigera-shell",
+                   "navigera+jev", "navigera-lightpanda+jev", "navigera-shell+jev",
+                   "agent-browser", "agent-browser-lightpanda"]
+          tools = [t.strip() for t in os.environ["TOOLS"].split(",") if t.strip() in known]
+          print("matrix=" + json.dumps([{"tool": t} for t in tools]))
+          EOF
+
+  eval:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    name: OpenRouter head-to-head (${{ matrix.run.tool }})
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: main
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      TOOL: ${{ matrix.run.tool }}
+      TASKS: ${{ inputs.tasks || 'lookup,purchase,account,docs,support,preferences' }}
+      REPS: ${{ inputs.reps || '2' }}
+      MODELS: ${{ inputs.models || 'deepseek/deepseek-v4.1-flash,inception/mercury-3' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The agent-setup steps the runner needs (navigera built from this
+      # commit, Chrome on $CHROME_BIN), without the Gemini CLI install.
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      # Node for the agent-browser jobs (agent-setup's version): run.py
+      # copies that tool's skill out of the global npm install.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: startsWith(matrix.run.tool, 'agent-browser')
+        with:
+          node-version: 24
+      - name: Build navigera (release)
+        run: |
+          cargo build --release --locked --bin navigera
+          # setup-rust-toolchain pins the toolchain for this checkout only
+          # (rustup override); agent workspaces get the default a developer
+          # machine has.
+          rustup default stable
+      - name: Chrome
+        run: |
+          echo "CHROME_BIN=$(which google-chrome)" >> "$GITHUB_ENV"
+          google-chrome --version
+      # agent-eval.yml's install step and pin, before the skilled runs:
+      # prepare() copies the skill from the global install, and the run
+      # env points the tool at $CHROME_BIN (or $LIGHTPANDA_BIN).
+      - name: Install agent-browser (for skilled runs)
+        if: startsWith(matrix.run.tool, 'agent-browser')
+        run: |
+          npm install -g agent-browser@0.39.1
+          npm ls -g --depth=0
+      # The variant setup steps are agent-eval.yml's: Lightpanda jobs get
+      # the release binary on $LIGHTPANDA_BIN, shell jobs point
+      # $CHROME_BIN at chrome-headless-shell instead.
+      - name: Lightpanda binary (navigera-lightpanda tools)
+        if: contains(matrix.run.tool, 'lightpanda')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.lightpanda || '1.0.1' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/lightpanda-bin"
+          gh release download "$RELEASE" --repo lightpanda-io/browser --pattern 'lightpanda-x86_64-linux' \
+            --dir "$RUNNER_TEMP/lightpanda-bin"
+          chmod +x "$RUNNER_TEMP/lightpanda-bin"/lightpanda*
+          echo "LIGHTPANDA_BIN=$RUNNER_TEMP/lightpanda-bin/lightpanda-x86_64-linux" >> "$GITHUB_ENV"
+          echo "::notice title=openrouter eval lightpanda::$("$RUNNER_TEMP/lightpanda-bin/lightpanda-x86_64-linux" version)"
+      - name: chrome-headless-shell (navigera-shell tools)
+        if: contains(matrix.run.tool, 'shell')
+        run: |
+          url=$(python3 tools/cft_matrix.py --no-beta | sed -n 's/^matrix=//p' \
+            | python3 -c 'import json,sys; print(next(e["url"] for e in json.load(sys.stdin) if e["kind"] == "chrome-headless-shell"))')
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/chs.zip" "$url"
+          unzip -q "$RUNNER_TEMP/chs.zip" -d "$RUNNER_TEMP/chs"
+          bin="$RUNNER_TEMP/chs/chrome-headless-shell-linux64/chrome-headless-shell"
+          echo "CHROME_BIN=$bin" >> "$GITHUB_ENV"
+          echo "::notice title=openrouter eval chrome::$("$bin" --version)"
+      - name: Decider relay (TypeSafe Jev)
+        if: contains(matrix.run.tool, '+jev')
+        uses: ./.github/actions/jev-relay
+        with:
+          key: ${{ secrets.TYPESAFE_API_KEY }}
+      - name: Head-to-head runs
+        run: |
+          bash bench/agent-eval/logged.sh "agent run log (openrouter, $TOOL)" \
+            python3 bench/agent-eval/openrouter_run.py --tool "$TOOL" --tasks "$TASKS" --reps "$REPS" \
+            --models "$MODELS" --out out/openrouter \
+            ${DECIDER_URL:+--decider-url "$DECIDER_URL" --decider-log "$DECIDER_LOG"}
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: openrouter-eval-${{ matrix.run.tool }}
+          path: |
+            out/openrouter/
+            ${{ runner.temp }}/jev.jsonl
+          if-no-files-found: ignore

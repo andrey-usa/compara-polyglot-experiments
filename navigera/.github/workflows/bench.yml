@@ -1,0 +1,228 @@
+name: bench
+
+# Browser-driver ladder: navigera (serve) vs Playwright vs Puppeteer
+# vs chromiumoxide on one scripted headless-Chrome session + eval/cold micros.
+#
+# Accounting: wall = best of N; driver CPU = the driver's OWN utime+stime
+# (zombie /proc read before reaping — wait4's rusage would also include any
+# Chrome the driver reaped); driver RSS = its own VmHWM; chrome CPU / peak
+# RSS sampled from /proc (approximate). Correctness gate: identical extracted JSON + counts across
+# all contenders, else the run fails.
+#
+# Manual dispatch, like bench-200m.yml in the gruppera repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: 'Session repetitions per contender (best-of-N wall)'
+        required: false
+        default: '3'
+      profile:
+        description: "set 'true' for a per-op wall/CPU profile of navigera in ladder.log (diagnostic)"
+        required: false
+        default: 'false'
+      only:
+        description: "comma-separated contenders (empty = all), e.g. nv-serve,gorod — fast narrow runs"
+        required: false
+        default: ''
+      scenarios:
+        description: "optional stages besides the session gate: eval,cold,realworld,browse,agent"
+        required: false
+        default: 'eval,cold,realworld,browse,agent'
+      baseline_ref:
+        description: "A/B: also run navigera built from this ref (branch, tag or FULL commit SHA) as nv-baseline; same machine, same run"
+        required: false
+        default: ''
+  schedule:
+    # Weekly contender check: latest Playwright, Puppeteer, agent-browser etc.
+    # (installed with @latest below) vs this repo's navigera.
+    - cron: '0 7 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  ladder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      REPS: ${{ inputs.reps || '3' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            . -> target
+            bench/ladder/contenders/chromiumoxide -> target
+            bench/ladder/contenders/chromey -> target
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27"
+
+      - name: Chrome version
+        run: |
+          CHROME_BIN=$(which google-chrome)
+          echo "CHROME_BIN=$CHROME_BIN" >> "$GITHUB_ENV"
+          "$CHROME_BIN" --version
+
+      - name: Install Microsoft Edge
+        # Optional contender: a flaky vendor download must not kill the
+        # ladder; a missing binary shows up under "Skipped" in the table.
+        continue-on-error: true
+        run: |
+          curl -fsSL --retry 4 --retry-all-errors https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg > /dev/null
+          echo "deb [arch=amd64] https://packages.microsoft.com/repos/edge stable main" | sudo tee /etc/apt/sources.list.d/microsoft-edge.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq microsoft-edge-stable
+          EDGE_BIN=$(which microsoft-edge-stable || which microsoft-edge)
+          echo "EDGE_BIN=$EDGE_BIN" >> "$GITHUB_ENV"
+          "$EDGE_BIN" --version
+
+      - name: Install Brave
+        # Optional contender: a flaky vendor download must not kill the
+        # ladder; a missing binary shows up under "Skipped" in the table.
+        continue-on-error: true
+        run: |
+          sudo curl -fsSL --retry 4 --retry-all-errors -o /usr/share/keyrings/brave-browser-archive-keyring.gpg https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] https://brave-browser-apt-release.s3.brave.com/ stable main" | sudo tee /etc/apt/sources.list.d/brave-browser-release.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq brave-browser
+          BRAVE_BIN=$(which brave-browser-stable || which brave-browser)
+          echo "BRAVE_BIN=$BRAVE_BIN" >> "$GITHUB_ENV"
+          "$BRAVE_BIN" --version
+
+      - name: Install Lightpanda
+        # Optional contender: a flaky vendor download must not kill the
+        # ladder; a missing binary shows up under "Skipped" in the table.
+        continue-on-error: true
+        run: |
+          curl -fsSL --retry 4 --retry-all-errors -o /usr/local/bin/lightpanda https://github.com/lightpanda-io/browser/releases/download/1.0.1/lightpanda-x86_64-linux
+          chmod a+x /usr/local/bin/lightpanda
+          lightpanda version || true
+
+      - name: Install chrome-headless-shell (nv-shell contender)
+        # Chrome for Testing's headless-only build of the same Stable Chrome:
+        # no browser UI layer, so it starts faster. Optional.
+        continue-on-error: true
+        run: |
+          url=$(curl -sSfL --retry 3 https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin)["channels"]["Stable"]; print(next(x["url"] for x in d["downloads"]["chrome-headless-shell"] if x["platform"]=="linux64"))')
+          curl -sSfL --retry 3 -o /tmp/shell.zip "$url"
+          unzip -q /tmp/shell.zip -d /opt
+          SHELL_BIN=/opt/chrome-headless-shell-linux64/chrome-headless-shell
+          echo "SHELL_BIN=$SHELL_BIN" >> "$GITHUB_ENV"
+          "$SHELL_BIN" --version
+
+      - name: Install agent tools (agent-browser, playwright-cli, Playwright MCP, Chrome DevTools MCP)
+        # Optional: a failed install shows up under "Skipped".
+        # @latest: the weekly schedule measures against the newest releases.
+        continue-on-error: true
+        run: |
+          npm install -g agent-browser@latest @playwright/cli@latest @playwright/mcp@latest chrome-devtools-mcp@latest
+          npm ls -g --depth=0
+
+      - name: Build navigera (release)
+        run: cargo build --release --bin navigera
+
+
+      - name: Build baseline navigera (A/B)
+        if: inputs.baseline_ref != ''
+        env:
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+        run: |
+          git fetch --depth=1 origin "$BASELINE_REF"
+          git worktree add /tmp/nv-baseline FETCH_HEAD
+          cargo build --release --bin navigera \
+            --manifest-path /tmp/nv-baseline/Cargo.toml --target-dir /tmp/nv-baseline-target
+          echo "NAVIGERA_BASELINE=/tmp/nv-baseline-target/release/navigera" >> "$GITHUB_ENV"
+          echo "baseline: $(git -C /tmp/nv-baseline rev-parse --short HEAD)"
+
+      - name: Build chromiumoxide contender (release)
+        run: |
+          cargo build --release \
+            --manifest-path bench/ladder/contenders/chromiumoxide/Cargo.toml
+
+      - name: Build chromey contender (release)
+        # Optional (crates.io latest): a build failure shows under "Skipped".
+        continue-on-error: true
+        run: |
+          cargo build --release \
+            --manifest-path bench/ladder/contenders/chromey/Cargo.toml
+
+      - name: Build Go contenders
+        run: |
+          set -e
+          cd bench/ladder/contenders/chromedp
+          go mod tidy
+          go build -o ladder-chromedp .
+          cd ../gorod
+          go mod tidy
+          go build -o ladder-gorod .
+
+      - name: Install node contenders
+        run: npm install --no-audit --no-fund
+        working-directory: bench/ladder
+
+      - name: Generate fixtures
+        run: python3 bench/ladder/gen_fixtures.py
+
+      - name: Run ladder
+        env:
+          LADDER_PROFILE: ${{ inputs.profile == 'true' && '1' || '0' }}
+          ONLY: ${{ inputs.only || '' }}
+          SCENARIOS: ${{ inputs.scenarios || 'eval,cold,realworld,browse,agent' }}
+        run: |
+          set -o pipefail
+          export NAVIGERA="$PWD/target/release/navigera"
+          export CHROME_BIN
+          mkdir -p bench/ladder/out
+          python3 bench/ladder/ladder.py --out-dir bench/ladder/out \
+            --reps "$REPS" --only "$ONLY" \
+            --scenarios "$SCENARIOS" 2>&1 | tee bench/ladder/out/ladder.log
+
+      - name: Table as annotations (readable via the checks API)
+        if: always()
+        run: python3 bench/ladder/annotate.py bench/ladder/out/table.md
+
+      - name: Results JSON as annotations (publish.json)
+        if: success()
+        run: python3 bench/ladder/annotate.py bench/ladder/out/publish.json "ladder json"
+
+      - name: Failure log tail as annotations
+        if: failure()
+        run: |
+          tail -c 30000 bench/ladder/out/ladder.log > /tmp/ladder-tail.log || true
+          python3 bench/ladder/annotate.py /tmp/ladder-tail.log "ladder log tail"
+
+      - name: Upload results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ladder-results
+          path: bench/ladder/out/
+
+      - name: Publish table
+        run: |
+          {
+            echo "## bench — browser-driver ladder ($(date -u +%Y-%m-%d))"
+            echo ""
+            echo "**CPU:** $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs) — $(nproc) vCPU · **RAM:** $(free -g | awk '/Mem:/ {print $2}') GB · **Chrome:** $(google-chrome --version)"
+            echo "**Reps:** $REPS (best-of-N wall) · **Cache:** warm (fixtures on 127.0.0.1)"
+            echo ""
+            cat bench/ladder/out/table.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat bench/ladder/out/table.md

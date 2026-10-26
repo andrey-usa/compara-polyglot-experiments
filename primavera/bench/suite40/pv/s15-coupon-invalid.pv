@@ -1,0 +1,19 @@
+# A bogus coupon is rejected with no reload and no discount line.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "An invalid coupon is rejected"
+  goto /shop/p/101 --wait commit
+  click --selector "#detail-add"
+  expect --selector "#cart-count" text is 1
+  goto /cart --wait commit
+  fill --label "Coupon code" BOGUS
+  click --role button --name "Apply coupon"
+  expect text "Invalid coupon"
+  expect no text "Discount (BOGUS)"

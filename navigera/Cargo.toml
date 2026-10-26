@@ -1,0 +1,30 @@
+[package]
+name = "navigera"
+version = "0.6.0"
+edition = "2021"
+default-run = "navigera"
+description = "Drive headless Chrome from the shell, one command per step: a native Rust CDP CLI for AI agents (accessibility-tree refs, sessions, tabs, iframes, dialogs) plus a JSON-lines serve mode."
+license = "MIT"
+repository = "https://github.com/andrey-usa/navigera"
+homepage = "https://github.com/andrey-usa/navigera"
+documentation = "https://github.com/andrey-usa/navigera/blob/master/docs/navigera.md"
+readme = "README.md"
+keywords = ["chrome", "cdp", "browser-automation", "headless", "cli"]
+categories = ["command-line-utilities", "web-programming", "development-tools::testing"]
+rust-version = "1.91"
+include = ["/src/**", "/skills/**", "/tests/**", "/bench/site/server.py", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "net", "macros"] }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+tempfile = "3"
+base64 = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

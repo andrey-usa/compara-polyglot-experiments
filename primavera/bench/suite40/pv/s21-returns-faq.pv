@@ -1,0 +1,16 @@
+# Docs page: the collapsed <details> returns FAQ (37 days, 8% fee).
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "The returns FAQ opens"
+  goto /docs --wait commit
+  click --text "Returns FAQ"
+  expect text "37 days from delivery"
+  expect text "8% applies to opened items"
+  expect --selector "#returns-faq" attr open is ""

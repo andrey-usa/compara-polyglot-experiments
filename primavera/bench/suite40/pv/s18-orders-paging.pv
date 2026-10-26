@@ -1,0 +1,18 @@
+# Orders table paging: 25 orders, 10 per page.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "Paging through the order history"
+  run sign-in demo@acme.test hunter2
+  expect --selector "#pageinfo" text is "Page 1 of 3"
+  click --selector "#next"
+  expect --selector "#pageinfo" text is "Page 2 of 3"
+  expect --selector "#orders tr" count is 10
+  click --selector "#prev"
+  expect --selector "#pageinfo" text is "Page 1 of 3"

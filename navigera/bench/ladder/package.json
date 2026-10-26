@@ -1,0 +1,1 @@
+{"dependencies":{"playwright-core":"^1.63.0","puppeteer-core":"^24.0.0"},"description":"Node contenders for the browser-driver ladder (bench/ladder).","name":"ladder-contenders","private":true,"type":"module"}

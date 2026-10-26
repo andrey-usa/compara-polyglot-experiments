@@ -1,0 +1,109 @@
+name: ide-eval
+
+# The browser inside open-source IDE agents: Cline CLI, Kilo CLI and
+# Continue's `cn`, each given navigera (CLI + skill), `navigera mcp`, or
+# Playwright MCP. See bench/ide-eval/run.py.
+#
+#   mock    a scripted OpenAI-compatible model (bench/ide-eval/mock_llm.py)
+#           plays the lookup task through whatever tools the agent offers.
+#           No key; deterministic. A gate: every agent must reach the
+#           browser both ways and hand the results back.
+#   gemini  the same agents on a real model, when GEMINI_API_KEY is set in
+#           the `main` environment (manual runs: pick tasks and model).
+#
+# Results: annotations `ide eval mock N/M` and `ide eval gemini N/M`.
+
+on:
+  push:
+    branches: [master]
+    paths: [src/**, skills/**, bench/ide-eval/**, bench/agent-eval/**, .github/workflows/ide-eval.yml]
+  pull_request:
+    paths: [src/**, skills/**, bench/ide-eval/**, bench/agent-eval/**, .github/workflows/ide-eval.yml]
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Gemini model id for the real-model leg (empty: mock only)"
+        default: "gemini-3.5-flash-lite"
+      tasks:
+        description: "comma-separated task ids for the real-model leg"
+        default: "lookup,purchase"
+      agents:
+        description: "cline,kilo,continue"
+        default: "cline,kilo,continue"
+      browsers:
+        description: "navigera,navigera-mcp,playwright-mcp"
+        default: "navigera,navigera-mcp,playwright-mcp"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ide-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned so a run measures navigera, not an agent update.
+  CLINE: cline@3.0.70
+  KILO: "@kilocode/cli@7.8.8"
+  CONTINUE: "@continuedev/cli@1.5.47"
+  PLAYWRIGHT_MCP: "@playwright/mcp@0.0.83"
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: main
+    env:
+      HAS_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - name: Build navigera
+        run: |
+          cargo build --release --locked --bin navigera
+          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+      - name: Install the agents and Playwright MCP
+        run: |
+          mkdir -p "$RUNNER_TEMP/agents" && cd "$RUNNER_TEMP/agents"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "$CLINE" "$KILO" "$CONTINUE" "$PLAYWRIGHT_MCP"
+          node node_modules/cline/postinstall.mjs
+          echo "AGENTS=$RUNNER_TEMP/agents/node_modules" >> "$GITHUB_ENV"
+          echo "CHROME_BIN=$(which google-chrome)" >> "$GITHUB_ENV"
+      - name: Mock model (all agents x all browsers)
+        run: |
+          set +e
+          python3 bench/ide-eval/run.py --model mock --out out/mock --require-pass \
+            --cline "$AGENTS/cline/bin/cline" --kilo "$AGENTS/.bin/kilo" --cn "$AGENTS/.bin/cn" \
+            --playwright-mcp "$AGENTS/@playwright/mcp/cli.js"
+          rc=$?
+          python3 bench/ladder/annotate.py out/mock/table.md "ide eval mock"
+          exit $rc
+      - name: Real model
+        if: env.HAS_KEY == 'true' && github.event_name == 'workflow_dispatch' && inputs.model != ''
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MODEL: ${{ inputs.model || 'gemini-3.5-flash-lite' }}
+          TASKS: ${{ inputs.tasks }}
+          AGENTS_LIST: ${{ inputs.agents || 'cline,kilo,continue' }}
+          BROWSERS: ${{ inputs.browsers || 'navigera,navigera-mcp,playwright-mcp' }}
+        run: |
+          python3 bench/ide-eval/run.py --model "gemini:$MODEL" --tasks "$TASKS" \
+            --agents "$AGENTS_LIST" --browsers "$BROWSERS" --timeout 900 --out out/gemini \
+            --cline "$AGENTS/cline/bin/cline" --kilo "$AGENTS/.bin/kilo" --cn "$AGENTS/.bin/cn" \
+            --playwright-mcp "$AGENTS/@playwright/mcp/cli.js" || true
+          python3 bench/ladder/annotate.py out/gemini/table.md "ide eval gemini"
+          python3 bench/ladder/annotate.py out/gemini/runs.json "ide eval json gemini"
+      - name: No key
+        if: env.HAS_KEY != 'true'
+        run: echo "::notice title=ide eval::no GEMINI_API_KEY in the main environment; ran the mock model only"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: ide-eval
+          path: out/

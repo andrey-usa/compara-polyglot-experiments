@@ -1,0 +1,4 @@
+scenario "Stops for a look"
+  goto /m1
+  eval "document.title = 'paused here'"
+  expect title is never --timeout-ms 200

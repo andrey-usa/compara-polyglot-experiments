@@ -1,0 +1,13 @@
+# Shop grid: products render after the delayed fetch (350 ms + API).
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "The shop lists products after the delayed fetch"
+  expect --role status text is "Showing 12 of 60 products"
+  expect --selector ".card" count is 12

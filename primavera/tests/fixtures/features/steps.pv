@@ -1,0 +1,4 @@
+# Steps for the .feature files beside this one.
+step "I sign in with {password}"
+  fill --label Password ${password}
+  click --text "Sign in"

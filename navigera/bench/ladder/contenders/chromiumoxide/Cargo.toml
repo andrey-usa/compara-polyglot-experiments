@@ -1,0 +1,23 @@
+[package]
+name = "ladder-chromiumoxide"
+version = "0.1.0"
+edition = "2021"
+
+# Bench-only contender for the browser-driver ladder: the same canonical
+# session driven through chromiumoxide (native Rust CDP, like navigera's
+# own engine). Not part of the shipped tool.
+
+[[bin]]
+name = "ladder-chromiumoxide"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chromiumoxide = "0.7"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3

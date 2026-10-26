@@ -1,0 +1,11 @@
+# Cookie consent: accepting the banner dismisses it and it stays gone.
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+scenario "Accepting the cookie banner dismisses it"
+  goto /shop --wait commit
+  expect --selector "#cookie" visible
+  click --selector "#cookie-accept"
+  expect not --selector "#cookie" visible
+  goto /cart --wait commit
+  expect not --selector "#cookie" visible

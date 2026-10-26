@@ -1,0 +1,30 @@
+[package]
+name = "primavera-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+[package.metadata]
+cargo-fuzz = true
+[dependencies]
+libfuzzer-sys = "0.4"
+navigera = { path = "../../navigera" }
+anyhow = "1"
+serde_json = "1"
+regex = "1"
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+[lib]
+name = "pvlib"
+path = "src/lib.rs"
+[[bin]]
+name = "pv_parse"
+path = "fuzz_targets/pv_parse.rs"
+test = false
+doc = false
+[[bin]]
+name = "gherkin_parse"
+path = "fuzz_targets/gherkin_parse.rs"
+test = false
+doc = false
+[workspace]

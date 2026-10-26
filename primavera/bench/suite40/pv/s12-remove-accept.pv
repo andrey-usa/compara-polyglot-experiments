@@ -1,0 +1,19 @@
+# Remove asks confirm(); accepting empties the cart.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "Removing an item after confirming empties the cart"
+  goto /shop/p/101 --wait commit
+  click --selector "#detail-add"
+  expect --selector "#cart-count" text is 1
+  goto /cart --wait commit
+  dialog --accept
+  click --selector '[data-remove="101"]'
+  expect text "Your cart is empty."
+  expect --selector "#cart-count" text is 0
