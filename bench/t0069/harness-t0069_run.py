@@ -34,8 +34,9 @@ TRIAL_WALL_CAP_S = 1800
 DONE_CMD = "echo TASK-DONE"
 
 # Prompt-gate pins (verified before the FIRST paid request; fail-closed):
-# primavera arm manual = `primavera skill` of the next 3aa36db build (7438 B; lead 2026-10-26: CI builds next head 3aa36db - 76d22b9 is not public).
-EXPECTED_PV_SKILL_SHA256 = "322c5be977257903aa6bb3f3b1c7220894e09242427d4be800d2d41f26672c7a"
+# primavera arm manual = `primavera skill` of the pinned build (T-0069: next 3aa36db,
+# 7438 B; T-0091 round 2: next 7026c80 on navigera 0.6.2 master 69ea463, 7432 B).
+EXPECTED_PV_SKILL_SHA256 = "a4b79287e8ab23a2140f21107afe1c4df9eada6b13db4ee34c8b009bd1209585"
 # playwright arm manual = playwright-skill.md (drafted from Playwright docs; 6154 B).
 EXPECTED_PW_SKILL_SHA256 = "6e4564b7a74852086fdcb3c08e159dc62ba83c8638b289b2f212ab349a4c43fc"
 

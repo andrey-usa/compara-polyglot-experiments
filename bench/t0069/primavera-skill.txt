@@ -1,6 +1,6 @@
 ---
 name: primavera
-description: Write and run plain-text web tests (.pv files) on real Chrome with primavera — each step is a navigera command line, each check an `expect` that retries. Use to turn what you did in a navigera session into a regression test, to check a web app after a change, or to automate a browser job, without writing Playwright code.
+description: Write and run plain-text web tests (.pv files) on real Chrome with primavera — each step is a navigera command line, each check an `expect` that retries. Use to turn what you did in a navigera session into a regression test, to check a web app after a change, or to automate a browser job, without writing test code.
 ---
 
 # primavera

@@ -56,7 +56,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with: { repository: andrey-usa/primavera, ref: 3aa36db15c8ba6ad38dd839a87a8e941c5f69178, path: primavera, persist-credentials: false }
+        with: { repository: andrey-usa/primavera, ref: 7026c8031967e0fa146b04e2f2a6e2092e359302, path: primavera, persist-credentials: false }
       - uses: actions/checkout@v4
         with: { repository: andrey-usa/navigera, ref: cc300d30f2fa72896c522fadc50293db7a38bdc7, path: navigera, persist-credentials: false }
       - uses: dtolnay/rust-toolchain@stable
@@ -108,7 +108,7 @@ jobs:
         run: |
           sudo mkdir -p /opt/pw-browsers && sudo chmod 777 /opt/pw-browsers
           sudo mkdir -p /opt/t0069/pw && sudo chown runner:runner /opt/t0069/pw
-          cd /opt/t0069/pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test >/dev/null 2>&1
+          cd /opt/t0069/pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test@1.64.1 >/dev/null 2>&1
           npx playwright install --with-deps chromium >/dev/null 2>&1
           sudo chmod -R a+rX /opt/pw-browsers /opt/t0069/pw
           echo "== pw/browsers symlinks resolving back through runner home (must be empty) =="
@@ -231,7 +231,7 @@ jobs:
         run: |
           sudo mkdir -p /opt/pw-browsers && sudo chmod 777 /opt/pw-browsers
           sudo mkdir -p /opt/t0069/pw && sudo chown runner:runner /opt/t0069/pw
-          cd /opt/t0069/pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test >/dev/null 2>&1
+          cd /opt/t0069/pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test@1.64.1 >/dev/null 2>&1
           npx playwright install --with-deps chromium >/dev/null 2>&1
           sudo chmod -R a+rX /opt/pw-browsers /opt/t0069/pw
           echo "pw ready: $(npx playwright --version)"
