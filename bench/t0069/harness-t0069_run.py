@@ -473,6 +473,9 @@ def main():
     ap.add_argument("--slice-mod", type=int, default=1, help="split the task list into N deterministic slices")
     ap.add_argument("--slice-index", type=int, default=0, help="0-based slice index (tasks[i] where i %% mod == index)")
     ap.add_argument("--uncapped", action="store_true", help="disable the dollar spend refusal (WAL unchanged); requires explicit operator authorization")
+    ap.add_argument("--wall-budget-minutes", type=float, default=0,
+                    help="stop STARTING new trials when elapsed + trial wall cap would exceed this budget; in-flight trial finishes, remaining trials are reported as DRAINED (0 = no budget)")
+    ap.add_argument("--skip", default="", help="comma-separated TASK:TRIAL pairs to skip (resume after a drain; every trial still runs exactly once across dispatches)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -513,11 +516,23 @@ def main():
     if args.slice_mod > 1:
         tasks = [t for i, t in enumerate(tasks) if i % args.slice_mod == args.slice_index]
         print(f"SLICE {args.slice_index + 1}/{args.slice_mod}: tasks={','.join(tasks)}", flush=True)
+    skip = {p.strip() for p in args.skip.split(",") if p.strip()}
     site = Site(args.site_dir, args.port)
     jpath = os.path.join(args.out, f"t0069-episodes-{RUN_ID}.jsonl")
     n = 0
+    t_start = time.time()
+    drained = []
+    stop = False
     for task_id in tasks:
         for trial in range(1, args.trials + 1):
+            if f"{task_id}:{trial}" in skip:
+                print(f"[skip] {task_id} t{trial} already completed in an earlier dispatch", flush=True)
+                continue
+            if stop or (args.wall_budget_minutes > 0 and
+                        (time.time() - t_start) + TRIAL_WALL_CAP_S > args.wall_budget_minutes * 60):
+                stop = True
+                drained.append(f"{task_id}:{trial}")
+                continue
             rec = run_trial(args.arm, task_id, trial, args, ledger, site)
             rec["run"] = RUN_ID
             with open(jpath, "a") as f:
@@ -528,6 +543,14 @@ def main():
             print(f"[{n}] {args.arm} {task_id} t{trial} score={rec['score']} "
                   f"pass_clean={rec['pass_clean']} pass_broken={rec['pass_broken']} "
                   f"turns={rec['turns']} cost={rec['cost']:.4f} wall={rec['wall_s']}s err={rec['error']}", flush=True)
+    if drained:
+        dpath = os.path.join(args.out, f"t0069-drained-{RUN_ID}.json")
+        with open(dpath, "w") as f:
+            json.dump({"run": RUN_ID, "drained": drained,
+                       "resume_with": "--skip " + ",".join(drained)}, f, indent=1)
+        print(f"DRAIN: wall budget reached; {len(drained)} trials deferred "
+              f"(resume this slice in a later dispatch; every trial runs exactly once). "
+              f"deferred={','.join(drained)} file={dpath}", flush=True)
     print(f"ledger: computed=${ledger['cost']:.4f} retained=${ledger['retained']:.4f} "
           f"requests={ledger['requests']} tokens={ledger['tokens']}")
 

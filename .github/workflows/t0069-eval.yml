@@ -24,6 +24,14 @@
 #   sufficient: same-uid /proc/<pid>/environ would otherwise expose the key.
 # - The zero-spend `preflight` job runs the seeded-solution self-test through
 #   the exact restricted-user path on both arms and gates all paid jobs.
+# - BOUNDED EXECUTION: 4 slices/arm = 9 trials per eval job (worst case
+#   9 x 30-min trial cap = 270 min + overhead < 360-min job timeout), and the
+#   harness stops STARTING trials 30 min before a 300-min wall budget, finishing
+#   the in-flight trial and recording deferred trials for an exact-once resume
+#   in a later dispatch. Results never depend on post-timeout always() steps:
+#   GitHub forcibly terminates cancelled/timed-out jobs after a 5-minute grace
+#   (workflow cancellation reference), so the run is designed to finish well
+#   before any platform timeout.
 # - Checkouts use persist-credentials: false; workflow permissions are read-only.
 name: T-0069 M3 exit eval
 permissions:
@@ -40,7 +48,7 @@ on:
     inputs:
       slice_mod:
         description: "deterministic slices per arm (matrix must match)"
-        default: "2"
+        default: "4"
 
 jobs:
   build:
@@ -114,10 +122,10 @@ jobs:
       fail-fast: false
       matrix:
         arm: [primavera, playwright]
-        slice: [0, 1]
+        slice: [0, 1, 2, 3]
     env:
       SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
-      SLICE_MOD: ${{ github.event.inputs.slice_mod || '2' }}
+      SLICE_MOD: ${{ github.event.inputs.slice_mod || '4' }}
       PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
     steps:
       - uses: actions/checkout@v4
@@ -146,7 +154,7 @@ jobs:
           set +e
           python3 harness-t0069_run.py --arm "$ARM" --trials 3 \
             --slice-mod "$SLICE_MOD" --slice-index "$SLICE" \
-            --as-user benchr \
+            --as-user benchr --wall-budget-minutes 300 \
             --primavera-bin "$GITHUB_WORKSPACE/bin/primavera" --pw-dir "$GITHUB_WORKSPACE/pw" \
             --out "out/$RUNTAG" --uncapped \
             > "out/$RUNTAG/harness-stdout.log" 2>&1
