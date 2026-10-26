@@ -1,32 +1,37 @@
 # Security policy
 
+compara parses untrusted CSV, JSON and Parquet files, and its Parquet reader
+decodes pages itself. Any input that makes it crash, hang, read out of bounds
+or report a wrong count is a bug we want to hear about.
+
+## What to expect
+
+- A malformed or hostile file should end the run with exit 2 and a message;
+  a panic, an abort or a hang is a bug. `tests/hostile.rs` holds one file per
+  way this has failed before (deep or oversized footers, wrapping lengths,
+  decompression bombs, truncated rows), and CI runs it on every push.
+- No `unsafe` code depends on the file's contents: the `unsafe` blocks are
+  SIMD loads behind bounds checks, prefetches, a `set_len` after the writes
+  it covers, and the memory map.
+- Memory grows with the row counts a file declares. A valid Parquet file can
+  describe a billion equal values in a few kilobytes, so a small file is not
+  a small comparison; run untrusted inputs under a memory limit (`ulimit -v`,
+  a container) if that matters.
+- A gzip or zstd input that expands past 1 GB to more than 1000 times its
+  size is refused (`COMPARA_MAX_EXPANSION`), and an `http(s)://` input or
+  redirect that leads to a link-local address (a cloud metadata service) is
+  refused (`COMPARA_ALLOW_LINK_LOCAL=1`). Other private and loopback hosts
+  stay readable: they are where many tables live.
+- The HTML report shows cell values as text. It loads nothing from the
+  network and runs no code from the data.
+- Exported CSVs (`--export-dir`, the report's download) keep values exactly
+  as they were. A value beginning with `=`, `+`, `-` or `@` is a formula to a
+  spreadsheet application: open untrusted exports as text.
+- Writing a file you are comparing while compara has it mapped can end the
+  run with SIGBUS; compare a copy of a file that is still being written.
+
+## Reporting
+
 Please report vulnerabilities privately through
-[GitHub security advisories](https://github.com/andrey-usa/navigera/security/advisories/new)
+[GitHub security advisories](https://github.com/andrey-usa/compara/security/advisories/new)
 rather than a public issue. Only the latest release receives fixes.
-
-## What navigera protects, and how
-
-navigera runs a real browser for an agent that opens pages nobody vetted.
-
-| boundary | protection |
-|---|---|
-| a malicious page vs. your account | Chrome's renderer sandbox stays on. navigera adds `--no-sandbox` only when Chrome can't have one: as root (containers, CI), with `NAVIGERA_NO_SANDBOX=1`, or after Chrome reports at launch that the machine has no usable sandbox, in which case it says so on stderr. It remembers that for that browser binary in the private session directory, until the binary changes or the machine reboots, so later launches skip the attempt; deleting `no-sandbox-*` there brings it back |
-| other local users vs. your session | Unix: the session socket and log live in `$XDG_RUNTIME_DIR/navigera` or `$TMPDIR/navigera-<uid>`, mode 0700, refused if it is a symlink, someone else's or open to others; the log is 0600 and never follows a symlink. Windows: a loopback port that drops any client whose first line isn't the 128-bit token from your own `%TEMP%` |
-| a web page vs. the CDP connection | the default transport is a private pipe (Linux/macOS): no port at all. Chrome rejects DevTools WebSocket connections from web origins |
-| the downloaded binary | `install.sh` / `install.ps1` verify the SHA-256 published with each release; release builds carry GitHub build-provenance attestations (`gh attestation verify <file> -R andrey-usa/navigera`) |
-| the MCP server's file access | every file a tool or `browser_run` step reads or writes (upload, route `body_file`, `state`, `network --har`/`--body-file`, `pdf`, `screenshot --path`, `downloads --dir`) must be inside the working directory, and `file:` and `chrome://`/`devtools://` pages are refused, unless `NAVIGERA_MCP_ALLOW_FILES=1` |
-| page content vs. third parties | nothing leaves the machine but the browser's own traffic, unless you configure a decision model (`TYPESAFE_API_KEY` / `NAVIGERA_DECIDER_URL`). Then `find` and `check` send the page's accessibility tree to it, with text typed into fields replaced by `(filled)`; the key goes to `curl` on stdin, not in its arguments |
-
-## Known exposures
-
-- **DevTools port.** `--transport ws`, Windows sessions and the persistent
-  `--profile` browser listen on a loopback DevTools port. Chrome has no
-  authentication there: any process on the machine that finds the port can
-  drive that browser. For a `--profile` browser (your sign-ins), that lasts as
-  long as the browser stays open. On a shared machine, close it with
-  `quit --close-browser` when you're done.
-- **`eval` runs any JavaScript** in the page, and `upload` (CLI) sends any
-  file you name: by design, for the agent you run.
-- **Prompt injection.** Page text reaches the model. The skill and the MCP
-  server tell the agent to treat it as data; the agent and its approval
-  settings decide what it does with it.

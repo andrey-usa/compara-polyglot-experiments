@@ -124,9 +124,6 @@ def npm(args) -> None:
             "keywords": args.keywords.split(",") if args.keywords else [],
             "bin": {args.name: f"bin/{args.name}.js"}, "files": ["bin"],
             "engines": {"node": ">=16"}, "optionalDependencies": optional}
-    if args.mcp_name:
-        # The MCP Registry checks that the npm package claims the server name.
-        meta["mcpName"] = args.mcp_name
     (main / "package.json").write_text(json.dumps(meta, indent=2) + "\n")
     readme = Path(args.readme) if args.readme else None
     (main / "README.md").write_text(readme.read_text() if readme and readme.exists()
@@ -141,6 +138,8 @@ def wheel(args) -> None:
     out = Path(args.out) / "wheels"
     out.mkdir(parents=True, exist_ok=True)
     dist_name = args.name.replace("-", "_")
+    # PEP 427: wheel filenames must not contain "-" in the version; "_" instead.
+    wheel_version = args.version.replace("-", "_")
     readme = Path(args.readme) if args.readme else None
     long_description = readme.read_text() if readme and readme.exists() else args.description
     metadata = "\n".join([
@@ -164,9 +163,9 @@ def wheel(args) -> None:
     for target, archive, _ in archives(Path(args.dist), args.name):
         tag = f"py3-none-{TARGETS[target][2]}"
         exe, data = binary(archive, args.name)
-        info = f"{dist_name}-{args.version}.dist-info"
+        info = f"{dist_name}-{wheel_version}.dist-info"
         files = {
-            f"{dist_name}-{args.version}.data/scripts/{exe}": (data, 0o755),
+            f"{dist_name}-{wheel_version}.data/scripts/{exe}": (data, 0o755),
             f"{info}/METADATA": (metadata.encode(), 0o644),
             f"{info}/WHEEL": (("Wheel-Version: 1.0\nGenerator: package.py\nRoot-Is-Purelib: false\n"
                                + "".join(f"Tag: py3-none-{t}\n" for t in TARGETS[target][2].split("."))).encode(),
@@ -180,7 +179,7 @@ def wheel(args) -> None:
             record.write(f"{path},sha256={digest},{len(content)}\n")
         record.write(f"{info}/RECORD,,\n")
         files[f"{info}/RECORD"] = (record.getvalue().encode(), 0o644)
-        path = out / f"{dist_name}-{args.version}-{tag}.whl"
+        path = out / f"{dist_name}-{wheel_version}-{tag}.whl"
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
             for name, (content, mode) in files.items():
                 entry = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
@@ -249,7 +248,6 @@ def main() -> None:
     ap.add_argument("--license-file", default="LICENSE")
     ap.add_argument("--readme", default="README.md")
     ap.add_argument("--keywords", default="")
-    ap.add_argument("--mcp-name", default="", help="npm: the server's MCP Registry name (io.github.<owner>/<name>)")
     args = ap.parse_args()
     args.version = args.version.removeprefix("v")
     {"npm": npm, "wheel": wheel, "homebrew": homebrew, "scoop": scoop}[args.kind](args)

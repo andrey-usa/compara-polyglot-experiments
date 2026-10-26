@@ -6,456 +6,343 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-### Added
-
-- `install-browser [chrome-headless-shell | chrome] [--channel stable|beta|dev|canary]`:
-  downloads Chrome from Google's Chrome for Testing into navigera's own cache
-  (`--where` prints it; `$NAVIGERA_BROWSERS` moves it), each file checked
-  against the archive's checksum. Headless sessions use an installed
-  chrome-headless-shell first (about 3x faster to start); a Chrome installed
-  this way is the fallback where the system has none.
-
-- `--near <text>` with a locator: the match whose own part of the page
-  (its card, row or section) shows the text. `locate` writes it when a
-  role and name match more than one element, before falling back to a CSS
-  path.
-- `locate <target>`: the locators that find an element again, most stable
-  first (test id, role and name, label, placeholder, text, CSS), each kept
-  only when the finder an op would use picks that element on the page;
-  `--frame` added inside a frame (a cross-origin one named from the page
-  that holds it); `secret: true` for a password field. An element in a
-  shadow root gets its hosts' path: `--selector "#app >>> x-card >>> button"`.
-- `--selector "host >>> inner"`: `inner` inside the open shadow root of an
-  element `host` matches (or a shadow root under it), for every op,
-  `wait --selector` and `get count`.
-- `history [--clear]`: the actions a session ran and its waits, oldest first; one on a
-  ref carries its element's `locate` from just before it ran, and each
-  what the page said after it (title, heading, status messages). What
-  `primavera from-session` turns into a test.
-
 ### Fixed
 
-- Numbers from the page keep their exact value: `eval` and the JSON
-  output printed about one double in five slightly off in its last digit
-  (`9480.300552478155` as `9480.300552478157`). Found by fuzzing.
-- `scroll --to bottom` (the page's, or inside a target) at the end already
-  waits up to 2 s for a list that loads more to grow, then goes to the new
-  end: two in a row, as a recorded session replays them, reached only the
-  first page of a lazy list.
-- `history` marks a click that changed nothing (`no_effect: true`), so a
-  test writer can drop it when the same click follows.
-- A `goto` to a server that takes the connection and never answers fails
-  at its timeout and cancels that navigation: the tab answers at once again
-  (it had answered nothing while the dead load was pending, so the next
-  `url` or `ax`, and a test runner's failure screenshot, each waited their
-  whole timeout too: one failed step cost 105 s).
-- A control inside its `<label>` (a select, a textarea) is named by the
-  label's own words for `--label`/`--name`, not with its options' text.
-- `get box` of an element inside an iframe is in top-level viewport pixels
-  (each frame's offset added), as `mouse` takes them and Playwright's
-  `boundingBox()` reports; it was relative to the element's own frame.
-- `--natural` with chrome-headless-shell as the browser (`--chromium`,
-  `$CHROME_BIN`) is refused with a message instead of starting a browser
-  that still tells pages it is headless.
-- `--from` copies Chrome 156's local storage, which is one `LocalStorage`
-  SQLite file there (with its journal) instead of a `Local Storage`
-  directory: sign-ins kept in local storage came over empty.
-- A `--profile` browser falls back to no sandbox the way navigera's own
-  launches do (as root, with `NAVIGERA_NO_SANDBOX`, or after a first start
-  that failed for want of one); it had exited and the profile could not
-  be used on such a machine.
-
-### Changed
-
-- Browser discovery no longer looks in other tools' browser caches: it takes
-  `--chromium`, `$CHROME_BIN`, a system Chrome, Chromium or Edge, or what
-  `install-browser` installed. Point `$CHROME_BIN` at a browser elsewhere.
+- Delta-encoded Parquet integers whose deltas need more than 32 bits (an
+  INT64 column with large jumps between rows) lost their high bits and were
+  read as wrong values; they are read whole now.
 
 ### Security
 
-- tokio 1.54 (RUSTSEC-2026-0386).
-- MCP: `browser_run` steps could read and write files outside the working
-  directory (a route's `body_file` served any local file to the page;
-  `state save`, `network --har`/`--body-file`, `pdf` and `downloads --dir`
-  wrote anywhere). Every file a step names is now held to the working
-  directory, as uploads were, and the browser's own pages (`chrome://`,
-  `devtools://`) are refused; `NAVIGERA_MCP_ALLOW_FILES=1` lifts both.
-- The default download directory is now inside `navigera-<uid>` in the
-  temp directory (mode 0700), not a world-readable `navigera-downloads-<pid>`.
+- A Parquet page that claims a bit width wider than its values (found by
+  fuzzing) is refused with a message; a debug build panicked on it and a
+  release one read garbage.
 
-## [0.6.0] - 2026-10-24
+- A gzip or zstd input that expands past 1 GB to more than 1000 times its
+  size is refused as a decompression bomb; it was expanded whole into
+  `TMPDIR` first (`COMPARA_MAX_EXPANSION=<times>`, 0 for no limit).
+- `http(s)://` inputs and their redirects no longer reach link-local
+  addresses (cloud metadata services: 169.254.169.254, fe80::/10,
+  fd00:ec2::254), by address or by name (`COMPARA_ALLOW_LINK_LOCAL=1`
+  allows it); redirects stop after 10, and a refused one says why.
 
-The browser handed over to a person and back, downloads, frames of any
-origin and custom dropdowns; clicks that wait for what moves or covers
-their element and say when they changed nothing; and `reset` and `fork`,
-so a test runner gets a clean, separate session in about 40 ms.
+## [0.6.0] - 2026-10-26
+
+Tables compared where they are: in S3, Google Cloud Storage and Azure, on
+the web, as directories and globs of parts, and as Delta Lake tables at a
+version. A container image and a GitHub Action. Faster on every format,
+and inside a container's memory limit a refusal that says why rather than
+an OOM kill.
 
 ### Added
 
-- Element ops reach into same-origin iframes, framesets and `srcdoc`
-  frames, and `--selector` into open shadow roots, when the page itself
-  has no match (role/name and text locators already reached shadow roots).
-  `wait --selector/--text/--gone`, `get count` and `text` look there too.
-- `--wait-ms <ms>` (on `start`, `serve`, `mcp` or one command;
-  `NAVIGERA_WAIT_MS`): how long element ops wait for their element when they
-  name no timeout. A test suite against a slow app sets it once.
-- Downloads: files a page downloads are saved under `--download-dir`
-  (`NAVIGERA_DOWNLOAD_DIR`; default a directory of the session's own) with
-  the name the page gave them. `downloads` lists them; `wait --download
-  "*.csv"` waits for one and returns its path. `downloads --dir <path>`
-  gives one session a directory of its own (kept across `reset`; forks
-  and other sessions keep theirs), so a test runner can give each test
-  one and file names don't carry over (`report (2).csv`) between tests.
-- `click --button right|middle` (a native context-menu click), `click
-  --force` (DOM events on the element, covered or not), `select --add`
-  (add to a multiple select's choice), `tab-select <target id>`,
-  `network --since <n>`.
-- `select` on custom dropdowns (ARIA comboboxes such as react-select): it
-  opens them the way a user does (ArrowDown, else a click), finds the
-  option in the listbox that opened (portals included), types to filter
-  when it isn't listed, and clicks it.
-- `fill --keys`: clear the field and type the value key by key, for forms
-  whose app keeps only what was typed.
-- `scroll --to top|bottom` with a target scrolls inside it.
-- Selectors, text and locators reach into cross-origin iframes (a payment
-  provider's card form, a sign-in frame) when the page itself has no match:
-  navigera looks there from an isolated world of its own, which the page
-  can't see. A single `wait --text`/`--selector` does too. With `--attach`,
-  frames in another process stay ref-only.
-- Library: `Driver::fork` (and `BrowserSession::fork`), another driver on
-  the same browser in a browser context of its own, movable to another
-  thread: several sessions at once without a browser each (a test runner's
-  workers). Each takes only the tabs its own tabs open, and routes,
-  credentials, the dialog answer and the downloads list are each
-  session's own.
-- `reset`: a clean slate in the same browser, a new browser context (no
-  cookies, storage or cache from before) with one blank tab, in about 40 ms
-  instead of a new browser's few hundred. For test runners that isolate
-  scenarios, and agents that want to start over signed out. `set`, routes,
-  init scripts and the dialog answer stay; `reset --all` drops them too.
-- `--frame <css>` on element targets and `wait`: look only inside that
-  iframe or frame (`"#outer >> #inner"` for nested ones), of this origin
-  or another, when two frames hold the same element (the first frame the
-  CSS matches; when it matches none, the error says so). Without it,
-  frames are searched as before.
-- `mouse move|down|up|click|wheel`: raw mouse input at a point, for what
-  has no element to aim at (a canvas, a map, a game): viewport CSS pixels,
-  or from a target's top-left corner (`mouse click 30 40 --selector
-  canvas`). The pointer stays where it went and held buttons stay held, so
-  `mouse down`, moves (`--steps` for a smooth path), `mouse up` drags or
-  draws; `--count 2` double-clicks; `--button right|middle`. A target
-  out of view is scrolled into view first, as for a click; `down`, `up`
-  and `wheel` with a target go to its center; a click outside the
-  viewport is refused instead of landing on nothing. MCP:
-  `browser_mouse`. (An agent working through WebGames couldn't play its
-  canvas games without it.)
-- `--attach ws://host:port/devtools/page/<id>`: work in that one tab of a
-  running browser as it is, not in a window of its own (a tab a paused
-  test run left open for a look). `BrowserSession::page_endpoint` gives a
-  tab's.
-- A click that changes nothing says so (`no_effect` in its result): no DOM
-  change, focus, form value, URL, scroll, clipboard write, request, dialog,
-  tab or download within 200 ms. Requests that are the page reporting the
-  click (beacons, analytics services, first-party `/event/…`-style paths
-  whose answer changes nothing) don't count, and the note names them;
-  nor does what the browser or page loads on its own meanwhile (the tab's
-  icon, lazy images, fonts).
-  Typically a button the page hasn't wired up yet. A click that does
-  something costs nothing extra; one whose effect comes a moment later now
-  returns once it has.
-
-- `start --profile <name> --from chrome`: the agent's own browser, seeded
-  with a copy of one of your Chrome profiles' sign-ins -- cookies (HttpOnly
-  too), Local Storage, IndexedDB, saved logins -- so it starts signed in
-  without touching your running browser, on any Chrome version (attaching
-  needs 144+). `--from` takes `chrome`, `beta`, `dev`, `canary`,
-  `chromium`, `edge` or a user data directory; `--from-profile` picks a
-  profile by directory, name or email. The copy replaces only a profile
-  navigera made, and is refused while that profile's browser runs.
-- `show` / `hide` (MCP: `browser_handoff`): the session's browser on the
-  person's screen with the same tabs and sign-ins, for a step only they can
-  do -- a login, a 2FA prompt, a CAPTCHA -- and back off it. A `--profile`
-  browser restarts on its own profile; one navigera launched hands its
-  cookies and storage to its replacement.
-- `navigera profiles`: the browsers and profiles a session can be handed
-  (name, signed-in email, whether `--attach` reaches the browser now), and
-  navigera's own `--profile` browsers.
-- `--natural` (`NAVIGERA_NATURAL=1`): a headless browser that shows pages no
-  sign of being headless -- the user agent the same Chrome sends with a
-  window (page, workers, request headers) and a real screen size -- checked
-  in CI against a page that runs the checks anti-bot scripts make.
+- Inputs from object storage and the web: `s3://`, `gs://`, `az://` (and
+  `adl`, `azure`, `abfs`, `abfss`), `http://` and `https://`, wherever a
+  file is accepted. Credentials come from each cloud's own environment --
+  `AWS_*` and `~/.aws` profiles (keys, session tokens, `AWS_ENDPOINT_URL`
+  for MinIO and the like, web identity for EKS, ECS task roles, instance
+  metadata), `GOOGLE_*` and application default credentials, `AZURE_*`
+  (account keys, SAS, service principals, managed and workload identity)
+  -- and a presigned or SAS URL is read as it is. Objects are read in 8 MB
+  ranges, sixteen at a time (`COMPARA_FETCH_CONCURRENCY`), into a temporary
+  file. A Parquet object is read only as far as the comparison reads it:
+  its footer and the column chunks of the key and compared columns, so
+  `--compare` on two columns of a wide table fetches those two. `columns`
+  on a remote Parquet file reads its last 64 KB. The `cloud` feature is on
+  by default; without it the binary reads local files only. Every range is
+  read from the version whose first bytes were read (`If-Match` on its
+  ETag), so an object overwritten mid-read is an error rather than a file
+  stitched from two versions; throttled and failed ranges are retried.
+  A plain HTTP server that ignores ranges sends the object whole; it is
+  written to disk as it arrives (the temporary directory's room checked
+  first), never held in memory.
+- A download that takes a while says how far it has got every ten seconds
+  on stderr, so a CI job's or a pod's log shows it moving
+  (`COMPARA_PROGRESS` sets the seconds; 0 turns it off).
+- Outputs to the same places: `-o`, `--json` and `--export-dir` take an
+  `s3://`, `gs://` or `az://` URL (or a presigned `https://` one), written
+  in one request or as a multipart upload of 16 MB parts. `--json -` prints
+  the summary on standard output, and the counts line goes to standard
+  error, so a pipeline or a CI step reads one JSON document.
+- A directory, a quoted glob (`'out/date=*/*.parquet'`, `**` for any depth)
+  or an object storage prefix (`s3://bucket/orders/`, or the same without the
+  slash when no object has that name) is a side: its files, read as one table
+  in path order. CSV and TSV parts must share a header, Parquet parts a
+  schema (names, order, types, nullability), and the error names the part
+  and the difference; compressed parts are expanded on the way. Remote parts
+  are fetched with sixteen ranges in flight across all of them, Parquet
+  parts only as far as the comparison reads them. Hive partition
+  directories (`date=2026-10-01/`) are columns of the table, as text, unless
+  the files already have them: a Parquet part gets a column chunk of one
+  dictionary value per row group, a CSV or JSON part the value in every row.
+  `.`- and `_`-prefixed names are passed over; Iceberg tables are refused.
+- Delta Lake tables, local or in object storage, at their latest version or
+  at `@vN` (`s3://lake/orders@v41`): the files the log says make that
+  version, from its last checkpoint and the commits after it, so two
+  versions of a table compare like two tables. Deletion vectors, column
+  mapping, V2 checkpoints and a log cleaned up past the version asked for
+  are refused with what to do instead; a Delta table further down a
+  directory is named rather than read as loose files.
+- Credentials as each cloud's own tools find them, laptops included: an AWS
+  profile that uses SSO, an assumed role or a `credential_process` is
+  resolved as the AWS CLI resolves it; an `az login` is used when Azure has
+  nothing else; and with no credentials at all a public bucket is read
+  unsigned rather than refused.
+- `--exit-zero`: exit 0 when the tables differ, for a scheduled job whose
+  output is the report -- a Kubernetes Job, an Airflow task -- where exit 1
+  would mark the run failed.
+- `-` for either file reads standard input.
+- Gzip and zstd files are read as what they hold, by their first bytes
+  rather than their names (`.csv.gz`, `.ndjson.zst`); bzip2, xz and zip are
+  named and refused rather than read as a CSV.
+- `compara env`: the CPUs, memory, container limit, heap limit and
+  temporary directory this process sees, with the room left in it, and
+  where each cloud's credentials would come from (keys, a profile, web
+  identity, a CLI sign-in, metadata) -- by what is set, nothing fetched. A
+  download or a table of parts that the temporary directory has no room for
+  is refused before it starts, with how much it needs and where.
+- A container image, `ghcr.io/andrey-usa/compara`: the release binary on
+  distroless for `linux/amd64` and `linux/arm64`, non-root, with build
+  provenance and an SBOM.
+- A GitHub Action (`uses: andrey-usa/compara@v0`): installs the release
+  binary, compares, writes the counts and the most-changed columns to the job
+  summary, and fails the step on differences; its outputs are the counts and
+  the JSON summary's path.
 
 ### Changed
 
-- A click that may navigate waits for this tab's navigation only when one
-  can come: not for a `download` link, a link or form that opens another
-  tab or window, or a link or submit inside a frame (which navigates the
-  frame), and the wait ends as soon as the click opened a dialog, a tab or
-  a download instead. Each of those clicks had cost 150-200 ms (a
-  download link 170 ms, now about 20).
+- A closed pipe ends the process quietly, as it ends `cat`: `compara head
+  big.csv | head -1` used to print an internal error.
+- Faster on every format and thread count. On 2M-row pairs, 4-core GitHub
+  Actions runners, best of five (CI run 39728278163), the time against the
+  C port of the same tool: CSV 0.75x at one thread and 0.83x at four, TSV
+  0.74x and 0.81x, NDJSON 0.52x and 0.67x, Parquet 0.57x and 0.73x.
+  - Quoted CSV: the row end and the join's register count follow quotes by
+    parity, a register at a time, instead of a scan per quoted field and a
+    field walk per quoted row. On the same 2M rows with their text fields
+    quoted, 0.61x the C port's time at one thread and 0.63x at four (CI run
+    39729954571).
+  - Parquet: the join reads each key column through a form settled once per
+    column, and compares short keys by a load or two instead of `memcmp`:
+    the match sweep runs in half the instructions.
+  - Buffers of 4 MB or more are advised onto transparent huge pages, so
+    filling them takes a page fault per 2 MB rather than per 4 KB: on the
+    2M-row Parquet pair 75,651 faults become 16,889.
+  - NDJSON rows are proved equal before they are parsed, and the CSV join's
+    register count, key hash and index insert do less per row.
+- Inside a container with a memory limit, the heap is held under that limit
+  (`RLIMIT_DATA`, a sixteenth below it), so running out of memory is a
+  refusal that says what needed how much -- exit 2 -- rather than an OOM kill
+  with no message (exit 137). Under `--engine auto` a CSV pair whose indexes
+  do not fit is then compared by the `sortmerge` engine, which spills to
+  disk, with the same answer. `COMPARA_CONTAIN=0` turns this off. In a
+  container, files being written -- spilled runs, downloads, expanded gzip
+  -- are handed to the disk as they go rather than left dirty in the page
+  cache, where they count against the same limit: a 160 MB container whose
+  heap stayed under 120 MB was OOM-killed by them.
+- `sortmerge` sizes its batches from the heap it may have, and builds the
+  report's rows only when there is a report: a summary run of a 2M-row CSV
+  pair now completes in a 40 MB heap (`ulimit -d`), where it failed in
+  100 MB. Named with `--engine sortmerge` in a heap under 24 MB, it is
+  refused before it starts rather than aborted midway; under 48 MB `auto`
+  doesn't fall back to it on its own, and its refusal says that
+  `--engine sortmerge` tries it.
+- The README has a table of comparisons read from S3 against DuckDB's
+  `httpfs` (CI run 39793328982): at 10M rows a side, 2.7 times faster on a
+  Parquet pair, 2.8 on CSV, 6.0 on a table of Parquet parts, in a third to
+  a half of its memory.
+- The README's speed table is rerun on this code (CI runs 39728430053 and
+  39729034092): at ten million rows and four threads, CSV 1.20 s to 1.08 s,
+  NDJSON 2.79 s to 1.26 s, Parquet 1.41 s to 1.17 s. Its input column was
+  labelled "a side" but held both files; it says so now.
 
-- A click waits for its element to stop moving: CSS animations and
-  transitions on it or an ancestor (a modal sliding in) finish first, since
-  pages often wire a dialog's buttons only once it has opened. Pages with
-  nothing animating pay nothing for this.
-- A script sent to a page that a navigation then replaced no longer waits
-  out the whole timeout when the old page never answers (seen on macOS):
-  a second after the new page commits, the op looks again there.
-- `--text` prefers an exact match inside a cross-origin frame (the "Pay"
-  button of a payment frame) over page text that merely contains it (a
-  "Payment details" heading), and never picks an iframe by its title.
-- `--text` matches what an element shows as well as what names it: a
-  button showing "Add to cart" whose `aria-label` is "Add Carbon Gear to
-  cart" is the match, not the product card around it (a click on the card
-  did nothing; `no_effect` caught it in the benchmark).
-- A click on an element that stays covered by another fails and names the
-  covering element, instead of sending DOM events to an element no user
-  could click. The element is first tried at other scroll positions, which
-  is what uncovers it from a sticky header; `fill` does the same before
-  typing into a field under a panel.
-- `select` matches option labels with whitespace collapsed (non-breaking
-  spaces count as spaces).
-- `type` with a target fails when the target doesn't take focus, instead of
-  typing into whatever has it.
-- A disabled control is waited for (a Submit that unlocks once the form is
-  valid) and otherwise refused: `click` and `fill` no longer report
-  success on a disabled button, or a disabled or read-only field.
-- When a selector's first match is out of a user's reach (a decoy copy of
-  an id parked off the page) and another match isn't, the other one is
-  used.
-- A click on an element a user can't see where it is (zero size, clipped,
-  the hidden input of a styled radio card) fails at once and names what
-  stands for it, instead of waiting and then sending DOM events.
-- An element op whose page is replaced by a navigation while it looks for
-  its element (a step that saves with a request and then reloads) looks
-  again on the new page instead of failing with "Inspected target
-  navigated or closed".
-- "not found" errors name the wait asked for (5000 ms, not 4750), and page
-  errors drop the redundant `Error:` prefix.
+## [0.5.3] - 2026-10-22
 
-- A `--profile` browser starts with `navigator.webdriver` false, as
-  navigera's own launches always have, and `quit --close-browser` returns
-  once the profile is free, so a `start` right after it finds no browser on
-  its way out.
-
-- With a decision model on, a plain `ax` of a tree over 16 KB
-  (`NAVIGERA_AX_PREVIEW_BYTES`) shows its first 40 lines and how many more
-  there are, with a note that `--find` and
-  `check` act on the whole page without reading it and that `ax --limit
-  <n>` reads it all. The note alone came after the whole tree, once the
-  agent had read it: in the 0.5.0 eval the agent reached for `--find` or
-  `check` unasked in 3 of 12 runs. `ax` with a limit, a depth, `--all` or a
-  scope is unchanged, and so is `ax` without a decider.
-
-### Fixed
-
-- A page that stops answering (a script holding its thread, a renderer
-  hung under load) cost one full command timeout per command after it:
-  a click's press timed out, then its clean-up and checks each waited the
-  whole 35 s again (105 s for one click on a loaded macOS runner). Now,
-  once a command on a tab has gone unanswered, the next ones wait 3 s
-  until the tab answers again: the click fails about 35 s in and says it
-  timed out, and the next op fails in seconds rather than another 35.
-- A session's only tab closing (the user closed it in an `--attach`ed
-  browser, or the page closed itself) left every op failing with Chrome's
-  "Session with given id not found", while `status` and `tab-list` still
-  showed the tab. Now ops say the tab is closed and that `tab-new`
-  opens another; `status` and the tab in `tab-list` carry `closed: true`;
-  and `tab-new` (or `reset`) replaces the closed tab instead of listing
-  it beside the new one. An op still waiting on a tab when it closes (an
-  `eval` awaiting a promise, a `goto` waiting for a slow page) ends then
-  and says so, instead of after its 35 s timeout; with other tabs open,
-  the session goes on in one of them.
-- `--attach <port>` and `--attach http://host:port` sent Chrome's
-  `/json/version` request without the port in `Host`, got back a WebSocket
-  URL without one, and failed to connect.
-- `goto` and `reload` try once more when Chrome answers "Not attached to
-  an active page" (the tab's target was swapped mid-navigation), instead of
-  failing the step.
-- `goto` no longer retries a navigation that ended in `ERR_ABORTED`
-  because it was an answer: a URL that downloads a file was fetched four
-  times (four copies on disk); now the file is saved once and `goto`
-  succeeds with `download: <name>`, the page staying where it was. A 204 or
-  205 answer fails at once and says so, instead of after three retries.
-- `goto` and `reload` no longer wait out their whole timeout when the
-  load event is lost on its way (seen as rare 35 s stalls on slow macOS
-  machines): every 2 s they also look at the page itself, and return once
-  its document is the new one and has loaded.
-
-## [0.5.0] - 2026-10-22
-
-Lightpanda 1.0 as a second engine, the inspection and state commands agents
-reach for in Playwright, and a decision model the agent is told how to use.
+Two Parquet files compared up to 2.5 times faster, JSON files that are one
+top-level array, and two silent wrong answers on JSON input fixed.
 
 ### Added
 
-- Lightpanda 1.0 (`--engine lightpanda`, or `NAVIGERA_ENGINE=lightpanda` for
-  every command of a shell): the same commands and `ax` tree as on Chrome,
-  with the engine's gaps covered (see Fixed). CI runs the end-to-end suite
-  on Lightpanda 1.0.1 and the nightly.
-- `drag <from> <to>`: HTML5 drag and drop for a `draggable` source (the drag
-  events with one DataTransfer, since headless Chrome will not start a native
-  drag from synthetic input, and on Lightpanda too), a held mouse moved
-  across for anything else; the result says whether the drop was accepted.
-- `state save|load <file>`: every cookie and the open tabs' localStorage to
-  a file and back, in Playwright's `storageState` format, so a signed-in
-  session can be reused, by navigera or Playwright.
-- `status`: the session's engine, browser executable, CDP endpoint and tab
-  state.
-- `console`, `errors`, `network` (one request in full with `network <n>`,
-  HAR with `--har`): what the page logged and fetched; an uncaught exception
-  during a command is reported in its `notes`.
-- `cookies` (list/set/delete/clear), `storage` (local/session), `pdf`.
-- `set viewport|device|media|geo|offline|headers|ua|locale|timezone|credentials`:
-  emulation for every tab, replayed on new tabs.
-- `route` / `unroute`: fail or answer requests by URL glob.
-- `init-script`: code that runs before the page's own in every document.
-- Locators on every element command: `--role/--name`, `--label`,
-  `--placeholder`, `--testid`, `--nth`.
-- `get`, `is`, `dblclick`, `focus`, `check`/`uncheck <target>`,
-  `keydown`/`keyup`, `insert-text`, `wait --idle`.
-- MCP: `browser_console_messages`, `browser_network_requests`,
-  `browser_resize`.
-- `notes` in responses: what the engine did differently from what was asked
-  (e.g. a Lightpanda popup loaded in the current tab).
-- Agent eval: any OpenAI-compatible model as the agent (`--agent openai`,
-  e.g. DeepSeek-V4.1-Flash through SiliconFlow) on the same tasks, prompt,
-  turn limit and timeout as Gemini CLI; the decision benchmark takes such a
-  model as its baseline; an OpenRouter head-to-head of tool variants
-  (`openrouter-eval.yml`); a WebArena-Verified pilot (`bench/webarena`,
-  `webarena-eval.yml`).
+- A JSON file can be one top-level array of objects, compact or
+  pretty-printed, as well as one object per line: the rows are the array's
+  objects and the columns the keys of the first one. Newline-delimited JSON
+  reads as fast as before.
+
+### Fixed
+
+- A JSON value that is an object or an array was read as absent, so two
+  different nested values compared as the same missing value and the change
+  went unreported (0.5.2 and earlier). It is now compared as its JSON text,
+  as written, and the report and export show that text. The README says what
+  that means for key order and spacing, and when to flatten first.
+- A pretty-printed top-level JSON array whose rows hold objects on lines of
+  their own lost rows when read on several threads: a split guessed at the
+  next line opening an object could land inside a row, and the rows read
+  from there were dropped without a word (200,000 rows counted as 100,718
+  at four threads). Splits are now checked as CSV splits are, and redone on
+  bounds that follow the array's depth when a guess was wrong; the guess
+  itself takes the column the first row opens at. Top-level arrays were new
+  in 0.5.3-alpha.1; 0.5.2 did not read them.
 
 ### Changed
 
-- With a decision model on, the agent is told how to use it where it
-  decides what to do next: `start` adds a note (act with `--find`, verify
-  with `check`, read `ax` only for text to report), a tree over 60 lines
-  ends with a one-line note that acting needs no reading, and the skill's
-  main loop shows the decider form next to the ax form. Before, `start` said
-  only `"decider": "<model>"` and the usage sat in a later skill section: in
-  eval run 39437548538 the agent saw the decider in 8 of 10 runs and used
-  it in none; in run 39561380436 it used it in 3 of 15 unprompted.
-- Agent eval: a `preferences` task (a 170-line settings form, four named
-  changes, a confirmation to check; the rest must stay as it was), the task
-  the decider is measured on, and the three-arm protocol for measuring it
-  (`navigera`, `navigera+jev`, `navigera+jev-told`, one model key each).
-- `start` on a running session with a different engine fails instead of
-  silently reusing it.
+- Two Parquet files compare faster on the columnar path. Snappy pages are
+  expanded with whole-word copies; a column's row groups are read in runs on
+  threads of their own, both sides at once, so a file with fewer columns
+  than cores no longer leaves cores idle; a slot of the key index holds its
+  row, so a match costs one cache miss less, the cells a probe compares are
+  prefetched, and integer, date and other word keys are hashed a column at a
+  time; the compared columns go largest first and each is compared on
+  several threads; the footer is parsed once per file. In CI (run
+  39468615515, a 4-core runner, a 5M-row pair written by pyarrow, counts
+  only) the comparison took 1.26 s at one thread, 0.79 s at two and 0.56 s
+  at four, against 2.34 s, 1.53 s and 1.40 s for 0.5.3-alpha.1; DuckDB took
+  6.73 s, 3.94 s and 3.13 s and Polars 4.98 s, 3.32 s and 2.73 s on the same
+  runner. With the changed rows written out: 1.29 s, 1.09 s and 0.72 s,
+  against 2.43 s, 2.19 s and 1.90 s. Answers are the same; a footer the
+  row-group runs cannot trust is read in one pass, as before.
+- `--export-dir` on two Parquet files keeps the decoded compared columns for
+  the export when the memory budget has room for them, instead of reading
+  each column a second time.
+- The key index is built on one thread unless `COMPARA_PARALLEL_INSERT` is
+  set: the parallel build, taken from 1M rows on, measured slower.
+- Each occupied slot of the key index is ranked with one POPCNT per key where
+  the CPU has it, chosen at run time.
+- `COMPARA_PHASES=1` also prints each compared Parquet column's read and
+  compare times.
+- The README lists TSV and JSON as input formats of their own, with how each
+  is read: TSV through the CSV reader, JSON as one object per line or one
+  top-level array of objects, its columns the keys of the first object.
 
-### Fixed
-
-- `reload` and `goto` try again after a moment when Chrome answers "Not
-  attached to an active page" (the tab between two documents; nothing was
-  done yet): seen once in a parallel test run. `tab-select` reads 4 or
-  more hex characters as a target id even when they are all digits.
-- A fork's `tab-new` opened its tab in the default browser context, with
-  the owner's cookies and storage; it opens in the fork's own now. A
-  download started by a subframe is listed for the session whose tab holds
-  it (it went to the default list); `reset --all` no longer reports a
-  dialog answered before it; a closed fork's routes, answers and downloads
-  are let go.
-- Sessions on one browser (`Driver::fork`) no longer share routes, HTTP
-  credentials, the dialog answer or the download list: each is the
-  session's own, keyed by its browser context. One worker's `route` mocked
-  the others' requests, and `unroute` removed theirs.
-- `--attach <port>` and `--attach http://host:port`: the DevTools URL asked
-  for carries the port again (Chrome answered with a WebSocket URL without
-  one, and the connection was refused).
-- Lightpanda 1.0.x: `goto` waits for the load event (it returned at commit
-  and gave up after 500 ms); confirm()/prompt() get the dialog policy (they
-  returned false/null while reported accepted); `target=_blank` pages are
-  followed in the one tab; iframes and stylesheets load; table cells keep
-  their text in `ax`; shadow-DOM clicks no longer wait 3 s; no `xvfb-run`
-  wrapper; telemetry off through `LIGHTPANDA_DISABLE_TELEMETRY`.
-- Dialogs, popups and JS navigations reported just before a command's
-  response are no longer missed by the op that caused them.
-- Lightpanda: a navigation a click handler starts (`location.href = ...`)
-  is waited for. The engine reports it only after the click's reply, so the
-  click returned the old page with `loading: true`; it now returns the page
-  the click led to.
-- Lightpanda: `ax` shows what open shadow roots hold. The engine's tree
-  stops at a shadow root and gives the nodes inside no ids, so a coupon
-  field in a web component was invisible to an agent reading the snapshot;
-  it is now listed under the root, without refs, with `--text` as the way to
-  target it.
-- Lightpanda: a settings form reads in `ax` as it does on Chrome. A
-  checkbox showed its default value `"on"`, which reads like a state (in the
-  DeepSeek eval, run 39530836547, both Lightpanda runs of the preferences
-  task left a box unticked and failed); a `<select>` inside a `<label>` was
-  named with every option ("Currency USD EUR GBP …") next to a copy of the
-  label; an unnamed table cell took two lines per checkbox. The preferences
-  page is 177 lines on Lightpanda now, 243 before, 169 on Chrome.
-- Lightpanda: a checkbox or radio shows in `ax` the state a click left it
-  in. The engine's tree keeps the `checked` attribute the page loaded with,
-  so a box an agent had ticked read as unticked; in the DeepSeek eval (run
-  39691526622) an agent clicked one back that way and ran out of turns.
-- Lightpanda: an empty password field no longer reads as filled in `ax`.
-  The engine gives every password field the value `*****`; the snapshot now
-  asks the field and shows a dot per character, or nothing, as on Chrome.
-
-## [0.4.1] - 2026-10-14
+## [0.5.2] - 2026-10-16
 
 ### Added
 
-- `find <description>`, `check <question>` and `--find <description>` on
-  element commands: element choice and yes/no questions about the page,
-  answered by a System One decision model (TypeSafe Jev) when
-  `TYPESAFE_API_KEY` or `NAVIGERA_DECIDER_URL` is set. MCP gains
-  `browser_find`, `browser_check` and a `find` target in that case only.
-  Typed values are redacted from what is sent. `start` reports `"decider"`
-  with the model id, so an agent can tell without reading the key.
-- `server.json` for the MCP Registry (`io.github.andrey-usa/navigera`; the npm
-  package carries the matching `mcpName`), published by the release workflow
-  when `PUBLISH_MCP_REGISTRY` is set.
-- `install-skill --continue` (`.continue/skills`); `--global` finds the home
-  directory on Windows too.
-- `navigera mcp`: a Model Context Protocol server on stdio for IDE agents
-  (Cline, Roo Code, Kilo Code, Continue, VS Code, Claude Desktop, Cursor).
-  18 tools named after Playwright MCP's, `snapshot: true` on every action,
-  `browser_run` for several steps in one call; the browser starts on the first
-  tool call.
+- `compara-gen-data --format tsv` writes the CSV rows tab-separated, so a TSV
+  pair can be benchmarked against the same rows in CSV. On a 1M-row pair TSV
+  is within 5% of CSV on every engine (`turbo` 0.15 s against 0.14 s,
+  `native` 1.33 s against 1.28 s, `sortmerge` 2.07 s against 1.98 s, four
+  threads) and gives the same answer and export files, which
+  `tests/formats.rs` now holds every engine to.
+
+### Changed
+
+- On x86-64 the CSV, TSV and NDJSON readers scan with AVX2 when the CPU has
+  it, asked at run time, so the release binaries and `cargo install` get the
+  vector scan that before needed a build made with `-C target-cpu=x86-64-v3`.
+  On a 2M-row pair, four threads, CSV counts in 0.24 s against 0.28 s (paired
+  1.16x), TSV 1.19x, NDJSON 1.02x, level with the x86-64-v3 build on all three;
+  answers and export files are the same, byte for byte. A CPU without AVX2,
+  and aarch64, scan eight bytes at a time as before.
+- `--export-dir` on two Parquet files runs on the columnar path. Before, it
+  stopped with "--export-dir is not supported on the parquet path" unless
+  `--engine turbo` was given, which reads the files row by row: on a 1M-row
+  pair with 60,000 changed rows that took 1.48 s and 766 MB, now 0.31 s and
+  363 MB; at 5M rows 11.3 s and 3.8 GB, now 1.8 s and 1.7 GB. The files are
+  the same, byte for byte.
+- `--export-dir` without `-o` no longer gathers the report's rows, which
+  nothing then reads.
+- Two Parquet files compressed with gzip, zstd or LZ4 are compared on the
+  columnar path, as snappy and uncompressed ones were. Before, any of them
+  sent the pair through the row-by-row reader, and zstd is what polars writes
+  by default: a 2M-row pair it wrote took 1.14 s at two threads, now 0.39 s,
+  what the same pair written with snappy takes.
+
+## [0.5.1] - 2026-10-14
+
+### Changed
+
+- `compare` writes the HTML report only with `-o`/`--out`. Without an output
+  flag it prints the counts and writes nothing; before, it wrote
+  `<a>__vs__<b>.html` into the working directory. `--json` and
+  `--export-dir` write their files on their own, and `--no-compress` without
+  `-o` is an error.
+- `--engine sortmerge` or `--engine native` on a Parquet or JSON input exits 2
+  with a message. Before, a Parquet pair took the columnar path anyway and
+  the report said `parquet`.
+- `--memory` and `COMPARA_MEMORY` apply to two Parquet files: they decide how
+  many columns are read at once, and a pair that needs more than a stated
+  budget is refused before anything is read. Before, the columnar path
+  ignored them.
+- Two Parquet files with boolean, integer, float, date, time, timestamp or
+  decimal columns are compared on the columnar path, a word per value. Before,
+  one such column sent the pair through the row-by-row reader: a 1M-row file
+  written by DuckDB took 1.9 s and 4.5 s of CPU, now 0.4 s and 1.0 s.
+- `native` holds rows packed and indexes keys without copying them: a 1M-row
+  pair took 27 s and 2.9 GB, now 1.6 s and 0.7 GB; 10M rows take 33 s and
+  6.7 GB, where 72 s and 25.7 GB were reported.
+- `sortmerge` reads and sorts the two files at once and merges with a heap:
+  a 1M-row pair took 9.8 s, now 2-3 s; 10M rows 209 s, now 35 s, in 260 MB.
+
+### Fixed
+
+- A CSV or JSON side compared with a Parquet side showed changed cells that
+  held the same value: `31.40` against the DOUBLE 31.4, `12345` against the
+  DECIMAL 12345.00, `2026-09-01 02:15:00` against the timestamp
+  `2026-09-01T02:15:00`. A column Parquet stores as numbers now compares by
+  exact value, and a temporal one by instant; a 100k-row CSV against its own
+  Parquet export went from 100,000 changed rows to none.
+- A UTF-8 byte order mark at the start of a CSV or NDJSON file became part of
+  the first column's name in the default engine (`key column(s) missing`),
+  and made an NDJSON file read as CSV.
+- The weekly contender benchmark now holds DuckDB and pandas to compara's
+  counts on the same question: it counted duplicate keys per row, read empty
+  strings as NULL and did not map `unchanged`.
+
+Hostile Parquet and NDJSON files are refused with exit 2 and a message,
+where before a few bytes could crash or exhaust the process (found by
+mutation fuzzing; each case is a test in `tests/hostile.rs`):
+
+- a zstd page whose stream expands past its header's size was decompressed
+  in full first: a 133 KB file used 8 GB of memory. Decompression now
+  stops one byte past the declared size (zstd, gzip, snappy, LZ4).
+- a footer nested 200,000 structs deep overflowed the stack; nesting past
+  64 levels is refused.
+- a list count larger than the footer could hold sized an allocation of
+  up to 100 GB (abort) or, for lists of bools, looped for hours.
+- a string length, page size or value count near 2^64 or negative wrapped
+  the bounds checks and panicked.
+- a `DELTA_BINARY_PACKED` header claiming a 10^16-value miniblock, and an
+  RLE run of billions of values, were materialized up front (abort).
+- an NDJSON file cut off right after a key's opening quote panicked
+  `head` and `compare`.
+- `--no-compress` reports: a value holding `<!--<script>` kept the
+  report's script from running (a blank page). Every `<` in the embedded
+  JSON is now written `\u003c`.
 
 ### Security
 
-- Chrome's renderer sandbox is on by default. `--no-sandbox` is added only as
-  root, with `NAVIGERA_NO_SANDBOX=1`, or when Chrome reports that the machine
-  has no usable sandbox (with a warning on stderr). That last case is
-  remembered per browser binary until it changes or the machine reboots, so
-  only the first launch pays for the failed attempt (about 350 ms with Chrome
-  for Testing on a GitHub runner).
-- Named sessions live in a private per-user directory
-  (`$XDG_RUNTIME_DIR/navigera` or `$TMPDIR/navigera-<uid>`, mode 0700) instead
-  of `/tmp/navigera-<name>.sock`, so another user can't squat a session's
-  socket; the log is 0600 and doesn't follow symlinks.
-- `install.sh` and `install.ps1` verify the release's SHA-256 checksum.
-- The skill tells agents to treat page text as data, not instructions.
+- Release workflow: read-only token by default, write access only for the
+  job that creates the release; signed build provenance for the archives;
+  every action pinned to a commit. CI runs `cargo audit`.
 
-## [0.4.0] - 2026-10-09
+## [0.5.0] - 2026-10-09
 
-First public release.
+First release as a standalone project.
 
 ### Added
 
-- Named sessions: a warm browser behind a local socket, one shell command per
-  step (`navigera -s <name> start`, then `goto`, `ax`, `click`, …, `quit`).
-- `ax`: the page as a compact accessibility tree with `[ref=N]` handles,
-  including iframes (cross-origin too) and open shadow DOM; links carry their
-  `url`.
-- Element commands by ref, CSS selector or visible text, with auto-wait;
-  trusted mouse and keyboard input; tabs, dialogs, popups, uploads,
-  screenshots.
-- `serve`: a JSON-lines protocol on stdin/stdout; a line holding a JSON array
-  runs as a batch.
-- `eval --file <path>` and `eval -` (script from stdin).
-- `--attach` (your running Chrome 144+) and `--profile` (a persistent
-  navigera browser).
-- An agent skill compiled into the binary (`navigera skill`,
-  `navigera install-skill`).
-- Prebuilt binaries for Linux (x86_64, aarch64; static), macOS (arm64,
-  x86_64) and Windows (x64); install scripts for sh and PowerShell; packages
-  for crates.io, npm, PyPI, Homebrew and Scoop.
+- `compare`, `columns` and `head` over CSV, newline-delimited JSON and Parquet,
+  with either side in any format.
+- Three engines with one result contract: `turbo` (default), `sortmerge`
+  (bounded memory, spills to disk) and `native`.
+- A self-contained HTML report, a JSON summary (`--json`), uncapped CSV exports
+  (`--export-dir`) and `--summary` for counts only.
+- Profiles in `compara.toml` for recurring comparisons.
+- `compara --version`.
+- `compara-gen-data --row-group-size` and `--dict-limit` for the Parquet
+  layout.
+- Prebuilt binaries for Linux (x86_64, aarch64; glibc 2.28+), macOS (arm64,
+  x86_64) and Windows (x64); packages for crates.io, npm, PyPI, Homebrew and
+  Scoop.
 
-[0.6.0]: https://github.com/andrey-usa/navigera/releases/tag/v0.6.0
-[0.5.0]: https://github.com/andrey-usa/navigera/releases/tag/v0.5.0
-[0.4.1]: https://github.com/andrey-usa/navigera/releases/tag/v0.4.1
-[0.4.0]: https://github.com/andrey-usa/navigera/releases/tag/v0.4.0
+### Changed
+
+- The data generator and the benchmark harness are `compara-gen-data` and
+  `compara-bench` (the latter behind the `bench` feature).
+
+[0.6.0]: https://github.com/andrey-usa/compara/releases/tag/v0.6.0
+[0.5.3]: https://github.com/andrey-usa/compara/releases/tag/v0.5.3
+[0.5.2]: https://github.com/andrey-usa/compara/releases/tag/v0.5.2
+[0.5.1]: https://github.com/andrey-usa/compara/releases/tag/v0.5.1
+[0.5.0]: https://github.com/andrey-usa/compara/releases/tag/v0.5.0

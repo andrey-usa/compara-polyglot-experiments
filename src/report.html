@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root{--ink:#1c2026;--mute:#6a7180;--rule:#e3e6ea;--bg:#fff;--soft:#f5f6f8;--focus:#2f5bd8;
+--unch:#c9ced6;--chg:#b7791f;--chg-bg:#fff4dc;--rem:#c0392b;--rem-bg:#fde8e6;--add:#237a48;--add-bg:#e4f4ea;--rh:34px}
+@media (prefers-color-scheme:dark){:root{--ink:#e6e8ec;--mute:#9aa1ad;--rule:#2b3038;--bg:#15181c;--soft:#1d2126;
+--unch:#3b414b;--chg:#e2a640;--chg-bg:#3a2d12;--rem:#ef6b5b;--rem-bg:#40201c;--add:#5dc487;--add-bg:#193524}}
+*{box-sizing:border-box}html,body{margin:0;height:100%}
+body{font:14px/1.45 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif;color:var(--ink);background:var(--bg);
+font-variant-numeric:tabular-nums;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+button,input{font:inherit;color:inherit}
+button{background:none;border:0;padding:0;cursor:pointer}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+header{padding:18px 24px 0}
+h1{font-size:19px;font-weight:600;margin:0 0 2px;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--mute);font-weight:400;padding:0 6px}
+.sub{color:var(--mute);margin:0}
+.recon{padding:16px 24px 4px}
+.bar{display:flex;height:22px;border-radius:4px;overflow:hidden;background:var(--unch)}
+.bar i{display:block;height:100%;min-width:0}
+.bar .u{background:var(--unch)}.bar .c{background:var(--chg)}.bar .r{background:var(--rem)}.bar .a{background:var(--add)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 26px;margin-top:10px}
+.legend button{display:flex;align-items:baseline;gap:8px;padding:2px 0;border-bottom:2px solid transparent}
+.legend button:hover{border-bottom-color:var(--rule)}
+.legend b{font-size:22px;font-weight:600;line-height:1}
+.legend b::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:8px;vertical-align:1px}
+.legend .u b::before{background:var(--unch)}.legend .c b::before{background:var(--chg)}
+.legend .r b::before{background:var(--rem)}.legend .a b::before{background:var(--add)}
+.legend span{color:var(--mute)}
+.files{display:flex;flex-wrap:wrap;gap:4px 32px;margin:12px 0 0;color:var(--mute)}
+.files b{color:var(--ink);font-weight:600}
+.files .warn{color:var(--chg)}
+.tabs{display:flex;gap:2px;padding:12px 24px 0;border-bottom:1px solid var(--rule)}
+.tabs button{padding:8px 12px;border-bottom:2px solid transparent;margin-bottom:-1px;color:var(--mute)}
+.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--ink)}
+.tabs button small{margin-left:6px;color:var(--mute)}
+.tools{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;padding:10px 24px}
+.tools input{flex:1 1 220px;max-width:420px;padding:6px 10px;border:1px solid var(--rule);border-radius:6px;background:var(--bg)}
+.tools .act{color:var(--focus)}
+.tools .n{color:var(--mute);margin-left:auto}
+.chips{display:flex;flex-wrap:wrap;gap:6px;padding:0 24px 8px}
+.chip{border:1px solid var(--rule);border-radius:14px;padding:2px 10px;color:var(--mute);font-size:13px}
+.chip[aria-pressed=true]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.chip small{opacity:.7;margin-left:4px}
+.vp{flex:1;overflow:auto;position:relative;border-top:1px solid var(--rule)}
+.hd,.row{display:grid;grid-template-columns:var(--cols);min-width:max-content;height:var(--rh);align-items:center}
+.hd{position:sticky;top:0;z-index:2;background:var(--soft);color:var(--mute);font-weight:500;border-bottom:1px solid var(--rule)}
+.hd button{text-align:left;width:100%;padding:0 12px;height:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hd button::after{content:"";margin-left:5px;color:var(--ink)}
+.hd button.asc::after{content:"↑"}.hd button.desc::after{content:"↓"}
+.sp{position:relative}
+.rows{position:absolute;left:0;right:0;top:0}
+.row{border-bottom:1px solid var(--rule);cursor:default}
+.row:hover,.row.sel{background:var(--soft)}
+.row.sel{box-shadow:inset 3px 0 var(--focus)}
+.cell{padding:0 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cell.k{font-weight:600}
+.nil{color:var(--mute);font-style:italic}
+.chg{display:inline-flex;gap:6px;align-items:baseline;margin-right:14px;font-size:13px}
+.chg b{font-weight:500;color:var(--mute)}
+.chg s{color:var(--rem);background:var(--rem-bg);padding:0 4px;border-radius:3px}
+.chg i{font-style:normal;color:var(--add);background:var(--add-bg);padding:0 4px;border-radius:3px}
+.empty{padding:48px 24px;color:var(--mute);text-align:center}
+.note{padding:6px 24px;color:var(--chg);background:var(--chg-bg);font-size:13px}
+aside{position:fixed;right:0;bottom:0;width:min(560px,100%);max-height:60vh;overflow:auto;background:var(--bg);
+border:1px solid var(--rule);border-radius:10px 0 0 0;box-shadow:0 -6px 24px rgba(0,0,0,.12);padding:14px 18px;z-index:5}
+aside[hidden]{display:none}
+aside h2{font-size:14px;margin:0 0 8px;display:flex;gap:12px;align-items:baseline}
+aside h2 button{margin-left:auto;color:var(--mute)}
+aside table{border-collapse:collapse;width:100%}
+aside th{text-align:left;color:var(--mute);font-weight:500;padding:4px 8px 4px 0}
+aside td{padding:4px 8px 4px 0;border-top:1px solid var(--rule);vertical-align:top;word-break:break-word}
+aside td.a{color:var(--rem)}aside td.b{color:var(--add)}
+.cols td,.cols th{padding:0 12px}.cols th{position:sticky;top:0;background:var(--soft);color:var(--mute);font-weight:500;height:34px;border-bottom:1px solid var(--rule);z-index:2}
+.cbar{height:8px;background:var(--chg);border-radius:2px}
+kbd{font:12px inherit;color:var(--mute)}
+.loading{padding:48px 24px;color:var(--mute)}
+@media (max-width:700px){header,.recon,.tabs,.tools,.chips{padding-left:14px;padding-right:14px}.legend{gap:6px 18px}.legend b{font-size:18px}}
+@media (prefers-reduced-motion:no-preference){.row{transition:background .08s}}
+</style></head>
+<body>
+<div id="app" class="loading">Loading…</div>
+<aside id="dr" hidden></aside>
+<script id="payload" type="application/__MODE__">__PAYLOAD__</script>
+<script>
+(async function(){
+const el=document.getElementById('payload'),mode=el.type.split('/')[1];
+let D;
+try{
+  if(mode==='gzip'){
+    const bin=Uint8Array.from(atob(el.textContent.trim()),c=>c.charCodeAt(0));
+    const txt=await new Response(new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+    D=JSON.parse(txt);
+  }else D=JSON.parse(el.textContent);
+}catch(e){document.getElementById('app').innerHTML='<div class="empty">This browser cannot decode the report payload (needs gzip DecompressionStream, i.e. a 2023+ browser). Regenerate with --no-compress.</div>';return;}
+el.remove();
+
+const M=D.meta,C=D.counts,K=M.key,NK=K.length,CMP=M.compared;
+const fmt=n=>n.toLocaleString();
+const esc=s=>s==null?'':String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const cellv=v=>v==null?'<span class="nil">empty</span>':esc(v);
+const dupRows=[...D.dup_a.rows.map(r=>['A',...r]),...D.dup_b.rows.map(r=>['B',...r])];
+const TABS=[
+ {id:'changed',label:'Changed',n:C.changed,cols:[...K,'Differences'],rows:D.changed.rows,trunc:D.changed.truncated},
+ {id:'added',label:'Added',n:C.added,cols:D.added.cols,rows:D.added.rows,trunc:D.added.truncated},
+ {id:'removed',label:'Removed',n:C.removed,cols:D.removed.cols,rows:D.removed.rows,trunc:D.removed.truncated},
+ {id:'dups',label:'Duplicate keys',n:C.a_dup_keys+C.b_dup_keys,cols:['File',...K,'Rows'],rows:dupRows,trunc:D.dup_a.truncated||D.dup_b.truncated},
+ {id:'columns',label:'Columns',n:CMP.length}
+];
+const S={tab:'changed',q:'',col:null,sort:null,dir:1,sel:-1,view:[]};
+const RH=34;
+const total=C.unchanged+C.changed+C.added+C.removed||1;
+const pct=n=>(100*n/total).toFixed(2)+'%';
+const app=document.getElementById('app');app.className='';
+app.innerHTML=`
+<header><h1>${esc(M.a.name)}<em>→</em>${esc(M.b.name)}</h1>
+<p class="sub">Compared on ${K.map(esc).join(' + ')} across ${fmt(CMP.length)} column${CMP.length==1?'':'s'}. ${esc(M.engine)}, ${M.seconds}s, ${esc(M.generated.replace('T',' ').slice(0,16))}.</p></header>
+<section class="recon" aria-label="Reconciliation">
+ <div class="bar"><i class="u" style="width:${pct(C.unchanged)}" title="Unchanged"></i><i class="c" style="width:${pct(C.changed)}" title="Changed"></i><i class="r" style="width:${pct(C.removed)}" title="Removed"></i><i class="a" style="width:${pct(C.added)}" title="Added"></i></div>
+ <div class="legend">
+  <button class="u" data-go="columns"><b>${fmt(C.unchanged)}</b><span>unchanged</span></button>
+  <button class="c" data-go="changed"><b>${fmt(C.changed)}</b><span>changed</span></button>
+  <button class="r" data-go="removed"><b>${fmt(C.removed)}</b><span>removed, only in A</span></button>
+  <button class="a" data-go="added"><b>${fmt(C.added)}</b><span>added, only in B</span></button>
+ </div>
+ <div class="files">
+  <span><b>A</b> ${esc(M.a.name)}: ${fmt(C.a_rows)} rows, ${fmt(C.a_keys)} keys${C.a_dup_keys?`, <span class="warn">${fmt(C.a_dup_keys)} duplicated (${fmt(C.a_dup_rows)} rows)</span>`:''}</span>
+  <span><b>B</b> ${esc(M.b.name)}: ${fmt(C.b_rows)} rows, ${fmt(C.b_keys)} keys${C.b_dup_keys?`, <span class="warn">${fmt(C.b_dup_keys)} duplicated (${fmt(C.b_dup_rows)} rows)</span>`:''}</span>
+  ${M.only_in_a.length||M.only_in_b.length?`<span class="warn">Columns not compared: ${M.only_in_a.length?`only in A: ${M.only_in_a.map(esc).join(', ')}`:''}${M.only_in_a.length&&M.only_in_b.length?'; ':''}${M.only_in_b.length?`only in B: ${M.only_in_b.map(esc).join(', ')}`:''}</span>`:''}
+ </div>
+</section>
+<nav class="tabs" role="tablist">${TABS.map((t,i)=>`<button role="tab" data-tab="${t.id}" title="Press ${i+1}">${t.label}<small>${fmt(t.n)}</small></button>`).join('')}</nav>
+<div class="tools"><input id="q" type="search" placeholder="Filter rows (press / to focus)" aria-label="Filter rows"><button class="act" id="dl">Download shown rows as CSV</button><span class="n" id="cnt"></span></div>
+<div class="chips" id="chips"></div>
+<div id="note"></div>
+<div class="vp" id="vp"></div>`;
+
+const vp=document.getElementById('vp'),q=document.getElementById('q'),chips=document.getElementById('chips'),note=document.getElementById('note'),cnt=document.getElementById('cnt');
+const dr=document.getElementById('dr');
+const tab=()=>TABS.find(t=>t.id===S.tab);
+
+function rowText(t,r){ if(r._s===undefined){ r._s=(t.id==='changed'?[...r.slice(0,NK),...r[NK].flatMap(c=>[CMP[c[0]],c[1],c[2]])]:r).map(v=>v==null?'':String(v)).join('\u0001').toLowerCase(); } return r._s; }
+function build(){
+  const t=tab(); if(t.id==='columns'){renderColumns();return;}
+  let rows=t.rows;
+  if(t.id==='changed'&&S.col!=null) rows=rows.filter(r=>r[NK].some(c=>c[0]===S.col));
+  if(S.q){const qq=S.q.toLowerCase();rows=rows.filter(r=>rowText(t,r).includes(qq));}
+  if(S.sort!=null){const i=S.sort,d=S.dir;rows=[...rows].sort((a,b)=>{const x=a[i],y=b[i];if(x==null)return 1;if(y==null)return -1;const nx=+x,ny=+y;return (isNaN(nx)||isNaN(ny)?String(x).localeCompare(String(y)):nx-ny)*d;});}
+  S.view=rows;S.sel=-1;
+  const same=rows.length===t.rows.length;
+  cnt.textContent=same?`${fmt(rows.length)} rows`:`${fmt(rows.length)} of ${fmt(t.rows.length)} rows`;
+  note.innerHTML=t.trunc?`<div class="note">Showing the first ${fmt(t.rows.length)} of ${fmt(t.n)} rows. Run with --export-dir for the full list.</div>`:'';
+  const smp=rows.slice(0,300),widths=t.cols.map((c,i)=>{if(t.id==='changed'&&i>=NK)return 'minmax(360px,1fr)';
+    let L=String(c).length;for(const r of smp){const v=r[i];if(v!=null)L=Math.max(L,String(v).length);}return Math.min(360,Math.max(96,Math.round(L*7.5)+26))+'px';});
+  if(t.id==='dups')widths[0]='64px';
+  vp.style.setProperty('--cols',widths.join(' '));
+  vp.innerHTML=`<div class="hd">${t.cols.map((c,i)=>`<button data-s="${i}" class="${S.sort===i?(S.dir>0?'asc':'desc'):''}"${t.id==='changed'&&i>=NK?' disabled':''}>${esc(c)}</button>`).join('')}</div><div class="sp" style="height:${rows.length*RH}px"><div class="rows" id="rows"></div></div>${rows.length?'':'<div class="empty">'+(t.rows.length?'No rows match the filter.':'Nothing here.')+'</div>'}`;
+  vp.scrollTop=0;paint();
+}
+function paint(){
+  const t=tab(),rows=S.view,box=document.getElementById('rows');if(!box)return;
+  const start=Math.max(0,Math.floor((vp.scrollTop-RH)/RH)-5),end=Math.min(rows.length,Math.ceil((vp.scrollTop+vp.clientHeight)/RH)+5);
+  box.style.transform=`translateY(${start*RH}px)`;
+  let h='';
+  for(let i=start;i<end;i++){const r=rows[i];
+    h+=`<div class="row${i===S.sel?' sel':''}" data-i="${i}">`;
+    if(t.id==='changed'){h+=r.slice(0,NK).map(v=>`<div class="cell k">${cellv(v)}</div>`).join('')+`<div class="cell">${r[NK].map(c=>`<span class="chg"><b>${esc(CMP[c[0]])}</b><s>${cellv(c[1])}</s><i>${cellv(c[2])}</i></span>`).join('')}</div>`;}
+    else{const kn=t.id==='dups'?NK+1:NK;h+=r.map((v,j)=>`<div class="cell${j<kn?' k':''}">${cellv(v)}</div>`).join('');}
+    h+='</div>';}
+  box.innerHTML=h;
+}
+function renderColumns(){
+  const m=C.matched||1,cols=[...D.columns].sort((a,b)=>b.changed-a.changed),mx=Math.max(1,...cols.map(c=>c.changed));
+  cnt.textContent=`${fmt(cols.length)} columns`;note.innerHTML='';
+  vp.style.setProperty('--cols','1fr');
+  vp.innerHTML=`<table class="cols" style="border-collapse:collapse;width:100%"><thead><tr><th style="text-align:left">Column</th><th style="text-align:right">Changed</th><th style="text-align:right">% of matched</th><th style="text-align:right">Blanked in B</th><th style="text-align:right">Filled in B</th><th style="width:30%"></th></tr></thead><tbody>${cols.map(c=>`<tr style="height:34px;border-bottom:1px solid var(--rule)"><td><button class="act" data-col="${CMP.indexOf(c.name)}" title="Show changed rows for this column">${esc(c.name)}</button></td><td style="text-align:right">${fmt(c.changed)}</td><td style="text-align:right">${(100*c.changed/m).toFixed(2)}%</td><td style="text-align:right">${fmt(c.blanked)}</td><td style="text-align:right">${fmt(c.filled)}</td><td><div class="cbar" style="width:${100*c.changed/mx}%;opacity:${c.changed?1:0}"></div></td></tr>`).join('')}</tbody></table>${cols.length?'':'<div class="empty">No columns were compared.</div>'}`;
+}
+function setTab(id){S.tab=id;S.sort=null;S.col=null;S.sel=-1;closeDrawer();
+  document.querySelectorAll('.tabs button').forEach(b=>b.setAttribute('aria-selected',b.dataset.tab===id));
+  chips.innerHTML=id==='changed'?D.columns.filter(c=>c.changed).sort((a,b)=>b.changed-a.changed).map(c=>`<button class="chip" data-c="${CMP.indexOf(c.name)}" aria-pressed="false">${esc(c.name)}<small>${fmt(c.changed)}</small></button>`).join(''):'';
+  build();}
+function openDrawer(i){const t=tab(),r=S.view[i];if(!r||t.id==='columns')return;S.sel=i;paint();
+  let body='';
+  if(t.id==='changed')body=`<table><tr><th>Column</th><th>A</th><th>B</th></tr>${r[NK].map(c=>`<tr><td>${esc(CMP[c[0]])}</td><td class="a">${cellv(c[1])}</td><td class="b">${cellv(c[2])}</td></tr>`).join('')}</table>`;
+  else body=`<table>${t.cols.map((c,j)=>`<tr><th>${esc(c)}</th><td>${cellv(r[j])}</td></tr>`).join('')}</table>`;
+  const keyv=(t.id==='dups'?r.slice(1,NK+1):r.slice(0,NK)).map(v=>v==null?'':v).join(' / ');
+  dr.innerHTML=`<h2><span>${esc(keyv)}</span><button id="cp" title="Copy key">Copy key</button><button id="cl" title="Close (Esc)">Close</button></h2>${body}`;dr.hidden=false;
+  dr.querySelector('#cl').onclick=closeDrawer;dr.querySelector('#cp').onclick=()=>navigator.clipboard&&navigator.clipboard.writeText(keyv);}
+function closeDrawer(){dr.hidden=true;if(S.sel>=0){S.sel=-1;paint();}}
+function download(){const t=tab();if(t.id==='columns')return;const cq=v=>{v=v==null?'':String(v);return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
+  let lines=[];
+  if(t.id==='changed'){lines.push([...K,'column','A','B'].map(cq).join(','));S.view.forEach(r=>r[NK].forEach(c=>lines.push([...r.slice(0,NK),CMP[c[0]],c[1],c[2]].map(cq).join(','))));}
+  else{lines.push(t.cols.map(cq).join(','));S.view.forEach(r=>lines.push(r.map(cq).join(',')));}
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([lines.join('\n')],{type:'text/csv'}));a.download=`${t.id}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
+
+vp.addEventListener('scroll',paint,{passive:true});
+vp.addEventListener('click',e=>{const s=e.target.closest('[data-s]');if(s){const i=+s.dataset.s;S.dir=S.sort===i?-S.dir:1;S.sort=i;build();return;}
+  const c=e.target.closest('[data-col]');if(c){setTab('changed');const ch=chips.querySelector(`[data-c="${c.dataset.col}"]`);if(ch)ch.click();return;}
+  const r=e.target.closest('.row');if(r)openDrawer(+r.dataset.i);});
+document.querySelector('.tabs').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b)setTab(b.dataset.tab);});
+document.querySelector('.legend').addEventListener('click',e=>{const b=e.target.closest('[data-go]');if(b)setTab(b.dataset.go);});
+chips.addEventListener('click',e=>{const b=e.target.closest('.chip');if(!b)return;const c=+b.dataset.c;S.col=S.col===c?null:c;chips.querySelectorAll('.chip').forEach(x=>x.setAttribute('aria-pressed',+x.dataset.c===S.col));build();});
+let deb;q.addEventListener('input',()=>{clearTimeout(deb);deb=setTimeout(()=>{S.q=q.value.trim();build();},120);});
+document.getElementById('dl').onclick=download;
+document.addEventListener('keydown',e=>{if(e.target===q){if(e.key==='Escape'){q.value='';S.q='';build();q.blur();}return;}
+  if(e.key==='/'){e.preventDefault();q.focus();}else if(e.key==='Escape')closeDrawer();
+  else if(e.key>='1'&&e.key<='5')setTab(TABS[+e.key-1].id);
+  else if(e.key==='ArrowDown'||e.key==='ArrowUp'){if(tab().id==='columns')return;e.preventDefault();const n=Math.min(S.view.length-1,Math.max(0,S.sel+(e.key==='ArrowDown'?1:-1)));openDrawer(n);const y=n*RH;if(y<vp.scrollTop+RH)vp.scrollTop=y-RH;else if(y+RH>vp.scrollTop+vp.clientHeight)vp.scrollTop=y+2*RH-vp.clientHeight;}});
+window.addEventListener('resize',paint);
+setTab(C.changed?'changed':C.added?'added':C.removed?'removed':'columns');
+})();
+</script>
+</body></html>

@@ -1,17 +1,46 @@
-//! navigera: from-scratch CDP CLI for AI-agentic browser exploration.
+//! Parameterised composite-key CSV comparison with a self-contained HTML report.
 //!
-//! Native Rust Chrome DevTools Protocol engine (no WebDriver, no external
-//! driver crates): direct CDP JSON-RPC over WebSocket, two-worker Tokio
-//! runtime, JSON-lines protocol with `serve` mode and one-shot subcommands.
+//! Two CSV files are joined on a composite key and the differing cells are
+//! reported: what changed, what was added, what was removed, and which keys are
+//! duplicated in either file. Nothing about a specific dataset lives in the
+//! code — key columns, compared columns and normalisation are all runtime
+//! parameters.
+//!
+//! ```no_run
+//! use compara::{Options, compare, render};
+//! use std::path::Path;
+//!
+//! let mut opt = Options::with_key(["order_id", "line_no"]);
+//! opt.ignore = vec!["updated_at".to_string()];
+//! let result = compare(Path::new("july.csv"), Path::new("august.csv"), &mut opt)?;
+//! std::fs::write("report.html", render(&result, true)?)?;
+//! # Ok::<(), compara::Error>(())
+//! ```
+//!
+//! The result contract, the report template and the exit codes are shared byte
+//! for byte with the Python, TypeScript, Java and Go implementations of this
+//! tool, so a report from any of them is interchangeable.
 
-pub mod browser;
-pub mod cdp;
-pub mod cli;
-pub mod decide;
-pub mod emulate;
-pub mod install;
-pub mod mcp;
-pub mod proc;
-pub mod protocol;
-pub mod session;
-pub mod timing;
+pub mod alloc;
+pub mod columns;
+pub mod contract;
+pub mod engine;
+pub mod error;
+pub mod gendata;
+pub mod hugepages;
+pub mod memory;
+pub mod options;
+pub mod parallel;
+pub mod parquet;
+pub mod phases;
+pub mod profiles;
+pub mod report;
+pub mod rowstore;
+pub mod sections;
+pub mod source;
+
+pub use contract::{CellDiff, ColumnStat, CompareResult, Counts, Section, Val};
+pub use engine::compare;
+pub use error::{Error, Result};
+pub use options::{DEFAULT_MAX_ROWS, Engine, Options, parse_list};
+pub use report::render;

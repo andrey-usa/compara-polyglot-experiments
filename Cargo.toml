@@ -1,31 +1,78 @@
 [package]
-name = "navigera"
+name = "compara"
 version = "0.6.0"
-edition = "2021"
-default-run = "navigera"
-description = "Drive headless Chrome from the shell, one command per step: a native Rust CDP CLI for AI agents (accessibility-tree refs, sessions, tabs, iframes, dialogs) plus a JSON-lines serve mode."
+edition = "2024"
+rust-version = "1.90"
+description = "Compare two tables (CSV, NDJSON, Parquet) on a composite key: counts, per-column statistics and a self-contained HTML report."
 license = "MIT"
-repository = "https://github.com/andrey-usa/navigera"
-homepage = "https://github.com/andrey-usa/navigera"
-documentation = "https://github.com/andrey-usa/navigera/blob/master/docs/navigera.md"
+repository = "https://github.com/andrey-usa/compara"
+homepage = "https://github.com/andrey-usa/compara"
 readme = "README.md"
-keywords = ["chrome", "cdp", "browser-automation", "headless", "cli"]
-categories = ["command-line-utilities", "web-programming", "development-tools::testing"]
-rust-version = "1.91"
-include = ["/src/**", "/skills/**", "/tests/**", "/bench/site/server.py", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md"]
+keywords = ["csv", "parquet", "diff", "compare", "data-quality"]
+categories = ["command-line-utilities", "parser-implementations", "development-tools::testing"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md", "/compara.example.toml"]
+default-run = "compara"
+
+[lib]
+name = "compara"
+path = "src/lib.rs"
+
+[[bin]]
+name = "compara"
+path = "src/main.rs"
+
+[[bin]]
+name = "compara-gen-data"
+path = "src/bin/gen_data.rs"
+
+[[bin]]
+name = "compara-bench"
+path = "src/bin/bench.rs"
+required-features = ["bench"]
+
+[features]
+default = ["cloud"]
+# The benchmark harness: `cargo run --release --features bench --bin compara-bench`.
+bench = []
+# s3://, gs://, az:// and https:// inputs, read through Apache Arrow's
+# object_store with each cloud's own credential chain. Off, the binary reads
+# local files only and carries no network or TLS code.
+cloud = ["dep:object_store", "dep:tokio", "dep:futures", "dep:bytes", "dep:url", "dep:reqwest"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "net", "macros"] }
-tokio-tungstenite = "0.30"
-futures-util = "0.3"
-tempfile = "3"
-base64 = "0.23"
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["float_roundtrip"] }
-anyhow = "1"
-miniz_oxide = "0.9"
+# Engine: native, over the csv crate.
+csv = "1.4.0"
+# Engine: turbo. Maps the file instead of reading it, so the bytes are paged in
+# on demand and evictable rather than held on the heap.
+memmap2 = "0.9"
+# turbo's Parquet reader decodes its own pages -- snappy and LZ4 are written out
+# in the engine, because each is eighty lines of byte copying. These two are not:
+# a deflate and a zstd decoder are real programs, and are pulled in for it
+# rather than written here.
+zstd = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.151"
+flate2 = "1.1.10"
+base64 = "0.23.1"
+# Cloud inputs (feature `cloud`): object storage and HTTP, read in parallel
+# ranges. object_store is the Apache Arrow project's client, the one DataFusion,
+# Polars and delta-rs read the clouds through; tokio is its runtime, driven
+# from a blocking call here and nowhere else.
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "gcp", "azure", "http"], optional = true }
+tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread"], optional = true }
+futures = { version = "0.3.34", default-features = false, features = ["std"], optional = true }
+bytes = { version = "1.12.1", optional = true }
+url = { version = "2.5.8", optional = true }
+# Plain and presigned HTTPS, whose query string object_store's HTTP store drops.
+# The same client object_store builds on, with no feature it does not already use.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "http2"], optional = true }
+# Local time with an offset for the report header; std has no calendar.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[profile.dev]
+debug = 0
 
 [profile.release]
-lto = true
+opt-level = 3
+lto = "thin"
 codegen-units = 1
-strip = true

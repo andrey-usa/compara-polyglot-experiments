@@ -1,0 +1,162 @@
+name: compara
+description: >-
+  Compare two tables -- CSV, TSV, NDJSON or Parquet, local or on s3://, gs://,
+  az:// or https:// -- on a composite key, summarise the differences in the job
+  summary, and fail the step when they differ.
+author: andrey-usa
+branding:
+  icon: columns
+  color: blue
+
+inputs:
+  a:
+    description: The first table (a path or a URL).
+    required: true
+  b:
+    description: The second table (a path or a URL).
+    required: true
+  key:
+    description: Comma-separated key columns.
+    required: true
+  args:
+    description: >-
+      More `compara compare` arguments, e.g. `-i updated_at --tolerance 0.01`
+      or `--profile orders`.
+    default: ""
+  report:
+    description: Write the HTML report to this path (or URL).
+    default: ""
+  fail-on-differences:
+    description: Fail the step when the tables differ (exit code 1).
+    default: "true"
+  version:
+    description: The compara release to use, e.g. 0.6.0, or `latest`.
+    default: latest
+  binary:
+    description: An existing compara binary to run instead of downloading one.
+    default: ""
+
+outputs:
+  identical:
+    description: "`true` when the tables are the same."
+    value: ${{ steps.compare.outputs.identical }}
+  changed:
+    description: Rows matched on the key whose compared columns differ.
+    value: ${{ steps.compare.outputs.changed }}
+  added:
+    description: Keys only in B.
+    value: ${{ steps.compare.outputs.added }}
+  removed:
+    description: Keys only in A.
+    value: ${{ steps.compare.outputs.removed }}
+  summary:
+    description: Path of the JSON summary (counts and per-column statistics).
+    value: ${{ steps.compare.outputs.summary }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install compara
+      id: install
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        BINARY: ${{ inputs.binary }}
+      run: |
+        set -euo pipefail
+        if [ -n "$BINARY" ]; then
+          echo "bin=$BINARY" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) target=x86_64-unknown-linux-gnu ;;
+          Linux-ARM64) target=aarch64-unknown-linux-gnu ;;
+          macOS-ARM64) target=aarch64-apple-darwin ;;
+          macOS-X64) target=x86_64-apple-darwin ;;
+          Windows-X64) target=x86_64-pc-windows-msvc ;;
+          *) echo "::error title=compara::no release binary for $RUNNER_OS $RUNNER_ARCH"; exit 1 ;;
+        esac
+        if [ "$VERSION" = latest ]; then
+          base="https://github.com/andrey-usa/compara/releases/latest/download"
+        else
+          base="https://github.com/andrey-usa/compara/releases/download/v${VERSION#v}"
+        fi
+        dir="$RUNNER_TEMP/compara-$VERSION-$target"
+        mkdir -p "$dir"
+        if [ "$RUNNER_OS" = Windows ]; then
+          curl -fsSL "$base/compara-$target.zip" -o "$dir/c.zip"
+          (cd "$dir" && unzip -oq c.zip)
+          echo "bin=$dir/compara.exe" >> "$GITHUB_OUTPUT"
+        else
+          curl -fsSL "$base/compara-$target.tar.gz" | tar -xz -C "$dir"
+          echo "bin=$dir/compara" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Compare
+      id: compare
+      shell: bash
+      env:
+        BIN: ${{ steps.install.outputs.bin }}
+        A: ${{ inputs.a }}
+        B: ${{ inputs.b }}
+        KEY: ${{ inputs.key }}
+        ARGS: ${{ inputs.args }}
+        REPORT: ${{ inputs.report }}
+        FAIL: ${{ inputs.fail-on-differences }}
+      run: |
+        # The runner starts bash with -e; compara's exit code is an answer
+        # here (1: the tables differ), not a failure of the script.
+        set +e -uo pipefail
+        summary="$RUNNER_TEMP/compara-summary-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RANDOM.json"
+        report=()
+        [ -n "$REPORT" ] && report=(-o "$REPORT")
+        # ARGS is split as a shell would split it, quotes included.
+        eval "extra=($ARGS)"
+        "$BIN" compare "$A" "$B" -k "$KEY" "${extra[@]}" "${report[@]}" --json "$summary"
+        code=$?
+        echo "summary=$summary" >> "$GITHUB_OUTPUT"
+        if [ "$code" -ge 2 ] && [ "$code" -ne 3 ]; then
+          echo "::error title=compara::the comparison failed (exit $code)"
+          exit "$code"
+        fi
+        python3 - "$summary" "$code" "$A" "$B" <<'EOF'
+        import json, os, sys
+        path, code, a, b = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+        s = json.load(open(path))
+        c = s["counts"]
+        identical = c["changed"] == 0 and c["added"] == 0 and c["removed"] == 0
+        with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+            out.write(f"identical={'true' if identical else 'false'}\n")
+            for k in ("changed", "added", "removed"):
+                out.write(f"{k}={c[k]}\n")
+        f = lambda n: f"{n:,}"
+        lines = [
+            f"### compara: {'identical' if identical else 'differences'}",
+            "",
+            f"`{a}` → `{b}`",
+            "",
+            "| rows A | rows B | matched | changed | added | removed | duplicate keys A / B |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
+            f"| {f(c['a_rows'])} | {f(c['b_rows'])} | {f(c['matched'])} | {f(c['changed'])} | "
+            f"{f(c['added'])} | {f(c['removed'])} | {f(c['a_dup_keys'])} / {f(c['b_dup_keys'])} |",
+        ]
+        cols = [col for col in s.get("columns", []) if col.get("changed")]
+        if cols:
+            cols.sort(key=lambda col: -col["changed"])
+            lines += ["", "| column | changed | of matched |", "|---|---:|---:|"]
+            for col in cols[:20]:
+                pct = 100 * col["changed"] / max(c["matched"], 1)
+                lines.append(f"| `{col['name']}` | {f(col['changed'])} | {pct:.2f}% |")
+            if len(cols) > 20:
+                lines.append(f"| … {len(cols) - 20} more | | |")
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+            out.write("\n".join(lines) + "\n")
+        EOF
+        if [ "$code" -eq 1 ] && [ "$FAIL" = true ]; then
+          echo "::error title=compara::the tables differ"
+          exit 1
+        fi
+        if [ "$code" -eq 3 ]; then
+          exit 3
+        fi
+        exit 0

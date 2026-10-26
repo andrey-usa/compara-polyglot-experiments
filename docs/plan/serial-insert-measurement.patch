@@ -1,0 +1,13 @@
+diff --git a/src/engine/turbo.rs b/src/engine/turbo.rs
+index d4b4cac..0990422 100644
+--- a/src/engine/turbo.rs
++++ b/src/engine/turbo.rs
+@@ -494,7 +494,7 @@ fn row_end(ix: &RowIndex, row: i32, size: usize) -> usize {
+ /// (`RowIndex::insert_parallel`); below it the serial insertion takes well
+ /// under a second and is left alone. `COMPARA_PARALLEL_INSERT=1` (set and not
+ /// "0") takes the parallel insertion at any size, for the tests.
+-const PARALLEL_INSERT_ROWS: usize = 1 << 20;
++const PARALLEL_INSERT_ROWS: usize = usize::MAX;
+ 
+ /// The fewest slots a region of a parallel insertion is given.
+ const MIN_REGION: usize = 64;

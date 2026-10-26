@@ -17,9 +17,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: parse_args
-            seeds: none
-          - target: command_json
+          - target: text_compare
+            seeds: text
+          - target: parquet_compare
+            seeds: parquet
+          - target: delta_log
             seeds: none
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -34,6 +36,10 @@ jobs:
         working-directory: fuzz
         run: |
           mkdir -p "corpus/${{ matrix.target }}" artifacts
+          case "${{ matrix.seeds }}" in
+            text) cp ../tests/fixtures/formats/*.csv ../tests/fixtures/formats/*.tsv ../tests/fixtures/formats/*.ndjson "corpus/${{ matrix.target }}/" 2>/dev/null || true ;;
+            parquet) cp ../tests/fixtures/formats/*.parquet ../tests/fixtures/hostile/*.parquet "corpus/${{ matrix.target }}/" 2>/dev/null || true ;;
+          esac
           ls "corpus/${{ matrix.target }}" | head -20
       - name: fuzz
         working-directory: fuzz
