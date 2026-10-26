@@ -1,1 +1,1 @@
-run-arm: 20261026T042410Z scope: 12 tasks x 3 trials x 2 arms, 2 slices per arm
+run-arm: 20261026T043843Z scope: 12 tasks x 3 trials x 2 arms, 2 slices per arm (retry after build-step fix)
