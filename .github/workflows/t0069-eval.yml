@@ -89,29 +89,48 @@ jobs:
       - run: chmod 755 bin bin/primavera
       - name: create restricted bench user
         run: sudo useradd benchr || true
+      - name: stage bench tree outside runner home (least-privilege - benchr needs no /home/runner traversal)
+        run: |
+          sudo mkdir -p /opt/t0069
+          sudo cp -a bin /opt/t0069/bin
+          sudo cp -a experiments/bench/t0069 /opt/t0069/bench
+          sudo chmod -R a+rX /opt/t0069
+          sudo chown -R runner:runner /opt/t0069
+          echo "== staged symlinks resolving back through runner home (must be empty) =="
+          find /opt/t0069 -type l -print0 | while IFS= read -r -d '' l; do \
+            t=$(readlink -f "$l" 2>/dev/null || echo UNRESOLVABLE)
+            case "$t" in /home/runner/*|UNRESOLVABLE) echo "BACK-REF $l -> $t";; esac
+          done
+          echo "(check complete)"
       - name: arm B toolchain (playwright, shared browser path)
         if: matrix.arm == 'playwright'
         env:
           PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
         run: |
           sudo mkdir -p /opt/pw-browsers && sudo chmod 777 /opt/pw-browsers
-          mkdir -p pw && cd pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test >/dev/null 2>&1
+          sudo mkdir -p /opt/t0069/pw && sudo chown runner:runner /opt/t0069/pw
+          cd /opt/t0069/pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test >/dev/null 2>&1
           npx playwright install --with-deps chromium >/dev/null 2>&1
-          sudo chmod -R a+rX /opt/pw-browsers
+          sudo chmod -R a+rX /opt/pw-browsers /opt/t0069/pw
+          echo "== pw/browsers symlinks resolving back through runner home (must be empty) =="
+          find /opt/t0069/pw /opt/pw-browsers -type l -print0 | while IFS= read -r -d '' l; do \
+            t=$(readlink -f "$l" 2>/dev/null || echo UNRESOLVABLE)
+            case "$t" in /home/runner/*|UNRESOLVABLE) echo "BACK-REF $l -> $t";; esac
+          done
+          echo "(check complete)"
           echo "pw ready: $(npx playwright --version)"
-      - name: binary + path forensics as the bench user (tests the EACCES hypothesis directly)
+      - name: staged-tree traversal + exec forensics as the bench user (verifies least-privilege layout)
         run: |
-          echo "== modes of binary and its directory =="
-          stat -c '%a %U:%G %n' bin bin/primavera || true
-          echo "== every path component =="
-          namei -l "$GITHUB_WORKSPACE/bin/primavera" || true
-          echo "== mount options for the workspace filesystem (noexec check) =="
-          findmnt -T "$GITHUB_WORKSPACE" -o TARGET,OPTIONS || true
-          echo "== trivial workspace script as benchr (exec-from-workspace, artifact-independent) =="
-          printf '#!/bin/sh\necho benchr-workspace-exec-ok\n' > bin/probe.sh && chmod 755 bin/probe.sh
-          sudo -n -u benchr env -i HOME=/tmp TERM=dumb LANG=C.UTF-8 "$GITHUB_WORKSPACE/bin/probe.sh" 2>&1 || true
-          echo "== the actual downloaded primavera binary as benchr =="
-          sudo -n -u benchr env -i HOME=/tmp TERM=dumb LANG=C.UTF-8 "$GITHUB_WORKSPACE/bin/primavera" --version 2>&1 | tail -3 || true
+          echo "== staged modes + every path component (must NOT cross /home/runner) =="
+          stat -c '%a %U:%G %n' /opt/t0069/bin /opt/t0069/bin/primavera || true
+          namei -l /opt/t0069/bin/primavera || true
+          echo "== trivial staged script as benchr =="
+          printf '#!/bin/sh\necho benchr-staged-exec-ok\n' | sudo tee /opt/t0069/bin/probe.sh >/dev/null && sudo chmod 755 /opt/t0069/bin/probe.sh
+          sudo -n -u benchr env -i HOME=/tmp TERM=dumb LANG=C.UTF-8 /opt/t0069/bin/probe.sh 2>&1 || true
+          echo "== the actual primavera binary as benchr (staged path) =="
+          sudo -n -u benchr env -i HOME=/tmp TERM=dumb LANG=C.UTF-8 /opt/t0069/bin/primavera --version 2>&1 | tail -3 || true
+          echo "== confirm benchr still CANNOT traverse runner home (negative control) =="
+          sudo -n -u benchr env -i HOME=/tmp ls "$GITHUB_WORKSPACE" 2>&1 | tail -1 || true
       - name: browser facts (non-sensitive; identifies the shared-layer failure class)
         run: |
           echo "== runner chrome candidates =="
@@ -126,7 +145,7 @@ jobs:
         env:
           PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
         run: |
-          cd pw
+          cd /opt/t0069/pw
           sudo -n -u benchr env -i HOME=/tmp TERM=dumb LANG=C.UTF-8             PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers PATH="$PATH" \
             npx playwright screenshot about:blank /tmp/pw-probe.png 2>&1 | tail -3 || true
       - name: self-test via restricted user (stdout to file; status lines only)
@@ -134,24 +153,24 @@ jobs:
           ARM: ${{ matrix.arm }}
           PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
         run: |
-          cd experiments/bench/t0069
-          mkdir -p out
+          cd /opt/t0069/bench
+          sudo mkdir -p /opt/t0069/out && sudo chown runner:runner /opt/t0069/out
           python3 harness-t0069_run.py --arm "$ARM" --self-test \
             --as-user benchr \
-            --primavera-bin "$GITHUB_WORKSPACE/bin/primavera" --pw-dir "$GITHUB_WORKSPACE/pw" \
-            --out "$GITHUB_WORKSPACE/experiments/bench/t0069/out/preflight-$ARM" > "out/preflight-$ARM.log" 2>&1
-          tail -2 "out/preflight-$ARM.log"
+            --primavera-bin /opt/t0069/bin/primavera --pw-dir /opt/t0069/pw \
+            --out /opt/t0069/out/preflight-$ARM > /opt/t0069/out/preflight-$ARM.log 2>&1
+          tail -2 /opt/t0069/out/preflight-$ARM.log
       - name: gate on expected self-test scores
-        run: python3 experiments/bench/t0069/preflight-check.py --arm ${{ matrix.arm }} --out experiments/bench/t0069/out
+        run: python3 experiments/bench/t0069/preflight-check.py --arm ${{ matrix.arm }} --out /opt/t0069/out
       - name: encrypt preflight diagnostics (ciphertext + tag only leave the runner)
         if: always()
         env:
           ARM: ${{ matrix.arm }}
         run: |
           umask 077
-          cd experiments/bench/t0069
+          cd /opt/t0069
           mkdir -p /tmp/upload-diag
-          tar czf "/tmp/preflight-$ARM.tar.gz" "out/preflight-$ARM" "out/preflight-$ARM.log" 2>/dev/null || tar czf "/tmp/preflight-$ARM.tar.gz" "out" 
+          tar czf "/tmp/preflight-$ARM.tar.gz" "out/preflight-$ARM" "out/preflight-$ARM.log" 2>/dev/null || tar czf "/tmp/preflight-$ARM.tar.gz" "out"
           head -c 64 /dev/urandom > /tmp/symkey.bin
           ENCKEYHEX=$(head -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
           MACKEYHEX=$(tail -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
@@ -160,7 +179,7 @@ jobs:
           openssl enc -aes-256-cbc -K "$ENCKEYHEX" -iv "$IVHEX" \
             -in "/tmp/preflight-$ARM.tar.gz" -out /tmp/cipher.bin
           cat /tmp/iv.bin /tmp/cipher.bin > "/tmp/upload-diag/preflight-$ARM.tar.gz.enc"
-          openssl pkeyutl -encrypt -pubin -inkey ci-results-pub.pem \
+          openssl pkeyutl -encrypt -pubin -inkey /opt/t0069/bench/ci-results-pub.pem \
             -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
             -in /tmp/symkey.bin -out "/tmp/upload-diag/preflight-$ARM.symkey.enc"
           cat "/tmp/upload-diag/preflight-$ARM.symkey.enc" "/tmp/upload-diag/preflight-$ARM.tar.gz.enc" \
