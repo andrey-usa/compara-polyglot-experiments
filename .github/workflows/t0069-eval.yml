@@ -13,9 +13,10 @@
 #   the bundle key RSA-OAEP-SHA256-wrapped to bench/t0069/ci-results-pub.pem.
 #   The private unwrap key lives only in the private board repo. No decryption
 #   material, no board-write credential, and no repo secret beyond the existing
-#   `main` environment's SILICONFLOW_API_KEY ever exists in CI. Anyone
+#   DIAGNOSTICS-ONLY VARIANT: the eval job is removed, so no job references the
+#   `main` environment and SILICONFLOW_API_KEY is never injected in this run. Anyone
 #   downloading the public artifact gets ciphertext + tag only.
-# - SILICONFLOW_API_KEY isolation: the harness pops it from its environment at
+# - (full-run variant) SILICONFLOW_API_KEY isolation: the harness pops it from its environment at
 #   startup, never puts it in any child env (including the site server), and
 #   every model-generated shell command plus every scoring run of model-written
 #   code executes as the dedicated unprivileged user `benchr`
@@ -98,6 +99,23 @@ jobs:
           npx playwright install --with-deps chromium >/dev/null 2>&1
           sudo chmod -R a+rX /opt/pw-browsers
           echo "pw ready: $(npx playwright --version)"
+      - name: browser facts (non-sensitive; identifies the shared-layer failure class)
+        run: |
+          echo "== runner chrome candidates =="
+          which google-chrome google-chrome-stable chromium chromium-browser 2>/dev/null || true
+          google-chrome --version 2>/dev/null || echo "no system google-chrome"
+          echo "== userns/apparmor policy (ubuntu 24.04 restricts unprivileged userns) =="
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "sysctl key absent"
+          echo "== system chrome as the bench user (about:blank DOM or launch error) =="
+          sudo -n -u benchr env -i HOME=/tmp TERM=dumb LANG=C.UTF-8             google-chrome --headless=new --no-first-run --dump-dom about:blank 2>&1 | tail -3 || true
+      - name: bundled chromium as the bench user (playwright arm; about:blank or launch error)
+        if: matrix.arm == 'playwright'
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+        run: |
+          cd pw
+          sudo -n -u benchr env -i HOME=/tmp TERM=dumb LANG=C.UTF-8             PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers PATH="$PATH" \
+            npx playwright screenshot about:blank /tmp/pw-probe.png 2>&1 | tail -3 || true
       - name: self-test via restricted user (stdout to file; status lines only)
         env:
           ARM: ${{ matrix.arm }}
@@ -112,89 +130,35 @@ jobs:
           tail -2 "out/preflight-$ARM.log"
       - name: gate on expected self-test scores
         run: python3 experiments/bench/t0069/preflight-check.py --arm ${{ matrix.arm }} --out experiments/bench/t0069/out
-
-  eval:
-    needs: [build, preflight]
-    runs-on: ubuntu-latest
-    timeout-minutes: 360  # 18 trials/slice x 30-min trial wall cap worst case exceeds 240
-    environment: main
-    strategy:
-      fail-fast: false
-      matrix:
-        arm: [primavera, playwright]
-        slice: [0, 1, 2, 3]
-    env:
-      SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
-      SLICE_MOD: ${{ github.event.inputs.slice_mod || '4' }}
-      PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
-    steps:
-      - uses: actions/checkout@v4
-        with: { path: experiments, persist-credentials: false }
-      - uses: actions/download-artifact@v4
-        with: { name: primavera-bin, path: bin }
-      - run: chmod +x bin/primavera
-      - name: create restricted bench user
-        run: sudo useradd benchr || true
-      - name: arm B toolchain (playwright, shared browser path)
-        if: matrix.arm == 'playwright'
-        run: |
-          sudo mkdir -p /opt/pw-browsers && sudo chmod 777 /opt/pw-browsers
-          mkdir -p pw && cd pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test >/dev/null 2>&1
-          npx playwright install --with-deps chromium >/dev/null 2>&1
-          sudo chmod -R a+rX /opt/pw-browsers
-          echo "pw ready: $(npx playwright --version)"
-      - name: run slice (stdout/stderr to files only)
+      - name: encrypt preflight diagnostics (ciphertext + tag only leave the runner)
+        if: always()
         env:
           ARM: ${{ matrix.arm }}
-          SLICE: ${{ matrix.slice }}
         run: |
+          umask 077
           cd experiments/bench/t0069
-          RUNTAG="ci-${{ github.run_id }}-${{ matrix.arm }}-s${{ matrix.slice }}"
-          mkdir -p "out/$RUNTAG"
-          set +e
-          python3 harness-t0069_run.py --arm "$ARM" --trials 3 \
-            --slice-mod "$SLICE_MOD" --slice-index "$SLICE" \
-            --as-user benchr --wall-budget-minutes 300 \
-            --primavera-bin "$GITHUB_WORKSPACE/bin/primavera" --pw-dir "$GITHUB_WORKSPACE/pw" \
-            --out "out/$RUNTAG" --uncapped \
-            > "out/$RUNTAG/harness-stdout.log" 2>&1
-          RC=$?
-          set -e
-          echo "$RC" > "out/$RUNTAG/exit-code.txt"
-          echo "RUNTAG=$RUNTAG" >> "$GITHUB_ENV"
-          echo "slice finished: arm=$ARM slice=$SLICE (detail stays off the public log)"
-      - name: encrypt results (encrypt-then-MAC; public key only, no secrets here)
-        if: always()
-        run: |
-          umask 077  # symkey/tarball/iv unreadable even to the bench uid during the encrypt window
-          cd experiments/bench/t0069
-          mkdir -p /tmp/upload
-          tar czf "/tmp/${RUNTAG}.tar.gz" "out/${RUNTAG}"
+          mkdir -p /tmp/upload-diag
+          tar czf "/tmp/preflight-$ARM.tar.gz" "out/preflight-$ARM" "out/preflight-$ARM.log" 2>/dev/null || tar czf "/tmp/preflight-$ARM.tar.gz" "out" 
           head -c 64 /dev/urandom > /tmp/symkey.bin
           ENCKEYHEX=$(head -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
           MACKEYHEX=$(tail -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
           head -c16 /dev/urandom > /tmp/iv.bin
           IVHEX=$(od -An -tx1 /tmp/iv.bin | tr -d ' \n')
           openssl enc -aes-256-cbc -K "$ENCKEYHEX" -iv "$IVHEX" \
-            -in "/tmp/${RUNTAG}.tar.gz" -out /tmp/cipher.bin
-          cat /tmp/iv.bin /tmp/cipher.bin > "/tmp/upload/${RUNTAG}.tar.gz.enc"
+            -in "/tmp/preflight-$ARM.tar.gz" -out /tmp/cipher.bin
+          cat /tmp/iv.bin /tmp/cipher.bin > "/tmp/upload-diag/preflight-$ARM.tar.gz.enc"
           openssl pkeyutl -encrypt -pubin -inkey ci-results-pub.pem \
             -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
-            -in /tmp/symkey.bin -out "/tmp/upload/${RUNTAG}.symkey.enc"
-          cat "/tmp/upload/${RUNTAG}.symkey.enc" "/tmp/upload/${RUNTAG}.tar.gz.enc" \
+            -in /tmp/symkey.bin -out "/tmp/upload-diag/preflight-$ARM.symkey.enc"
+          cat "/tmp/upload-diag/preflight-$ARM.symkey.enc" "/tmp/upload-diag/preflight-$ARM.tar.gz.enc" \
             | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$MACKEYHEX" -binary \
-            > "/tmp/upload/${RUNTAG}.mac"
-          shred -u /tmp/symkey.bin /tmp/iv.bin /tmp/cipher.bin "/tmp/${RUNTAG}.tar.gz"
-          echo "results encrypted (ciphertext + tag only leave this runner)"
+            > "/tmp/upload-diag/preflight-$ARM.mac"
+          shred -u /tmp/symkey.bin /tmp/iv.bin /tmp/cipher.bin "/tmp/preflight-$ARM.tar.gz"
+          echo "preflight diagnostics encrypted (ciphertext + tag only leave this runner)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: results-${{ matrix.arm }}-s${{ matrix.slice }}
-          path: /tmp/upload/
+          name: preflight-diag-${{ matrix.arm }}
+          path: /tmp/upload-diag/
           retention-days: 1
-      - name: propagate recorded benchmark result
-        if: always()
-        run: |
-          RC=$(cat "experiments/bench/t0069/out/${RUNTAG}/exit-code.txt" 2>/dev/null || echo 99)
-          echo "slice exit code: $RC (decrypted results carry the detail)"
-          exit "$RC"
+

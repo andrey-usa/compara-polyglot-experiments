@@ -1,1 +1,1 @@
-run-arm: 20261026T1121Z scope: 12 tasks x 3 trials x 2 arms, 2 slices per arm (owner-approved single attempt 2026-10-26 07:20 ET after the chown-ordering fix; no auto-rearm after any failure)
+run-arm: 20261026T1155Z scope: DIAGNOSTICS ONLY (owner-approved 2026-10-26 07:54 ET): eval job removed, no model secret present, preflight self-test + bench-user browser probes + encrypted diagnostics on any outcome
