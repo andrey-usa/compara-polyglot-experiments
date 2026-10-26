@@ -248,19 +248,27 @@ class Site:
 def solution_name(arm):
     return "solution.pv" if arm == "primavera" else "solution.spec.ts"
 
+# Env allowlist for model-executed code under --as-user. The full step env is
+# NOT safe to pass: it carries runner-scoped credentials (ACTIONS_RUNTIME_TOKEN
+# etc.) that must never reach model-written commands or scoring of model-written
+# tests. PATH comes from the caller's env because it carries the arm-specific
+# prepend (primavera bin dir / playwright node_modules/.bin).
+RESTRICTED_ENV_KEYS = ("PATH", "PLAYWRIGHT_BROWSERS_PATH")
+
 def as_user_prefix(args, env, workdir):
     """Wrap a command to run as the restricted bench user (CI paid runs; local
-    self-tests run unwrapped). The given env (already *_API_KEY-scrubbed,
-    arm-specific PATH included) is passed explicitly with HOME forced to the
-    trial workdir, so nothing leaks from the sudoing process and no harness
-    credential is reachable from model-executed code."""
+    self-tests run unwrapped). Only allowlisted variables are passed, with HOME
+    forced to the trial workdir: no harness credential and no runner-scoped
+    token is reachable from model-executed code."""
     if not getattr(args, "as_user", None):
         return None
-    env = dict(env)
-    env["HOME"] = workdir
-    env.pop("SILICONFLOW_API_KEY", None)
+    keep = {k: env[k] for k in RESTRICTED_ENV_KEYS if env.get(k)}
+    keep["HOME"] = workdir
+    keep["BASE_URL"] = env.get("BASE_URL", "")
+    keep["TERM"] = "dumb"
+    keep["LANG"] = "C.UTF-8"
     return ["sudo", "-n", "-u", args.as_user, "env", "-i"] + \
-        [f"{k}={v}" for k, v in env.items()]
+        [f"{k}={v}" for k, v in keep.items()]
 
 def run_restricted(argv, args, env, workdir, **kw):
     pre = as_user_prefix(args, env, workdir)

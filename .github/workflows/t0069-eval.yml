@@ -108,7 +108,7 @@ jobs:
   eval:
     needs: [build, preflight]
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 360  # 18 trials/slice x 30-min trial wall cap worst case exceeds 240
     environment: main
     strategy:
       fail-fast: false
