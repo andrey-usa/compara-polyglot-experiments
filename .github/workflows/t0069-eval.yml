@@ -13,10 +13,9 @@
 #   the bundle key RSA-OAEP-SHA256-wrapped to bench/t0069/ci-results-pub.pem.
 #   The private unwrap key lives only in the private board repo. No decryption
 #   material, no board-write credential, and no repo secret beyond the existing
-#   DIAGNOSTICS-ONLY VARIANT: the eval job is removed, so no job references the
-#   `main` environment and SILICONFLOW_API_KEY is never injected in this run. Anyone
+#   environment-scoped SILICONFLOW_API_KEY leaves the runner. Anyone
 #   downloading the public artifact gets ciphertext + tag only.
-# - (full-run variant) SILICONFLOW_API_KEY isolation: the harness pops it from its environment at
+# - SILICONFLOW_API_KEY isolation: the harness pops it from its environment at
 #   startup, never puts it in any child env (including the site server), and
 #   every model-generated shell command plus every scoring run of model-written
 #   code executes as the dedicated unprivileged user `benchr`
@@ -170,7 +169,10 @@ jobs:
           umask 077
           cd /opt/t0069
           mkdir -p /tmp/upload-diag
-          tar czf "/tmp/preflight-$ARM.tar.gz" "out/preflight-$ARM" "out/preflight-$ARM.log" 2>/dev/null || tar czf "/tmp/preflight-$ARM.tar.gz" "out"
+          sudo tar czf "/tmp/preflight-$ARM.tar.gz" \
+            --exclude='*/.config' --exclude='*/.local' --exclude='*/.cache' --exclude='*/.npm/_cacache' \
+            "out/preflight-$ARM" "out/preflight-$ARM.log"
+          sudo chown $(id -u):$(id -g) "/tmp/preflight-$ARM.tar.gz"
           head -c 64 /dev/urandom > /tmp/symkey.bin
           ENCKEYHEX=$(head -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
           MACKEYHEX=$(tail -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
@@ -194,3 +196,101 @@ jobs:
           path: /tmp/upload-diag/
           retention-days: 1
 
+
+  eval:
+    needs: [build, preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 18 trials/slice x 30-min trial wall cap worst case exceeds 240
+    environment: main
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [primavera, playwright]
+        slice: [0, 1, 2, 3]
+    env:
+      SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+      SLICE_MOD: ${{ github.event.inputs.slice_mod || '4' }}
+      PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: experiments, persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: primavera-bin, path: bin }
+      - run: chmod 755 bin bin/primavera
+      - name: create restricted bench user
+        run: sudo useradd benchr || true
+      - name: stage bench tree outside runner home (least-privilege - benchr needs no /home/runner traversal)
+        run: |
+          sudo mkdir -p /opt/t0069
+          sudo cp -a bin /opt/t0069/bin
+          sudo cp -a experiments/bench/t0069 /opt/t0069/bench
+          sudo chmod -R a+rX /opt/t0069
+          sudo chown -R runner:runner /opt/t0069
+      - name: arm B toolchain (playwright, shared browser path)
+        if: matrix.arm == 'playwright'
+        run: |
+          sudo mkdir -p /opt/pw-browsers && sudo chmod 777 /opt/pw-browsers
+          sudo mkdir -p /opt/t0069/pw && sudo chown runner:runner /opt/t0069/pw
+          cd /opt/t0069/pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null 2>&1
+          sudo chmod -R a+rX /opt/pw-browsers /opt/t0069/pw
+          echo "pw ready: $(npx playwright --version)"
+      - name: run slice (stdout/stderr to files only)
+        env:
+          ARM: ${{ matrix.arm }}
+          SLICE: ${{ matrix.slice }}
+        run: |
+          cd /opt/t0069/bench
+          RUNTAG="ci-${{ github.run_id }}-${{ matrix.arm }}-s${{ matrix.slice }}"
+          sudo mkdir -p /opt/t0069/out && sudo chown runner:runner /opt/t0069/out
+          mkdir -p "/opt/t0069/out/$RUNTAG"
+          set +e
+          python3 harness-t0069_run.py --arm "$ARM" --trials 3 \
+            --slice-mod "$SLICE_MOD" --slice-index "$SLICE" \
+            --as-user benchr --wall-budget-minutes 300 \
+            --primavera-bin /opt/t0069/bin/primavera --pw-dir /opt/t0069/pw \
+            --out "/opt/t0069/out/$RUNTAG" --uncapped \
+            > "/opt/t0069/out/$RUNTAG/harness-stdout.log" 2>&1
+          RC=$?
+          set -e
+          echo "$RC" > "/opt/t0069/out/$RUNTAG/exit-code.txt"
+          echo "RUNTAG=$RUNTAG" >> "$GITHUB_ENV"
+          echo "slice finished: arm=$ARM slice=$SLICE (detail stays off the public log)"
+      - name: encrypt results (encrypt-then-MAC; public key only, no secrets here)
+        if: always()
+        run: |
+          umask 077  # symkey/tarball/iv unreadable even to the bench uid during the encrypt window
+          cd /opt/t0069
+          mkdir -p /tmp/upload
+          sudo tar czf "/tmp/${RUNTAG}.tar.gz" \
+            --exclude='*/.config' --exclude='*/.local' --exclude='*/.cache' --exclude='*/.npm/_cacache' \
+            "out/${RUNTAG}"
+          sudo chown $(id -u):$(id -g) "/tmp/${RUNTAG}.tar.gz"
+          head -c 64 /dev/urandom > /tmp/symkey.bin
+          ENCKEYHEX=$(head -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
+          MACKEYHEX=$(tail -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
+          head -c16 /dev/urandom > /tmp/iv.bin
+          IVHEX=$(od -An -tx1 /tmp/iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$ENCKEYHEX" -iv "$IVHEX" \
+            -in "/tmp/${RUNTAG}.tar.gz" -out /tmp/cipher.bin
+          cat /tmp/iv.bin /tmp/cipher.bin > "/tmp/upload/${RUNTAG}.tar.gz.enc"
+          openssl pkeyutl -encrypt -pubin -inkey /opt/t0069/bench/ci-results-pub.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/symkey.bin -out "/tmp/upload/${RUNTAG}.symkey.enc"
+          cat "/tmp/upload/${RUNTAG}.symkey.enc" "/tmp/upload/${RUNTAG}.tar.gz.enc" \
+            | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$MACKEYHEX" -binary \
+            > "/tmp/upload/${RUNTAG}.mac"
+          shred -u /tmp/symkey.bin /tmp/iv.bin /tmp/cipher.bin "/tmp/${RUNTAG}.tar.gz"
+          echo "results encrypted (ciphertext + tag only leave this runner)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.arm }}-s${{ matrix.slice }}
+          path: /tmp/upload/
+          retention-days: 1
+      - name: propagate recorded benchmark result
+        if: always()
+        run: |
+          RC=$(cat "/opt/t0069/out/${RUNTAG}/exit-code.txt" 2>/dev/null || echo 99)
+          echo "slice exit code: $RC (decrypted results carry the detail)"
+          exit "$RC"
