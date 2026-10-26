@@ -1,3 +1,0 @@
-scenario "Needs a person"
-  goto /
-  handoff until text Never --timeout-ms 300

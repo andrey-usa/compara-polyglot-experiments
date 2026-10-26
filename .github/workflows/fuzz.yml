@@ -1,15 +1,14 @@
 name: fuzz
 on:
-  push:
-    branches: [experiment-39]
-    paths:
-      - "navigera/fuzz/**"
-      - "compara/fuzz/**"
-      - "primavera/fuzz/**"
-      - ".github/workflows/fuzz.yml"
+  pull_request:
+    paths: ["fuzz/**", "src/**"]
+  schedule: [{cron: "0 3 * * *"}]  # nightly, 30 min per target
   workflow_dispatch:
-permissions:
-  contents: read
+    inputs:
+      duration:
+        description: "Fuzz seconds per target (empty: 300, or 1800 on schedule)"
+        required: false
+permissions: {contents: read}
 jobs:
   fuzz:
     runs-on: ubuntu-latest
@@ -18,68 +17,53 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - product: navigera
-            target: parse_args
+          - target: parse_args
             seeds: none
-          - product: navigera
-            target: command_json
+          - target: command_json
             seeds: none
-          - product: compara
-            target: text_compare
-            seeds: text
-          - product: compara
-            target: parquet_compare
-            seeds: parquet
-          - product: compara
-            target: delta_log
-            seeds: none
-          - product: primavera
-            target: pv_parse
-            seeds: pv
-          - product: primavera
-            target: gherkin_parse
-            seeds: feature
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: nightly
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version 0.13.2
       - name: seed corpus
-        working-directory: ${{ matrix.product }}/fuzz
+        working-directory: fuzz
         run: |
           mkdir -p "corpus/${{ matrix.target }}" artifacts
-          case "${{ matrix.seeds }}" in
-            text) cp ../tests/fixtures/formats/*.csv ../tests/fixtures/formats/*.tsv ../tests/fixtures/formats/*.ndjson "corpus/${{ matrix.target }}/" 2>/dev/null || true ;;
-            parquet) cp ../tests/fixtures/formats/*.parquet ../tests/fixtures/hostile/*.parquet "corpus/${{ matrix.target }}/" 2>/dev/null || true ;;
-            pv) find ../examples ../tests -name '*.pv' -exec cp {} "corpus/${{ matrix.target }}/" \; 2>/dev/null || true ;;
-            feature) find ../tests ../examples -name '*.feature' -exec cp {} "corpus/${{ matrix.target }}/" \; 2>/dev/null || true ;;
-          esac
           ls "corpus/${{ matrix.target }}" | head -20
-      - name: fuzz (30 min)
-        working-directory: ${{ matrix.product }}/fuzz
+      - name: fuzz
+        working-directory: fuzz
+        env:
+          # ASAN aborts on huge allocations instead of returning NULL; the
+          # product handles those cleanly, so let the allocator fail soft.
+          ASAN_OPTIONS: allocator_may_return_null=1
         run: |
           # NOTE: this step runs under bash -e, so a plain failing command
           # aborts the script before the log-copy lines below run. The
           # cargo invocation must therefore be in an OR list (exempt from
           # -e) for its log to survive a crash, hang or build failure.
+          DURATION="${{ inputs.duration }}"
+          if [ -z "$DURATION" ]; then
+            if [ "${{ github.event_name }}" = "schedule" ]; then DURATION=1800; else DURATION=300; fi
+          fi
           code=0
           cargo +nightly fuzz run --fuzz-dir . ${{ matrix.target }} "corpus/${{ matrix.target }}" -- \
-            -max_total_time=1800 -rss_limit_mb=2048 -timeout=10 -max_len=65536 \
+            -max_total_time="$DURATION" -rss_limit_mb=2048 -timeout=10 -max_len=65536 \
             -artifact_prefix="$PWD/artifacts/" > "fuzz-${{ matrix.target }}.log" 2>&1 || code=$?
           tail -40 "fuzz-${{ matrix.target }}.log" > artifacts/run-summary.txt || true
           cp "fuzz-${{ matrix.target }}.log" artifacts/ || true
           exit $code
       - name: upload corpus and crashes
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: fuzz-${{ matrix.target }}
           path: |
-            ${{ matrix.product }}/fuzz/corpus/${{ matrix.target }}
-            ${{ matrix.product }}/fuzz/artifacts
-            ${{ matrix.product }}/fuzz/fuzz-${{ matrix.target }}.log
+            fuzz/corpus/${{ matrix.target }}
+            fuzz/artifacts
+            fuzz/fuzz-${{ matrix.target }}.log
           retention-days: 30

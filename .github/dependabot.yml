@@ -1,15 +1,16 @@
 version: 2
 updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
+  - package-ecosystem: cargo
+    directory: /
     schedule:
-      interval: "monthly"
-    commit-message:
-      prefix: "chore"
-
-  - package-ecosystem: "cargo"
-    directory: "/rust"
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
     schedule:
-      interval: "monthly"
-    commit-message:
-      prefix: "chore"
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
