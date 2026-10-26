@@ -1,0 +1,73 @@
+# Docs site generator comparison: build all four, upload as artifacts.
+#
+# Builds the same four navigera docs pages with Starlight (Astro),
+# MkDocs Material, mdBook, and Zensical, runs the internal link checker
+# against each output, and uploads each built site as a CI artifact.
+# Deliberately NOT a Pages deploy: the sample sites are for inspection
+# from the run's artifacts, not for publication.
+name: Docs site comparison
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: docs-site/starlight/package-lock.json
+      - name: Install Python generators
+        run: pip install "mkdocs<2" "mkdocs-material==9.7.1" pymdown-extensions "zensical==0.0.72"
+      - name: Install mdBook
+        run: |
+          curl -sL -o /tmp/mdbook.tar.gz https://github.com/rust-lang/mdBook/releases/download/v0.5.2/mdbook-v0.5.2-x86_64-unknown-linux-gnu.tar.gz
+          mkdir -p /tmp/mdbook-bin && tar xzf /tmp/mdbook.tar.gz -C /tmp/mdbook-bin
+          echo "/tmp/mdbook-bin" >> "$GITHUB_PATH"
+      - name: Sync content and build all four
+        run: |
+          cd docs-site
+          python3 sync-content.py
+          npm --prefix starlight ci
+          npm --prefix starlight run build
+          mkdocs build -f mkdocs/mkdocs.yml
+          mdbook build mdbook
+          (cd zensical && zensical build)
+      - name: Link check and sizes
+        run: |
+          cd docs-site
+          for site in starlight/dist mkdocs/site mdbook/book zensical/site; do
+            echo "--- $site ---"
+            python3 check-links.py "$site" --allow link-baseline.txt
+            du -sh "$site"
+            find "$site" -type f | wc -l
+          done
+      - name: Upload Starlight site
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-starlight
+          path: docs-site/starlight/dist
+      - name: Upload MkDocs Material site
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-mkdocs-material
+          path: docs-site/mkdocs/site
+      - name: Upload mdBook site
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-mdbook
+          path: docs-site/mdbook/book
+      - name: Upload Zensical site
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-zensical
+          path: docs-site/zensical/site

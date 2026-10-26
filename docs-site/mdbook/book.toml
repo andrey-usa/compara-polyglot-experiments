@@ -1,0 +1,14 @@
+# navigera docs built with mdBook (binary release 0.5.2).
+[book]
+title = "navigera docs"
+authors = []
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/andrey-usa/navigera"
+# Defaults kept everywhere else: sidebar, search, theme picker, code
+# copy buttons are mdBook's built-in output.
