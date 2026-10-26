@@ -1,795 +1,864 @@
-//! The command line.
-//!
-//! ```text
-//! compara compare A.csv B.csv --key id,region [--compare c1,c2] [--out report.html]
-//! compara compare A.csv B.csv --profile orders
-//! ```
-//!
-//! Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (only
-//! with `--fail-on-dups`). That makes it a drop-in CI or pipeline gate.
+//! primavera: plain-text web tests on real Chrome, run by one native binary
+//! through navigera. See README.md.
 
-use std::fs;
-use std::io::Write;
+mod allure;
+mod axtree;
+mod config;
+mod expect;
+mod fix;
+mod from_session;
+mod gherkin;
+mod http;
+mod mcp;
+mod nearest;
+mod record;
+mod report;
+mod runner;
+mod server;
+mod shot;
+mod suite;
+mod trace;
+
+use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{mpsc, Condvar, Mutex};
+use std::time::Instant;
 
-use compara::error::{Error, Result};
-
-#[global_allocator]
-static ALLOCATOR: compara::hugepages::HugePages = compara::hugepages::HugePages;
-use compara::source::{Source, Want};
-use compara::{Options, compare, parse_list, profiles, render};
+/// The agent skill: the format and the commands, for an agent writing tests.
+const SKILL_MD: &str = include_str!("../skills/primavera/SKILL.md");
 
 const USAGE: &str = "\
-usage: compara <command> [options]
+primavera: plain-text web tests on real Chrome (through navigera)
 
-commands:
-  compare A B     Compare two tables on a composite key: print the counts, and with -o
-                  write an HTML report
-  columns FILE    Print one file's column names, one per line
-  head FILE       Print the first rows of one file (default 10)
-  version         Print the version (also --version)
-  env             Print what this process sees: CPUs, memory and its limits, the
-                  temporary directory, and whether URLs can be read
+usage:
+  primavera run [<file.pv|file.feature|dir>...] [options]
+                                                run scenarios (default: the current directory)
+  primavera lint [<file|dir>...]                check files without a browser
+  primavera list [<file|dir>...]                the scenarios a run would take
+  primavera trace <dir> [<line>]                a recorded trace (--trace): every step, or one in full
+  primavera fix [<file>:<line>] [--use <n>] [--all [--min <p>]]
+                                                put a suggestion of the last run (nearest on the page) into the failing step
+  primavera navigera <command…>                 navigera's commands, built in (`primavera navigera -s work goto <url>`)
+  primavera from-session <name> [--scenario <s>] [--out <f.pv>]
+                                                what a navigera session did, as a scenario (refs as locators)
+  primavera record <url> [--out <f.pv>] [--scenario <s>] [--headless] [--for <s>]
+                                                a browser to use by hand; what you do becomes a scenario
+  primavera record --extend <f.pv> [--scenario <s>] [--base-url <url>] [--secrets <file>]
+                                                run a scenario to its end, then record more steps into it
+  primavera mcp [--headed] [--chromium <path>]  an MCP server: navigera's browser tools and primavera_from_session/run/failure/fix
+  primavera skill                               the agent skill (the format and commands, for an AI agent)
+  primavera --version
 
-A, B and FILE are paths, `-` for standard input, or with cloud support s3://,
-gs://, az:// and https:// URLs. Gzip and zstd files are read as what they hold.
-A directory, a quoted glob ('out/date=*/*.parquet', `**` for any depth) or an
-object storage prefix (s3://bucket/orders/) is its files read as one table, in
-path order; names starting with `.` or `_` in a directory are passed over, and
-Hive partition directories (date=2026-10-01/) are columns. A Delta table is read
-at its latest version, or at TABLE@vN (s3://lake/orders@v41).
+run options:
+  --base-url <url>      where relative URLs (`goto /cart`) point (else `base` in the file, PRIMAVERA_BASE_URL)
+  --var <name=value>    a variable for ${name} (repeatable)
+  --secrets <file>      NAME=value lines for ${secret:NAME} (the environment comes first); masked in output
+  --grep <text>         only scenarios whose name contains it
+  --tag <tag>           only scenarios with this @tag (repeatable: any of them)
+  --workers <n|auto>    scenarios at once (default 1; auto: half the CPUs, at most 8); also -j <n>
+  --isolation <how>     context (default): one browser, a browser context per worker; browser: a browser each
+  --retries <n>         run a failing scenario again, up to n times; one that then passes is flaky
+  --fail-on-flaky       a flaky scenario fails the run
+  --shard <i/n>         run the i-th of n slices (for CI matrix jobs)
+  --repeat <n>          run every scenario n times (flake hunting: each run is reported, then a pass count)
+  --shuffle [<seed>]    run in a random order (the seed is printed; give it again to repeat the order)
+  --reporter <name>     console (default), jsonl (one JSON object per scenario on stdout), github
+                        (workflow annotations; on by itself under GitHub Actions); repeatable
+  --config <file>       settings, a [server] and [env.<name>] profiles (default: ./primavera.toml)
+  --env <name>          the config's [env.<name>] profile on top of the rest
+  --update-screenshots  a screenshot that differs from its baseline (or has none) becomes it
+  --compare-report <k>  what `expect download … compare` keeps: html, json, rows (comma-separated) or none (default html)
+  --trace <when>        on-failure or all: each step's page, console and requests in trace.jsonl
+                        beside the screenshot (and ax.txt at a failure); read it with `primavera trace`
+  --junit <file>        also write JUnit XML
+  --cucumber <file>     also write Cucumber JSON for the .feature files (step by step)
+  --allure <dir>        also write Allure results (a JSON file per scenario run, screenshots attached)
+  --html <file>         also write the run as one HTML page (steps, times, failures with their screenshot)
+  --json                print what the scenarios saved, as one JSON object, at the end
+  --timeout-ms <ms>     how long an expect retries (default 5000)
+  --wait-ms <ms>        how long a step waits for its element (navigera's default 5000)
+  --headed              show the browser
+  --chromium <path>     the browser to run
+  --engine lightpanda   run on Lightpanda (no layout: a fast smoke tier; screenshots and pixel checks fail)
+  --evidence <dir>      failure screenshots and downloads (default .primavera/runs/<time>)
+  --pause-on-failure    keep the browser at a failure, open to `navigera --attach`, until Enter (one worker)
 
-columns and head read CSV, newline-delimited JSON and Parquet, and neither reads
-more of the file than it has to: `columns` on Parquet reads the footer, and
-`head` stops at the first page. Both take --delimiter and --encoding.
-
-head options:
-  -n, --rows N            Rows to show (default 10)
-      --csv               Print as CSV instead of an aligned table
-
-compare options:
-  -k, --key COLS          Comma-separated key column(s) (or from --profile)
-  -c, --compare COLS      Columns to compare (default: all common non-key columns)
-  -i, --ignore COLS       Columns to skip
-  -p, --profile NAME      Profile name from compara.toml
-      --config PATH       Path to compara.toml
-      --trim              Strip whitespace before comparing
-      --ignore-case
-      --empty-is-null     Treat empty string and null as equal
-      --tolerance N       Absolute numeric tolerance
-      --max-rows N        Rows embedded per section (default 50000)
-      --delimiter D       Force delimiter (default: auto)
-      --encoding ENC
-      --engine E          auto | turbo | sortmerge | native
-      --threads N
-      --memory SIZE       Memory to plan for, e.g. 8G (default: what the machine or
-                          container has free); decides when large text files are
-                          joined in one pass instead of two, and how many columns of
-                          two Parquet files are read at once; Parquet that needs
-                          more than SIZE one column at a time is refused
-      --export-dir DIR    Write full changed/added/removed CSVs here (a directory, or a
-                          URL prefix such as s3://bucket/run-42/)
-  -o, --out PATH          Write the HTML report here, a path or a URL (no report without it)
-      --json PATH         Write a JSON summary (counts + column stats) here, a path or a
-                          URL; `-` prints it, and the counts line goes to stderr
-      --no-compress       Report: embed plain JSON instead of gzip (older browsers)
-      --summary           Print the counts and write nothing, and refuse any flag that would
-                          (the default without -o, --json or --export-dir)
-      --fail-on-dups      Exit 3 when either file has duplicate keys
-      --exit-zero         Exit 0 when the tables differ: for a scheduled job whose
-                          output is the report, where a difference is not a failure
-                          (a Kubernetes Job, an Airflow task)
-
-Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with --fail-on-dups).
+exit codes: 0 all passed, 1 a scenario failed, 2 a file or an argument is wrong, 3 the browser or the app server didn't start
 ";
 
-/// Replaces the panic hook with one that cannot hang.
-///
-/// The hook the standard library installs takes a lock, then symbolises the
-/// stack, and symbolising allocates. Under a memory budget that allocation can
-/// fail, and the allocation error hook reaches for the same lock the panicking
-/// thread is already holding: the process stops, in a state no timeout of its
-/// own will end. On a benchmark runner a hang is the worst of the three
-/// outcomes -- worse than the abort it replaced -- because nothing after it
-/// runs. Two threads panicking at once also interleave the default hook's
-/// output mid-word, which is how `memory allocation of 800040080004008000400
-/// bytes failed` got printed.
-///
-/// So: one line, one write, no backtrace -- and `RUST_BACKTRACE` does not change
-/// that. It used to: this hook printed `Backtrace::force_capture()` whenever
-/// the variable was set, on the theory that it did not take the lock. It does.
-/// `Backtrace`'s `Display` resolves symbols under the same backtrace lock, the
-/// allocation error hook reaches for it, and the thread waits on itself; a
-/// second panicking thread then waits on the stderr lock and `main` on `join`.
-/// Measured at a 4.5 MB `ulimit -d`: 4 hangs in 30 runs with `RUST_BACKTRACE`
-/// set, none in 30 without. And "the caller's risk" was nobody's choice:
-/// `setup-rust-toolchain` exports `RUST_BACKTRACE` to every CI job, and plenty
-/// of shells set it globally, which is how `tests/out_of_memory.rs` came to
-/// fail intermittently on pull requests that touched nothing near it.
-///
-/// A backtrace is still there for whoever asks for this program's one by name:
-/// `COMPARA_BACKTRACE=1`. It can hang under a memory cap, for the reason above.
-fn quiet_panics() {
-    std::panic::set_hook(Box::new(|info| {
-        let what = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
-            .unwrap_or("a panic with no message");
-        let mut err = std::io::stderr().lock();
-        match info.location() {
-            Some(at) => {
-                let _ = writeln!(
-                    err,
-                    "error: internal: {what} at {}:{}",
-                    at.file(),
-                    at.line()
-                );
-            }
-            None => {
-                let _ = writeln!(err, "error: internal: {what}");
-            }
-        }
-        if std::env::var_os("COMPARA_BACKTRACE").is_some() {
-            let _ = writeln!(err, "{}", std::backtrace::Backtrace::force_capture());
-        }
-        let _ = err.flush();
-    }));
+struct Args {
+    cmd: String,
+    paths: Vec<PathBuf>,
+    opts: runner::Options,
+    junit: Option<PathBuf>,
+    cucumber: Option<PathBuf>,
+    allure: Option<PathBuf>,
+    html: Option<PathBuf>,
+    /// primavera.toml's `[server]`.
+    server: Option<config::Server>,
+    workers: usize,
+    retries: u32,
+    fail_on_flaky: bool,
+    shard: Option<(usize, usize)>,
+    reporters: Vec<String>,
+    json: bool,
+    /// `context` (one browser, a context per worker) or `browser`.
+    isolation: String,
+    repeat: u32,
+    shuffle: Option<u64>,
 }
 
-/// A closed pipe ends the process quietly, as it ends `cat`: `compara head
-/// big.csv | head -1` is not an error. Rust ignores SIGPIPE, so a write to a
-/// closed pipe would fail -- and `println!` would panic -- instead.
-fn default_sigpipe() {
-    #[cfg(unix)]
-    {
-        unsafe extern "C" {
-            fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
+fn parse_args() -> Result<Args, String> {
+    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let cmd = raw.remove(0);
+    // primavera.toml (or --config), and its --env profile: flags before the
+    // command line's, which win.
+    let mut take = |flag: &str| -> Result<Option<String>, String> {
+        match raw.iter().position(|w| w == flag) {
+            Some(i) if i + 1 < raw.len() => {
+                let v = raw.remove(i + 1);
+                raw.remove(i);
+                Ok(Some(v))
+            }
+            Some(_) => Err(format!("{flag} needs a value")),
+            None => Ok(None),
         }
-        const SIGPIPE: std::ffi::c_int = 13;
-        const SIG_DFL: usize = 0;
-        // SAFETY: restores the default disposition of one signal.
-        unsafe {
-            signal(SIGPIPE, SIG_DFL);
+    };
+    let config_file = take("--config")?;
+    let env = take("--env")?;
+    let config = config::load(config_file.as_deref().map(std::path::Path::new), env.as_deref())?;
+    let mut words = config.as_ref().map(|c| c.profile.words()).unwrap_or_default();
+    words.extend(raw);
+    let it = words.into_iter();
+    let mut paths = Vec::new();
+    let stamp =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
+    let mut opts = runner::Options::new(stamp);
+    let mut junit = None;
+    let mut cucumber = None;
+    let mut allure = None;
+    let mut html = None;
+    let mut base_flag = None;
+    let mut workers = 1usize;
+    let mut retries = 0u32;
+    let mut fail_on_flaky = false;
+    let mut shard = None;
+    let mut reporters: Vec<String> = Vec::new();
+    let mut json = false;
+    let mut isolation = "context".to_string();
+    let mut repeat = 1u32;
+    let mut shuffle = None;
+    let mut it = it.peekable();
+    while let Some(a) = it.next() {
+        if a == "--shuffle" {
+            // An optional seed: the next word when it is a number.
+            let seed = it.peek().and_then(|w| w.parse::<u64>().ok());
+            if seed.is_some() {
+                it.next();
+            }
+            shuffle = Some(seed.unwrap_or(stamp ^ (std::process::id() as u64).rotate_left(32)));
+            continue;
+        }
+        let mut val = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
+        match a.as_str() {
+            "--base-url" => base_flag = Some(val("--base-url")?),
+            "--var" => {
+                let kv = val("--var")?;
+                let (k, v) = kv.split_once('=').ok_or_else(|| format!("--var takes name=value, not {kv:?}"))?;
+                opts.vars.insert(k.trim().to_string(), v.to_string());
+            }
+            "--secrets" => {
+                let path = val("--secrets")?;
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("--secrets {path}: {e}"))?;
+                opts.secrets = secrets_file(&text).map_err(|e| format!("--secrets {path}: {e}"))?;
+            }
+            "--pause-on-failure" => opts.pause = true,
+            "--grep" => opts.grep = Some(val("--grep")?),
+            "--tag" => opts.tags.push(val("--tag")?.trim_start_matches('@').to_string()),
+            "--junit" => junit = Some(PathBuf::from(val("--junit")?)),
+            "--cucumber" => cucumber = Some(PathBuf::from(val("--cucumber")?)),
+            "--allure" => allure = Some(PathBuf::from(val("--allure")?)),
+            "--html" => html = Some(PathBuf::from(val("--html")?)),
+            "--timeout-ms" => {
+                let v = val("--timeout-ms")?;
+                opts.expect_ms = v.parse().map_err(|_| format!("--timeout-ms takes milliseconds, not {v:?}"))?;
+            }
+            "--wait-ms" => {
+                let v = val("--wait-ms")?;
+                opts.wait_ms = Some(v.parse().map_err(|_| format!("--wait-ms takes milliseconds, not {v:?}"))?);
+            }
+            "--headed" => opts.headed = true,
+            "--update-screenshots" => opts.update_shots = true,
+            "--trace" => opts.trace = trace::Trace::parse(&val("--trace")?)?,
+            "--compare-report" => opts.compare_report = expect::report_kinds(&val("--compare-report")?)?,
+            "--chromium" => opts.chromium = Some(val("--chromium")?),
+            "--engine" => {
+                let e = val("--engine")?;
+                if e != "chrome" && e != "lightpanda" {
+                    return Err(format!("--engine takes chrome or lightpanda, not {e:?}"));
+                }
+                opts.engine = e;
+            }
+            "--evidence" => opts.evidence = PathBuf::from(val("--evidence")?),
+            "--workers" | "-j" => {
+                let v = val("--workers")?;
+                workers = if v == "auto" {
+                    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+                    (cpus / 2).clamp(1, 8)
+                } else {
+                    v.parse::<usize>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| format!("--workers takes a number or auto, not {v:?}"))?
+                };
+            }
+            "--retries" => {
+                let v = val("--retries")?;
+                retries = v.parse().map_err(|_| format!("--retries takes a number, not {v:?}"))?;
+            }
+            "--fail-on-flaky" => fail_on_flaky = true,
+            "--repeat" => {
+                let v = val("--repeat")?;
+                repeat =
+                    v.parse().ok().filter(|n| *n > 0).ok_or_else(|| format!("--repeat takes a number, not {v:?}"))?;
+            }
+            "--shard" => {
+                let v = val("--shard")?;
+                let parsed = v
+                    .split_once('/')
+                    .and_then(|(i, n)| Some((i.parse::<usize>().ok()?, n.parse::<usize>().ok()?)))
+                    .filter(|(i, n)| *n > 0 && *i >= 1 && i <= n);
+                shard = Some(parsed.ok_or_else(|| format!("--shard takes i/n with 1 <= i <= n, not {v:?}"))?);
+            }
+            "--reporter" => {
+                let v = val("--reporter")?;
+                for r in v.split(',') {
+                    if !matches!(r, "console" | "jsonl" | "github") {
+                        return Err(format!("unknown reporter {r:?} (console, jsonl, github)"));
+                    }
+                    reporters.push(r.to_string());
+                }
+            }
+            "--json" => json = true,
+            "--isolation" => {
+                isolation = val("--isolation")?;
+                if isolation != "context" && isolation != "browser" {
+                    return Err(format!("--isolation takes context or browser, not {isolation:?}"));
+                }
+            }
+            "-h" | "--help" => return Err(USAGE.to_string()),
+            f if f.starts_with('-') => return Err(format!("unknown option {f}\n\n{USAGE}")),
+            p => paths.push(PathBuf::from(p)),
         }
     }
+    if base_flag.is_some() {
+        opts.base = base_flag;
+    }
+    if paths.is_empty() {
+        let from_config = config.as_ref().and_then(|c| c.profile.paths.clone()).unwrap_or_default();
+        paths.extend(from_config.into_iter().map(PathBuf::from));
+    }
+    if paths.is_empty() {
+        paths.push(PathBuf::from("."));
+    }
+    // Annotations alone say nothing about a passing run: the console stays
+    // on unless the JSON lines take its place.
+    if !reporters.iter().any(|r| r == "console" || r == "jsonl") {
+        reporters.push("console".into());
+    }
+    if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") && !reporters.iter().any(|r| r == "github") {
+        reporters.push("github".into());
+    }
+    Ok(Args {
+        cmd,
+        paths,
+        opts,
+        junit,
+        cucumber,
+        allure,
+        html,
+        server: config.and_then(|c| c.profile.server),
+        workers,
+        retries,
+        fail_on_flaky,
+        shard,
+        reporters,
+        json,
+        isolation,
+        repeat,
+        shuffle,
+    })
+}
+
+/// `NAME=value` lines (`#` comments, optional quotes around the value).
+fn secrets_file(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (k, v) = line.split_once('=').ok_or_else(|| format!("line {}: expected NAME=value", i + 1))?;
+        let v = v.trim();
+        let v = match (v.chars().next(), v.chars().last()) {
+            (Some(q @ ('"' | '\'')), Some(e)) if q == e && v.len() >= 2 => &v[1..v.len() - 1],
+            _ => v,
+        };
+        out.insert(k.trim().to_string(), v.to_string());
+    }
+    Ok(out)
+}
+
+fn load(paths: &[PathBuf]) -> Result<Vec<suite::Suite>, String> {
+    let files = suite::discover(paths).map_err(|e| format!("reading {:?}: {e}", paths))?;
+    if files.is_empty() {
+        return Err("no .pv or .feature files found".into());
+    }
+    let mut suites = Vec::new();
+    let mut errors = Vec::new();
+    for f in files {
+        match std::fs::read_to_string(&f) {
+            Ok(text) if f.extension().is_some_and(|e| e == "feature") => match gherkin::parse(&f, &text) {
+                Ok(s) => suites.push(s),
+                Err(e) => errors.push(e.to_string()),
+            },
+            Ok(text) => match suite::parse(&f, &text) {
+                Ok(s) => suites.push(s),
+                Err(e) => errors.push(e.to_string()),
+            },
+            Err(e) => errors.push(format!("{}: {e}", f.display())),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+    suite::resolve(&mut suites).map_err(|e| e.to_string())?;
+    Ok(suites)
 }
 
 fn main() -> ExitCode {
-    default_sigpipe();
-    quiet_panics();
-    compara::alloc::hold_reserve();
-    // Inside a container, out of memory is a refusal, not an OOM kill.
-    compara::memory::contain();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let status = run(&args);
-    report_peak_rss();
-    ExitCode::from(status)
-}
-
-fn run(args: &[String]) -> u8 {
-    let Some(command) = args.first() else {
-        eprint!("{USAGE}");
-        return 2;
-    };
-    match command.as_str() {
-        "-h" | "--help" | "help" => {
-            print!("{USAGE}");
-            0
-        }
-        "-V" | "--version" | "version" => {
-            println!("compara {}", env!("CARGO_PKG_VERSION"));
-            0
-        }
-        "compare" => match cmd_compare(&args[1..]) {
-            Ok(status) => status,
-            Err(e) => {
-                eprintln!("error: {e}");
-                2
-            }
-        },
-        "columns" => match cmd_columns(&args[1..]) {
-            Ok(status) => status,
-            Err(e) => {
-                eprintln!("error: {e}");
-                2
-            }
-        },
-        "env" => {
-            print_env();
-            0
-        }
-        "head" => match cmd_head(&args[1..]) {
-            Ok(status) => status,
-            Err(e) => {
-                eprintln!("error: {e}");
-                2
-            }
-        },
-        other => {
-            eprint!("error: unknown command: {other}\n\n{USAGE}");
-            2
-        }
+    // navigera's own commands, for exploring a page before writing the
+    // test (`primavera navigera -s work goto …`); a session they start is
+    // served by this executable again (`--session <name> …` first).
+    let first = std::env::args().nth(1);
+    if first.as_deref() == Some("navigera") {
+        return navigera::cli::main(std::env::args().take(1).chain(std::env::args().skip(2)));
     }
-}
-
-/// A small GNU-style argument reader: `--name value`, `--name=value`, `-n value`
-/// and bare flags, with everything else treated as a file argument.
-struct Args {
-    values: Vec<(String, Option<String>)>,
-    positional: Vec<String>,
-}
-
-/// The options that take no value. Anything else consumes the token after it,
-/// which is how a file path can appear before, between or after the options.
-const FLAGS: [&str; 10] = [
-    "trim",
-    "ignore-case",
-    "empty-is-null",
-    "no-compress",
-    "fail-on-dups",
-    "exit-zero",
-    "summary",
-    // `head --csv`. A value-taking flag left out of this list does not fail
-    // quietly -- it eats the token after it -- but it does fail confusingly:
-    // `head a.csv --csv` reported "--csv needs a value".
-    "csv",
-    "help",
-    "h",
-];
-
-impl Args {
-    fn parse(argv: &[String]) -> Result<Self> {
-        let mut values = Vec::new();
-        let mut positional = Vec::new();
-        let mut i = 0;
-        while i < argv.len() {
-            let token = &argv[i];
-            let Some(rest) = token.strip_prefix('-').map(|r| r.trim_start_matches('-')) else {
-                positional.push(token.clone());
-                i += 1;
-                continue;
-            };
-            if rest.is_empty() {
-                positional.push(token.clone());
-                i += 1;
-                continue;
+    if first.as_deref().is_some_and(|a| a == "--session" || a.starts_with("--session=")) {
+        return navigera::cli::main(std::env::args());
+    }
+    // The test loop over MCP: navigera's browser tools and primavera's own.
+    // Flags after `mcp` are navigera's (`--headed`, `--chromium <path>`).
+    if first.as_deref() == Some("mcp") {
+        let args = std::iter::once("navigera".to_string()).chain(std::env::args().skip(2)).chain(["mcp".to_string()]);
+        let config = match navigera::protocol::parse_args(args) {
+            Ok(parsed) => parsed.config,
+            Err(e) => {
+                eprintln!(
+                    "primavera mcp: {}",
+                    match e {
+                        navigera::protocol::ArgsError::Help(t) | navigera::protocol::ArgsError::Invalid(t) => t,
+                    }
+                );
+                return ExitCode::from(2);
             }
-            match rest.split_once('=') {
-                Some((name, value)) => values.push((name.to_string(), Some(value.to_string()))),
-                None if FLAGS.contains(&rest) => values.push((rest.to_string(), None)),
-                None => {
-                    let value = argv
-                        .get(i + 1)
-                        .ok_or_else(|| Error::new(format!("{token} needs a value")))?;
-                    values.push((rest.to_string(), Some(value.clone())));
-                    i += 1;
+        };
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        return mcp::serve(&config, &mut stdin.lock(), &mut stdout.lock());
+    }
+    // `fix` and `from-session` take their own words.
+    type Own = fn(&[String]) -> Result<String, String>;
+    let own: Option<Own> = match std::env::args().nth(1).as_deref() {
+        Some("fix") => Some(fix::main),
+        Some("from-session") => Some(from_session::main),
+        Some("record") => Some(record::main),
+        _ => None,
+    };
+    if let Some(main) = own {
+        let words: Vec<String> = std::env::args().skip(2).collect();
+        return match main(&words) {
+            Ok(text) => {
+                print!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(msg) if msg == USAGE => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
+    };
+    match args.cmd.as_str() {
+        "skill" => {
+            print!("{SKILL_MD}");
+            ExitCode::SUCCESS
+        }
+        "--version" | "-V" | "version" => {
+            println!("primavera {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        "trace" => {
+            let dir = args.paths.first().cloned().unwrap_or_else(|| PathBuf::from(".primavera/runs"));
+            let only = args.paths.get(1).and_then(|p| p.to_str()?.parse::<usize>().ok());
+            match trace::show(&dir, only) {
+                Ok(text) => {
+                    print!("{text}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(2)
                 }
             }
-            i += 1;
         }
-        Ok(Args { values, positional })
-    }
-
-    fn get(&self, long: &str, short: Option<&str>) -> Option<&str> {
-        self.values
-            .iter()
-            .find(|(name, _)| name == long || Some(name.as_str()) == short)
-            .and_then(|(_, value)| value.as_deref())
-    }
-
-    fn flag(&self, long: &str) -> bool {
-        self.values.iter().any(|(name, _)| name == long)
-    }
-
-    fn number<T: std::str::FromStr>(&self, long: &str) -> Result<Option<T>> {
-        match self.get(long, None) {
-            None => Ok(None),
-            Some(v) => v
-                .parse::<T>()
-                .map(Some)
-                .map_err(|_| Error::new(format!("--{long} must be a number, got: {v}"))),
+        "lint" => match load(&args.paths) {
+            Ok(suites) => {
+                // Variables nothing sets: warnings, since the environment of
+                // the run (a CI secret) may still set them.
+                let mut run_vars: Vec<String> = args.opts.vars.keys().cloned().collect();
+                run_vars.extend(args.opts.secrets.keys().map(|k| format!("secret:{k}")));
+                let mut warnings = 0;
+                for s in &suites {
+                    for sc in &s.scenarios {
+                        for (line, name) in suite::unset_vars(s, sc, &run_vars) {
+                            warnings += 1;
+                            println!(
+                                "warning: {}:{line}: ${{{name}}} isn't set by the file, --var, a data row or a save before it, nor in this environment",
+                                s.file.display()
+                            );
+                        }
+                    }
+                }
+                let n: usize = suites.iter().map(|s| s.scenarios.len()).sum();
+                let w = if warnings > 0 { format!(", {warnings} warning(s)") } else { String::new() };
+                println!("ok: {} file(s), {n} scenario(s){w}", suites.len());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        },
+        "list" => match load(&args.paths) {
+            Ok(suites) => {
+                for job in planned(&suites, &args) {
+                    let (suite, sc) = job.get(&suites);
+                    let tags: String = sc.tags.iter().map(|t| format!(" @{t}")).collect();
+                    println!("{}:{}  {}{tags}", suite.file.display(), sc.line, sc.name);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        },
+        "run" => run(args),
+        other => {
+            eprintln!("unknown command {other:?}\n\n{USAGE}");
+            ExitCode::from(2)
         }
     }
 }
 
-fn cmd_compare(argv: &[String]) -> Result<u8> {
-    let args = Args::parse(argv)?;
-    if args.flag("help") || args.flag("h") {
-        print!("{USAGE}");
-        return Ok(0);
-    }
-    if args.positional.len() < 2 {
-        return Err(Error::new(
-            "compare needs two files: compara compare A.csv B.csv --key ...",
-        ));
-    }
-    if args.positional.len() > 2 {
-        return Err(Error::new(format!(
-            "compare takes two inputs, A and B, and was given {}; a glob the shell expanded \
-             gives one per file -- quote it ('data/*.parquet') and compara reads its files as \
-             one table, or name the directory",
-            args.positional.len()
-        )));
-    }
-    let (a_spec, b_spec) = (args.positional[0].as_str(), args.positional[1].as_str());
-    if a_spec == "-" && b_spec == "-" {
-        return Err(Error::new("only one side can be read from standard input"));
-    }
-
-    let mut opt = Options::default();
-    if let Some(name) = args.get("profile", Some("p")) {
-        let found = profiles::load(args.get("config", None))?;
-        let profile = found
-            .get(name)
-            .ok_or_else(|| Error::new(format!("profile not found: {name}")))?;
-        profile.apply_to(&mut opt);
-    }
-
-    // Only options actually given override the profile, hence the `if let`s.
-    if let Some(v) = args.get("key", Some("k")) {
-        opt.key = parse_list(v);
-    }
-    if let Some(v) = args.get("compare", Some("c")) {
-        opt.compare = Some(parse_list(v));
-    }
-    if let Some(v) = args.get("ignore", Some("i")) {
-        opt.ignore = parse_list(v);
-    }
-    opt.trim |= args.flag("trim");
-    opt.ignore_case |= args.flag("ignore-case");
-    opt.empty_is_null |= args.flag("empty-is-null");
-    if let Some(v) = args.number::<f64>("tolerance")? {
-        opt.tolerance = v;
-    }
-    if let Some(v) = args.number::<usize>("max-rows")? {
-        opt.max_rows = v;
-    }
-    if let Some(v) = args.number::<usize>("threads")? {
-        opt.threads = Some(v);
-    }
-    if let Some(v) = args.get("memory", None) {
-        opt.memory = Some(compara::memory::parse_size(v).ok_or_else(|| {
-            Error::new(format!(
-                "--memory must be a size such as 512M or 8G, got: {v}"
-            ))
-        })?);
-    }
-    if let Some(v) = args.get("delimiter", None) {
-        opt.delimiter = v.chars().next();
-    }
-    if let Some(v) = args.get("encoding", None) {
-        opt.encoding = v.to_string();
-    }
-    if let Some(v) = args.get("engine", None) {
-        opt.engine = v.to_string();
-    }
-    // An export to object storage is written here first and copied there
-    // after; the engines write to a directory.
-    let mut export_to: Option<(String, compara::source::TempDir)> = None;
-    if let Some(v) = args.get("export-dir", None) {
-        if compara::source::is_remote(v) {
-            let dir = compara::source::TempDir::new("export")?;
-            opt.export_dir = Some(dir.path().to_string_lossy().into_owned());
-            export_to = Some((v.to_string(), dir));
-        } else {
-            opt.export_dir = Some(v.to_string());
+fn run(args: Args) -> ExitCode {
+    let started = Instant::now();
+    let suites = match load(&args.paths) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
         }
+    };
+    // The app under test, up before the browser and down after the run.
+    let _server = match args.server.as_ref().map(server::start) {
+        Some(Err(e)) => {
+            eprintln!("{e}");
+            return ExitCode::from(3);
+        }
+        Some(Ok(running)) => Some(running),
+        None => None,
+    };
+    let mut opts = args.opts.clone();
+    // The first file's `base` serves when the run names none.
+    if opts.base.is_none() {
+        opts.base = suites.iter().find_map(|s| s.base.clone());
     }
-    if opt.key.is_empty() {
-        return Err(Error::new("--key (or a profile with key) is required"));
+    let mut jobs = planned(&suites, &args);
+    if jobs.is_empty() {
+        eprintln!("no scenario matches");
+        return ExitCode::from(2);
+    }
+    // Longest first (from the last runs), so the slowest one doesn't start
+    // last; ones never timed go first, as they may be long.
+    let timings = Timings::load();
+    if args.repeat > 1 {
+        jobs = jobs.iter().flat_map(|j| (1..=args.repeat).map(move |rep| runner::Job { rep, ..*j })).collect();
+    }
+    match args.shuffle {
+        Some(seed) => {
+            shuffle(&mut jobs, seed);
+            eprintln!("shuffled with seed {seed} (--shuffle {seed} runs this order again)");
+        }
+        None => jobs.sort_by(|a, b| {
+            let t = |j: &runner::Job| timings.get(&j.key(&suites)).copied().unwrap_or(f64::INFINITY);
+            t(b).partial_cmp(&t(a)).unwrap_or(std::cmp::Ordering::Equal)
+        }),
     }
 
-    // Without -o there is no report: the counts line is the answer, and the
-    // engine skips collecting the rows a report would embed. `--summary` says
-    // so explicitly, and refuses an output flag rather than quietly ignoring
-    // one, because "write this here" and "write nothing" cannot both be
-    // honoured and guessing which was meant is how a file silently stops
-    // appearing.
-    let summary_only = args.flag("summary");
-    if summary_only {
-        for (flag, short) in [("out", Some("o")), ("json", None), ("export-dir", None)] {
-            if args.get(flag, short).is_some() {
-                return Err(Error::new(format!(
-                    "--summary writes nothing; --{flag} asks it to"
-                )));
+    let jsonl = args.reporters.iter().any(|r| r == "jsonl");
+    let console = args.reporters.iter().any(|r| r == "console");
+    let github = args.reporters.iter().any(|r| r == "github");
+    // A pause holds the run at one failure: one worker.
+    let workers = if opts.pause { 1 } else { args.workers.min(jobs.len()).max(1) };
+    let hooks = Hooks::new(&suites, &jobs);
+    // One browser, a context per worker (`--isolation context`, the
+    // default), or a browser per worker. The first browser is kept here
+    // and closes last.
+    let mut owner = None;
+    let mut forks: Vec<Option<runner::Runner>> = (0..workers).map(|_| None).collect();
+    // (One worker needs no sharing: its own browser is the one browser.)
+    if args.isolation == "context" && workers > 1 && opts.engine != "lightpanda" {
+        match runner::Runner::launch(opts.clone()) {
+            Ok(r) => {
+                for slot in forks.iter_mut() {
+                    *slot = r.fork().ok();
+                }
+                owner = Some(r);
+            }
+            Err(e) => {
+                eprintln!("the browser didn't start: {e:#}");
+                return ExitCode::from(3);
             }
         }
     }
-    let report = args.get("out", Some("o")).map(PathBuf::from);
-    if report.is_none() && args.flag("no-compress") {
-        return Err(Error::new(
-            "--no-compress is about the HTML report; add -o <path> to write one",
-        ));
-    }
-    // Only the report embeds rows. An export is every row, which each engine
-    // keeps for it whether or not this is set.
-    opt.row_lists = report.is_some();
-
-    // Both sides are fetched at once: a download is network-bound, and the
-    // two do not share anything until the engine runs.
-    let want = Want::for_options(&opt);
-    let (a, b) = std::thread::scope(|scope| {
-        // A thread wants a stack, and under a small memory limit there may be
-        // none to give: then B is read after A, on this one.
-        let b = std::thread::Builder::new()
-            .spawn_scoped(scope, || Source::open(b_spec, &want))
-            .ok();
-        let a = Source::open(a_spec, &want);
-        let b = match b {
-            Some(h) => h
-                .join()
-                .unwrap_or_else(|_| Err(Error::new("reading B panicked"))),
-            None => Source::open(b_spec, &want),
-        };
-        (a, b)
+    let queue = Mutex::new(std::collections::VecDeque::from(jobs));
+    let (tx, rx) = mpsc::channel::<Event>();
+    let mut results: Vec<runner::ScenarioResult> = Vec::new();
+    let mut launch_errors = Vec::new();
+    std::thread::scope(|scope| {
+        for (w, fork) in forks.into_iter().enumerate() {
+            let tx = tx.clone();
+            let (queue, suites, opts, hooks) = (&queue, &suites, &opts, &hooks);
+            let retries = args.retries;
+            scope.spawn(move || worker(w, fork, queue, suites, opts, hooks, retries, tx));
+        }
+        drop(tx);
+        let mut out = std::io::stdout();
+        for ev in rx {
+            match ev {
+                Event::Done(r) => {
+                    let mut text = String::new();
+                    if github {
+                        text.push_str(&report::github(&r));
+                    }
+                    if jsonl {
+                        text.push_str(&report::jsonl(&r));
+                    }
+                    if console {
+                        // With jsonl on stdout, the console goes to stderr.
+                        if jsonl {
+                            eprint!("{}", report::console_line(&r));
+                        } else {
+                            text.push_str(&report::console_line(&r));
+                        }
+                    }
+                    let _ = out.write_all(text.as_bytes());
+                    let _ = out.flush();
+                    results.push(*r);
+                }
+                Event::LaunchFailed(e) => launch_errors.push(e),
+            }
+        }
     });
-    let (a, b) = (a?, b?);
-    for (side, source) in [("A", &a), ("B", &b)] {
-        for step in source.steps() {
-            eprintln!("{side} {}: {step}", source.spec());
+    drop(owner);
+    let left = queue.lock().map(|q| q.len()).unwrap_or(0);
+    if left > 0 {
+        eprintln!("the browser didn't start: {}", launch_errors.first().map(String::as_str).unwrap_or("?"));
+        eprintln!("{left} scenario(s) not run");
+        if results.is_empty() {
+            return ExitCode::from(3);
         }
     }
-
-    let mut result = compare(a.path(), b.path(), &mut opt)?;
-    for (meta, source) in [(&mut result.meta.a, &a), (&mut result.meta.b, &b)] {
-        if source.path() != Path::new(source.spec()) {
-            meta.name = source.name();
-            meta.path = source.spec().to_string();
-            meta.size = source.stored_size();
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    if console && args.repeat > 1 {
+        // How often each scenario passed across its runs.
+        let mut text = String::from("repeats:\n");
+        for (name, ok, n) in &report::tally(&results) {
+            let mark = if ok == n { "    " } else { "FLAKY " };
+            text.push_str(&format!("  {mark}{ok}/{n}  {name}\n"));
         }
-    }
-
-    let mut written: Option<(String, u64)> = None;
-    if let Some(out_path) = report {
-        let html = render(&result, !args.flag("no-compress"))?;
-        let dest = out_path.to_string_lossy().into_owned();
-        written = Some((dest.clone(), html.len() as u64));
-        write_output(&dest, html.as_bytes())?;
-    }
-    // `--json -` is the summary on standard output, for a pipe or a CI step;
-    // the counts line goes to standard error so the output stays one document.
-    let json_to_stdout = args.get("json", None) == Some("-");
-    if let Some(path) = args.get("json", None) {
-        let summary = serde_json::to_string_pretty(&result.summary())?;
-        if json_to_stdout {
-            println!("{summary}");
+        if jsonl {
+            eprint!("{text}");
         } else {
-            write_output(path, summary.as_bytes())?;
+            print!("{text}");
         }
     }
-    if let Some((dest, dir)) = &export_to {
-        let mut names: Vec<_> = fs::read_dir(dir.path())?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
-        names.sort();
-        for path in names {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let to = format!("{}/{name}", dest.trim_end_matches('/'));
-            compara::source::upload(&path, &to)?;
-        }
-    }
-
-    let c = &result.counts;
-    let line = format!(
-        "A {} rows | B {} rows | matched {} (changed {}) | added {} | removed {} | \
-         dup keys A {} B {} | {} {}s",
-        comma(c.a_rows),
-        comma(c.b_rows),
-        comma(c.matched),
-        comma(c.changed),
-        comma(c.added),
-        comma(c.removed),
-        comma(c.a_dup_keys),
-        comma(c.b_dup_keys),
-        result.meta.engine,
-        result.meta.seconds
-    );
-    let report_line = written
-        .as_ref()
-        .map(|(dest, bytes)| format!("Report: {dest} ({:.0} KB)", *bytes as f64 / 1024.0));
-    for text in std::iter::once(line).chain(report_line) {
-        if json_to_stdout {
-            eprintln!("{text}");
+    if console {
+        let line = report::summary(&results, ms);
+        if jsonl {
+            eprintln!("{line}");
         } else {
-            println!("{text}");
+            println!("{line}");
         }
     }
-
-    if args.flag("fail-on-dups") && (c.a_dup_keys > 0 || c.b_dup_keys > 0) {
-        return Ok(3);
+    if jsonl {
+        print!("{}", report::jsonl_summary(&results, ms));
     }
-    let code = if result.identical() || args.flag("exit-zero") {
-        0
+    if args.json {
+        let saved: serde_json::Map<String, serde_json::Value> =
+            results.iter().map(|r| (r.name.clone(), serde_json::json!(r.saved))).collect();
+        println!("{}", serde_json::Value::Object(saved));
+    }
+    Timings::save(&results);
+    fix::save(&results);
+    if let Some(dir) = &args.allure {
+        if let Err(e) = allure::write(&results, &suites, dir) {
+            eprintln!("could not write Allure results to {}: {e}", dir.display());
+        }
+    }
+    if let Some(path) = &args.cucumber {
+        if let Err(e) = std::fs::write(path, gherkin::cucumber(&results, &suites)) {
+            eprintln!("could not write {}: {e}", path.display());
+        }
+    }
+    if let Some(path) = &args.junit {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(path, report::junit(&results, ms)) {
+            eprintln!("could not write {}: {e}", path.display());
+        }
+    }
+    if let Some(path) = &args.html {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        match std::fs::write(path, report::html(&results, ms, dir)) {
+            Ok(()) => eprintln!("report {}", path.display()),
+            Err(e) => eprintln!("could not write {}: {e}", path.display()),
+        }
+    }
+    let failed = results.iter().any(|r| !r.passed()) || (args.fail_on_flaky && results.iter().any(|r| r.flaky()));
+    if failed || left > 0 {
+        ExitCode::from(1)
     } else {
-        1
-    };
-    // The process ends when this returns, and the kernel takes its memory back
-    // in one step. Dropping the result first freed the report's rows a string
-    // at a time -- several hundred thousand of them at the default row cap,
-    // 45ms of a 1.7s run on a 4M-row pair -- for nothing anyone can observe.
-    std::mem::forget(result);
-    Ok(code)
-}
-
-/// Writes an output where it was asked for: a local path, or an object
-/// storage or HTTP URL, by way of a temporary file.
-fn write_output(dest: &str, bytes: &[u8]) -> Result<()> {
-    if compara::source::is_remote(dest) {
-        let dir = compara::source::TempDir::new("out")?;
-        let local = dir.path().join("output");
-        fs::write(&local, bytes)?;
-        compara::source::upload(&local, dest)?;
-        return Ok(());
+        ExitCode::SUCCESS
     }
-    fs::write(dest, bytes).map_err(|e| Error::new(format!("cannot write {dest}: {e}")))
 }
 
-/// `compara env`: what this process sees of the machine, for whoever is
-/// working out why a container run behaved as it did.
-fn print_env() {
-    let mb = |b: u64| format!("{} MB", b >> 20);
-    println!("compara {}", env!("CARGO_PKG_VERSION"));
-    println!(
-        "cloud inputs: {}",
-        if cfg!(feature = "cloud") {
-            "s3://, gs://, az://, http(s):// (credentials from the environment)"
-        } else {
-            "no (built without the `cloud` feature)"
+/// A seeded Fisher-Yates shuffle (xorshift64*): the same seed, the same
+/// order, on every machine.
+fn shuffle(jobs: &mut [runner::Job], seed: u64) {
+    let mut x = seed.max(1);
+    for i in (1..jobs.len()).rev() {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        let r = x.wrapping_mul(0x2545F4914F6CDD1D);
+        jobs.swap(i, (r % (i as u64 + 1)) as usize);
+    }
+}
+
+/// The scenarios this run takes: `--grep`, `--tag`, then `--shard` (every
+/// n-th, in file order, so the slices are the same on every machine).
+fn planned(suites: &[suite::Suite], args: &Args) -> Vec<runner::Job> {
+    let jobs = runner::jobs(suites, &args.opts);
+    match args.shard {
+        Some((i, n)) => jobs.into_iter().enumerate().filter(|(k, _)| k % n == i - 1).map(|(_, j)| j).collect(),
+        None => jobs,
+    }
+}
+
+enum Event {
+    Done(Box<runner::ScenarioResult>),
+    LaunchFailed(String),
+}
+
+/// Each file's `before all` (run by the first worker that takes one of its
+/// scenarios, while the others that do wait) and `after all` (run by the
+/// worker that finishes its last).
+struct Hooks {
+    before: Mutex<Vec<Hook>>,
+    ready: Condvar,
+    left: Mutex<Vec<usize>>,
+}
+
+type HookResult = Result<BTreeMap<String, String>, Box<runner::Failure>>;
+
+enum Hook {
+    Idle,
+    Running,
+    Done(HookResult),
+}
+
+impl Hooks {
+    fn new(suites: &[suite::Suite], jobs: &[runner::Job]) -> Self {
+        let mut left = vec![0; suites.len()];
+        for j in jobs {
+            left[j.suite] += 1;
         }
-    );
-    for (scheme, source) in compara::source::credential_sources() {
-        println!("  {scheme}:// credentials: {source}");
-    }
-    println!(
-        "cpus: {}",
-        std::thread::available_parallelism().map_or(1, |n| n.get())
-    );
-    match compara::memory::probe() {
-        Some(m) => println!(
-            "memory: {} limit, {} available",
-            mb(m.limit),
-            mb(m.available)
-        ),
-        None => println!("memory: unknown"),
-    }
-    match compara::memory::container_limit() {
-        Some(l) => println!("container memory limit: {}", mb(l)),
-        None => println!("container memory limit: none"),
-    }
-    match compara::memory::contained() {
-        Some(c) => println!(
-            "heap limit: {} (from the container's; out of memory is refused, not killed)",
-            mb(c)
-        ),
-        None => println!("heap limit: none set"),
-    }
-    if let Ok(v) = std::env::var("COMPARA_MEMORY") {
-        println!("COMPARA_MEMORY: {v}");
-    }
-    let tmp = std::env::temp_dir();
-    let writable = compara::source::temp_dir_writable();
-    let free = compara::source::free_space(&tmp)
-        .map(|b| format!(", {} free", compara::source::human(b)))
-        .unwrap_or_default();
-    println!(
-        "temp dir: {} ({}{free})",
-        tmp.display(),
-        if writable {
-            "writable"
-        } else {
-            "NOT writable: set TMPDIR"
+        Hooks {
+            before: Mutex::new(suites.iter().map(|_| Hook::Idle).collect()),
+            ready: Condvar::new(),
+            left: Mutex::new(left),
         }
-    );
-}
+    }
 
-/// Groups a count with thousands separators, matching the other implementations.
-fn comma(n: i64) -> String {
-    let digits = n.unsigned_abs().to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
-    if n < 0 {
-        out.push('-');
-    }
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Prints this process's peak resident set size for the benchmark harness, when
-/// it asks.
-///
-/// Rust has no portable API for it, so this reads `VmHWM` from `/proc`; on a
-/// platform without it nothing is printed and the harness records no figure
-/// rather than a wrong one.
-fn report_peak_rss() {
-    if std::env::var_os("COMPARA_PRINT_PEAK_RSS").is_none() {
-        return;
-    }
-    let Ok(status) = fs::read_to_string("/proc/self/status") else {
-        return;
-    };
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmHWM:") {
-            let kb: String = rest.chars().filter(char::is_ascii_digit).collect();
-            if !kb.is_empty() {
-                let _ = writeln!(std::io::stderr(), "PEAK_RSS_KB {kb}");
+    /// File `i`'s `before all`, run once: what it saved, or how it failed.
+    fn before(&self, i: usize, run: impl FnOnce() -> HookResult) -> HookResult {
+        let Ok(mut st) = self.before.lock() else { return Ok(BTreeMap::new()) };
+        loop {
+            match &st[i] {
+                Hook::Done(r) => return r.clone(),
+                Hook::Running => match self.ready.wait(st) {
+                    Ok(g) => st = g,
+                    Err(_) => return Ok(BTreeMap::new()),
+                },
+                Hook::Idle => {
+                    st[i] = Hook::Running;
+                    drop(st);
+                    let r = run();
+                    if let Ok(mut st) = self.before.lock() {
+                        st[i] = Hook::Done(r.clone());
+                    }
+                    self.ready.notify_all();
+                    return r;
+                }
             }
+        }
+    }
+
+    /// One of file `i`'s scenarios is done: whether it was the last.
+    fn finished(&self, i: usize) -> bool {
+        self.left
+            .lock()
+            .map(|mut l| {
+                l[i] = l[i].saturating_sub(1);
+                l[i] == 0
+            })
+            .unwrap_or(false)
+    }
+
+    fn vars(&self, i: usize) -> BTreeMap<String, String> {
+        match self.before.lock().as_deref().map(|b| &b[i]) {
+            Ok(Hook::Done(Ok(v))) => v.clone(),
+            _ => BTreeMap::new(),
+        }
+    }
+}
+
+/// One worker: its own browser, started when it takes its first scenario,
+/// then scenarios from the shared queue until it is empty.
+#[allow(clippy::too_many_arguments)]
+fn worker(
+    id: usize,
+    fork: Option<runner::Runner>,
+    queue: &Mutex<std::collections::VecDeque<runner::Job>>,
+    suites: &[suite::Suite],
+    opts: &runner::Options,
+    hooks: &Hooks,
+    retries: u32,
+    tx: mpsc::Sender<Event>,
+) {
+    // A context on the shared browser, else a browser of its own.
+    let mut browser: Option<runner::Runner> = fork;
+    loop {
+        let Some(job) = queue.lock().ok().and_then(|mut q| q.pop_front()) else { return };
+        if browser.is_none() {
+            match runner::Runner::launch(opts.clone()) {
+                Ok(r) => browser = Some(r),
+                Err(e) => {
+                    // Give the scenario back to a worker whose browser runs.
+                    if let Ok(mut q) = queue.lock() {
+                        q.push_front(job);
+                    }
+                    let _ = tx.send(Event::LaunchFailed(format!("{e:#}")));
+                    return;
+                }
+            }
+        }
+        let Some(r) = browser.as_mut() else { return };
+        let (suite, sc) = job.get(suites);
+        let job_rep = job.rep;
+        r.rep = job_rep;
+        let before = if suite.before_all.is_empty() {
+            Ok(BTreeMap::new())
+        } else {
+            hooks.before(job.suite, || r.hook(suite, &suite.before_all, "before all", &BTreeMap::new()))
+        };
+        let mut result = match &before {
+            Ok(vars) => {
+                let mut result = r.run(suite, sc, 1, vars);
+                let mut earlier = Vec::new();
+                while !result.passed() && result.attempt <= retries {
+                    earlier.extend(result.failure.take());
+                    let next = result.attempt + 1;
+                    result = r.run(suite, sc, next, vars);
+                }
+                result.retried = earlier;
+                result
+            }
+            // Not run: the file's `before all` failed.
+            Err(f) => runner::ScenarioResult::failed(suite, sc.name.clone(), sc.line, sc.tags.clone(), (**f).clone()),
+        };
+        result.worker = id;
+        if job_rep > 0 {
+            result.rep = job_rep;
+            result.name = format!("{} #{job_rep}", result.name);
+        }
+        if tx.send(Event::Done(Box::new(result))).is_err() {
             return;
         }
-    }
-}
-
-/// `compara columns FILE` — the column names, one per line.
-///
-/// One per line rather than a comma list because that is what a shell wants:
-/// the whole point of asking is usually to build a `--key` out of the answer,
-/// and `paste -sd,` turns this into one.
-fn cmd_columns(argv: &[String]) -> Result<u8> {
-    let args = Args::parse(argv)?;
-    if args.flag("help") || args.flag("h") {
-        print!("{USAGE}");
-        return Ok(0);
-    }
-    let Some(first) = args.positional.first() else {
-        return Err(Error::new("columns needs a file: compara columns data.csv"));
-    };
-    let mut opt = Options::default();
-    apply_read_options(&args, &mut opt);
-
-    let source = Source::open(first, &Want::footer_only())?;
-    let shape = compara::engine::turbo::shape(source.path(), &opt)?;
-    for name in &shape.columns {
-        println!("{name}");
-    }
-    // To stderr so the names on stdout stay pipeable on their own.
-    match shape.rows {
-        Some(rows) => eprintln!(
-            "{}: {} columns, {} rows",
-            shape.format,
-            shape.columns.len(),
-            thousands(rows)
-        ),
-        None => eprintln!(
-            "{}: {} columns (row count needs a full read)",
-            shape.format,
-            shape.columns.len()
-        ),
-    }
-    Ok(0)
-}
-
-/// `compara head FILE [-n N]` — the first rows, aligned, or `--csv` for a
-/// machine.
-fn cmd_head(argv: &[String]) -> Result<u8> {
-    let args = Args::parse(argv)?;
-    if args.flag("help") || args.flag("h") {
-        print!("{USAGE}");
-        return Ok(0);
-    }
-    let Some(first) = args.positional.first() else {
-        return Err(Error::new("head needs a file: compara head data.csv"));
-    };
-    let want = match args.get("rows", Some("n")) {
-        Some(text) => text
-            .parse::<usize>()
-            .map_err(|_| Error::new(format!("--rows must be a whole number, got: {text}")))?,
-        None => 10,
-    };
-    let mut opt = Options::default();
-    apply_read_options(&args, &mut opt);
-
-    let source = Source::open(first, &Want::all())?;
-    let (columns, rows) = compara::engine::turbo::head(source.path(), want, &opt)?;
-    if args.flag("csv") {
-        println!("{}", csv_line(&columns));
-        for row in &rows {
-            println!("{}", csv_line(row));
-        }
-        return Ok(0);
-    }
-    print_table(&columns, &rows);
-    Ok(0)
-}
-
-/// The two flags that change how a file is *read* rather than compared.
-fn apply_read_options(args: &Args, opt: &mut Options) {
-    if let Some(v) = args.get("delimiter", None) {
-        opt.delimiter = v.chars().next();
-    }
-    if let Some(v) = args.get("encoding", None) {
-        opt.encoding = v.to_string();
-    }
-}
-
-/// One CSV line, quoting only what has to be quoted.
-fn csv_line(cells: &[String]) -> String {
-    cells
-        .iter()
-        .map(|c| {
-            if c.contains([',', '"', '\n', '\r']) {
-                format!("\"{}\"", c.replace('"', "\"\""))
-            } else {
-                c.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// An aligned table, capped so one wide column cannot push the rest off screen.
-fn print_table(columns: &[String], rows: &[Vec<String>]) {
-    const CAP: usize = 32;
-    let clip = |s: &str| -> String {
-        let count = s.chars().count();
-        if count <= CAP {
-            s.to_string()
-        } else {
-            // A marker rather than a silent cut: a preview that quietly shortens
-            // a value teaches the wrong thing about the data.
-            format!("{}…", s.chars().take(CAP - 1).collect::<String>())
-        }
-    };
-    let head: Vec<String> = columns.iter().map(|c| clip(c)).collect();
-    let body: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| r.iter().map(|c| clip(c)).collect())
-        .collect();
-
-    let mut width: Vec<usize> = head.iter().map(|c| c.chars().count()).collect();
-    for row in &body {
-        for (i, cell) in row.iter().enumerate() {
-            if i < width.len() {
-                width[i] = width[i].max(cell.chars().count());
+        if hooks.finished(job.suite) && !suite.after_all.is_empty() {
+            if let Err(f) = r.hook(suite, &suite.after_all, "after all", &hooks.vars(job.suite)) {
+                let line = suite.after_all[0].line;
+                let mut done = runner::ScenarioResult::failed(suite, "(after all)".into(), line, Vec::new(), *f);
+                done.worker = id;
+                if tx.send(Event::Done(Box::new(done))).is_err() {
+                    return;
+                }
             }
         }
     }
-
-    let line = |cells: &[String]| -> String {
-        cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let pad = width.get(i).copied().unwrap_or(0);
-                format!("{c:<pad$}")
-            })
-            .collect::<Vec<_>>()
-            .join("  ")
-            .trim_end()
-            .to_string()
-    };
-
-    println!("{}", line(&head));
-    println!(
-        "{}",
-        width
-            .iter()
-            .map(|w| "-".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("  ")
-    );
-    for row in &body {
-        println!("{}", line(row));
-    }
 }
 
-/// `1234567` as `1,234,567`, the way the compare summary already writes counts.
-fn thousands(n: i64) -> String {
-    let digits = n.abs().to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
+/// How long each scenario took last time (`.primavera/timings.json`), to
+/// start the slow ones first.
+struct Timings;
+
+impl Timings {
+    const PATH: &'static str = ".primavera/timings.json";
+
+    fn load() -> BTreeMap<String, f64> {
+        std::fs::read_to_string(Self::PATH).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
     }
-    if n < 0 { format!("-{out}") } else { out }
+
+    fn save(results: &[runner::ScenarioResult]) {
+        let mut all = Self::load();
+        for r in results {
+            all.insert(r.key(), (r.ms * 10.0).round() / 10.0);
+        }
+        if std::fs::create_dir_all(".primavera").is_ok() {
+            let _ = std::fs::write(Self::PATH, serde_json::to_string_pretty(&all).unwrap_or_default());
+        }
+    }
 }

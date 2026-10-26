@@ -1,0 +1,5 @@
+scenario "An API that fails"
+  http GET /api/fail
+
+scenario "Nothing listening"
+  http GET http://127.0.0.1:9/ --timeout-ms 3000

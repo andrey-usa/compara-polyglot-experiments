@@ -1,0 +1,5 @@
+scenario "A program that fails"
+  exec ${PY} -c "import sys; sys.stderr.write('db down'); sys.exit(2)"
+
+scenario "A program that doesn't stop"
+  exec --timeout-ms 300 ${PY} -c "import time; time.sleep(5)"

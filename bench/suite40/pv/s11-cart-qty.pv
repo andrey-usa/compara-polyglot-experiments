@@ -1,0 +1,17 @@
+# Changing the quantity in the cart re-posts and reloads (4 x $60.32 = $241.28).
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "Changing the quantity updates the subtotal"
+  goto /shop/p/101 --wait commit
+  click --selector "#detail-add"
+  expect --selector "#cart-count" text is 1
+  goto /cart --wait commit
+  fill --selector "#qty-101" --value "4"
+  expect --selector "#subtotal" text is "$241.28" --timeout-ms 10000

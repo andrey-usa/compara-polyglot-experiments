@@ -1,0 +1,10 @@
+# late-render: the app renders after a seeded 1-8 s delay; clicking or
+# asserting before the render races the app.
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+scenario "Waiting for the late render before continuing"
+  goto ${GAUNTLET_URL:-http://127.0.0.1:18201}/late-render --wait commit
+  expect --selector "#ready" visible --timeout-ms 15000
+  click --selector "#go"
+  expect text "Done"

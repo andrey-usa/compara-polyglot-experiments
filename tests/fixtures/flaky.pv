@@ -1,0 +1,7 @@
+scenario "Fails once, then passes"
+  goto /flaky
+  expect text "ok" --timeout-ms 300
+
+scenario "Steady"
+  goto /late?ms=50
+  expect --selector "#s" text is ready

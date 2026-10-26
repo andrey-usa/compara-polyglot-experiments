@@ -1,0 +1,11 @@
+scenario "exec runs a program, and what it said is checked and kept"
+  exec ${PY} -c "print('order 42 SHIPPED')"
+    expect exit 0
+    expect stdout contains SHIPPED
+  expect ${exec.stdout} is "order 42 SHIPPED"
+  exec ${PY} -c "import sys; sys.stderr.write('no such order'); sys.exit(3)"
+    expect exit 3
+    expect stderr is "no such order"
+  # It runs next to this file, and knows the site.
+  exec ${PY} exec_helper.py
+  expect stdout is "exec_helper.py here; base http"

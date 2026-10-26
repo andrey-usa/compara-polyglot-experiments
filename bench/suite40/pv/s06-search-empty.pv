@@ -1,0 +1,15 @@
+# Search with no matches.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "A search with no matches says so"
+  fill --label "Search products" zzz-no-such-product
+  press Enter
+  expect --role status text is "No products match."
+  expect --selector ".card" count is 0

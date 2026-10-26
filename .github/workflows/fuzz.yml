@@ -8,7 +8,13 @@ on:
       duration:
         description: "Fuzz seconds per target (empty: 300, or 1800 on schedule)"
         required: false
+      navigera:
+        description: "navigera branch or commit to build against"
+        required: false
+        default: "session-history"
 permissions: {contents: read}
+env:
+  NAVIGERA_REF: ${{ inputs.navigera || 'session-history' }}
 jobs:
   fuzz:
     runs-on: ubuntu-latest
@@ -17,15 +23,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: text_compare
-            seeds: text
-          - target: parquet_compare
-            seeds: parquet
-          - target: delta_log
-            seeds: none
+          - target: pv_parse
+            seeds: pv
+          - target: gherkin_parse
+            seeds: feature
     steps:
+      # primavera builds against navigera checked out beside it
+      # (`../navigera`), same layout as its ci workflow.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          path: primavera
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: andrey-usa/navigera
+          ref: ${{ env.NAVIGERA_REF }}
+          path: navigera
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
@@ -33,16 +46,16 @@ jobs:
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version 0.13.2
       - name: seed corpus
-        working-directory: fuzz
+        working-directory: primavera/fuzz
         run: |
           mkdir -p "corpus/${{ matrix.target }}" artifacts
           case "${{ matrix.seeds }}" in
-            text) cp ../tests/fixtures/formats/*.csv ../tests/fixtures/formats/*.tsv ../tests/fixtures/formats/*.ndjson "corpus/${{ matrix.target }}/" 2>/dev/null || true ;;
-            parquet) cp ../tests/fixtures/formats/*.parquet ../tests/fixtures/hostile/*.parquet "corpus/${{ matrix.target }}/" 2>/dev/null || true ;;
+            pv) find ../examples ../tests -name '*.pv' -exec cp {} "corpus/${{ matrix.target }}/" \; 2>/dev/null || true ;;
+            feature) find ../tests ../examples -name '*.feature' -exec cp {} "corpus/${{ matrix.target }}/" \; 2>/dev/null || true ;;
           esac
           ls "corpus/${{ matrix.target }}" | head -20
       - name: fuzz
-        working-directory: fuzz
+        working-directory: primavera/fuzz
         env:
           # ASAN aborts on huge allocations instead of returning NULL; the
           # product handles those cleanly, so let the allocator fail soft.
@@ -69,7 +82,7 @@ jobs:
         with:
           name: fuzz-${{ matrix.target }}
           path: |
-            fuzz/corpus/${{ matrix.target }}
-            fuzz/artifacts
-            fuzz/fuzz-${{ matrix.target }}.log
+            primavera/fuzz/corpus/${{ matrix.target }}
+            primavera/fuzz/artifacts
+            primavera/fuzz/fuzz-${{ matrix.target }}.log
           retention-days: 30

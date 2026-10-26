@@ -1,6 +1,2 @@
-/target/
-/bench/
-/data/
-/out/
-/compara.toml
-__pycache__/
+/target
+/.primavera

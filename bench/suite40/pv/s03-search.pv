@@ -1,0 +1,16 @@
+# Search submits on Enter only (no button); the list re-renders via pushState.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "Search narrows the product list"
+  fill --label "Search products" valve
+  press Enter
+  expect --role status text is "Showing 6 of 6 products"
+  expect url contains "q=valve"
+  expect js "[...document.querySelectorAll('.card h3')].every((h) => h.textContent.includes('Valve'))"

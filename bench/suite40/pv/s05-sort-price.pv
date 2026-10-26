@@ -1,0 +1,14 @@
+# Sort <select>; the cheapest product (seed 7) is the Nickel Spring at $3.04.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "Sorting by price shows the cheapest first"
+  select --label "Sort by" --value "price-asc"
+  expect --selector ".card h3" text is "Nickel Spring"
+  expect js "document.querySelector('.card .price').textContent" is "$3.04"

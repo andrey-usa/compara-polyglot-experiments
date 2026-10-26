@@ -1,333 +1,508 @@
-# compara
+# primavera
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/andrey-usa/compara/actions/workflows/ci.yml/badge.svg)](https://github.com/andrey-usa/compara/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/compara.svg)](https://crates.io/crates/compara)
-[![PyPI](https://img.shields.io/pypi/v/compara.svg)](https://pypi.org/project/compara/)
-[![npm](https://img.shields.io/npm/v/compara.svg)](https://www.npmjs.com/package/compara)
+Plain-text web tests that run on real Chrome. One native binary drives the
+browser in-process through [navigera](https://github.com/andrey-usa/navigera):
+no Node, no transpile step, no driver process, and no model at run time.
 
-Extremely fast table comparison: two tables on a composite key, with counts,
-per-column statistics and a self-contained HTML report. Key columns, compared
-columns and normalisation rules are parameters, so one tool serves every
-recurring comparison: a nightly export against yesterday's, a CSV against the
-Parquet a warehouse emits, a migration's source against its target.
+```text
+# tests/shop.pv
+base http://127.0.0.1:8000
 
-> Faster software for a better planet — less energy, less compute, more time for life.
+before each
+  goto /shop
+  click --selector "#cookie-accept"
 
-- Reads **CSV, TSV, JSON (newline-delimited or one array of objects) and
-  Parquet**, and the two sides need not be in the same format.
-- Ten million rows × 20 columns in about a second on four cores
-  ([numbers below](#speed)).
-- Reads and writes **object storage and the web** directly -- `s3://`,
-  `gs://`, `az://`, `https://` -- with each cloud's own credentials, and
-  fetches only the Parquet columns it compares
-  ([cloud and containers](#cloud-and-containers)).
-- One static binary, and a distroless container image; the report is a
-  single HTML file with nothing to host.
-- Exit codes made for pipelines: `0` identical, `1` differences, `2` error,
-  `3` duplicate keys (with `--fail-on-dups`).
-
-## Install
-
-Prebuilt binaries for Linux (x86_64, aarch64), macOS (arm64, x86_64) and
-Windows (x64) are on the [releases page](https://github.com/andrey-usa/compara/releases),
-and the same binaries through package managers:
-
-| | |
-|---|---|
-| Cargo | `cargo install --locked compara` |
-| npm | `npm install -g compara` (or `npx compara …`) |
-| pip / uv | `pip install compara` · `uv tool install compara` |
-| Homebrew | `brew install andrey-usa/tap/compara` |
-| Scoop | `scoop bucket add andrey-usa https://github.com/andrey-usa/scoop-bucket` then `scoop install compara` |
-| Docker | `docker run --rm -v "$PWD:/data" ghcr.io/andrey-usa/compara compare a.csv b.csv -k id` |
-
-## Use
-
-```sh
-compara compare a.csv b.csv -k account_id,txn_id -i updated_at
-compara compare a.csv b.csv -k account_id,txn_id -i updated_at -o report.html
-compara compare a.csv b.csv -k account_id,txn_id --trim --tolerance 0.005
-compara compare export.csv warehouse.parquet -k id
-compara compare a.csv b.csv --profile orders --json summary.json --export-dir out/
-compara columns data.parquet          # column names (reads only the footer)
-compara head data.ndjson -n 5         # first rows, aligned
+scenario "Adding a product counts it in the cart" @smoke
+  click --text "Add to cart"
+  expect --selector "#cart-count" text is 1
+  goto /cart
+  expect text "Your cart"
 ```
 
-`compare` prints the counts and writes nothing else unless asked. `-o PATH`
-writes the HTML report: counts, per-column statistics, and the changed,
-added, removed and duplicate rows, each section capped at `--max-rows`
-(counts are always exact). [`examples/report.html`](examples/report.html) is
-one, made from the two files next to it:
-
-```sh
-compara compare examples/orders_2026-08.csv examples/orders_2026-09.csv -k order_id,line_no -i updated_at -o examples/report.html
+```console
+$ primavera run tests --junit report.xml
+PASS  tests/shop.pv:7  Adding a product counts it in the cart  (557 ms)
+1 passed, 0 failed in 0.9 s
 ```
 
-| Option | Effect |
+Status: pre-release. Everything below works in this build.
+
+## The format
+
+- Top-level lines: `base <url>`, `set NAME = value`, `use other.pv`,
+  `flow name(a, b)`, `step "<phrase>"` (a Gherkin step's steps, see
+  below), `auth name [ttl 30m]`, `before all|each`, `after each|all`,
+  `scenario "name" @tag…`. Steps are indented under them.
+- A step is a navigera command without the `navigera -s <session>`
+  prefix (`goto /cart`, `click --text Add`): `goto`, `click`, `fill`, `select`, `press`,
+  `check`, `hover`, `scroll`, `upload`, `wait`, `eval`, `set`, `route`,
+  `state load`, and the rest. Targets use navigera's locators (`--role`
+  with `--name`, `--label`, `--text`, `--placeholder`, `--testid`,
+  `--selector`, `--near <text>` for the one in the card or row that shows
+  the text, `--nth`). Refs from `ax` (`click 12`) are an error: they
+  change between runs. `check --label Terms` ticks a box; `check
+  "<question>"` with no locator asks navigera a yes/no question about
+  the page (a model call).
+- A relative path a step reads (`upload`, `state load`, `eval --file`,
+  `init-script --file`, `route --body-file`) is found next to the `.pv`
+  file, as `use` and `for each` files are, so a suite runs the same from
+  any directory. Files a step writes (`screenshot`, `state save`) land in
+  the current directory.
+- Words split like a shell's, with no expansion; inside double quotes
+  `\"` and `\\` stand for themselves and `\n`, `\r` for a line break
+  (a textarea's value). `${NAME}` and
+  `${NAME:-default}` come from `save`, a flow's arguments, the data row,
+  `before all`, `--var`, `set`, then the environment; `$$` (or `\$`) is a
+  literal `$`, and quotes don't stop `${…}` (`'${x}'` is filled in too). Also `${run.id}` (one per run: unique
+  emails), `${scenario.name}`, and `${download.path}`/`${download.name}`
+  after `expect download`.
+- `${secret:NAME}`: from the environment, else `--secrets <file>`
+  (`NAME=value` lines; the environment wins). Its value is masked as `***` in everything the run
+  prints and saves (messages, the page's URL and title, saved values,
+  JUnit and JSON lines).
+- A default with spaces is one word: quote it whole,
+  `"${GREETING:-hello there}"` (words split before `${…}` is filled in).
+- A `set` value can hold `${…}` too (a default, a `--var`, another `set`,
+  a secret, the environment): it is filled in once, when a scenario starts.
+- `save NAME = <command>` keeps a command's result (`get text …`).
+- `exec [--timeout-ms <ms>] <program> <args…>` runs a program (no shell:
+  `sh -c "…"` or `pwsh -c "…"` for one) in the `.pv` file's directory,
+  with `PRIMAVERA_BASE_URL` set, for what a browser can't reach: seed a
+  database (`psql`, `sqlplus`), call a script. Its exit code and output
+  become `${exec.exit}`, `${exec.stdout}` and `${exec.stderr}`, and
+  `expect exit 0`, `expect stdout contains SHIPPED`, `expect stderr …`
+  check them (the first 16 MB of each). A nonzero exit fails the step,
+  with the last line of its stderr, unless a step indented under it checks
+  `exit`. It is stopped after 60 s (`--timeout-ms`), and that fails the
+  step whatever is under it.
+
+  ```text
+  exec ./scripts/order-status.sh ${order}
+    expect exit 0
+    expect stdout contains SHIPPED
+  ```
+- `http <METHOD> <url> [--json <text> | --body <text> | --json-file <f> |
+  --body-file <f>] [--header "Name: value"]… [--no-follow] [--insecure]
+  [--timeout-ms <ms>]` makes a
+  request outside the page (an API to set up or check what the UI did; a
+  relative URL takes the base URL). The scenario's cookies go with it and
+  the cookies it sets come back to the browser, so an API sign-in signs
+  the page in. Its answer is `${http.status}` and `${http.body}`; `expect
+  status 201`, `expect json $.role is shopper`, `expect header Location
+  ends-with /u/1`, `expect body contains …` check it, and `save id = json
+  $.id` (or `header <name>`) keeps a value. A 4xx or 5xx fails the step,
+  with the start of the body, unless a step indented under it checks
+  `status`; a timeout fails it whatever is under it. Redirects are followed
+  (up to 20, a cookie set on the way going to the next hop and to the
+  browser); `--no-follow` gives the 3xx itself. `--insecure` accepts a
+  certificate nothing vouches for (a local server's own). It goes through `curl` (on every supported OS), its options on
+  curl's stdin, so a secret in a header or body stays out of the process
+  list.
+
+  ```text
+  http POST /api/users --json '{"email": "${email}", "role": "shopper"}'
+    expect status 201
+    expect json $.role is shopper
+  save user = json $.id
+  ```
+- `flow name(a, b)` at the top level holds steps; `run name x y` runs them
+  with `${a}` and `${b}` set. `use other.pv` takes another file's flows
+  and `set`s. A failure inside a flow names the flow's own line.
+- `optional <step>`: a step that may not apply (a cookie banner that only
+  sometimes shows); its failure is noted, not fatal.
+- `if <expect clause>` with steps indented under it runs them when the
+  clause holds now (or within its `--timeout-ms`): `if --selector
+  "#banner" visible`, then `click --text Accept` indented below.
+- `auth shopper [ttl 30m]` (`s`, `m`, `h`, `d`, or plain seconds) holds steps that sign in; `as shopper` in a
+  scenario starts it signed in. The block runs once per run, in a browser
+  context of its own, the first time a scenario needs it (the other
+  workers wait for it), and its cookies and storage are saved under
+  `.primavera/auth/` (keep that out of git); with a `ttl` the saved state
+  is reused by later runs until it is that old.
+- `before all` runs once for the file, before its first scenario; what it
+  saves every scenario of the file sees. If it fails, none of them run.
+  `after all` runs once after the last one (a failure there is reported as
+  `(after all)`).
+- `handoff until <expect clause>`: the steps only a person can do (2FA, a
+  CAPTCHA). When the clause already holds, nothing happens; else the
+  browser comes on screen, the run waits for the clause (5 minutes, or its
+  `--timeout-ms`) or Enter, and the browser goes back off screen. Plain
+  `handoff` waits for Enter. With no screen it fails at once and says so.
+- Data rows: an indented `examples` line with a table under it, or
+  `scenario "…" for each logins.csv`, makes one scenario per row, named
+  from the row (`scenario "Ship to ${country}"`); the row's columns are
+  variables.
+- `expect` retries until it holds or its timeout (5 s, `--timeout-ms` on the
+  line or the run) runs out; `exit`, `stdout`, `stderr`, `status`, `body`,
+  `json` and `header` read the last `exec` or `http` answer once. `is`
+  compares numbers as numbers (`1` is `1.0`). A glob (`request`,
+  `download`) has `*` for any run of characters and matches the whole URL
+  or file name:
+
+| expect | |
 |---|---|
-| `-k`, `--key` | composite key, required (or from a profile) |
-| `-c`, `--compare` | columns to diff; default every column present in both files except the key |
-| `-i`, `--ignore` | columns to skip (timestamps, run ids) |
-| `--trim`, `--ignore-case`, `--empty-is-null` | normalisation before comparing (applies to key and values) |
-| `--tolerance` | absolute numeric tolerance where both sides parse as numbers |
-| `--delimiter`, `--encoding` | override auto-detection (CSV only) |
-| `--threads` | how wide the engines run; the default is every core |
-| `--memory` | memory to plan for (e.g. `8G`); decides when large text files are joined in one pass instead of two, and how many columns of two Parquet files are read at once (a Parquet pair that needs more than a stated budget is refused) |
-| `--max-rows` | rows embedded per report section (default 50 000) |
-| `-o`, `--out` | write the HTML report here; there is no report without it |
-| `--export-dir` | full, uncapped changed/added/removed CSVs |
-| `--json` | write a JSON summary (counts and column stats; schema in `docs/contract.schema.json`) |
-| `--summary` | print the counts and refuse any flag that writes a file (the default without `-o`, `--json` or `--export-dir`) |
-| `--engine` | `auto` (default), `turbo`, `sortmerge` or `native`; `sortmerge` and `native` read CSV only |
-| `--no-compress` | plain JSON payload in the report, for pre-2023 browsers (with `-o`) |
-| `--fail-on-dups` | exit 3 when either file has duplicate keys |
+| `url`/`title` `is` (or `==`), `contains`, `starts-with`, `ends-with`, `matches` `<value>` | the active tab |
+| `text "<t>"`, `no text "<t>"` [`--within <target>`] | visible text, frames included, or inside an element |
+| `<target> visible`, `hidden`, `enabled`, `disabled`, `checked`, `unchecked`, `focused`, `editable`, `empty` | an element's state |
+| `<target> text`, `value`, `attr <name>`, `style <property>` + a comparison | an element's text, value, attribute or computed style |
+| `--selector <css> count` `is`, `>`, `>=`, `<`, `<=` `<n>` | how many match (exactly one `--selector`) |
+| `${var}` + a comparison | a saved value |
+| `js "<expression>"` (or `eval`) [+ a comparison] | a script in the page: truthy, or its value compared |
+| `request <METHOD> <url glob> [status <n>]`, `no request <METHOD> <url glob>` | a request the page made in this scenario (`*` in the URL matches anything) |
+| `request … json <$.path>` + a comparison | a value in the last matching response's JSON: `$`, `.key`, `[0]`, `["key"]` (`$.items[0].sku`) |
+| `request … count` + a comparison | how many matching requests |
+| `cookie <name>` [+ a comparison], `no cookie <name>`, `cookie <name> absent` | a cookie of the scenario's browser context |
+| `storage local\|session <key>` [+ a comparison \| `absent`] | Local or Session Storage |
+| `download <file glob>`, `no download …` | a finished download (then `${download.path}`, `${download.name}`: the latest match). Each scenario's downloads go to a directory of its own beside its evidence (`.primavera/runs/<time>/<scenario>/downloads`, kept only when something came), so a name never carries over from another scenario; a second file of the same name in one scenario arrives as `name (2).ext` |
+| `download <file glob> compare <expected file>` [`--key <columns>`] [compara flags…] | the download is the same table as the expected file beside the `.pv` ([compara](https://github.com/andrey-usa/compara) on the PATH, or `PRIMAVERA_COMPARA`): CSV, NDJSON or Parquet, either side; compara's flags (`-i`, `--trim`, `--tolerance`) pass through. A difference fails the step with compara's counts and the reports it kept beside the scenario's downloads: `--report html,json,rows` (the HTML report, the JSON summary of counts and column statistics, CSVs of the changed, added and removed rows) or `none`; the run's `--compare-report` (`compare_report` in `primavera.toml`, default `html`) when the step doesn't say, and compara's own `-o`, `--json` or `--export-dir` win |
+| `console` + a comparison, `no console "<t>"` | a console message (any level) |
+| `no errors` | no page exceptions or console errors |
+| `accessible` [`--selector <css>`] [`--tags wcag2a,wcag2aa,…`] [`--ignore <rule>,…`] | [axe-core](https://github.com/dequelabs/axe-core) (built in) finds no violation in the page, or under the selector: WCAG 2.0 and 2.1 A and AA by default; `--tags` replaces that set (`--tags wcag2a,wcag2aa,best-practice` to add axe's best practices); a failure names each rule, its impact, the first elements and what to fix |
+| `lcp`, `fcp`, `ttfb`, `load` `<`, `<=`, `>`, `>=` `<time>` (`2.5s`, `800ms`; a bare number is ms); `cls` + a comparison and a score (`0.1`) | a performance budget for the current page, as the browser measured it: largest and first contentful paint, time to first byte, the load event (ms from the navigation's start); the layout shift score (its largest session window, shifts after input left out). Not measured yet (the load event still to come) is retried |
+| `exit` [`is`] `<n>`, `stdout`/`stderr` + a comparison | what the last `exec` gave |
+| `status` [`is`] `<n>`, `body` + a comparison, `json <$.path>` [+ a comparison], `header <name>` [+ a comparison] | the last `http` answer |
+| `ax [<target>] matches` + the tree indented under it | the page's (or the target's) accessibility tree, as `navigera ax` prints it, holds those lines: partially (`button` matches `button "Place order"`) and in order, a line indented under another inside what that one matched, refs ignored, `/regex/` (spaces allowed) for a name or a value |
+| `screenshot <name> [<target>]` [`--full-page`] [`--threshold 0.2`] [`--max-diff-pixels <n>` \| `--max-diff-ratio <r>`] [`--mask <css>`]… | the viewport (or the element, or the whole page) as its baseline shows it, pixel by pixel; see below |
+| `not …` | any of them, negated |
 
-Duplicate keys are counted and listed per file; the first occurrence of each
-key takes part in the join.
+  `--soft` on any `expect` notes a failure and goes on; the scenario fails
+  at its end with all of them. A `${var}` can stand for any compared value
+  (a count, a regex), checked once it is filled in; `--timeout-ms` takes a
+  number as written.
 
-**Profiles.** A `compara.toml` in the working directory (or
-`~/.config/compara/compara.toml`, or `--config PATH`) names recurring
-comparisons: key, compared and ignored columns, normalisation, engine. See
-[`compara.example.toml`](compara.example.toml). The command line overrides the
-profile.
+  ```text
+  expect ax --role form --name Checkout matches
+    - textbox "Email" value=/.+@example\.com/
+    - combobox "Country" value="Canada"
+    - button "Place order"
+  ```
 
-## Cloud and containers
+  A screenshot's baseline is beside the `.pv` file, in
+  `<file>.pv.screenshots/<name>-<os>.png` (fonts differ between systems,
+  so each OS keeps its own); keep it with the tests. With none yet the run
+  writes it and the step fails, so a person looks at it first;
+  `--update-screenshots` writes or replaces baselines and passes. While it
+  is taken, animations and transitions stop, the caret hides and each
+  `--mask` element is painted over in magenta (a mask that matches nothing
+  fails the step). An element is scrolled into view first, inside its
+  scroll containers and frames, and cropped where it is on the page, in an
+  iframe too. Two pixels differ when their
+  colour distance is over `--threshold` (0 to 1); a mismatch writes this
+  run's image and a diff (the differing pixels red) to the evidence
+  directory and names both.
 
-Any file argument can be a URL, and so can `-o`, `--json` and
-`--export-dir`:
+  Copy the lines from `navigera ax` and keep the ones that matter. A miss
+  names the first line that has no place and the nearest line of its role
+  (`no line matches \`- combobox "Country" value="Mexico"\`; nearest:
+  \`- combobox "Country" value="Canada" options: …\``, the line as `ax`
+  prints it).
 
-```sh
-compara compare s3://lake/orders/2026-09.parquet s3://lake/orders/2026-10.parquet -k order_id \
-  --json s3://reports/orders/summary.json --export-dir s3://reports/orders/diff/
-compara compare gs://bucket/export.csv.gz az://container/warehouse.parquet -k id
-compara compare s3://lake/orders/run=41/ 's3://lake/orders/run=42/date=2026-10-*/*.parquet' -k order_id
-compara compare "https://bucket.s3.amazonaws.com/a.csv?X-Amz-Signature=..." b.csv -k id
-aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
+## Gherkin
+
+`.feature` files run as they are, beside `.pv` files (no generated code):
+`Feature`, `Background` (before each scenario), `Scenario`/`Example`,
+`Scenario Outline` (or `Scenario Template`) with `Examples` (or
+`Scenarios`) tables, several allowed, each with its own tags (`<column>`
+filled in; one scenario per row, named `Name (col=value, …)` when the name
+has no `<…>`), `Rule` (a `Background` under it runs before that rule's
+scenarios only), tags (a feature's go on all its scenarios), and
+`Given`/`When`/`Then`/`And`/`But`/`*` steps, all alike. English keywords
+only.
+
+A step is one of the run's own `step` blocks, from any `.pv` file it loads:
+
+```text
+step "I sign in with {password}"
+  fill --label Password ${password}
+  click --text "Sign in"
 ```
 
-| Scheme | Credentials, as that cloud's own tools find them |
-|---|---|
-| `s3://`, `s3a://` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, a `~/.aws` profile (`AWS_PROFILE`) -- static keys, or SSO, an assumed role or a `credential_process`, resolved the way the AWS CLI resolves them -- web identity (EKS), the ECS task role, instance metadata. `AWS_ENDPOINT_URL` for MinIO, R2, Ceph and the like. The bucket's region is looked up when none is set. |
-| `gs://` | `GOOGLE_APPLICATION_CREDENTIALS`, application default credentials (`gcloud auth application-default login`), the metadata server (GKE, Cloud Run). |
-| `az://`, `abfs(s)://`, `azure://`, `adl://` | `AZURE_STORAGE_ACCOUNT_NAME` with a key (`AZURE_STORAGE_ACCOUNT_KEY`), a SAS token (`AZURE_STORAGE_SAS_KEY`), a service principal, managed or workload identity, or an `az login` when there is nothing else. |
-| `http://`, `https://` | none: the URL is fetched as given, so a presigned S3 URL or an Azure SAS URL works as it is. A refused one that names a bucket or a storage account is retried signed. |
+`{name}` takes a `"…"` or `'…'` value or one word and is `${name}` in the
+steps under it; a line two `step` blocks match is an error. Else it is a
+phrase of the built-in book: `I open "/cart"` (`go to`, `navigate to`,
+`visit`, `am on`), `I click "Apply"` (`click on`; by visible text), `I fill
+"Email" with "a@b.c"` (`fill in`, `enter`; by label), `I type "x" into
+"Search"`, `I select "Canada" from "Country"` (or `in`), `I check "Terms"`,
+`I uncheck …`, `I press "Enter"`, `I wait for "Saved"`, `I see "Saved"` (`I
+should see`), `I don't see "Error"` (`should not`, `shouldn't`, `do not`),
+`the URL is|contains|starts with|ends with|matches "…"` (`url`, `page URL`),
+`the title is|contains … "…"` (`page title`). An icon button or a field
+with no label needs a `step` block (`click --role …`, `--placeholder`). A
+step nothing matches is a file error that says how to write it. Data tables and doc strings under a
+step aren't supported yet.
 
-- **No credentials, no setup**: with none to be found, a public bucket
-  (open data on S3 or GCS) is read unsigned, and the note on stderr says so;
-  a private one fails with what to set.
-- **Parquet is read as far as the comparison reads it**: the footer, then
-  only the column chunks of the key and compared columns. `--compare` on two
-  columns of a 200-column table fetches those two; `compara columns` fetches
-  the last 64 KB.
-- **Everything else is read in parallel ranges** (8 MB, sixteen at a time,
-  `COMPARA_FETCH_CONCURRENCY`) into a temporary file in `TMPDIR`. Gzip and
-  zstd files, local or remote, are read as what they hold; one that expands
-  past 1 GB to more than 1000 times its size is refused as a decompression
-  bomb (`COMPARA_MAX_EXPANSION=<times>`, 0 for no limit).
-- **Link-local addresses are not read**: an `http(s)://` table at
-  169.254.0.0/16, fe80::/10 or fd00:ec2::254 (where cloud machines get
-  their credentials), by address, by name or by a redirect, is refused;
-  `COMPARA_ALLOW_LINK_LOCAL=1` allows it. Redirects stop after 10.
-- **A table of many files is one side**: a directory, a quoted glob, or an
-  object storage prefix is its files read as one table, in path order --
-  Spark and Hive output (`date=2026-10-01/part-00000.snappy.parquet`), a
-  warehouse unload (`unload/0000_part_00.csv.gz`). CSV parts must share a
-  header and Parquet parts a schema, and the error names the part that does
-  not. From object storage the parts are fetched together, sixteen ranges in
-  flight across all of them, and Parquet parts only as far as the comparison
-  reads them. Hive partitions are columns: under `orders/`, the parts of
-  `date=2026-10-01/region=eu/` carry `date` and `region` (as text), so
-  `-k date,order_id` keys a table whose ids repeat from day to day, and a
-  partitioned table compares with a flat export that has those columns.
-  Names starting with `.` or `_` (`_SUCCESS`, `.crc`) are passed over.
-- **A Delta table is read at a version**: `s3://lake/orders/` is its latest
-  version, `s3://lake/orders@v41` the forty-first -- the files its log
-  (`_delta_log/`, checkpoint and commits) says make that version, and no
-  others -- so two versions compare like two tables:
-  `compara compare s3://lake/orders@v41 s3://lake/orders -k order_id`.
-  Deletion vectors and column mapping are refused rather than read wrong; an
-  Iceberg table is refused.
-- **Every range is read from one version of the object** (`If-Match` on its
-  ETag): an object overwritten mid-read is an error, not a file stitched
-  from two versions. Throttled and dropped ranges are retried.
-- **Outputs go up** in one request, or as a multipart upload for a large
-  export. `--json -` prints the summary on stdout and the counts on stderr.
+`--cucumber <file>` writes Cucumber JSON for the `.feature` files, step by
+step (passed, failed, skipped, with times), for test-management importers;
+`--junit`, `--html`, `--allure` and the console report them like any
+scenario.
 
-Against DuckDB 2.0.0 reading the same objects over S3 (`httpfs`), on one
-keyed comparison of 10M rows a side, both tools giving the same four counts
--- an S3 server (SeaweedFS) on the same 4-core runner, best of three (CI run
-39793328982):
+## Running
 
-| input on S3 | compara | DuckDB | peak RSS, compara / DuckDB |
-|---|---:|---:|---:|
-| Parquet, every column | 9.5 s | 25.3 s | 2.7 / 9.7 GB |
-| Parquet, one compared column | 6.7 s | 10.3 s | 2.0 / 3.9 GB |
-| Parquet, 9 parts under a prefix | 3.5 s | 20.8 s | 3.8 / 9.1 GB |
-| CSV, 1.7 GB a side | 21.5 s | 60.2 s | 4.1 / 13.8 GB |
+```text
+primavera run [<file.pv|file.feature|dir>...] [--base-url <url>] [--var k=v] [--grep <text>] [--tag <tag>]
+              [--workers <n|auto>|-j <n>] [--isolation context|browser] [--retries <n>] [--fail-on-flaky] [--shard <i/n>]
+              [--repeat <n>] [--shuffle [<seed>]]
+              [--reporter console|jsonl|github] [--junit <file>] [--cucumber <file>] [--allure <dir>] [--html <file>] [--json]
+              [--timeout-ms <ms>] [--wait-ms <ms>] [--headed] [--chromium <path>] [--engine chrome|lightpanda]
+              [--secrets <file>] [--evidence <dir>] [--pause-on-failure] [--trace on-failure|all] [--update-screenshots]
+              [--compare-report html,json,rows|none] [--config <file>] [--env <name>]
+primavera lint [<file.pv|file.feature|dir>...]
+primavera list [<file.pv|file.feature|dir>...]
+primavera trace <dir> [<line>]
+primavera fix [<file>:<line>] [--use <n>] [--all [--min <p>]]
+primavera navigera <command…>
+primavera from-session <name> [--scenario <name>] [--out <file.pv>]
+primavera record <url> [--out <file.pv>] [--scenario <name>] [--headless] [--for <seconds>]
+primavera record --extend <file.pv> [--scenario <name>] [--base-url <url>] [--secrets <file>]
+primavera mcp [--headed] [--chromium <path>]
+primavera skill          # the agent skill (what an agent reads to write tests)
+primavera --version
+```
 
-The single objects come off this server at about 90 MB/s each however many
-ranges are in flight, which is most of compara's time on them; the parts,
-fetched together, come at 340 MB/s.
+`--base-url` falls back to `base` in the file, then `PRIMAVERA_BASE_URL`.
+`--workers auto` is half the CPUs, at most 8.
 
-In a container:
+- A click that opens a tab or a popup (`target=_blank`, `window.open`)
+  moves the scenario to it, as navigera does: the next steps read and act
+  there. `tab-select 0` goes back to the first tab; `tab-close` closes the
+  one you're on.
+- Every scenario starts in a fresh browser context (navigera `reset
+  --all`: no cookies, storage, tabs, routes, init scripts, `set`
+  emulation or dialog answer from the scenario before), in about 40 ms
+  instead of a new browser's few hundred. `--workers n` runs n at once,
+  each in a browser context of one shared browser (about 40% less memory
+  at 4 workers than a browser each; `--isolation browser` gives each its
+  own); the longest start first (by `.primavera/timings.json`, which each
+  run updates; the first run goes in file order).
+- `--engine lightpanda` (or `engine = "lightpanda"` in a profile, or
+  `NAVIGERA_ENGINE=lightpanda`) runs on
+  [Lightpanda](https://github.com/lightpanda-io/browser) (`$LIGHTPANDA_BIN`
+  or `lightpanda` on the PATH), a new Lightpanda for each scenario (it has
+  one context per process): less memory, no layout. A smoke tier, not a
+  replacement: hover-revealed elements, new tabs, screenshots and `ax`
+  pixels need Chrome. On the 40-scenario suite's 25 site scenarios it
+  passes 22, and is not faster: 22 s against Chrome's 11 s at one worker
+  (half of it the three failures' waits).
+- `--html report.html` writes the run as one page that needs nothing
+  else to open: failed scenarios first and open, each with its steps and
+  their times, the failure (message, where the page was, what came
+  closest, the note) and its screenshot in the page (up to 2 MB; a
+  bigger one is linked); flaky ones show how their first try failed.
+  Secrets are masked as in the console. A screenshot two scenarios share
+  (a failed `before all`) is in the page once; a bigger one, and any once
+  the page holds 10 MB of them (failures first), is a link relative to the
+  report, so upload the report and `.primavera/runs/`
+  together. With `--repeat`, a pass count per scenario comes first. A run
+  that finds no scenario (exit 2) writes no report.
+- `--allure <dir>` writes Allure 2 results for `allure generate <dir>` or an
+  Allure server: one `<uuid>-result.json` per scenario run with its steps,
+  times, status (a flaky one passed, marked flaky), labels (the file, the
+  `.feature`'s name, tags, the worker) and the failure's screenshot
+  attached. The directory is kept, so several runs or shards can feed one
+  report; the history id is the same from run to run.
+- `--trace on-failure` (or `all`) records each step of a scenario: where
+  the page was, the console messages and the requests it brought, in
+  `trace.jsonl` beside the scenario's screenshot, with the page's ax tree
+  at a failure in `ax.txt`. `primavera trace <dir>` prints it (a run's
+  directory lists its traces); `primavera trace <dir> <line>` shows one
+  step in full, with the tree when it is the one that failed. Secrets are
+  masked in it as in the console.
+- `--retries n` runs a failing scenario again; one that passes then is
+  reported FLAKY with how its first try failed. `--fail-on-flaky` fails
+  the run on one. `--shard i/n` takes every n-th scenario, for CI matrix
+  jobs.
+- `--repeat 20 --shuffle` hunts flakes and order dependence: every
+  scenario runs 20 times (`name #k`), in a random order whose seed is
+  printed (`--shuffle <seed>` runs that order again), then a pass count per
+  scenario, FLAKY where it isn't all of them.
+- `--reporter jsonl` prints one JSON object per scenario as it finishes
+  (the console moves to stderr); `github` writes workflow annotations on
+  the failing lines, beside the console (on by itself under GitHub
+  Actions). `--json` prints
+  what the scenarios saved, for a pipeline's next step.
+- A failure prints the step, what was expected and seen, where the page
+  was, a screenshot (under `.primavera/runs/`), and a note when an earlier
+  click changed nothing on the page (navigera's `no_effect`), the usual
+  reason the next check fails. When the element isn't there, it lists the
+  closest ones on the page as locators to paste in:
 
-- `ghcr.io/andrey-usa/compara` is the release binary on
-  `gcr.io/distroless/cc` for `linux/amd64` and `linux/arm64`, running as a
-  non-root user with `WORKDIR /data`. Nothing else is in the image.
-- It reads the container's limits: threads from the CPU quota, memory from
-  the cgroup. **Out of memory is a message, not an OOM kill**: the heap is held
-  a margin under the limit, so a pair that does not fit is refused with what
-  needed how much (exit 2), and under `--engine auto` a CSV pair is compared
-  by the engine that spills to disk instead, with the same answer.
-- A read-only root filesystem works; standard input, compressed and remote
-  inputs and the spilling engine need a writable `TMPDIR` -- in Kubernetes an
-  `emptyDir` (disk-backed: a `medium: Memory` one counts against the memory
-  limit).
-- `compara env` prints what the process sees: CPUs, memory, the container's
-  limit, the heap limit it set, and whether the temporary directory is
-  writable.
+  ```text
+  FAIL  shop.pv:21  Accept the cookies  (611 ms)
+        line 23: click --role button --name "Accept everything"
+        click role="button" name="Accept everything": … no element …
+        nearest on the page:
+          1. button "Accept all"   --role button --name "Accept all"   0.63
+  ```
 
-In GitHub Actions, the action installs the release binary, writes the
-counts and the most-changed columns to the job summary, and fails the step
-when the tables differ (`fail-on-differences: false` to only report):
+  When that list is unsure (the best under 0.6, or the first two within
+  0.1) and a decision model is set up for navigera (`TYPESAFE_API_KEY`, or
+  `NAVIGERA_DECIDER_URL`), primavera also asks it which element the step
+  meant (navigera's `find`, on the failing page) and adds its pick, marked
+  `(decider)`: first when the model is at least 0.5 sure, else last (the
+  list stays at three); one call per such failure, none otherwise. The
+  list covers frames too: a step with `--frame` keeps it, and `fix` changes
+  only the locator.
+- `primavera fix <file>:<line> [--use <n>]` puts the last run's n-th
+  "nearest on the page" into that step (only its locator flags change, and
+  only if the line still reads as it did); `primavera fix --all [--min
+  0.6]` takes each failure's first suggestion that scored that much, and
+  plain `primavera fix` lists them. The failure block prints the command.
+  A click that something else covers (a consent bar, a modal) gets that
+  thing's buttons instead, "Accept", "Close", "Got it" … first, as an
+  `optional click` that `fix` puts before the step.
+  A `.feature` step is left alone: change its `step` block instead.
+- `primavera navigera …` is navigera itself, built in: explore a page the
+  way an agent does (`primavera navigera -s work start`, `goto`, `ax`,
+  `click 12`, `fill 15 ada@example.com`) with no second program to
+  install. `primavera from-session work` then writes what that session did
+  as a scenario: each action once, and the waits between (reads and `eval`
+  left out), every ref replaced by the most stable locator that found its
+  element again just before the action (test id, role and name, label, placeholder, text, CSS;
+  navigera's `locate`, each checked on the page; inside a web component's
+  shadow root, CSS through its hosts: `--selector "#tip >>> button"`), `base` from the first
+  `goto`, an `expect url` where an action moved the page, an `expect text`
+  for a heading that changed or a status/alert message that appeared (as a
+  comment when it has numbers, which may change), and a value typed
+  into a password field (`type=password`, as navigera's `locate` says) as
+  `${secret:NAME}`, named after the field (`${secret:PASSWORD}`,
+  `${secret:CONFIRM_PASSWORD}`). What it can't keep (a mouse at
+  coordinates, a ref no locator found again) is a `# left out:`
+  line. Read it through, keep the expects that matter, add the ones the
+  test is for. A session started by a plain `navigera` works too when that
+  navigera has `history`.
+- `primavera record <url> --out t.pv` opens a browser to use by hand: each
+  click, field change, check, select, upload and Enter becomes a step as
+  you do it, with the most stable locator that finds the element (the same
+  `locate` as `from-session`, run in the page at that moment; when the
+  click takes its element or the page away before that check is done, a
+  banner's Accept or a link, the element's own text or label read as it
+  was clicked), an `expect url` where the page
+  moved, a password field's value as `${secret:NAME}` (never written
+  down). The file is rewritten after
+  every step: close the browser or press Ctrl-C to stop. A click into a
+  field isn't a step (its value is); typing in a field twice keeps the
+  last value.
+- `primavera record --extend t.pv [--scenario <name>]` grows a scenario
+  instead: it runs that scenario (default: the file's last) to its end,
+  `after each` left out, then hands you the browser there; what you do
+  goes in after its last step, the same way, and the rest of the file stays
+  as it was. A scenario that fails before its end is not extended: fix it
+  first. `--headless` and `--for <s>` work as for `record`; a `.feature`
+  is refused (its steps live in its `step` blocks).
+- `primavera mcp` is the same loop for an agent over MCP (stdio): navigera's
+  browser tools (`browser_navigate`, `browser_snapshot`, `browser_click`,
+  … one browser for all of them) beside `primavera_from_session` (what
+  those tools did, as a scenario; `out` writes it), `primavera_run`,
+  `primavera_list`, `primavera_lint`, `primavera_failure` (the last run's
+  failures with the nearest elements) and `primavera_fix`. Register it as
+  `{"command": "primavera", "args": ["mcp"]}`. What the tools run, read
+  and write (`paths`, `out`, the files `args` names) stays inside the
+  working directory, as navigera's own tools' files do, and `args` can't
+  name a `--chromium` to start; `NAVIGERA_MCP_ALLOW_FILES=1` lifts both.
+  A project's own `.pv` files still do what they say (`exec`, `[server]`).
+- `--pause-on-failure` stops at a failure with the browser as the failure
+  left it and prints how to look at that very tab (`navigera -s pv start
+  --attach ws://…/devtools/page/…`, then `navigera -s pv ax`); Enter goes
+  on with the run. It runs one worker. With no terminal to press Enter in,
+  it waits `PRIMAVERA_PAUSE_S` seconds (default 600, for an agent looking
+  from elsewhere), and under CI (`CI` set) it doesn't pause unless that is
+  set.
+- Exit codes: 0 passed, 1 a scenario failed, 2 a file or argument is wrong,
+  3 the browser or the app server didn't start.
+
+## Config: `primavera.toml`
+
+A `primavera.toml` in the current directory (or `--config <file>`) holds
+what a run takes by default; flags on the command line win over it.
+Paths in it are from its own directory.
+
+```toml
+base_url = "http://127.0.0.1:3000"
+paths = ["tests"]            # what to run when the command line names nothing
+workers = 4                  # or "auto"
+retries = 1
+reporters = ["github"]       # added to --reporter
+junit = "reports/junit.xml"  # also html, cucumber, allure, secrets, evidence, chromium
+trace = "on-failure"         # or "all", "off"
+compare_report = ["html", "json"]  # what `expect download … compare` keeps
+[vars]                       # as --var; --var on the command line wins
+region = "us"
+
+[server]                     # the app under test
+command = "npm run dev"      # sh -c (cmd /C on Windows)
+cwd = "app"                  # where it runs (default: the config's directory)
+url = "http://127.0.0.1:3000/health"
+timeout_s = 60
+# reuse = true               # one already answering at url is used (default, except under CI: CI set and not empty, false or 0)
+# env = { PORT = "3000" }
+
+[env.staging]                # --env staging: on top of the rest
+base_url = "https://staging.example.com"
+[env.staging.vars]
+region = "eu"
+```
+
+The `[server]` starts before the browser and is ready when its `url`
+answers (any status under 500); its output goes to `.primavera/server.log`,
+and it is stopped with everything it started when the run ends. One that
+exits or doesn't answer in time ends the run with exit 3 and the end of its
+log. Other keys: `timeout_ms`, `wait_ms`, `isolation`, `fail_on_flaky`,
+`headed`; an unknown key is an error.
+
+## GitHub Actions
 
 ```yaml
-- uses: aws-actions/configure-aws-credentials@v5   # or any other credentials
-  with: {role-to-assume: arn:aws:iam::123456789012:role/ci, aws-region: us-east-1}
-- uses: andrey-usa/compara@v0
+- uses: andrey-usa/primavera@next
   with:
-    a: s3://lake/orders/baseline.parquet
-    b: out/orders.parquet
-    key: order_id,line_no
-    args: -i updated_at --tolerance 0.01
-    report: out/orders-diff.html
+    paths: tests
+    base-url: http://127.0.0.1:3000
+    args: --workers auto --retries 1 --junit report.xml
 ```
 
-Its outputs are `identical`, `changed`, `added`, `removed` and `summary`
-(the JSON summary's path).
+It runs on the runner's Chrome (Linux, macOS, Windows). `version` picks a
+release (`latest` by default, or a tag); with no release binary for the
+runner it builds primavera from the action's own commit (`source` asks for
+that), with navigera at `navigera-ref`. Failures are annotations on the
+lines that failed; the `evidence` output is the directory holding their
+screenshots, for `actions/upload-artifact`.
 
-A Kubernetes Job comparing two Parquet snapshots with the pod's IAM role
-(IRSA), its summary written next to the data; without `--exit-zero` the Job
-fails when they differ:
+## Container
 
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata: {name: orders-diff}
-spec:
-  backoffLimit: 0
-  template:
-    spec:
-      serviceAccountName: lake-reader          # annotated with the IAM role
-      restartPolicy: Never
-      containers:
-        - name: compara
-          image: ghcr.io/andrey-usa/compara:latest
-          args: [compare, s3://lake/orders/v1.parquet, s3://lake/orders/v2.parquet,
-                 -k, order_id, --json, s3://reports/orders/summary.json, --exit-zero]
-          resources: {limits: {memory: 2Gi, cpu: "4"}}
-          securityContext: {readOnlyRootFilesystem: true, runAsNonRoot: true}
-          volumeMounts: [{name: tmp, mountPath: /tmp}]
-      volumes: [{name: tmp, emptyDir: {}}]
+`Dockerfile` builds an image with primavera and Debian's headless Chromium,
+amd64 or arm64, from the directory holding both checkouts (see Building):
+
+```console
+$ docker build -f primavera/Dockerfile -t primavera .
+$ docker run --rm --network host -v "$PWD/tests:/tests:ro" primavera run /tests --base-url http://127.0.0.1:3000
 ```
 
-## Speed
+It runs as an unprivileged user (any uid, so OpenShift's random ones too),
+with a read-only root filesystem if asked (`HOME=/tmp`, a `/tmp` to write
+to, and a writable working directory: `.primavera/` with the last run,
+timings and evidence goes there, `/work` by default), and without Chrome's own sandbox: a container without user
+namespaces can't give Chrome one, and the container is the boundary.
+`examples/kubernetes/job.yaml` is a Job: the tests from a ConfigMap, JUnit
+and evidence in `/work/out`, a memory-backed `/dev/shm`.
 
-Ten million rows × 20 columns, keyed on `(account_id, txn_id)`, `--ignore
-updated_at`, four threads on a 4 vCPU / 16 GB GitHub Actions runner, best of
-five. Each format ran on a runner of its own, named below (CI runs
-39728430053 and 39729034092 in
-[compara-polyglot-experiments](https://github.com/andrey-usa/compara-polyglot-experiments)).
-Each cell is wall time · CPU time · memory above the mapped input.
+## Building
 
-| Format | Input, both files | Runner CPU | compara |
-|---|---:|---|---|
-| CSV | 3,509 MB | AMD EPYC 7763 | 1.08 s · 3.5 s · 591 MB |
-| ndjson | 8,488 MB | AMD EPYC 9V45 | 1.26 s · 3.9 s · 592 MB |
-| Parquet | 1,535 MB | Intel Xeon 6973P-C | 1.17 s · 3.8 s · 1,174 MB |
+primavera links navigera as a library, checked out beside it:
 
-Two Parquet files against DuckDB and Polars, on the same kind of runner
-(CI run 39468615515: a 5M-row pair written by pyarrow, counts only, median
-of three): compara 1.26 s at one thread and 0.56 s at four, DuckDB 6.73 s and
-3.13 s, Polars 4.98 s and 2.73 s. With the changed, added and removed rows
-written out, compara 0.72 s at four threads, DuckDB 4.00 s, Polars 2.74 s.
+```text
+work/
+  navigera/     github.com/andrey-usa/navigera (or navigera-private)
+  primavera/    this repository
+```
 
-Contender benchmarks rerun weekly
-([`bench-contenders.yml`](.github/workflows/bench-contenders.yml)) against the
-latest DuckDB.
+```console
+$ cd primavera && cargo build --release
+$ ./target/release/primavera run examples --base-url http://127.0.0.1:<port>
+```
 
-## Engines
-
-Three backends, one result contract: every engine returns identical counts and
-column statistics for the same input, and the test suite asserts it cell for
-cell. `--engine auto` takes the first one that can load the input, in this
-order.
-
-| Engine | Implementation | Memory model | Use it for |
-|---|---|---|---|
-| `turbo` | mapped file, byte-level index; CSV, JSON and Parquet | off-heap bytes, index in memory | the default, and the fastest |
-| `sortmerge` | external sort, merge join | bounded memory, spills to disk | files past what memory can index |
-| `native` | over the `csv` crate | in-memory, row-oriented | the dependency-light baseline |
-
-All three read values as text, with no type inference, so `1.0` and `1` stay
-different unless a tolerance is set, and all three treat an empty field as
-absent whether or not it is quoted. A Parquet column is the exception, on
-either side: it stores typed values, so a column it holds as numbers
-compares by value with the other file's text (`31.40` against the DOUBLE
-31.4 is no change), and a date, time or timestamp column by instant (`T` or
-a space, a zero fraction or none, `Z` or nothing).
-
-### Input formats
-
-`turbo` decides what a file is by its content rather than its name: a Parquet
-magic number, a leading `{` or `[`, or a CSV header.
-
-| Format | How it is read |
-|---|---|
-| CSV | mapped, scanned eight bytes at a time; a field is an offset and a length; a UTF-8 byte order mark is skipped; the separator (comma, semicolon, tab or pipe) is read from the header line unless `--delimiter` names it |
-| TSV | the CSV reader with a tab for the separator, found in the header line like any other; the same rows as TSV and as CSV give the same answer and the same export |
-| JSON | one object per line (NDJSON), or one top-level array of objects; the columns are the keys of the first object, and a value is found by its key rather than its position; `\uXXXX` is decoded, so an escaped and a literal character compare equal; `null` and a missing key are both absent |
-| Parquet | pages decoded into an arena; dictionary-encoded columns point at the dictionary entry, so a repeated value costs eight bytes a row |
-
-**Nested JSON.** A value that is an object or an array is compared as its
-JSON text, as written: any difference inside it is a change to that column,
-and the report and export show the text. The same object written with its
-keys in another order, or with other spacing, is a change too, so JSON
-compares best flat, one scalar per key. For two files written by different
-tools, flatten nested values into top-level keys first (`jq`, or the writer's
-own option), and each nested field becomes a column compared on its own.
-
-The Parquet reader is written here rather than taken from a crate, to keep that
-representation instead of converting to Arrow arrays. It reads PLAIN,
-dictionary (`PLAIN_DICTIONARY`, `RLE_DICTIONARY`), RLE booleans and the
-version-2 delta encodings; uncompressed, snappy, gzip, zstd and LZ4-raw pages;
-data pages v1 and v2; definition levels for optional columns. It refuses, by
-name, nested or repeated schemas, `BYTE_STREAM_SPLIT`, LZO and Brotli.
-
-A typed Parquet value is rendered to text by a fixed rule: byte arrays as their
-bytes, booleans `true`/`false`, integers and decimals in full, floats in the
-shortest round-trip form, dates `YYYY-MM-DD`, timestamps ISO 8601.
-`tests/fixtures/formats/typed.csv` is that rule written down.
-
-Two Parquet files take a columnar path instead, which never builds a row: it
-joins on the key columns, then compares one column at a time, string columns
-by dictionary id or bytes and booleans, integers, floats, dates, times,
-timestamps and decimals of up to eight bytes as one word per value. A cell is
-rendered by the rule above only when the report shows it or `--export-dir`
-lists it. Added and removed rows are known from the join, so their cells are
-written out during that pass; which rows changed is known only after the last
-column, so an export reads the compared columns once more and writes out just
-those rows. It costs that second pass and the text it writes, rather than
-holding every column of both files at once. A column the two files store as
-different types, or with an encoding or page outside PLAIN, dictionary and v1
-pages (or LZO or Brotli compression), goes the row-by-row way instead, with
-the same answer.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+`examples/bench-site` runs against navigera's bench site
+(`python3 ../navigera/bench/site/server.py --port 0`).
 
 ## License
 
-[MIT](LICENSE)
+MIT. `vendor/axe-core` is axe-core, unmodified, under the Mozilla Public
+License 2.0 (its `LICENSE` beside it).

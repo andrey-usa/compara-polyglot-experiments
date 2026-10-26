@@ -1,0 +1,5 @@
+before all
+  expect title is "not this one" --timeout-ms 200
+
+scenario "Never runs"
+  goto /m1

@@ -1,0 +1,4 @@
+scenario "exec runs a script by its path next to this file, from any directory"
+  exec ./scripts/order-status.sh 42
+    expect exit 0
+    expect stdout is "order 42 SHIPPED"

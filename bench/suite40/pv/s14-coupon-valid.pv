@@ -1,0 +1,19 @@
+# Coupon widget lives in an open shadow root; SAVE10 = 10% off, then reload.
+use common.pv
+
+# NOTE: relative URLs resolve against --base-url (or PRIMAVERA_BASE_URL);
+# the gauntlet origin comes from GAUNTLET_URL.
+
+before each
+  goto /shop --wait commit
+  run accept-cookies
+
+scenario "A valid coupon lowers the total"
+  goto /shop/p/101 --wait commit
+  click --selector "#detail-add"
+  expect --selector "#cart-count" text is 1
+  goto /cart --wait commit
+  fill --label "Coupon code" SAVE10
+  click --role button --name "Apply coupon"
+  expect text "Coupon SAVE10 applied"
+  expect text "Discount (SAVE10)" --timeout-ms 10000
