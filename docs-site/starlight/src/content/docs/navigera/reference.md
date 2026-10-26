@@ -1,6 +1,6 @@
 ---
 title: Reference
-description: navigera` reference
+description: "navigera drives a real Chrome over the DevTools Protocol from one native"
 ---
 # `navigera` reference
 
@@ -13,7 +13,7 @@ binary. There are three ways to run it:
 | **serve** | `navigera serve`; JSON commands on stdin, one JSON response per line | programs holding a pipe open |
 | **one-shot** | `navigera <command> …` | a single action (launches and closes a browser) |
 
-The agent-oriented guide is [the skill](../skills/navigera/SKILL.md),
+The agent-oriented guide is [the skill](/navigera/skill/),
 also printed by `navigera skill`. This page is the full reference.
 
 ## CLI shape
@@ -261,7 +261,7 @@ among options, a yes/no probability) in a few hundred milliseconds and bills
 input tokens only. Opt-in: nothing is sent anywhere unless one of these is set
 where the session (or `navigera mcp`) starts:
 
-| variable | |
+| variable | Value |
 |---|---|
 | `TYPESAFE_API_KEY` | TypeSafe's API, `https://api.typesafe.ai/v1/systemone` |
 | `NAVIGERA_DECIDER_URL` | an endpoint with the same API (a LiteLLM proxy's `/typesafe/v1/systemone`, a mock); `http://` directly, `https://` through `curl` |
@@ -479,7 +479,7 @@ MCP Registry, as `io.github.andrey-usa/navigera`.
 
 **Your own browser: `--attach` and `--profile`** (with `start`, or `serve`):
 
-| | what it connects to | closes the browser? |
+| Way | what it connects to | closes the browser? |
 |---|---|---|
 | `--attach` / `--attach chrome` | your running Chrome (also `beta`, `dev`, `canary`, `chromium`, `edge`): Chrome 144+ serves remote debugging for your default profile once you turn it on at `chrome://inspect/#remote-debugging`, and asks you to Allow each connection. navigera reads the endpoint from `DevToolsActivePort` in that browser's user data directory | never |
 | `--attach <dir>` | a Chrome started with `--remote-debugging-port` and `--user-data-dir=<dir>` | never |

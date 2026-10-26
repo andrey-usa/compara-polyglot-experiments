@@ -1,6 +1,6 @@
 ---
 title: Multi-model
-description: Several models, one browser
+description: "An agent that browses spends most of its tokens reading pages. A single"
 ---
 # Several models, one browser
 
@@ -91,7 +91,7 @@ buttons, a page of 450 links); what Jev's documentation says it does not do
 (counting, comparing prices, dates); instructions planted in the page; and
 seven public pages. One run:
 
-| | Jev | Gemini 3.5 Flash-Lite |
+| Measure | Jev | Gemini 3.5 Flash-Lite |
 |---|--:|--:|
 | element choice right | 25/25 | 23/25 |
 | yes/no right | 14/14 | 14/14 |
