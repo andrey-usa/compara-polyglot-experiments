@@ -1,0 +1,188 @@
+name: publish-t0047
+
+# T-0047 result recovery lane (agent fb).
+#
+# The paid eval workflows upload their raw output as artifacts, but agent
+# sandboxes cannot download artifacts (that API always needs auth), so when a
+# publish step inside an eval job dies the numbers would otherwise be stuck in
+# an artifact. This lane runs in CI, where the repo token can read its own
+# artifacts: it downloads the queued artifact, re-runs the same summarizing
+# code, writes a diagnostics file and commits the results to experiment-44 -
+# the destination the eval workflows publish to.
+#
+# Trigger: add or change a queue entry under publish/jobs/*.txt on this
+# branch. One file per artifact:
+#   mode=miniwob|webarena
+#   run=<run id>            artifact=<artifact name>
+#   dest=bench/t0047-miniwob/... (results land here on experiment-44)
+#   note=<free text, recorded in the provenance>
+#
+# Nothing this workflow writes matches the eval workflows' trigger paths
+# (bench/miniwob/**, bench/webarena/**, bench/agent-eval/**, their own
+# workflow files), so it never starts paid work; it only touches
+# bench/t0047-*/** plus publish/diagnostics/**.
+
+on:
+  push:
+    branches: [t0047-publish]
+    paths:
+      - "publish/jobs/**"
+      - ".github/workflows/publish-t0047.yml"
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-t0047
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_BRANCH: experiment-44
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Recover queued artifacts
+        run: |
+          set -uo pipefail
+          mkdir -p publish/diagnostics
+          diag="publish/diagnostics/recovery-$(date -u +%Y%m%dT%H%M%SZ).md"
+          exec > >(tee -a "$diag") 2>&1
+          echo "# T-0047 recovery: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo
+          echo "- queue: $(ls publish/jobs/*.txt 2>/dev/null | tr '\n' ' ')"
+          echo "- run: $GITHUB_RUN_ID (attempt $GITHUB_RUN_ATTEMPT)"
+          echo "- branch tip seen by this job: $(git rev-parse HEAD)"
+          echo
+          : > /tmp/added.txt
+
+          for job in publish/jobs/*.txt; do
+            [ -e "$job" ] || continue
+            echo "## $job"
+            echo
+            unset mode run_id artifact dest note
+            while IFS= read -r line; do
+              case "$line" in
+                mode=*) mode="${line#mode=}" ;;
+                run=*) run_id="${line#run=}" ;;
+                artifact=*) artifact="${line#artifact=}" ;;
+                dest=*) dest="${line#dest=}" ;;
+                note=*) note="${line#note=}" ;;
+                ""|\#*) ;;
+                *) echo "- ignored queue line: $line" ;;
+              esac
+            done < "$job"
+            echo "- mode=$mode run=$run_id artifact=$artifact dest=$dest"
+            echo
+
+            raw="$RUNNER_TEMP/raw-$run_id-$artifact"
+            rm -rf "$raw"; mkdir -p "$raw"
+            echo "### gh run download"
+            echo '```'
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name "$artifact" --dir "$raw"
+            dl=$?
+            echo "download exit=$dl"
+            echo '```'
+            echo
+            echo "### artifact tree"
+            echo '```'
+            find "$raw" -type f -printf '%s\t%p\n' | sort -k2 | head -40
+            echo "files: $(find "$raw" -type f | wc -l); bytes: $(du -sb "$raw" | cut -f1)"
+            echo '```'
+            echo
+            if [ "$dl" != 0 ]; then
+              echo "download failed; nothing published for $artifact"
+              continue
+            fi
+
+            prov_run="recovered from artifact \`$artifact\` of CI run $run_id by publish-t0047 run $GITHUB_RUN_ID"
+            if [ "$mode" = "miniwob" ]; then
+              echo "### summarize (bench/miniwob/t0047_summary.py)"
+              echo '```'
+              python3 bench/miniwob/t0047_summary.py "$raw" --dest "$dest" \
+                --provenance "$prov_run" \
+                --provenance "branch commit: $(git rev-parse HEAD)" \
+                --provenance "${note:-note: none}"
+              echo "summary exit=$?"
+              echo '```'
+              ls -la "$dest" 2>/dev/null || echo "no $dest produced"
+            elif [ "$mode" = "webarena" ]; then
+              echo "### publish (webarena harness output)"
+              mkdir -p "$dest"
+              for f in table.md runs.jsonl summary.json; do
+                if [ -f "$raw/$f" ]; then cp "$raw/$f" "$dest/"; echo "copied $f"; else echo "missing $f"; fi
+              done
+              # the harness writes into a nested dir in some revisions
+              for f in $(find "$raw" -type f \( -name table.md -o -name runs.jsonl -o -name summary.json \) | grep -v "^$raw/[a-z]*\.\(md\|jsonl\|json\)$"); do
+                cp -n "$f" "$dest/" 2>/dev/null && echo "copied nested $f"
+              done
+              {
+                echo "recovered from artifact \`$artifact\` of CI run $run_id by publish-t0047 run $GITHUB_RUN_ID"
+                echo "branch commit: $(git rev-parse HEAD)"
+                [ -n "${note:-}" ] && echo "note: $note"
+              } > "$dest/PROVENANCE.txt"
+              ls -la "$dest"
+            else
+              echo "- unknown mode '$mode'; raw artifact kept only, nothing published"
+              continue
+            fi
+            if [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+              printf '%s\n' "$dest" >> /tmp/added.txt
+            else
+              echo "- $dest is empty after recovery; not publishing it"
+            fi
+            echo
+          done
+
+          echo "### commit"
+          echo '```'
+          git config user.name "andrey-usa"
+          git config user.email "62624421+andrey-usa@users.noreply.github.com"
+          # add every dest that produced files, plus the diagnostics
+          while IFS= read -r d; do [ -n "$d" ] && git add -f "$d"; done < /tmp/added.txt
+          git add -f publish/diagnostics
+          git status --short
+          git commit -m "T-0047 results recovered from CI artifacts [skip ci]" || echo "nothing to commit"
+          echo '```'
+          echo
+          echo "### push to $TARGET_BRANCH"
+          echo '```'
+          pushed=0
+          for i in 1 2 3 4 5; do
+            git fetch -q origin "$TARGET_BRANCH" || true
+            if git push origin "HEAD:refs/heads/$TARGET_BRANCH"; then
+              echo "pushed on attempt $i"; pushed=1; break
+            fi
+            echo "push attempt $i rejected"
+            if git rebase -q "origin/$TARGET_BRANCH" 2>&1; then
+              echo "rebased onto origin/$TARGET_BRANCH"
+            else
+              git rebase --abort 2>/dev/null || true
+              echo "rebase failed; retrying plain push"
+            fi
+            sleep $((i * 7))
+          done
+          echo "push_ok=$pushed"
+          echo '```'
+
+          {
+            echo
+            echo "- push to $TARGET_BRANCH ok: $pushed"
+          } >> "$diag"
+          git add -f publish/diagnostics
+          git commit --amend --no-edit -q || true
+
+          if [ "$pushed" != 1 ]; then
+            echo "### fallback: push the same commit to $GITHUB_REF_NAME so the diagnostics and results are readable"
+            git push -q origin "HEAD:refs/heads/$GITHUB_REF_NAME" || echo "fallback push failed too"
+            exit 1
+          fi

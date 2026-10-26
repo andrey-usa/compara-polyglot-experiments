@@ -1,0 +1,5 @@
+mode=miniwob
+run=40401302109
+artifact=miniwob-eval-t0047-axclick-o0c112s3
+dest=bench/t0047-miniwob
+note=T-0047 cell 1 (navigera ax-clickable, 112 tasks x 3 seeds, DeepSeek-V4.1-Flash): the eval step completed and the artifact was uploaded, but the eval job's own publish step failed, so the numbers are recovered here from the artifact
