@@ -296,11 +296,18 @@ def run_solution(arm, workdir, base_url, pw_bin_path, args=None):
     except subprocess.TimeoutExpired:
         return (False, "scoring run timed out (240s)")
 
-def setup_workdir(arm, workdir, args):
-    os.makedirs(workdir, exist_ok=True)
+def chown_workdir(workdir, args):
+    """Hand the trial workdir to the bench user. Must run AFTER every
+    harness-side write into the workdir (config + seeded solution): the
+    harness runs as the invoking user, the bench user owns the dir from
+    here on, and every later writer (model commands, scoring runs) already
+    executes as the bench user."""
     if getattr(args, "as_user", None):
         subprocess.run(["sudo", "-n", "chown", "-R", f"{args.as_user}:{args.as_user}", workdir],
                        check=True, capture_output=True)
+
+def setup_workdir(arm, workdir, args):
+    os.makedirs(workdir, exist_ok=True)
     if arm == "playwright":
         with open(os.path.join(workdir, "playwright.config.ts"), "w") as f:
             f.write("import { defineConfig } from '@playwright/test';\n"
@@ -385,7 +392,9 @@ def run_trial(arm, task_id, trial, args, ledger, site):
                 return rec
             shutil.copy(os.path.join(args.selftest_dir, st), os.path.join(workdir, solution_name(arm)))
             rec["done_declared"] = True
+            chown_workdir(workdir, args)
         else:
+            chown_workdir(workdir, args)
             messages = [{"role": "system", "content": args.system_prompt_text},
                         {"role": "user", "content": task_prompt(task_id, arm)}]
             reprompts = 0
