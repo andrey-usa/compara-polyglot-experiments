@@ -1,1 +1,1 @@
-run-arm: 20261026T1117Z scope: 12 tasks x 3 trials x 2 arms, 2 slices per arm (same approved retry: preflight caught a workdir-ownership ordering bug at \$0 spend; fixed and re-armed)
+run-arm: 20261026T1121Z scope: 12 tasks x 3 trials x 2 arms, 2 slices per arm (owner-approved single attempt 2026-10-26 07:20 ET after the chown-ordering fix; no auto-rearm after any failure)
