@@ -1,0 +1,88 @@
+name: t0090-oom-loop
+
+# T-0090: compara at a 4 MB heap limit sometimes aborts (SIGABRT, "memory
+# allocation of 8 bytes failed") instead of refusing with exit 2; seen once on
+# ubuntu-24.04-arm. This runs the out_of_memory test's exact command many
+# times on ARM and x86 and keeps a core and every thread's backtrace for each
+# run that did not exit 2.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  loop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RUNS: "150"
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+      CARGO_PROFILE_RELEASE_STRIP: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: andrey-usa/compara
+          ref: ceae6a14a008e2cedf9e98bcbea08b78254af378
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          cache: false
+      - name: build
+        run: cargo build --locked --release --bin compara
+      - name: fixture (the test's 120,000 rows)
+        run: |
+          python3 - <<'PY'
+          rows = 120_000
+          h = "account_id,txn_id,amount,updated_at\n"
+          a, b = [h], [h]
+          for i in range(rows):
+              key = f"a{i % 9999},t{i}"
+              a.append(f"{key},{i % 977}.{i % 97},2026-01-01\n")
+              if i % 100 == 0:
+                  b.append(f"{key},{i % 977}.{(i + 1) % 97},2026-02-02\n")
+              else:
+                  b.append(f"{key},{i % 977}.{i % 97},2026-01-01\n")
+          open("/tmp/a.csv", "w").write("".join(a))
+          open("/tmp/b.csv", "w").write("".join(b))
+          PY
+      - name: loop
+        run: |
+          sudo apt-get install -y -qq gdb >/dev/null
+          mkdir -p /tmp/cores /tmp/out
+          sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%p >/dev/null
+          nproc; uname -m; ldd --version | head -1
+          bin="$PWD/target/release/compara"
+          declare -A tally
+          for i in $(seq 1 "$RUNS"); do
+            for mb in 8 6 4 2; do
+              code=0
+              RUST_BACKTRACE=1 bash -c "ulimit -c unlimited; ulimit -d $((mb * 1024)); exec $bin compare /tmp/a.csv /tmp/b.csv -k account_id,txn_id -o /tmp/out/r.html" \
+                >/dev/null 2>/tmp/out/err.txt || code=$?
+              tally["$mb MB exit $code"]=$(( ${tally["$mb MB exit $code"]:-0} + 1 ))
+              if [ "$code" != 2 ]; then
+                cp /tmp/out/err.txt "/tmp/out/fail-$i-${mb}mb-exit$code.txt"
+              fi
+            done
+          done
+          for k in "${!tally[@]}"; do echo "$k: ${tally[$k]}"; done | sort | tee /tmp/out/tally.txt
+          n=0
+          for core in /tmp/cores/core.*; do
+            [ -e "$core" ] || continue
+            n=$((n + 1)); [ $n -le 5 ] || break
+            gdb -batch -q -ex 'info threads' -ex 'thread apply all bt' "$bin" "$core" > "/tmp/out/bt-$n.txt" 2>&1 || true
+            echo "== core $n"; grep -m 60 -E '^#|^Thread|^\*' "/tmp/out/bt-$n.txt" || true
+          done
+          echo "cores: $(ls /tmp/cores | wc -l)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: t0090-${{ matrix.os }}
+          path: /tmp/out
+          retention-days: 7
