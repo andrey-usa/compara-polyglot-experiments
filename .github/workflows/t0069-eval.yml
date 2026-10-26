@@ -166,6 +166,7 @@ jobs:
       - name: encrypt results (encrypt-then-MAC; public key only, no secrets here)
         if: always()
         run: |
+          umask 077  # symkey/tarball/iv unreadable even to the bench uid during the encrypt window
           cd experiments/bench/t0069
           mkdir -p /tmp/upload
           tar czf "/tmp/${RUNTAG}.tar.gz" "out/${RUNTAG}"
