@@ -1,0 +1,6 @@
+id,name,note,amount,tag,pad
+k1,Alpha,plain,10.0,x,  
+k2,CAFÉ,same,20.0,y,  
+k3,,left,30.0,z,  
+k4,Delta,Crème,40.0,w,p
+k5,naïve,gone,50.0,v,p

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/andrey-usa/compara/docs/contract.schema.json",
+  "title": "compara result contract",
+  "description": "What every port writes to --json. `counts` and `columns` are the contract: all four ports must return them identically on the same input. Everything else (`meta`, row samples) is a per-port extra and is allowed but never required. The arithmetic that must also hold is checked by scripts/contract.py, because JSON Schema cannot express it.",
+  "type": "object",
+  "required": ["counts", "columns"],
+  "properties": {
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "a_rows", "b_rows", "a_keys", "b_keys",
+        "matched", "unchanged", "changed", "added", "removed",
+        "a_dup_keys", "a_dup_rows", "b_dup_keys", "b_dup_rows"
+      ],
+      "properties": {
+        "a_rows": { "type": "integer", "minimum": 0 },
+        "b_rows": { "type": "integer", "minimum": 0 },
+        "a_keys": { "type": "integer", "minimum": 0 },
+        "b_keys": { "type": "integer", "minimum": 0 },
+        "matched": { "type": "integer", "minimum": 0 },
+        "unchanged": { "type": "integer", "minimum": 0 },
+        "changed": { "type": "integer", "minimum": 0 },
+        "added": { "type": "integer", "minimum": 0 },
+        "removed": { "type": "integer", "minimum": 0 },
+        "a_dup_keys": { "type": "integer", "minimum": 0 },
+        "a_dup_rows": { "type": "integer", "minimum": 0 },
+        "b_dup_keys": { "type": "integer", "minimum": 0 },
+        "b_dup_rows": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "columns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "changed", "blanked", "filled"],
+        "properties": {
+          "name": { "type": "string" },
+          "changed": { "type": "integer", "minimum": 0 },
+          "blanked": { "type": "integer", "minimum": 0 },
+          "filled": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "meta": { "type": "object" }
+  }
+}

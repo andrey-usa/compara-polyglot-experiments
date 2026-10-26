@@ -1,0 +1,67 @@
+diff --git a/src/engine/turbo.rs b/src/engine/turbo.rs
+index ccc3ed2..d4b4cac 100644
+--- a/src/engine/turbo.rs
++++ b/src/engine/turbo.rs
+@@ -380,6 +380,48 @@ fn hash_field(slab: &Slab, f: Field, opt: &Options, normalise: bool, seed: u64)
+     (h ^ len).wrapping_mul(PRIME)
+ }
+ 
++/// Each occupied slot's row becomes its key's position: the marks in `words`
++/// before the row, which is `before` for the whole words and a popcount for the
++/// rest.
++///
++/// That is one popcount per key, ten million of them at 10M rows, and a baseline
++/// x86-64 build has no POPCNT instruction: `count_ones` becomes a dozen
++/// instructions instead of one. So, as the row parse does for AVX2, the loop is
++/// compiled a second time for POPCNT and chosen once per call where the CPU has
++/// it -- every x86-64 CPU since 2008 does. A build for such a CPU compiles the
++/// one loop.
++fn rows_to_positions(part: &mut [u32], pos_mask: u32, words: &[u64], before: &[u32]) {
++    #[cfg(all(target_arch = "x86_64", not(target_feature = "popcnt")))]
++    if std::arch::is_x86_feature_detected!("popcnt") {
++        // Safety: the CPU has POPCNT, which is all the copy assumes.
++        return unsafe { rows_to_positions_popcnt(part, pos_mask, words, before) };
++    }
++    rows_to_positions_with(part, pos_mask, words, before)
++}
++
++/// [`rows_to_positions_with`] compiled for POPCNT.
++///
++/// # Safety
++/// The CPU has POPCNT.
++#[cfg(all(target_arch = "x86_64", not(target_feature = "popcnt")))]
++#[target_feature(enable = "popcnt")]
++unsafe fn rows_to_positions_popcnt(part: &mut [u32], pos_mask: u32, words: &[u64], before: &[u32]) {
++    rows_to_positions_with(part, pos_mask, words, before)
++}
++
++#[inline(always)]
++fn rows_to_positions_with(part: &mut [u32], pos_mask: u32, words: &[u64], before: &[u32]) {
++    for word in part.iter_mut() {
++        if *word != EMPTY_SLOT {
++            let row = ((*word & pos_mask) - 1) as usize;
++            let w = row >> 6;
++            let below = words[w] & ((1u64 << (row & 63)) - 1);
++            let position = (before[w] + below.count_ones()) as usize;
++            *word = (*word & !pos_mask) | (position as u32 + 1);
++        }
++    }
++}
++
+ fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u64 {
+     let mut h = 0xcbf2_9ce4_8422_2325;
+     // Hoisted from per-field: the options do not change mid-sweep.
+@@ -1042,12 +1084,7 @@ impl RowIndex {
+                     .ok()
+                     .and_then(|mut p| p.take())
+                     .ok_or_else(|| Error::new("an index region taken twice"))?;
+-                for word in part.iter_mut() {
+-                    if *word != EMPTY_SLOT {
+-                        let row = ((*word & pos_mask) - 1) as usize;
+-                        *word = (*word & !pos_mask) | (position(row) as u32 + 1);
+-                    }
+-                }
++                rows_to_positions(part, pos_mask, &words, &before);
+                 Ok(())
+             });
+             for d in done {

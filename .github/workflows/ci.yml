@@ -1,0 +1,121 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: python3 -m py_compile scripts/*.py packaging/*.py
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - run: cargo test --locked --release
+
+  # A small end-to-end run: generate a pair, compare it with every engine,
+  # require identical counts and column statistics, and check the report
+  # needs nothing from the network.
+  end-to-end:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - run: cargo build --locked --release --all-features
+      - name: Generate 200k rows a side
+        run: ./target/release/compara-gen-data --rows 200k --out-dir data
+      - name: Every engine gives the same answer
+        run: |
+          for e in turbo sortmerge native; do
+            code=0
+            ./target/release/compara compare data/200k_a.csv data/200k_b.csv \
+              -k account_id,txn_id -i updated_at --engine $e \
+              -o /tmp/$e.html --json /tmp/$e.json || code=$?
+            [ "$code" = 1 ] || { echo "::error::$e exited $code, expected 1 (differences found)"; exit 1; }
+          done
+          python3 - <<'PY'
+          import json, sys
+          engines = ["turbo", "sortmerge", "native"]
+          ref = json.load(open(f"/tmp/{engines[0]}.json"))
+          for e in engines[1:]:
+              n = json.load(open(f"/tmp/{e}.json"))
+              for section in ("counts", "columns"):
+                  if n[section] != ref[section]:
+                      sys.exit(f"{e} {section} differ from {engines[0]}: {n[section]} vs {ref[section]}")
+          print(f"all {len(engines)} engines agree:", json.dumps(ref["counts"]))
+          PY
+      - name: The report is self-contained
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          html = open("/tmp/turbo.html", encoding="utf-8").read()
+          external = re.search(r'(?:src|href)="(?!#)([^"]+)"', html)
+          if external:
+              sys.exit(f"report references an external resource: {external.group(1)}")
+          print(f"report: {len(html) // 1024} KB, no external references")
+          PY
+      - name: Benchmark harness, 10k rows
+        run: ./target/release/compara-bench --rows 10k --engine turbo --out-dir bench
+
+  # Known-vulnerable dependencies (RustSec advisory database).
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny warnings
+
+  # The oldest Rust that builds compara (rust-version in Cargo.toml).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: cargo check --locked --all-targets

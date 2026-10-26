@@ -1,0 +1,26 @@
+[package]
+name = "compara-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+[package.metadata]
+cargo-fuzz = true
+[dependencies]
+libfuzzer-sys = "0.4"
+compara = { path = ".." }
+[[bin]]
+name = "text_compare"
+path = "fuzz_targets/text_compare.rs"
+test = false
+doc = false
+[[bin]]
+name = "parquet_compare"
+path = "fuzz_targets/parquet_compare.rs"
+test = false
+doc = false
+[[bin]]
+name = "delta_log"
+path = "fuzz_targets/delta_log.rs"
+test = false
+doc = false
+[workspace]
