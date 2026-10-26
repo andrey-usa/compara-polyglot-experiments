@@ -55,7 +55,7 @@ jobs:
         run: |
           npm --prefix docs-site/starlight ci
           npm --prefix docs-site/starlight run build
-      - name: Link check (no allowlist: 0 broken)
+      - name: 'Link check (no allowlist: 0 broken)'
         run: python3 docs-site/check-links.py docs-site/starlight/dist
       - name: Axe and Pagefind search checks
         env:
