@@ -1,1 +1,1 @@
-run-arm: 20261026T043843Z scope: 12 tasks x 3 trials x 2 arms, 2 slices per arm (retry after build-step fix)
+run-arm: 20261026T110830Z scope: 12 tasks x 3 trials x 2 arms, 2 slices per arm (owner-approved retry 2026-10-26 07:07 ET, after two pre-trial CI failures; fixes validated at zero spend)
