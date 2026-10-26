@@ -1,0 +1,13 @@
+=== phase probe 2026-10-26T23:13:58Z run 40418305427 attempt 1
+head c33c97a64160521eb17e6c7e6797dac62df93eb9 branch t0047-publish repo andrey-usa/compara-polyglot-experiments
+queue: publish/jobs/01-miniwob-cell1.txt 
+gh: /usr/bin/gh gh version 2.102.0 (2026-09-30)
+token chars: 377
+$ gh auth status
+github.com
+  ✓ Logged in to github.com account github-actions[bot] (GH_TOKEN)
+  - Active account: true
+  - Git operations protocol: https
+  - Token: ghs_*************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************
+[gh-auth exit 0]
+remote: https://github.com/andrey-usa/compara-polyglot-experiments
