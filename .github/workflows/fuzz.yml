@@ -62,10 +62,14 @@ jobs:
       - name: fuzz (30 min)
         working-directory: ${{ matrix.product }}/fuzz
         run: |
+          # NOTE: this step runs under bash -e, so a plain failing command
+          # aborts the script before the log-copy lines below run. The
+          # cargo invocation must therefore be in an OR list (exempt from
+          # -e) for its log to survive a crash, hang or build failure.
+          code=0
           cargo +nightly fuzz run --fuzz-dir . ${{ matrix.target }} "corpus/${{ matrix.target }}" -- \
             -max_total_time=1800 -rss_limit_mb=2048 -timeout=10 -max_len=65536 \
-            -artifact_prefix="$PWD/artifacts/" > "fuzz-${{ matrix.target }}.log" 2>&1
-          code=$?
+            -artifact_prefix="$PWD/artifacts/" > "fuzz-${{ matrix.target }}.log" 2>&1 || code=$?
           tail -40 "fuzz-${{ matrix.target }}.log" > artifacts/run-summary.txt || true
           cp "fuzz-${{ matrix.target }}.log" artifacts/ || true
           exit $code
@@ -77,4 +81,5 @@ jobs:
           path: |
             ${{ matrix.product }}/fuzz/corpus/${{ matrix.target }}
             ${{ matrix.product }}/fuzz/artifacts
+            ${{ matrix.product }}/fuzz/fuzz-${{ matrix.target }}.log
           retention-days: 30
