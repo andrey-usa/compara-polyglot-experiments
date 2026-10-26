@@ -9,6 +9,9 @@ name: Docs site comparison
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - experiment-37
 
 permissions:
   contents: read
