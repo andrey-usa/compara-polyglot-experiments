@@ -412,10 +412,11 @@ _WRITE_TARGET_RE = re.compile(
 
 def salvage_partial_solution(arm, workdir, commands):
     """T-0091: when the agent never produced a runnable solution file (turn budget
-    exhausted, or no-command termination), materialize the most recent solution
-    content the model tried to write (heredoc body or redirect target) so scoring
-    sees the attempt. Never overwrites an existing non-empty solution file.
-    Returns the source turn number, or None."""
+    exhausted, or no-command termination), extract the most recent solution
+    content the model tried to write (heredoc body whose command targets the
+    solution file) into a SEPARATE diagnostic file. The scored solution file is
+    never created or modified here: the primary score always reflects the file
+    the agent actually left. Returns (source_turn, salvaged_path), or None."""
     sol = solution_name(arm)
     path = os.path.join(workdir, sol)
     if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -430,9 +431,10 @@ def salvage_partial_solution(arm, workdir, commands):
         if m and target.search(cmd):
             body = m.group(2)
             if body.strip():
-                with open(path, "w") as f:
+                spath = os.path.join(workdir, "salvaged-partial-" + sol)
+                with open(spath, "w") as f:
                     f.write(body + "\n")
-                return entry.get("turn")
+                return (entry.get("turn"), spath)
     return None
 
 def run_trial(arm, task_id, trial, args, ledger, site):
@@ -507,19 +509,18 @@ def run_trial(arm, task_id, trial, args, ledger, site):
                 messages.append({"role": "assistant", "content": text})
                 messages.append({"role": "user", "content":
                     f"Command output (truncated):\n{(r.stdout + r.stderr)[:3000]}"})
-        # T-0091: if the agent left no runnable solution file, materialize the most
-        # recent attempted write so scoring sees the attempt. The episode records
-        # where the scored solution came from (agent file vs salvaged partial) -
-        # a salvaged partial is the model's own un-run content, not a harness edit.
-        if not args.self_test:
-            salv = salvage_partial_solution(arm, workdir, rec.get("commands", []))
-            rec["solution_origin"] = (f"salvaged-partial-turn-{salv}" if salv else
-                                      ("missing" if salv is None and not (
-                                          os.path.exists(os.path.join(workdir, solution_name(arm)))
-                                          and os.path.getsize(os.path.join(workdir, solution_name(arm))) > 0)
-                                       else "agent-file"))
         # Scoring (harness-side; no model): pass on the trial's site config, then
         # must FAIL with the task's feature broken on top of the same config.
+        # T-0091: the PRIMARY score is unchanged - it evaluates exactly the
+        # solution file the agent left (solution_origin records agent-file vs
+        # missing). A salvaged partial, when one exists, is scored SEPARATELY as
+        # a labeled diagnostic (rec["salvage"]); it never feeds the primary
+        # score. Raw commands, outputs and the untouched workdir stay in the
+        # episode/workdir so both interpretations remain auditable.
+        sol_path = os.path.join(workdir, solution_name(arm))
+        if not args.self_test:
+            rec["solution_origin"] = ("agent-file" if os.path.exists(sol_path)
+                                      and os.path.getsize(sol_path) > 0 else "missing")
         ok1, tail1 = run_solution(arm, workdir, base_url, args.primavera_bin, args)
         rec["pass_clean"] = ok1
         rec["clean_tail"] = tail1[-400:]
@@ -528,6 +529,22 @@ def run_trial(arm, task_id, trial, args, ledger, site):
         rec["pass_broken"] = ok2
         rec["broken_tail"] = tail2[-400:]
         rec["score"] = 1 if (ok1 and not ok2) else 0
+        if not args.self_test and rec.get("solution_origin") == "missing":
+            salv = salvage_partial_solution(arm, workdir, rec.get("commands", []))
+            if salv:
+                turn_s, spath = salv
+                sdir = workdir + "-salvage"
+                setup_workdir(arm, sdir, args)
+                shutil.copy(spath, os.path.join(sdir, solution_name(arm)))
+                chown_workdir(sdir, args)
+                site.start(change=change)
+                s_ok1, s_tail1 = run_solution(arm, sdir, site.url(), args.primavera_bin, args)
+                site.start(change=change, broken=broken)
+                s_ok2, s_tail2 = run_solution(arm, sdir, site.url(), args.primavera_bin, args)
+                rec["salvage"] = {"diagnostic": True, "source_turn": turn_s,
+                                  "pass_clean": s_ok1, "pass_broken": s_ok2,
+                                  "score": 1 if (s_ok1 and not s_ok2) else 0,
+                                  "clean_tail": s_tail1[-400:], "broken_tail": s_tail2[-400:]}
     except AuthFatal:
         raise
     except (EpisodeWallCap, BudgetStop) as e:

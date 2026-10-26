@@ -47,14 +47,18 @@ class TestSalvage(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
 
-    def test_materializes_last_heredoc_write(self):
+    def test_materializes_last_heredoc_write_to_separate_file(self):
         cmds = [
             {"turn": 3, "cmd": "cat > solution.pv <<'EOF'\nbase $BASE_URL\nold\nEOF"},
             {"turn": 5, "cmd": "cat > solution.pv <<'EOF'\nbase $BASE_URL\nnew\nEOF"},
         ]
-        turn = H.salvage_partial_solution("primavera", self.dir, cmds)
+        turn, spath = H.salvage_partial_solution("primavera", self.dir, cmds)
         self.assertEqual(turn, 5)
-        with open(os.path.join(self.dir, "solution.pv")) as f:
+        # the scored solution path stays untouched (primary score keeps
+        # executed-file semantics); the partial is a separate diagnostic file
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "solution.pv")))
+        self.assertEqual(os.path.basename(spath), "salvaged-partial-solution.pv")
+        with open(spath) as f:
             self.assertIn("new", f.read())
 
     def test_never_overwrites_existing_solution(self):
