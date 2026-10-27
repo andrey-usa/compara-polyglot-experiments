@@ -129,7 +129,7 @@ jobs:
         run: python3 experiments/bench/t0069/preflight-check.py --arm ${{ matrix.arm }} --out /opt/t0069/out
 
   cell:
-    needs: [build, preflight]
+    needs: [plan, build, preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 360
     environment: main
