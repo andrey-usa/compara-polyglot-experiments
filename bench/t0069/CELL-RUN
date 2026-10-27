@@ -1,0 +1,4 @@
+Owner go received 2026-10-27 11:27Z for the 1024-vs-4096 output-cap cell.
+This file arms one run of t0096-cell.yml as committed (CELL.json: W4,W5,W2,R3,
+3 trials, both arms, max_tokens 1024 and 4096). The plan job prints the
+computed worst-case reserve before any paid job starts.
