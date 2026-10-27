@@ -1,0 +1,227 @@
+# T-0096 measure-first cell (experiment-45). PAID when armed: same prompts, two
+# output-token caps (1024 vs 4096) on the stall-heavy tasks. Armed ONLY by a push
+# that touches bench/t0069/CELL-RUN - one sentinel push per owner-approved run,
+# exactly like t0069-eval.yml's RUN sentinel. The CELL-RUN file is deliberately
+# ABSENT from this branch: committing it is the armed act and requires the owner's
+# go (see the T-0096 report for the reserve figure to approve).
+#
+# PRIVACY / ISOLATION / ACCOUNTING: identical model to t0069-eval.yml (status-only
+# logs, encrypt-then-MAC artifacts, benchr restricted user, WAL reserve/settle).
+# The harness reads the output-token cap from BENCH_MAX_TOKENS (default 1024, the
+# round-2 value), records it per episode and in the run summary, and prints its
+# own RESERVE-CEILING line before its first request.
+name: T-0096 measure-first cell
+permissions:
+  contents: read
+on:
+  push:
+    branches: [experiment-45]
+    paths: [bench/t0069/CELL-RUN]
+  workflow_dispatch:  # only resolves on the default branch; harmless here
+
+jobs:
+  plan:
+    # Zero spend: reads CELL.json, emits the matrix, prints the worst-case reserve
+    # for the WHOLE cell before any paid job is allowed to start.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.cfg.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: experiments, persist-credentials: false }
+      - id: cfg
+        run: |
+          cd experiments/bench/t0069
+          python3 - <<'PYEOF'
+          import json
+          cfg = json.load(open("CELL.json"))
+          tasks = [t.strip() for t in cfg["tasks"].split(",") if t.strip()]
+          PRICE_IN, PRICE_OUT, CTX_MAX = 0.15, 0.60, 1_049_000  # harness constants
+          total = 0.0
+          legs = []
+          for arm in cfg["arms"]:
+              for mt in cfg["max_tokens"]:
+                  mt = int(mt)
+                  req_max = CTX_MAX * PRICE_IN / 1e6 + mt * PRICE_OUT / 1e6
+                  worst = len(tasks) * cfg["trials"] * cfg["max_turns"] * req_max
+                  total += worst
+                  legs.append({"arm": arm, "max_tokens": str(mt)})
+                  print(f"CELL-LEG {arm} max_tokens={mt}: tasks={len(tasks)} "
+                        f"trials={cfg['trials']} max_turns={cfg['max_turns']} "
+                        f"req_max_usd={req_max:.5f} worst_case=${worst:.2f}")
+          print(f"CELL-RESERVE-CEILING total worst_case=${total:.2f} computed_not_billed "
+                f"({len(legs)} legs x {len(tasks)} tasks x {cfg['trials']} trials x "
+                f"{cfg['max_turns']} turns)")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": legs}) + "\n")
+          PYEOF
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: andrey-usa/primavera, ref: 7026c8031967e0fa146b04e2f2a6e2092e359302, path: primavera, persist-credentials: false }
+      - uses: actions/checkout@v4
+        with: { repository: andrey-usa/navigera, ref: cc300d30f2fa72896c522fadc50293db7a38bdc7, path: navigera, persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { shared-key: t0069, workspaces: primavera }
+      - name: build primavera (navigera is compiled in) at the round-2 pins
+        run: |
+          cargo build --release --manifest-path primavera/Cargo.toml
+          ./primavera/target/release/primavera --version
+          sha256sum primavera/target/release/primavera
+      - uses: actions/upload-artifact@v4
+        with: { name: primavera-bin, path: primavera/target/release/primavera, retention-days: 1 }
+
+  preflight:
+    # Zero model spend: seeded-solution self-test through the restricted-user path
+    # on both arms. Gates the paid cell exactly as in t0069-eval.yml.
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [primavera, playwright]
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: experiments, persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: primavera-bin, path: bin }
+      - run: chmod 755 bin bin/primavera
+      - name: create restricted bench user
+        run: sudo useradd benchr || true
+      - name: stage bench tree outside runner home
+        run: |
+          sudo mkdir -p /opt/t0069
+          sudo cp -a bin /opt/t0069/bin
+          sudo cp -a experiments/bench/t0069 /opt/t0069/bench
+          sudo chmod -R a+rX /opt/t0069
+          sudo chown -R runner:runner /opt/t0069
+      - name: arm B toolchain (playwright, shared browser path)
+        if: matrix.arm == 'playwright'
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+        run: |
+          sudo mkdir -p /opt/pw-browsers && sudo chmod 777 /opt/pw-browsers
+          sudo mkdir -p /opt/t0069/pw && sudo chown runner:runner /opt/t0069/pw
+          cd /opt/t0069/pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test@1.64.1 >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null 2>&1
+          sudo chmod -R a+rX /opt/pw-browsers /opt/t0069/pw
+          echo "pw ready: $(npx playwright --version)"
+      - name: self-test via restricted user (stdout to file; status lines only)
+        env:
+          ARM: ${{ matrix.arm }}
+          PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+        run: |
+          cd /opt/t0069/bench
+          sudo mkdir -p /opt/t0069/out && sudo chown runner:runner /opt/t0069/out
+          python3 harness-t0069_run.py --arm "$ARM" --self-test \
+            --as-user benchr \
+            --primavera-bin /opt/t0069/bin/primavera --pw-dir /opt/t0069/pw \
+            --out /opt/t0069/out/preflight-$ARM > /opt/t0069/out/preflight-$ARM.log 2>&1
+          tail -2 /opt/t0069/out/preflight-$ARM.log
+      - name: gate on expected self-test scores
+        run: python3 experiments/bench/t0069/preflight-check.py --arm ${{ matrix.arm }} --out /opt/t0069/out
+
+  cell:
+    needs: [build, preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: main
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+      BENCH_MAX_TOKENS: ${{ matrix.max_tokens }}
+      PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: experiments, persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: primavera-bin, path: bin }
+      - run: chmod 755 bin bin/primavera
+      - name: create restricted bench user
+        run: sudo useradd benchr || true
+      - name: stage bench tree outside runner home
+        run: |
+          sudo mkdir -p /opt/t0069
+          sudo cp -a bin /opt/t0069/bin
+          sudo cp -a experiments/bench/t0069 /opt/t0069/bench
+          sudo chmod -R a+rX /opt/t0069
+          sudo chown -R runner:runner /opt/t0069
+      - name: arm B toolchain (playwright, shared browser path)
+        if: matrix.arm == 'playwright'
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+        run: |
+          sudo mkdir -p /opt/pw-browsers && sudo chmod 777 /opt/pw-browsers
+          sudo mkdir -p /opt/t0069/pw && sudo chown runner:runner /opt/t0069/pw
+          cd /opt/t0069/pw && npm init -y >/dev/null 2>&1 && npm i @playwright/test@1.64.1 >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null 2>&1
+          sudo chmod -R a+rX /opt/pw-browsers /opt/t0069/pw
+          echo "pw ready: $(npx playwright --version)"
+      - name: run cell leg (stdout/stderr to files only)
+        env:
+          ARM: ${{ matrix.arm }}
+        run: |
+          cd /opt/t0069/bench
+          TASKS=$(python3 -c "import json;print(json.load(open('CELL.json'))['tasks'])")
+          TRIALS=$(python3 -c "import json;print(json.load(open('CELL.json'))['trials'])")
+          RUNTAG="cell-${{ github.run_id }}-${{ matrix.arm }}-mt${{ matrix.max_tokens }}"
+          sudo mkdir -p /opt/t0069/out && sudo chown runner:runner /opt/t0069/out
+          mkdir -p "/opt/t0069/out/$RUNTAG"
+          set +e
+          python3 harness-t0069_run.py --arm "$ARM" --tasks "$TASKS" --trials "$TRIALS" \
+            --as-user benchr --wall-budget-minutes 300 \
+            --primavera-bin /opt/t0069/bin/primavera --pw-dir /opt/t0069/pw \
+            --out "/opt/t0069/out/$RUNTAG" --uncapped \
+            > "/opt/t0069/out/$RUNTAG/harness-stdout.log" 2>&1
+          RC=$?
+          set -e
+          echo "$RC" > "/opt/t0069/out/$RUNTAG/exit-code.txt"
+          echo "RUNTAG=$RUNTAG" >> "$GITHUB_ENV"
+          echo "cell leg finished: arm=$ARM max_tokens=$BENCH_MAX_TOKENS (detail stays off the public log)"
+      - name: encrypt results (encrypt-then-MAC; public key only, no secrets here)
+        if: always()
+        run: |
+          umask 077
+          cd /opt/t0069
+          mkdir -p /tmp/upload
+          sudo tar czf "/tmp/${RUNTAG}.tar.gz" \
+            --exclude='*/.config' --exclude='*/.local' --exclude='*/.cache' --exclude='*/.npm/_cacache' \
+            "out/${RUNTAG}"
+          sudo chown $(id -u):$(id -g) "/tmp/${RUNTAG}.tar.gz"
+          head -c 64 /dev/urandom > /tmp/symkey.bin
+          ENCKEYHEX=$(head -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
+          MACKEYHEX=$(tail -c32 /tmp/symkey.bin | od -An -tx1 | tr -d ' \n')
+          head -c16 /dev/urandom > /tmp/iv.bin
+          IVHEX=$(od -An -tx1 /tmp/iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$ENCKEYHEX" -iv "$IVHEX" \
+            -in "/tmp/${RUNTAG}.tar.gz" -out /tmp/cipher.bin
+          cat /tmp/iv.bin /tmp/cipher.bin > "/tmp/upload/${RUNTAG}.tar.gz.enc"
+          openssl pkeyutl -encrypt -pubin -inkey /opt/t0069/bench/ci-results-pub.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/symkey.bin -out "/tmp/upload/${RUNTAG}.symkey.enc"
+          cat "/tmp/upload/${RUNTAG}.symkey.enc" "/tmp/upload/${RUNTAG}.tar.gz.enc" \
+            | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$MACKEYHEX" -binary \
+            > "/tmp/upload/${RUNTAG}.mac"
+          shred -u /tmp/symkey.bin /tmp/iv.bin /tmp/cipher.bin "/tmp/${RUNTAG}.tar.gz"
+          echo "results encrypted (ciphertext + tag only leave this runner)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cell-${{ matrix.arm }}-mt${{ matrix.max_tokens }}
+          path: /tmp/upload/
+          retention-days: 1
+      - name: propagate recorded benchmark result
+        if: always()
+        run: |
+          RC=$(cat "/opt/t0069/out/${RUNTAG}/exit-code.txt" 2>/dev/null || echo 99)
+          echo "cell leg exit code: $RC (decrypted results carry the detail)"
+          exit "$RC"

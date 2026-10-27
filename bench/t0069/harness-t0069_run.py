@@ -25,7 +25,11 @@ Self-test (no model, zero spend; T-0091: every task seeded in both arms):
 import argparse, glob, hashlib, json, os, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request
 
 PRICE_IN, PRICE_CACHED, PRICE_OUT = 0.15, 0.003, 0.60  # $/1M, SiliconFlow deepseek-ai/DeepSeek-V4.1-Flash
-CTX_MAX, MAX_TOKENS = 1_049_000, 1024
+CTX_MAX = 1_049_000
+# T-0096: output-token cap from the environment so a cell can compare caps
+# without a code change. 1024 is the round-2 value. Recorded per episode and
+# in the run summary.
+MAX_TOKENS = int(os.environ.get("BENCH_MAX_TOKENS", "1024"))
 REQ_MAX_USD = CTX_MAX * PRICE_IN / 1e6 + MAX_TOKENS * PRICE_OUT / 1e6  # 0.15796
 OUT_REC_CAP = 8192
 REQUEST_DEADLINE_S = 180
@@ -203,8 +207,18 @@ DSML_RE = re.compile(r"<｜+DSML｜+")
 def extract_command(text):
     m = CMD_RE.search(text)
     if m:
-        return m.group(1).strip().splitlines()[0].strip()
-    for line in text.strip().splitlines():
+        cand = m.group(1).strip().splitlines()[0].strip()
+        # T-0096: never execute a fence marker or an empty line. A truncated
+        # fenced block previously yielded "```bash" as the command (rc 2,
+        # pv W4 t3 turn 26).
+        return "" if (not cand or cand.startswith("```")) else cand
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        # T-0096: truncated fenced block (length cut): no complete command, and
+        # do NOT execute its first inner line either - a bare heredoc opener
+        # would create an empty solution file.
+        return ""
+    for line in stripped.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             return line
@@ -375,6 +389,17 @@ def task_prompt(task_id, arm):
             f"When the test passes, reply with the single command: {DONE_CMD}")
 
 
+def reprompt_empty_length_text():
+    """T-0096: empty content with finish_reason=length means the output budget
+    was exhausted before any visible content (reasoning consumed it). The
+    command-contract re-prompt cannot help an empty reply; this one asks for one
+    short command and chunked file writes."""
+    return ("Your previous reply was empty: the output token budget was exhausted "
+            "before any reply text. Reply with ONE short shell command now, in a "
+            "single fenced block. Write files in small appended chunks "
+            "(printf or cat >> file), never in one long command.")
+
+
 def reprompt_text(arm, attempt):
     """T-0091 stall recovery: attempt 1 is the generic contract reminder;
     attempt 2 repeats the tool's command contract and one minimal worked example."""
@@ -441,6 +466,7 @@ def salvage_partial_solution(arm, workdir, commands):
 def run_trial(arm, task_id, trial, args, ledger, site):
     kind, intent, broken, change, fx, seed = TASKS[task_id]
     rec = {"task": task_id, "kind": kind, "arm": arm, "trial": trial, "turns": 0,
+           "max_tokens": MAX_TOKENS,  # T-0096: the cap this episode ran under
            "done_declared": False, "pass_clean": None, "pass_broken": None, "score": 0,
            "tokens": 0, "cost": 0.0, "wall_s": 0.0, "error": None}
     t0 = time.time()
@@ -482,12 +508,21 @@ def run_trial(arm, task_id, trial, args, ledger, site):
                 if dsml:
                     rec["dsml_turns"] = rec.get("dsml_turns", 0) + 1
                 if kind_r != "command":
+                    empty_length = (text == "" and finish_reason == "length")
                     rec.setdefault("commands", []).append({"turn": turn, "cmd": None,
-                        "model_text": text[:400], "reply_kind": kind_r})
+                        "model_text": text[:400], "reply_kind": kind_r,
+                        "finish_reason": finish_reason})
                     if reprompts < 2:
                         reprompts += 1
+                        if empty_length:
+                            rt = reprompt_empty_length_text()
+                            rk = "empty-length"
+                        else:
+                            rt = reprompt_text(arm, reprompts)
+                            rk = f"contract-{reprompts}"
+                        rec["commands"][-1]["reprompt_sent"] = rk  # T-0096: which re-prompt was sent
                         messages.append({"role": "assistant", "content": text})
-                        messages.append({"role": "user", "content": reprompt_text(arm, reprompts)})
+                        messages.append({"role": "user", "content": rt})
                         continue
                     rec["error"] = f"model produced no command after 2 re-prompts (last: {kind_r})"
                     break
@@ -622,6 +657,12 @@ def main():
     if args.slice_mod > 1:
         tasks = [t for i, t in enumerate(tasks) if i % args.slice_mod == args.slice_index]
         print(f"SLICE {args.slice_index + 1}/{args.slice_mod}: tasks={','.join(tasks)}", flush=True)
+    # T-0096: worst-case reserve for this exact configuration, BEFORE any request.
+    n_trials_planned = len(tasks) * args.trials
+    worst = n_trials_planned * args.max_turns * REQ_MAX_USD
+    print(f"RESERVE-CEILING tasks={len(tasks)}({','.join(tasks)}) trials={args.trials} "
+          f"max_turns={args.max_turns} max_tokens={MAX_TOKENS} req_max_usd={REQ_MAX_USD:.5f} "
+          f"worst_case=${worst:.2f} computed_not_billed", flush=True)
     skip = {p.strip() for p in args.skip.split(",") if p.strip()}
     site = Site(args.site_dir, args.port)
     jpath = os.path.join(args.out, f"t0069-episodes-{RUN_ID}.jsonl")
@@ -657,7 +698,7 @@ def main():
         print(f"DRAIN: wall budget reached; {len(drained)} trials deferred "
               f"(resume this slice in a later dispatch; every trial runs exactly once). "
               f"deferred={','.join(drained)} file={dpath}", flush=True)
-    print(f"ledger: computed=${ledger['cost']:.4f} retained=${ledger['retained']:.4f} "
+    print(f"ledger: max_tokens={MAX_TOKENS} computed=${ledger['cost']:.4f} retained=${ledger['retained']:.4f} "
           f"requests={ledger['requests']} tokens={ledger['tokens']}")
 
 if __name__ == "__main__":
