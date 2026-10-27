@@ -2,7 +2,12 @@
   "tasks": "W4,W5,W2,R3",
   "trials": 3,
   "max_turns": 30,
-  "arms": ["primavera", "playwright"],
-  "max_tokens": ["1024", "4096"],
-  "note": "T-0096 measure-first cell: same prompts, 1024 vs 4096 output-token cap. Armed ONLY by a push touching bench/t0069/CELL-RUN after owner approval. Worst-case reserve is printed by the plan job before any paid job starts."
+  "arms": [
+    "primavera",
+    "playwright"
+  ],
+  "max_tokens": [
+    "4096"
+  ],
+  "note": "Measure-first cell: same prompts, output-token cap 4096 (the round-4 default). Armed ONLY by a push touching bench/t0069/CELL-RUN after owner approval. Worst-case reserve is printed by the plan job before any paid job starts."
 }

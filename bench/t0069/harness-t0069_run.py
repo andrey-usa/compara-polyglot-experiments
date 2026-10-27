@@ -209,16 +209,22 @@ DSML_RE = re.compile(r"<｜+DSML｜+")
 def extract_command(text):
     m = CMD_RE.search(text)
     if m:
-        cand = m.group(1).strip().splitlines()[0].strip()
-        # T-0096: never execute a fence marker or an empty line. A truncated
-        # fenced block previously yielded "```bash" as the command (rc 2,
-        # pv W4 t3 turn 26).
-        return "" if (not cand or cand.startswith("```")) else cand
+        # The WHOLE fenced block is the command (multi-line: heredocs, grouped
+        # writes). The first-line-only rule amputated heredocs and forced
+        # agents into one-line printf rewrites.
+        block = m.group(1).strip("\n")
+        first = block.splitlines()[0].strip() if block.splitlines() else ""
+        # Never execute a fence marker or an empty block. A truncated fenced
+        # block previously yielded "```bash" as the command (rc 2).
+        return "" if (not first or first.startswith("```")) else block
     stripped = text.strip()
     if stripped.startswith("```"):
-        # T-0096: truncated fenced block (length cut): no complete command, and
-        # do NOT execute its first inner line either - a bare heredoc opener
+        # Truncated fenced block (length cut): no complete command, and do
+        # NOT execute its first inner line either - a bare heredoc opener
         # would create an empty solution file.
+        return ""
+    if DSML_RE.search(stripped):
+        # Tool-call markup is not a shell command; never execute its lines.
         return ""
     for line in stripped.splitlines():
         line = line.strip()
@@ -227,9 +233,11 @@ def extract_command(text):
     return ""
 
 def classify_reply(text):
-    """kind 'command': a runnable first-line extraction exists. Any shell command
-    goes (T-0069 is a shell-tool bench; there is no single-tool invoke prefix).
-    Otherwise commandless variants -> re-prompt (cap 2 consecutive)."""
+    """kind 'command': a runnable extraction exists (the whole fenced block, or
+    one unfenced line). Any shell command goes (this is a shell-tool bench;
+    there is no single-tool invoke prefix). DSML markup alone is never
+    executed: it classifies as dsml_nocommand. Otherwise commandless variants
+    -> re-prompt (cap 2 consecutive)."""
     dsml = bool(DSML_RE.search(text))
     cand = extract_command(text)
     if cand:
@@ -402,6 +410,13 @@ def reprompt_empty_length_text():
             "(printf or cat >> file), never in one long command.")
 
 
+def reprompt_dsml_text():
+    """DSML markup is never executed; say so once, plainly."""
+    return ("Your reply was tool-call markup, not a shell command: no tool-call "
+            "markup; one fenced shell block. Reply with EXACTLY ONE shell "
+            "command in a single fenced block and nothing else.")
+
+
 def reprompt_text(arm, attempt):
     """T-0091 stall recovery: attempt 1 is the generic contract reminder;
     attempt 2 repeats the tool's command contract and one minimal worked example."""
@@ -519,6 +534,10 @@ def run_trial(arm, task_id, trial, args, ledger, site):
                         if empty_length:
                             rt = reprompt_empty_length_text()
                             rk = "empty-length"
+                        elif kind_r == "dsml_nocommand" and reprompts == 1:
+                            rt = reprompt_dsml_text()
+                            rk = "dsml"
+                            rec["dsml_nocommand"] = rec.get("dsml_nocommand", 0) + 1
                         else:
                             rt = reprompt_text(arm, reprompts)
                             rk = f"contract-{reprompts}"
@@ -536,13 +555,21 @@ def run_trial(arm, task_id, trial, args, ledger, site):
                     break
                 env = agent_env(arm, base_url, args)
                 pre = as_user_prefix(args, env, workdir)
+                # The whole block runs as one script, so heredocs and grouped
+                # writes survive; the file stays in the workdir for audit.
+                script = os.path.join(workdir, f".bench-turn-{turn}.sh")
+                with open(script, "w") as fh:
+                    fh.write(cmd + "\n")
+                os.chmod(script, 0o755)
                 if pre:
-                    r = subprocess.run(pre + ["bash", "-c", cmd], capture_output=True, text=True,
+                    r = subprocess.run(pre + ["bash", os.path.basename(script)],
+                                       capture_output=True, text=True,
                                        timeout=min(CMD_TIMEOUT_S, rem()), cwd=workdir)
                 else:
-                    r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                    r = subprocess.run(["bash", script], capture_output=True, text=True,
                                        timeout=min(CMD_TIMEOUT_S, rem()), cwd=workdir, env=env)
-                rec.setdefault("commands", []).append({"turn": turn, "cmd": cmd, "rc": r.returncode,
+                rec.setdefault("commands", []).append({"turn": turn, "cmd": cmd,
+                    "lines": cmd.count("\n") + 1, "rc": r.returncode,
                     "out": (r.stdout + r.stderr)[:OUT_REC_CAP], "finish_reason": finish_reason})
                 messages.append({"role": "assistant", "content": text})
                 messages.append({"role": "user", "content":
