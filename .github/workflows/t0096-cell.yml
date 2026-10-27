@@ -34,7 +34,7 @@ jobs:
         run: |
           cd experiments/bench/t0069
           python3 - <<'PYEOF'
-          import json
+          import json, os
           cfg = json.load(open("CELL.json"))
           tasks = [t.strip() for t in cfg["tasks"].split(",") if t.strip()]
           PRICE_IN, PRICE_OUT, CTX_MAX = 0.15, 0.60, 1_049_000  # harness constants
