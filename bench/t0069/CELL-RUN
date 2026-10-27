@@ -1,8 +1,7 @@
-Owner go received 2026-10-27 16:03Z for a third attempt at the 1024-vs-4096
-output-cap cell. The first attempt stopped in the plan job (a missing import),
-the second when the cell job's matrix came out empty (the job didn't list plan
-among its needs). Neither made a model call. Both fixes are in the commits
-before this one, and actionlint passes the workflow. This file arms one run of
+Owner go received 2026-10-27 21:05Z for one attempt of the round-4 cell.
+Since round 3 the harness runs each reply's whole fenced block as one script
+(a heredoc used to arrive cut to its first line) and re-prompts tool-call
+markup instead of running it as shell. This file arms one run of
 t0096-cell.yml as committed (CELL.json: W4,W5,W2,R3, 3 trials, both arms,
-max_tokens 1024 and 4096). The plan job prints the computed worst-case
-reserve ($228.80) before any paid job starts.
+max_tokens 4096). The plan job prints the computed worst-case reserve
+($115.06) before any paid job starts.
