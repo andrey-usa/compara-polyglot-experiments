@@ -1,7 +1,9 @@
-Owner go received 2026-10-27 21:05Z for one attempt of the round-4 cell.
-Since round 3 the harness runs each reply's whole fenced block as one script
-(a heredoc used to arrive cut to its first line) and re-prompts tool-call
-markup instead of running it as shell. This file arms one run of
-t0096-cell.yml as committed (CELL.json: W4,W5,W2,R3, 3 trials, both arms,
-max_tokens 4096). The plan job prints the computed worst-case reserve
-($115.06) before any paid job starts.
+Owner go received 2026-10-28 00:42Z for one attempt of the round-5 cell.
+Round 5 repeats round 4 (CELL.json: W4,W5,W2,R3, 3 trials, both arms,
+max_tokens 4096) on primavera next f29f368 with navigera next bc99d74
+compiled in: the rewritten agent skill (5341 B, sha256 dd42592f...), the
+print step, eval with statements and await, and lint that refuses what
+would fail only in the run. The harness now prices the cache hits the
+provider reports (cost_cached) beside the uncached bound the spend cap
+counts. This file arms one run of t0096-cell.yml as committed. The plan
+job prints the computed worst-case reserve before any paid job starts.
