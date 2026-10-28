@@ -20,8 +20,8 @@ the task's v2 eval script as the judge (pass = "SUCCESS" in stdout).
   gocalendar-4/6/8, gomail-1/2/4, marrisuite-8, networkin-1/5/6,
   omnizon-3/9/13, opendining-1/2/4, staynb-1/4/5, topwork-2/3/4,
   udriver-2/3/4, zilloft-2/3/5.
-- navigera: built in CI from the experiment-17 candidate tree @
-  e9c1b57 in full (the 0.6 candidate lineage); the system prompt reads
+- navigera: built in CI from the public navigera repo `next` branch @
+  575564eea8e56ef49ce2af91e26574b7edb1b752 in full; the system prompt reads
   the skill the built binary installs.
 - agent-browser: npm agent-browser@0.39.1 (same as the MiniWoB++ run).
 - Model: deepseek-ai/DeepSeek-V4.1-Flash via SiliconFlow

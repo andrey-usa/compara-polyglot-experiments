@@ -10,16 +10,11 @@ name: real-eval
 # default $2.49); two cells fit the $5 combined budget. Computed cost
 # is usage x listed prices, not provider-billed spend.
 #
-# Navigera is built from the experiment-17 candidate tree @ e9c1b57 in
-# full (ancestry-checked); agent-browser is npm agent-browser@0.39.1.
+# Navigera is built from the public navigera repo `next` branch @ 575564eea8e56ef49ce2af91e26574b7edb1b752 in
+# full; agent-browser is npm agent-browser@0.39.1.
 # No account, no key in any file or log, no leaderboard submission.
 
 on:
-  push:
-    branches: [experiment-27]
-    paths:
-      - bench/real/**
-      - .github/workflows/real-eval.yml
   workflow_dispatch:
     inputs:
       tools:
@@ -37,6 +32,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: real-eval-experiment-50
+  cancel-in-progress: true
 
 jobs:
   eval:
@@ -67,20 +66,21 @@ jobs:
         if: matrix.tool == 'agent-browser'
         with:
           node-version: 24
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: matrix.tool == 'navigera'
+        with:
+          repository: andrey-usa/navigera
+          ref: 575564eea8e56ef49ce2af91e26574b7edb1b752
+          path: nav-src
       - name: Build navigera (release)
         if: matrix.tool == 'navigera'
         run: |
-          git fetch --depth 10 origin experiment-17
-          git merge-base --is-ancestor e9c1b57 FETCH_HEAD
-          mkdir -p "$RUNNER_TEMP/nav-build"
-          git archive e9c1b57 navigera | tar -x -C "$RUNNER_TEMP/nav-build"
-          mv "$RUNNER_TEMP/nav-build/navigera" "$RUNNER_TEMP/nav-build/src"
-          echo "candidate provenance: $(git rev-parse e9c1b57)"
-          cd "$RUNNER_TEMP/nav-build/src"
+          echo "navigera pin: 575564eea8e56ef49ce2af91e26574b7edb1b752"
+          cd "$GITHUB_WORKSPACE/nav-src"
           cargo build --release --locked --bin navigera
-          echo "NAV_BIN=$RUNNER_TEMP/nav-build/src/target/release/navigera" >> "$GITHUB_ENV"
-          "$RUNNER_TEMP/nav-build/src/target/release/navigera" --version
-          "$RUNNER_TEMP/nav-build/src/target/release/navigera" install-skill --dir "$RUNNER_TEMP/skills"
+          echo "NAV_BIN=$PWD/target/release/navigera" >> "$GITHUB_ENV"
+          ./target/release/navigera --version
+          ./target/release/navigera install-skill --dir "$RUNNER_TEMP/skills"
           echo "NAVIGERA_SKILL_MD=$RUNNER_TEMP/skills/navigera/SKILL.md" >> "$GITHUB_ENV"
       - name: Install agent-browser
         if: matrix.tool == 'agent-browser'
