@@ -1,0 +1,90 @@
+# multitab.test.ts from Playwright - WORKAROUND VARIANTS.
+# Upstream tests (5 total): this file ports the 3 in describe "Multiple tabs on
+# one budget"; the 2 in describe "Refreshing a tab" live in multitab-refresh.pv.
+# Mapping by exact test name:
+#   "the follower takes over when the leader tab closes"  -> scenario below (W2 DEVIATION: extra follower reload after takeover; literal port in
+#      multitab-literal.pv FAILS here - defect D3 - so this variant is NOT
+#      proof of the upstream sequence; it verifies post-reload takeover writes)
+#   "closing the budget in the leader hands it to the follower" -> literal port
+#   "a leader that was hidden keeps its budget after resuming" -> W3 DEVIATION: eval-tag + trusted click replaces hasText row filtering (gap G4)
+# UA: PW forced a Chrome UA without "playwright" so the app uses the SharedWorker
+# coordinator; navigera's default UA (HeadlessChrome/156) also lacks it - same
+# code path, no override needed for this file.
+base http://127.0.0.1:3001
+
+before each
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  tab-new /
+  expect --testid budget-table visible --timeout-ms 60000
+
+scenario "W2 VARIANT: the follower takes over when the leader tab closes (with reload)"
+  tab-select 0
+  tab-close
+  # W2: after an abrupt leader close, the promoted follower's account view
+  # renders a stuck empty live query until a full page reload (PW's graceful
+  # runBeforeUnload close does not hit this). Reload after takeover, then
+  # proceed: proves the follower became leader, restored the budget and can
+  # write. Deviation from PW flow documented as pilot defect D3.
+  wait --ms 3000
+  reload
+  expect --testid budget-table visible --timeout-ms 60000
+  click --role link --name "Ally Savings"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row']" count >= 1 --timeout-ms 60000
+  wait --ms 1000
+  click --role button --name "Add New"
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "12.34" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='payee']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='payee'] input" "Kroger" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "after takeover"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  expect --selector "[data-testid='transaction-table']" text contains "after takeover"
+  wait --ms 2000
+  reload
+  click --role link --name "Ally Savings"
+  expect --selector "[data-testid='transaction-table']" text contains "after takeover" --timeout-ms 60000
+
+scenario "closing the budget in the leader hands it to the follower"
+  tab-select 0
+  eval "window.__actionsForMenu.closeBudget()"
+  expect text "Test Budget" --timeout-ms 30000
+  tab-select 1
+  wait --ms 5000
+  click --role link --name "Ally Savings"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row']" count >= 1 --timeout-ms 60000
+  wait --ms 1000
+  click --role button --name "Add New"
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "12.34" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='payee']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='payee'] input" "Kroger" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "after handover"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  expect --selector "[data-testid='transaction-table']" text contains "after handover"
+
+scenario "a leader that was hidden keeps its budget after resuming"
+  tab-select 0
+  eval "(async()=>{for (const v of ['hidden','visible']){Object.defineProperty(document,'visibilityState',{value:v,configurable:true});document.dispatchEvent(new Event('visibilitychange'));await new Promise(r=>setTimeout(r,500))}})()"
+  # W3 (gap G4: no hasText/composition filtering): tag the target cell via
+  # eval, then a real trusted click on the tag; a synthetic el.click() does
+  # not activate the React Aria cell editor.
+  eval "(()=>{const row=[...document.querySelectorAll(\"[data-testid='budget-table'] [data-testid='row']\")].find(r=>r.textContent.includes('Food'));row.querySelector(\"[data-testid='budget']\").setAttribute('data-pv-target','food-budget');return 'ok'})()"
+  click --selector "[data-pv-target='food-budget']"
+  fill --selector "[data-pv-target='food-budget'] input" "123"
+  press Enter
+  expect js "(()=>{const row=[...document.querySelectorAll(\"[data-testid='budget-table'] [data-testid='row']\")].find(r=>r.textContent.includes('Food'));return row.querySelector(\"[data-testid='budget']\").textContent.trim()})()" is "123.00"
+  tab-select 1
+  expect js "(()=>{const row=[...document.querySelectorAll(\"[data-testid='budget-table'] [data-testid='row']\")].find(r=>r.textContent.includes('Food'));return row.querySelector(\"[data-testid='budget']\").textContent.trim()})()" is "123.00"

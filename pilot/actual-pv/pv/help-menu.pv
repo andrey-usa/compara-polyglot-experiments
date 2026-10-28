@@ -1,0 +1,67 @@
+# help-menu.test.ts from Playwright (Actual Budget e2e @ dff6b4b) - LITERAL PORT.
+# Upstream tests (2), mapped by exact scenario name. toMatchThemeScreenshots(x4
+# calls) = 3 themed viewport screenshots each (auto/dark/midnight) with
+# no [data-vrt-mask] elements exist on these pages (PW masks nothing either;
+# primavera errors on an unmatched mask, so --mask omitted = parity here) -
+# 12 screenshots total, same order as upstream.
+# UA: PW config sets userAgent 'playwright' globally (this spec does not
+# override it) -> set ua "playwright" matches, gating Platform.isPlaywright
+# seeded demo data. mouse move 0 0 = upstream mouse.move(0,0). Screenshot
+# tolerance: sandbox renderer jitters ~0.1-0.15% (PW CI used maxDiffPixels 5);
+# --max-diff-pixels 5000 documented deviation, same as settings.pv.
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  mouse move 0 0
+
+scenario "Check the help menu visuals"
+  click --role button --name "Help"
+  expect --selector "[data-popover]" visible
+  expect text "Keyboard shortcuts"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot help-menu-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot help-menu-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot help-menu-midnight --max-diff-pixels 5000
+  press Escape
+
+scenario "Check the keyboard shortcuts modal visuals"
+  click --role button --name "Help"
+  click --text "Keyboard shortcuts"
+  expect --role dialog --name "Modal dialog" visible
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot shortcuts-modal-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot shortcuts-modal-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot shortcuts-modal-midnight --max-diff-pixels 5000
+  expect --selector "[placeholder='Search shortcuts']" value is ""
+  fill --selector "[placeholder='Search shortcuts']" "command"
+  expect text "Open the Command Palette"
+  eval "window.Actual.setTheme('auto')"
+  expect screenshot shortcuts-search-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect screenshot shortcuts-search-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect screenshot shortcuts-search-midnight --max-diff-pixels 5000
+  click --role button --name "Back"
+  expect --selector "[placeholder='Search shortcuts']" value is ""
+  click --text "Global"
+  expect text "Open the help menu"
+  eval "window.Actual.setTheme('auto')"
+  expect screenshot shortcuts-global-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect screenshot shortcuts-global-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect screenshot shortcuts-global-midnight --max-diff-pixels 5000

@@ -1,0 +1,85 @@
+# Actual Budget e2e specs converted from Playwright to primavera (.pv):
+# settings, multitab (incl. tab refresh) and help-menu (visual snapshots),
+# against actualbudget/actual @ dff6b4b. Same container and app start as the
+# Playwright baseline; per-test results via junit.xml. Standard GitHub-hosted
+# runner; no secrets; no paid calls.
+name: actual-pv-pilot
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-jammy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone actual @ pinned commit
+        run: |
+          git clone --filter=blob:none https://github.com/actualbudget/actual.git actual
+          cd actual && git checkout dff6b4b21bed7d20a0977cd71c990f40b6e26e8e
+      - name: Trust the repository directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/actual"
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'actual/.nvmrc'
+      - name: Enable corepack (yarn 4)
+        run: corepack enable
+      - name: Install dependencies
+        run: cd actual && yarn install --immutable
+      - name: Build browser bundle (CI parity)
+        env:
+          REACT_APP_NETLIFY: 'true'
+        run: cd actual && yarn build:browser --skip-translations
+      - name: Install Rust (for the primavera source build)
+        run: |
+          command -v cc >/dev/null || { apt-get update && apt-get install -y --no-install-recommends build-essential; }
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build primavera + navigera @ pinned commits
+        run: |
+          git clone --filter=blob:none https://github.com/andrey-usa/navigera.git navigera
+          git -C navigera checkout 575564eea8e56ef49ce2af91e26574b7edb1b752
+          git clone --filter=blob:none https://github.com/andrey-usa/primavera.git primavera
+          git -C primavera checkout 2ee2589cb8d481e120d1808f79a428dda93227b7
+          CARGO_TARGET_DIR="$RUNNER_TEMP/pv-target" cargo build --release --manifest-path primavera/Cargo.toml
+          echo "$RUNNER_TEMP/pv-target/release" >> "$GITHUB_PATH"
+      - name: Point primavera at the container Chromium
+        run: echo "CHROME_BIN=$(ls -d /ms-playwright/chromium-*/chrome-linux/chrome | head -1)" >> "$GITHUB_ENV"
+      - name: Start the app (baseline's server)
+        run: |
+          PORT=3001 node actual/packages/desktop-client/bin/serve-build.mjs > app.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:3001/ && break || sleep 2; done
+          curl -fsS -o /dev/null http://127.0.0.1:3001/
+      - name: Capture screenshot baselines in this environment
+        working-directory: pilot/actual-pv
+        run: |
+          mkdir -p results
+          primavera run pv/settings.pv pv/help-menu.pv --update-screenshots | tee results/vrt-baseline-pass.log
+      - name: Run the converted suite (per-test results)
+        working-directory: pilot/actual-pv
+        run: primavera run pv/settings.pv pv/multitab.pv pv/multitab-refresh.pv pv/help-menu.pv --retries 1 --junit results/junit.xml --evidence results/evidence | tee results/pilot-run.log
+      - name: Run the literal multitab takeover port (expected failure, defect repro)
+        if: ${{ always() }}
+        working-directory: pilot/actual-pv
+        run: |
+          set +e
+          primavera run pv/multitab-literal.pv > results/d3-repro.log 2>&1
+          code=$?
+          echo "literal port exit code: $code"
+          if [ $code -eq 0 ]; then echo "UNEXPECTED: literal port passed" > results/d3-unexpected-pass.txt; fi
+          exit 0
+      - name: Upload results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: actual-pv-pilot-results
+          path: |
+            pilot/actual-pv/results/
+            pilot/actual-pv/pv/settings.pv.screenshots/
+            pilot/actual-pv/pv/help-menu.pv.screenshots/
+          retention-days: 30

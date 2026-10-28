@@ -1,0 +1,37 @@
+# multitab.test.ts describe "Refreshing a tab" - LITERAL PORTS.
+# Upstream tests (2), mapped by exact name below. These tests build their own
+# context (no shared beforeEach); each scenario is self-contained.
+# UA: PW used a Chrome UA without "playwright" (SharedWorker coordinator path);
+# navigera's default UA also lacks it - same code path, no override.
+base http://127.0.0.1:3001
+
+scenario "a tab opened before the budget was created can refresh afterwards"
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  expect --role button --name "Try the demo" visible --timeout-ms 60000
+  tab-new /
+  expect --role button --name "Try the demo" visible --timeout-ms 60000
+  tab-select 0
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  eval "(async()=>{for (const v of ['hidden','visible']){Object.defineProperty(document,'visibilityState',{value:v,configurable:true});document.dispatchEvent(new Event('visibilitychange'));await new Promise(r=>setTimeout(r,500))}})()"
+  tab-select 1
+  reload
+  expect no text "Loading global preferences" --timeout-ms 30000
+  expect --testid budget-table visible --timeout-ms 60000
+
+scenario "a tab that closed the budget can refresh while another tab has it open"
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  eval "window.__actionsForMenu.closeBudget()"
+  expect text "Test Budget" --timeout-ms 30000
+  tab-new /
+  click --text "Test Budget"
+  expect --testid budget-table visible --timeout-ms 60000
+  tab-select 0
+  eval "(async()=>{for (const v of ['hidden','visible']){Object.defineProperty(document,'visibilityState',{value:v,configurable:true});document.dispatchEvent(new Event('visibilitychange'));await new Promise(r=>setTimeout(r,500))}})()"
+  reload
+  expect no text "Loading global preferences" --timeout-ms 30000
+  expect --testid budget-table visible --timeout-ms 60000

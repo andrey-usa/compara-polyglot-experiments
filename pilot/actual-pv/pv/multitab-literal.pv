@@ -1,0 +1,41 @@
+# LITERAL PORT of multitab.test.ts test
+# "the follower takes over when the leader tab closes" - NO workarounds.
+# EXPECTED OUTCOME: FAILS at the transaction-row expect (defect D3): after an
+# abrupt leader tab close, the promoted follower renders a stuck empty
+# transaction-table live query until a full page reload. Real Playwright passes
+# this same test in this sandbox (19.6s, pin dff6b4b). Repro runs:
+# Failure signature: the promoted follower renders 0 transaction rows for 60s+.
+# Kept failing on purpose; not part of the green pilot suite.
+base http://127.0.0.1:3001
+
+before each
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  tab-new /
+  expect --testid budget-table visible --timeout-ms 60000
+
+scenario "the follower takes over when the leader tab closes (literal)"
+  tab-select 0
+  tab-close
+  click --role link --name "Ally Savings"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row']" count >= 1 --timeout-ms 60000
+  wait --ms 1000
+  click --role button --name "Add New"
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "12.34" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='payee']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='payee'] input" "Kroger" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "after takeover"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  expect --selector "[data-testid='transaction-table']" text contains "after takeover"
+  wait --ms 2000
+  reload
+  click --role link --name "Ally Savings"
+  expect --selector "[data-testid='transaction-table']" text contains "after takeover" --timeout-ms 60000

@@ -1,0 +1,95 @@
+# settings.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b)
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  click --role link --name "Settings"
+  expect --testid settings visible
+
+scenario "checks the page visuals"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot settings-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot settings-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot settings-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+
+scenario "downloads the export of the budget"
+  click --role button --name "Export data"
+  expect download "*.zip" --timeout-ms 30000
+  expect ${download.name} matches '^\d{4}-\d{2}-\d{2}-.*\.zip$'
+
+scenario "moves pages between the sidebar and settings"
+  click --selector "label[for='toggle-sidebar-item-payees']"
+  click --selector "label[for='toggle-sidebar-item-schedules']"
+  expect --selector "[data-testid='sidebar-primary-buttons']" text contains Payees
+  expect not --selector "[data-testid='sidebar-primary-buttons']" text contains Schedules
+  expect --role navigation --name "Settings" text contains Schedules
+  expect not --role navigation --name "Settings" text contains Payees
+  click --role link --name "Schedules"
+  expect url ends-with /settings/schedules
+  expect --role navigation --name "Settings" visible
+  click --role link --name "Payees"
+  expect url ends-with /payees
+
+scenario "keeps the global CSS override readable after switching themes"
+  set viewport 1024 900
+  route "**/customThemeCatalog.json" --status 200 --body '[{"name":"Test theme","repo":"test/theme","mode":"light"}]' --content-type application/json --header "Access-Control-Allow-Origin: *"
+  route "**/test/theme/refs/heads/main/actual.css*" --status 200 --body ":root { --color-pageBackground: #eeeeee; }" --content-type text/css --header "Access-Control-Allow-Origin: *"
+  eval "window.Actual.setTheme('light')"
+  expect --selector "[data-theme]" attr data-theme is light
+  click --role button --name "Light"
+  click --role button --name "Custom theme"
+  click --role button --name "Test theme"
+  wait --idle --timeout-ms 10000
+  fill --role textbox --name "Custom Theme CSS" ":root { --color-pageBackground: #abcdef; }"
+  eval "[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Apply').focus()"
+  press Enter
+  eval "[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Close').focus()"
+  press Enter
+  expect --role button --name "Custom CSS override active" visible
+  click --role button --name "Test theme"
+  click --role button --name "Dark"
+  expect --role button --name "Custom CSS override active" visible
+  expect js "getComputedStyle(document.documentElement).getPropertyValue('--color-pageBackground').trim()" is "#abcdef"
+  click --role button --name "Dark"
+  click --role button --name "Midnight"
+  expect --role button --name "Custom CSS override active" visible
+  expect js "getComputedStyle(document.documentElement).getPropertyValue('--color-pageBackground').trim()" is "#abcdef"
+  click --role button --name "Midnight"
+  click --role button --name "Light"
+  expect --role button --name "Custom CSS override active" visible
+  expect js "getComputedStyle(document.documentElement).getPropertyValue('--color-pageBackground').trim()" is "#abcdef"
+  click --role button --name "Light"
+  click --role button --name "System default"
+  expect --role button --name "Custom CSS override active" visible
+  expect js "getComputedStyle(document.documentElement).getPropertyValue('--color-pageBackground').trim()" is "#abcdef"
+  set viewport 1024 900
+  scroll --selector "button[aria-label*='Custom CSS override']"
+  expect js "(()=>{const ib=document.querySelector(\"button[aria-label*='Custom CSS override']\").getBoundingClientRect(); const lb=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Light').getBoundingClientRect(); return !(ib.x < lb.x+lb.width && ib.x+ib.width > lb.x && ib.y < lb.y+lb.height && ib.y+ib.height > lb.y)})()"
+  expect js "(()=>{const r=document.querySelector(\"button[aria-label*='Custom CSS override']\").getBoundingClientRect(); return r.top>=0 && r.left>=0 && r.bottom<=innerHeight && r.right<=innerWidth})()"
+  set viewport 800 900
+  scroll --selector "button[aria-label*='Custom CSS override']"
+  expect js "(()=>{const ib=document.querySelector(\"button[aria-label*='Custom CSS override']\").getBoundingClientRect(); const lb=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Light').getBoundingClientRect(); return !(ib.x < lb.x+lb.width && ib.x+ib.width > lb.x && ib.y < lb.y+lb.height && ib.y+ib.height > lb.y)})()"
+  expect js "(()=>{const r=document.querySelector(\"button[aria-label*='Custom CSS override']\").getBoundingClientRect(); return r.top>=0 && r.left>=0 && r.bottom<=innerHeight && r.right<=innerWidth})()"
+  set viewport 375 900
+  expect --role navigation visible
+  scroll --selector "button[aria-label*='Custom CSS override']"
+  expect js "(()=>{const ib=document.querySelector(\"button[aria-label*='Custom CSS override']\").getBoundingClientRect(); const lb=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Light').getBoundingClientRect(); return !(ib.x < lb.x+lb.width && ib.x+ib.width > lb.x && ib.y < lb.y+lb.height && ib.y+ib.height > lb.y)})()"
+  expect js "(()=>{const r=document.querySelector(\"button[aria-label*='Custom CSS override']\").getBoundingClientRect(); return r.top>=0 && r.left>=0 && r.bottom<=innerHeight && r.right<=innerWidth})()"
+  eval "document.querySelector(\"button[aria-label*='Custom CSS override']\").focus()"
+  press Enter
+  expect --role textbox --name "Custom Theme CSS" value is ":root { --color-pageBackground: #abcdef; }"
+  fill --role textbox --name "Custom Theme CSS" ""
+  eval "[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Apply').focus()"
+  press Enter
+  eval "[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Close').focus()"
+  press Enter
+  expect not --role button --name "Custom CSS override active" visible
+  expect --selector "#custom-theme-active" count is 0
