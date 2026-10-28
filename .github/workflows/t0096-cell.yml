@@ -63,7 +63,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with: { repository: andrey-usa/primavera, ref: 9059117bdef9087ddce0ba73244a217bb064ac73, path: primavera, persist-credentials: false }
+        with: { repository: andrey-usa/primavera, ref: f29f3683dbb0188fe79f1b07a3683446b90f0300, path: primavera, persist-credentials: false }
       - uses: actions/checkout@v4
         with: { repository: andrey-usa/navigera, ref: bc99d747652d84c840dc5831e5d1fbbf13524dfb, path: navigera, persist-credentials: false }
       - uses: dtolnay/rust-toolchain@stable
