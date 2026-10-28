@@ -1,0 +1,68 @@
+# Checks compara's performance-gate job (branch perf-gate) on GitHub's
+# runners before it runs on a pull request, and whether those runners
+# expose a hardware instruction counter.
+name: gate check
+on:
+  push:
+    branches: [experiment-48]
+permissions:
+  contents: read
+jobs:
+  counter:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        paranoid: ["as-is", "1"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: andrey-usa/compara
+          ref: perf-gate
+          persist-credentials: false
+      - if: matrix.paranoid != 'as-is'
+        run: sudo sysctl -w kernel.perf_event_paranoid=${{ matrix.paranoid }}
+      - run: |
+          cat /proc/sys/kernel/perf_event_paranoid
+          python3 scripts/icount.py --counter perf -- /bin/true
+
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: andrey-usa/compara
+          ref: perf-gate
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends valgrind
+      - name: Build the head and the base
+        run: |
+          BASE_SHA=$(git rev-parse origin/main)
+          cargo build --locked --release --bin compara --bin compara-gen-data
+          mkdir -p gate
+          cp target/release/compara gate/head
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+          cargo build --locked --release --bin compara \
+            --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --target-dir target
+          cp target/release/compara gate/base
+      - name: Files of 50k and 200k rows a side
+        run: |
+          ./target/release/compara-gen-data --rows 200k --out-dir gate
+          for s in a b; do head -n 50001 "gate/200k_$s.csv" > "gate/50k_$s.csv"; done
+      - name: Gate
+        run: |
+          start=$(date +%s)
+          python3 scripts/perf_gate.py --head gate/head --base gate/base \
+            --counter cachegrind --require \
+            --small gate/50k_a.csv gate/50k_b.csv --large gate/200k_a.csv gate/200k_b.csv \
+            -- -k account_id,txn_id -i updated_at | tee -a "$GITHUB_STEP_SUMMARY" gate/out.txt
+          code=${PIPESTATUS[0]}
+          grep '^| [a-z]' gate/out.txt | while read -r row; do echo "::notice title=gate::$row"; done
+          echo "::notice title=gate::exit $code, $(( $(date +%s) - start )) s"
+          exit "$code"
