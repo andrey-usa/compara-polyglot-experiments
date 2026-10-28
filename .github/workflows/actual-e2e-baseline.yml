@@ -1,0 +1,54 @@
+# Run the Actual (actualbudget/actual) Playwright e2e suite on Chromium and
+# keep per-test results. Mirrors upstream .github/workflows/e2e-test.yml
+# (build flags, sharding, container, invocation) on standard GitHub-hosted
+# runners. No secrets, no paid services.
+name: actual-e2e-baseline
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  functional:
+    name: Functional (shard ${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-jammy
+    env:
+      E2E_USE_BUILD: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone actual @ pinned commit
+        run: |
+          git clone --filter=blob:none https://github.com/actualbudget/actual.git actual
+          cd actual && git checkout dff6b4b21bed7d20a0977cd71c990f40b6e26e8e
+      - name: Trust the repository directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/actual"
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'actual/.nvmrc'
+      - name: Enable corepack (yarn 4)
+        run: corepack enable
+      - name: Install dependencies
+        run: cd actual && yarn install --immutable
+      - name: Build browser bundle (upstream CI parity)
+        env:
+          REACT_APP_NETLIFY: 'true'
+        run: cd actual && yarn build:browser --skip-translations
+      - name: Set E2E port
+        run: echo "E2E_PORT=$((3000 + ${{ matrix.shard }}))" >> "$GITHUB_ENV"
+      - name: Run E2E tests (chromium)
+        run: cd actual && yarn e2e --shard=${{ matrix.shard }}/3
+      - name: Upload per-test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: actual-results-shard-${{ matrix.shard }}
+          path: actual/packages/desktop-client/test-results/
+          retention-days: 30
