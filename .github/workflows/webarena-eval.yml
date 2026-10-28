@@ -69,7 +69,7 @@ jobs:
     steps:
       - id: m
         env:
-          TOOLS: ${{ inputs.tools || 'navigera-next' }}
+          TOOLS: ${{ inputs.tools || 'navigera-062' }}
           MODELS: ${{ inputs.models || 'deepseek-ai/DeepSeek-V4.1-Flash' }}
           COUNT: ${{ inputs.count || '48' }}
           OFFSET: ${{ inputs.offset || '0' }}
