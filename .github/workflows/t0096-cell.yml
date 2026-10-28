@@ -63,13 +63,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with: { repository: andrey-usa/primavera, ref: 7026c8031967e0fa146b04e2f2a6e2092e359302, path: primavera, persist-credentials: false }
+        with: { repository: andrey-usa/primavera, ref: 9059117bdef9087ddce0ba73244a217bb064ac73, path: primavera, persist-credentials: false }
       - uses: actions/checkout@v4
-        with: { repository: andrey-usa/navigera, ref: cc300d30f2fa72896c522fadc50293db7a38bdc7, path: navigera, persist-credentials: false }
+        with: { repository: andrey-usa/navigera, ref: bc99d747652d84c840dc5831e5d1fbbf13524dfb, path: navigera, persist-credentials: false }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { shared-key: t0069, workspaces: primavera }
-      - name: build primavera (navigera is compiled in) at the round-2 pins
+      - name: build primavera (navigera is compiled in) at the round-5 pins (both next)
         run: |
           cargo build --release --manifest-path primavera/Cargo.toml
           ./primavera/target/release/primavera --version

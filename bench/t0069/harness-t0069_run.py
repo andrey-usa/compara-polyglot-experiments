@@ -42,7 +42,11 @@ DONE_CMD = "echo TASK-DONE"
 # 7438 B; T-0091 round 2 + T-0096 cell: primavera next 7026c80, navigera compiled in
 # via path dep at cc300d30 (side branch off f37b95c; NOT 0.6.2/69ea463, predates
 # 3830c5e and 1e77d29; CI checkouts pin it in t0069-eval.yml and t0096-cell.yml), 7432 B).
-EXPECTED_PV_SKILL_SHA256 = "a4b79287e8ab23a2140f21107afe1c4df9eada6b13db4ee34c8b009bd1209585"
+# Round 5: primavera next with the rewritten agent skill (5341 B, shorter than
+# the Playwright manual), navigera next compiled in; both pinned in t0096-cell.yml.
+EXPECTED_PV_SKILL_SHA256 = "dd42592fa25b7e52e461fc274fca5b8b2f1768fdcefb59af32171d1972d3d306"
+# The round-2 to round-4 manual, for the record: a4b79287e8ab23a2140f21107afe1c4df9eada6b13db4ee34c8b009bd1209585
+# (primavera-skill-7026c80.txt).
 # playwright arm manual = playwright-skill.md (drafted from Playwright docs; 6154 B).
 EXPECTED_PW_SKILL_SHA256 = "6e4564b7a74852086fdcb3c08e159dc62ba83c8638b289b2f212ab349a4c43fc"
 
@@ -191,14 +195,36 @@ def chat(api_key, model, messages, ledger, max_spend, deadline_s=None):
         signal.setitimer(signal.ITIMER_REAL, 0)
     ledger["retained"] -= REQ_MAX_USD
     u = data.get("usage") or {}
-    cost = (u.get("prompt_tokens", 0) - u.get("prompt_cache_hit_tokens", 0)) * PRICE_IN / 1e6 \
-         + u.get("prompt_cache_hit_tokens", 0) * PRICE_CACHED / 1e6 \
-         + u.get("completion_tokens", 0) * PRICE_OUT / 1e6
-    wal_append(ledger, {"event": "settle", "req": seq, "t": time.time(), "usage": u, "cost_usd": cost})
+    parts = usage_parts(u)
+    # cost_usd stays the uncached bound (every prompt token at PRICE_IN): it
+    # is what the spend cap and the WAL count, so a wrong cache price can only
+    # overstate spend. cost_cached_usd prices the cache hits the provider
+    # reported; it is the figure arms are compared on.
+    cost = parts["prompt"] * PRICE_IN / 1e6 + parts["completion"] * PRICE_OUT / 1e6
+    cost_cached = (parts["prompt"] - parts["cached"]) * PRICE_IN / 1e6 + parts["cached"] * PRICE_CACHED / 1e6 \
+        + parts["completion"] * PRICE_OUT / 1e6
+    wal_append(ledger, {"event": "settle", "req": seq, "t": time.time(), "usage": u, "cost_usd": cost,
+                        "cost_cached_usd": cost_cached, **{f"{k}_tokens": v for k, v in parts.items()}})
     ledger["cost"] += cost
+    ledger["cost_cached"] = ledger.get("cost_cached", 0.0) + cost_cached
+    for k, v in parts.items():
+        ledger[f"{k}_tokens"] = ledger.get(f"{k}_tokens", 0) + v
     ledger["tokens"] += u.get("total_tokens", 0)
     ledger["requests"] += 1
+    u = dict(u, _parts=parts, _cost_cached=cost_cached)
     return data["choices"][0]["message"]["content"], u, cost, data["choices"][0].get("finish_reason")
+
+def usage_parts(u):
+    """Prompt, cache-hit, completion and reasoning tokens of one reply. The
+    OpenAI-style field (SiliconFlow) is prompt_tokens_details.cached_tokens;
+    DeepSeek's own API says prompt_cache_hit_tokens. Reasoning tokens are part
+    of completion_tokens, billed at PRICE_OUT."""
+    pd = u.get("prompt_tokens_details") or {}
+    cd = u.get("completion_tokens_details") or {}
+    prompt = int(u.get("prompt_tokens") or 0)
+    cached = int(pd.get("cached_tokens") or u.get("prompt_cache_hit_tokens") or 0)
+    return {"prompt": prompt, "cached": min(cached, prompt), "completion": int(u.get("completion_tokens") or 0),
+            "reasoning": int(cd.get("reasoning_tokens") or 0)}
 
 class EpisodeWallCap(Exception):
     pass
@@ -485,7 +511,8 @@ def run_trial(arm, task_id, trial, args, ledger, site):
     rec = {"task": task_id, "kind": kind, "arm": arm, "trial": trial, "turns": 0,
            "max_tokens": MAX_TOKENS,  # T-0096: the cap this episode ran under
            "done_declared": False, "pass_clean": None, "pass_broken": None, "score": 0,
-           "tokens": 0, "cost": 0.0, "wall_s": 0.0, "error": None}
+           "tokens": 0, "cost": 0.0, "cost_cached": 0.0, "prompt_tokens": 0, "cached_tokens": 0,
+           "completion_tokens": 0, "reasoning_tokens": 0, "wall_s": 0.0, "error": None}
     t0 = time.time()
     workdir = os.path.join(args.out, f"work-{ledger['run_id']}-{task_id}-t{trial}")
     def rem():
@@ -520,6 +547,9 @@ def run_trial(arm, task_id, trial, args, ledger, site):
                                                         args.max_spend, deadline_s=rem())
                 rec["tokens"] += usage.get("total_tokens", 0)
                 rec["cost"] += cost
+                rec["cost_cached"] += usage.get("_cost_cached", 0.0)
+                for k, v in (usage.get("_parts") or {}).items():
+                    rec[f"{k}_tokens"] += v
                 rec.setdefault("finish_reasons", []).append(finish_reason)
                 kind_r, cmd, dsml = classify_reply(text)
                 if dsml:
@@ -718,7 +748,9 @@ def main():
             n += 1
             print(f"[{n}] {args.arm} {task_id} t{trial} score={rec['score']} "
                   f"pass_clean={rec['pass_clean']} pass_broken={rec['pass_broken']} "
-                  f"turns={rec['turns']} cost={rec['cost']:.4f} wall={rec['wall_s']}s err={rec['error']}", flush=True)
+                  f"turns={rec['turns']} cost={rec['cost']:.4f} cost_cached={rec['cost_cached']:.4f} "
+                  f"out={rec['completion_tokens']} reasoning={rec['reasoning_tokens']} "
+                  f"wall={rec['wall_s']}s err={rec['error']}", flush=True)
     if drained:
         dpath = os.path.join(args.out, f"t0069-drained-{RUN_ID}.json")
         with open(dpath, "w") as f:
@@ -727,8 +759,11 @@ def main():
         print(f"DRAIN: wall budget reached; {len(drained)} trials deferred "
               f"(resume this slice in a later dispatch; every trial runs exactly once). "
               f"deferred={','.join(drained)} file={dpath}", flush=True)
-    print(f"ledger: max_tokens={MAX_TOKENS} computed=${ledger['cost']:.4f} retained=${ledger['retained']:.4f} "
-          f"requests={ledger['requests']} tokens={ledger['tokens']}")
+    print(f"ledger: max_tokens={MAX_TOKENS} computed=${ledger['cost']:.4f} (uncached bound) "
+          f"cached=${ledger.get('cost_cached', 0.0):.4f} retained=${ledger['retained']:.4f} "
+          f"requests={ledger['requests']} tokens={ledger['tokens']} prompt={ledger.get('prompt_tokens', 0)} "
+          f"cache_hits={ledger.get('cached_tokens', 0)} out={ledger.get('completion_tokens', 0)} "
+          f"reasoning={ledger.get('reasoning_tokens', 0)}")
 
 if __name__ == "__main__":
     try:

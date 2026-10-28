@@ -9,5 +9,5 @@
   "max_tokens": [
     "4096"
   ],
-  "note": "Measure-first cell: same prompts, output-token cap 4096 (the round-4 default). Armed ONLY by a push touching bench/t0069/CELL-RUN after owner approval. Worst-case reserve is printed by the plan job before any paid job starts."
+  "note": "Round 5: the round-4 cell (same prompts, tasks, trials and 4096 output cap) on primavera next 9059117 with navigera next bc99d74 compiled in: the rewritten agent skill (5341 B), the print step, eval with statements and await, lint that refuses what would fail only in the run. The harness prices the cache hits the provider reports (cost_cached) beside the uncached bound the spend cap counts, and records prompt, cache-hit, output and reasoning tokens per request and episode. Armed ONLY by a push touching bench/t0069/CELL-RUN after owner approval. Worst-case reserve is printed by the plan job before any paid job starts."
 }
