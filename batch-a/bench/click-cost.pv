@@ -1,0 +1,4 @@
+base http://127.0.0.1:8123
+scenario "click cost on a static button"
+  goto /button.html
+  click --role button --name "static target"

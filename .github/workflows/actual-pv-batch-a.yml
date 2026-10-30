@@ -62,6 +62,12 @@ jobs:
             echo "no preinstalled browser under /ms-playwright; falling back to primavera navigera install-browser (chrome-headless-shell download, same container)"
             primavera navigera install-browser
           fi
+      - name: Apply the click stable-box patch, run its test, build the patched primavera
+        run: |
+          git -C navigera apply batch-a/navigera-click-stable-box.patch
+          git -C navigera diff --stat
+          NAVIGERA_REQUIRE_BROWSER=1 CARGO_TARGET_DIR="$RUNNER_TEMP/nv-test-target" cargo test --release --manifest-path navigera/Cargo.toml --test interactions a_click_waits_for_a_moving_target_to_stop
+          CARGO_TARGET_DIR="$RUNNER_TEMP/pv-target-patched" cargo build --release --manifest-path primavera/Cargo.toml
       - name: Start the app (baseline's server)
         run: |
           PORT=3001 node actual/packages/desktop-client/bin/serve-build.mjs > app.log 2>&1 &
@@ -101,7 +107,28 @@ jobs:
           primavera run pv/controls-by-payee-1frame.pv --repeat 10 --junit results/by-payee-control-junit.xml --evidence results/evidence > results/by-payee-control.log 2>&1 || P=$?
           cat results/by-payee-control.log
           echo "by-payee control rc=$P (non-gating pacing control)"
+      - name: "Measure by-payee with the patched click (--repeat 10)"
+        working-directory: batch-a/actual-pv
+        run: |
+          mkdir -p results
+          "$RUNNER_TEMP/pv-target-patched/release/primavera" run pv/transactions.pv --grep "filters transactions by payee" --repeat 10 --junit results/by-payee-patched-junit.xml --evidence results/evidence > results/by-payee-patched.log 2>&1 || P=$?
+          cat results/by-payee-patched.log
+          echo "patched by-payee rc=$P (non-gating patched measurement)"
+      - name: "Click cost on a static button, before vs after (20 clicks each)"
+        run: |
+          mkdir -p batch-a/actual-pv/results
+          python3 -m http.server 8123 --directory batch-a/bench &>/dev/null &
+          SRV=$!
+          sleep 1
+          primavera run batch-a/bench/click-cost.pv --repeat 20 --reporter jsonl > batch-a/actual-pv/results/click-cost-before.jsonl 2>&1 || true
+          "$RUNNER_TEMP/pv-target-patched/release/primavera" run batch-a/bench/click-cost.pv --repeat 20 --reporter jsonl > batch-a/actual-pv/results/click-cost-after.jsonl 2>&1 || true
+          kill $SRV || true
+          for f in before after; do
+            echo "click-cost $f:"
+            jq -r 'select(.event=="scenario") | .ms' batch-a/actual-pv/results/click-cost-$f.jsonl | sort -n | awk '{a[NR]=$1} END{printf "  n=%d median=%.1fms min=%.1f max=%.1f\n", NR, a[int((NR+1)/2)], a[1], a[NR]}'
+          done
       - name: Run the converted batch (per-test results)
+        if: ${{ !contains(github.event.head_commit.message, '[skip-batch]') }}
         working-directory: batch-a/actual-pv
         run: |
           mkdir -p results
