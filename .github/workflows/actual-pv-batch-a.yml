@@ -77,15 +77,15 @@ jobs:
         working-directory: batch-a/actual-pv
         run: |
           mkdir -p results
-          primavera run pv/accounts.pv --grep "right clicking an account in sidebar" --repeat 2 --junit results/sidebar-junit.xml --evidence results/evidence | tee results/sidebar-rerun.log
-          P=${PIPESTATUS[0]}
+          primavera run pv/accounts.pv --grep "right clicking an account in sidebar" --repeat 2 --junit results/sidebar-junit.xml --evidence results/evidence > results/sidebar-rerun.log 2>&1; P=$?
+          cat results/sidebar-rerun.log
           echo "sidebar rerun rc=$P (recorded here; the batch gate below is authoritative)"
       - name: Run the converted batch (per-test results)
         working-directory: batch-a/actual-pv
         run: |
           mkdir -p results
-          primavera run pv/rules.pv pv/schedules.pv pv/budget.pv pv/transactions.pv pv/accounts.pv --retries 1 --junit results/junit.xml --evidence results/evidence | tee results/batch-a-run.log
-          P=${PIPESTATUS[0]}
+          primavera run pv/rules.pv pv/schedules.pv pv/budget.pv pv/transactions.pv pv/accounts.pv --retries 1 --junit results/junit.xml --evidence results/evidence > results/batch-a-run.log 2>&1; P=$?
+          cat results/batch-a-run.log
           ! grep -q "scenarios not run" results/batch-a-run.log || { echo "batch did not execute"; exit 1; }
           T=$(grep -c "<testcase " results/junit.xml || true)
           F=$(grep -cE "<(failure|error)[ >]" results/junit.xml || true)
