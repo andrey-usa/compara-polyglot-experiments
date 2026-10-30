@@ -1,16 +1,16 @@
-From dcb41e4581fa9fbfaa39c1c042a87ac24f9811e1 Mon Sep 17 00:00:00 2001
+From 2354b087f84dafcf00a541d5ee466c804a487171 Mon Sep 17 00:00:00 2001
 From: andrey-usa <62624421+andrey-usa@users.noreply.github.com>
 Date: Fri, 30 Oct 2026 00:47:25 +0000
 Subject: [PATCH] Wide scans with NEON on aarch64
 
 Wide::detect is Some on aarch64, where NEON is baseline, and hits and same compare two 16-byte registers with a one-bit-per-byte mask packed by weight, so the callers are unchanged. The five text parsing copies carry target_feature(neon) on aarch64, and the setup paths take Wide there too. A randomized test checks the masks against a byte at a time for every delimiter value and every offset.
 ---
- src/engine/turbo/field.rs | 170 ++++++++++++++++++++++++++++++++++++--
+ src/engine/turbo/field.rs | 174 ++++++++++++++++++++++++++++++++++++--
  src/engine/turbo/text.rs  |  45 +++++-----
- 2 files changed, 186 insertions(+), 29 deletions(-)
+ 2 files changed, 190 insertions(+), 29 deletions(-)
 
 diff --git a/src/engine/turbo/field.rs b/src/engine/turbo/field.rs
-index d5cef4f..aa95b22 100644
+index d5cef4f..2fbe245 100644
 --- a/src/engine/turbo/field.rs
 +++ b/src/engine/turbo/field.rs
 @@ -70,7 +70,10 @@ pub(super) fn is_real(f: Field) -> bool {
@@ -71,7 +71,7 @@ index d5cef4f..aa95b22 100644
          }
      }
  }
-@@ -235,6 +249,81 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
+@@ -235,6 +249,85 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
      _mm256_movemask_epi8(equal) as u32 as u64
  }
  
@@ -142,9 +142,13 @@ index d5cef4f..aa95b22 100644
 +            vld1q_u8(data.as_ptr().add(at + 16)),
 +        )
 +    };
-+    let (ba, bb) = unsafe { (vdupq_n_u8(a), vdupq_n_u8(b)) };
-+    let eq_lo = unsafe { vorrq_u8(vceqq_u8(lo, ba), vceqq_u8(lo, bb)) };
-+    let eq_hi = unsafe { vorrq_u8(vceqq_u8(hi, ba), vceqq_u8(hi, bb)) };
++    // No `unsafe` here: inside a function with `target_feature(enable =
++    // "neon")`, the NEON intrinsics need no unsafe block, and clippy denies
++    // the unused one. The loads above keep theirs: raw-pointer arithmetic
++    // is unsafe, and so is the `neon_movemask` call below.
++    let (ba, bb) = (vdupq_n_u8(a), vdupq_n_u8(b));
++    let eq_lo = vorrq_u8(vceqq_u8(lo, ba), vceqq_u8(lo, bb));
++    let eq_hi = vorrq_u8(vceqq_u8(hi, ba), vceqq_u8(hi, bb));
 +    let lo = unsafe { neon_movemask(eq_lo) };
 +    let hi = unsafe { neon_movemask(eq_hi) };
 +    (lo as u64) | ((hi as u64) << 16)
@@ -153,7 +157,7 @@ index d5cef4f..aa95b22 100644
  const ONES: u64 = 0x0101_0101_0101_0101;
  const HIGH: u64 = 0x8080_8080_8080_8080;
  
-@@ -435,9 +524,17 @@ fn word_at(data: &[u8], at: usize) -> u64 {
+@@ -435,9 +528,17 @@ fn word_at(data: &[u8], at: usize) -> u64 {
  fn fixed() -> Wide {
      Wide(())
  }
@@ -174,7 +178,7 @@ index d5cef4f..aa95b22 100644
  )))]
  #[inline(always)]
  fn fixed() -> Swar {
-@@ -699,6 +796,61 @@ mod tests {
+@@ -699,6 +800,61 @@ mod tests {
          }
      }
  

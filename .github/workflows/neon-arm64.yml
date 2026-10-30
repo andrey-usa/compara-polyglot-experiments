@@ -125,6 +125,13 @@ jobs:
           } | tee ab-table.csv
           echo "--- sample phases (CSV, head, run 1) ---"
           cat phases-csv-head-1.txt
+      - name: upload A/B table and phases
+        uses: actions/upload-artifact@v4
+        with:
+          name: ab-table
+          path: |
+            ab-table.csv
+            phases-*.txt
       - name: summary
         run: |
           python3 - <<'EOF'
