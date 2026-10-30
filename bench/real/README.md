@@ -21,7 +21,7 @@ the task's v2 eval script as the judge (pass = "SUCCESS" in stdout).
   omnizon-3/9/13, opendining-1/2/4, staynb-1/4/5, topwork-2/3/4,
   udriver-2/3/4, zilloft-2/3/5.
 - navigera: built in CI from the public navigera repo `next` branch @
-  e08688b9c905f5788fabf145d34ef3f9b617ebcf in full; the system prompt reads
+  35ff0103cc2539cec5e97c60d73962d219d58465 in full; the system prompt reads
   the skill the built binary installs.
 - agent-browser: npm agent-browser@0.39.1 (same as the MiniWoB++ run).
 - Model: deepseek-ai/DeepSeek-V4.1-Flash via SiliconFlow
