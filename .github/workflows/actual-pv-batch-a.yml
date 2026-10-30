@@ -62,11 +62,24 @@ jobs:
             echo "no preinstalled browser under /ms-playwright; falling back to primavera navigera install-browser (chrome-headless-shell download, same container)"
             primavera navigera install-browser
           fi
-      - name: Apply the click stable-box patch, run its test, build the patched primavera
+      - name: "Click stable-box: negative control 3x unpatched, positive 3x patched, patched build"
         run: |
-          git -C navigera apply "$GITHUB_WORKSPACE/batch-a/navigera-click-stable-box.patch"
+          git -C navigera apply "$GITHUB_WORKSPACE/batch-a/navigera-click-stable-box-tests-only.patch"
           git -C navigera diff --stat
-          NAVIGERA_REQUIRE_BROWSER=1 CARGO_TARGET_DIR="$RUNNER_TEMP/nv-test-target" cargo test --release --manifest-path navigera/Cargo.toml --test interactions a_click_waits_for_a_moving_target_to_stop
+          echo "=== NEGATIVE CONTROL (tests-only patch, unpatched src): moving-target 3x (expected to FAIL - proves the test discriminates) ==="
+          for i in 1 2 3; do
+            NAVIGERA_REQUIRE_BROWSER=1 CARGO_TARGET_DIR="$RUNNER_TEMP/nv-test-target" cargo test --release --manifest-path navigera/Cargo.toml --test interactions a_click_waits_for_a_moving_target_to_stop 2>&1 | grep -E 'test result' || true
+          done
+          echo "=== never-stops 3x unpatched (passes both ways by design - no-hang guard, not a discriminator) ==="
+          for i in 1 2 3; do
+            NAVIGERA_REQUIRE_BROWSER=1 CARGO_TARGET_DIR="$RUNNER_TEMP/nv-test-target" cargo test --release --manifest-path navigera/Cargo.toml --test interactions a_click_on_a_target_that_never_stops_still_lands 2>&1 | grep -E 'test result' || true
+          done
+          git -C navigera apply "$GITHUB_WORKSPACE/batch-a/navigera-click-stable-box-src-only.patch"
+          echo "=== POSITIVE CONTROL (patched src): moving-target + never-stops, 3x each, must pass ==="
+          for i in 1 2 3; do
+            NAVIGERA_REQUIRE_BROWSER=1 CARGO_TARGET_DIR="$RUNNER_TEMP/nv-test-target" cargo test --release --manifest-path navigera/Cargo.toml --test interactions a_click_waits_for_a_moving_target_to_stop
+            NAVIGERA_REQUIRE_BROWSER=1 CARGO_TARGET_DIR="$RUNNER_TEMP/nv-test-target" cargo test --release --manifest-path navigera/Cargo.toml --test interactions a_click_on_a_target_that_never_stops_still_lands
+          done
           CARGO_TARGET_DIR="$RUNNER_TEMP/pv-target-patched" cargo build --release --manifest-path primavera/Cargo.toml
       - name: Start the app (baseline's server)
         run: |

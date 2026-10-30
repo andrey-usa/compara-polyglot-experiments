@@ -1,0 +1,103 @@
+diff --git a/tests/fixtures/interactions_site.py b/tests/fixtures/interactions_site.py
+index c4012c6..bf646e8 100644
+--- a/tests/fixtures/interactions_site.py
++++ b/tests/fixtures/interactions_site.py
+@@ -31,6 +31,10 @@ getting wrong, one page each, built the way those sites behave:
+ /drag-pointer   the same list, each item made draggable on pointerdown (as
+                 React Aria does)
+ /drag-slider    a knob that follows a held mouse (no drag starts)
++/never-stops    a button that never stops drifting: the click still
++                happens once the settle budget runs out
++/moving-target  a button that glides to a stop over its first frames
++                (no CSS animation), reporting where it was clicked
+ /xo-parent      a card form in a cross-site iframe (localhost in a 127.0.0.1
+                 page: its own process); ?same-site: cross-origin, same process
+ 
+@@ -43,6 +47,44 @@ HEAD = "<!doctype html><html><head><meta charset=utf-8><title>{title}</title><st
+ 
+ PAGES = {}
+ 
++
++
++PAGES["/never-stops"] = ("never stops", "", """
++<p id=status>waiting</p>
++<button id=drifter style="position:absolute;left:200px;top:60px;width:60px;height:30px"
++  onclick="document.getElementById('status').textContent='ok '+event.clientX+' '+event.clientY">D</button>
++<script>
++// A perpetual small drift, no CSS animation: the box never reads the same
++// twice, so only the settle budget can end the wait - then the click must
++// still land on the button (the drift is smaller than the button).
++let dx = 0, dir = 1;
++const drift = () => {
++  dx += dir * 3;
++  if (Math.abs(dx) >= 12) dir = -dir;
++  document.getElementById('drifter').style.left = (200 + dx) + 'px';
++  requestAnimationFrame(drift);
++};
++requestAnimationFrame(drift);
++</script>""")
++
++PAGES["/moving-target"] = ("moving target", "", """
++<p id=status>waiting</p>
++<button id=mover style="position:absolute;left:60px;top:60px;width:34px;height:22px"
++  onclick="document.getElementById('status').textContent='ok '+event.clientX+' '+event.clientY">M</button>
++<script>
++// No CSS animation: a plain rAF glide, the shape a deferred page commit
++// takes. 40px a frame for 12 frames, then still - a one-read click lands
++// on empty page where the button used to be.
++let x = 60, frames = 0;
++const glide = () => {
++  if (frames++ >= 12) return;
++  x += 40;
++  document.getElementById('mover').style.left = x + 'px';
++  requestAnimationFrame(glide);
++};
++requestAnimationFrame(glide);
++</script>""")
++
+ PAGES["/leader"] = ("leader", "", """
+ <p id=role>waiting</p>
+ <script>
+diff --git a/tests/interactions.rs b/tests/interactions.rs
+index 23023fa..e6987cd 100644
+--- a/tests/interactions.rs
++++ b/tests/interactions.rs
+@@ -427,6 +427,38 @@ fn a_click_waits_for_a_sliding_modal_to_settle() {
+     }
+ }
+ 
++#[test]
++fn a_click_waits_for_a_moving_target_to_stop() {
++    let (true, Some(site)) = (chrome(), site()) else { return };
++    let s = Session::start("moving-target", &[]);
++    s.ok(&["goto", &format!("{}/moving-target", site.url)]);
++    s.ok(&["click", "--selector", "#mover"]);
++    let status = s.text(&["get", "text", "--selector", "#status"]);
++    // The button glides 40px a frame for 12 frames from x=60, then stops:
++    // settled box centre x is 60 + 12*40 + 34/2 = 557. A click read before
++    // it stopped lands on empty page and the status stays "waiting".
++    assert!(status.starts_with("ok "), "click did not land on the button: {status}");
++    let x: i32 = status
++        .strip_prefix("ok ")
++        .and_then(|rest| rest.split(' ').next())
++        .and_then(|n| n.parse().ok())
++        .expect("status carries the click x");
++    assert!((540..=574).contains(&x), "click x {x} is not the settled centre 557");
++}
++
++#[test]
++fn a_click_on_a_target_that_never_stops_still_lands() {
++    let (true, Some(site)) = (chrome(), site()) else { return };
++    let s = Session::start("never-stops", &[]);
++    s.ok(&["goto", &format!("{}/never-stops", site.url)]);
++    s.ok(&["click", "--selector", "#drifter"]);
++    let status = s.text(&["get", "text", "--selector", "#status"]);
++    // The drift is +/-12px around x=200, the button 60px wide: a click at
++    // the last-read centre always lands on it once the settle budget ends
++    // the stability wait. Reaching here at all proves there is no hang.
++    assert!(status.starts_with("ok "), "click did not land on the button: {status}");
++}
++
+ #[test]
+ fn a_field_under_a_panel_is_uncovered_before_typing() {
+     let (true, Some(site)) = (chrome(), site()) else { return };
