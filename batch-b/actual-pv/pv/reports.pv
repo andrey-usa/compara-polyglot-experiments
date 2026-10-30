@@ -54,6 +54,16 @@
 # centre), which React Aria's press handling needs; a bare .click()
 # never changed the value. The following expect still verifies the
 # popover opened and the value became Tag.
+# W17 (second Split occurrence only, supersedes W16 there): the
+# W16 sequence left the Tag option hidden after go-back, so the
+# trigger is clicked by its current value, saved from the DOM
+# (upstream clicks the splitRow button itself, whose accessible
+# name is its current value); the following expect still verifies
+# the popover opened and the value became Tag. The Donut scenario
+# now asserts the custom-editor URL and Donut-button visibility
+# before clicking (upstream's goToCustomReportPage/selectMode
+# auto-waits); its run-6 failure is recorded as flaky-or-timing
+# unless run 7 shows a navigation divergence.
 # W12: the forecast card is scrolled into view, then an expect js
 # polls until its heading renders (upstream scrolls in a retry loop;
 # the old single-shot eval ran before the async card render, so no
@@ -471,7 +481,8 @@ scenario "splits transactions into exact tag buckets and scopes them"
   expect js "[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=notes]')].map(n=>n.textContent.trim()).filter(t=>t.includes('#')).join('|')" is "#red #circle"
   back
   expect --testid reports-page visible
-  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');if(!b)return false;b.scrollIntoView();const r=b.getBoundingClientRect();const c={bubbles:true,cancelable:true,button:0,clientX:r.left+r.width/2,clientY:r.top+r.height/2};b.dispatchEvent(new PointerEvent('pointerover',{...c,pointerType:'mouse',isPrimary:true}));b.dispatchEvent(new PointerEvent('pointerdown',{...c,pointerType:'mouse',isPrimary:true,buttons:1}));b.dispatchEvent(new MouseEvent('mousedown',{...c,buttons:1}));b.focus();b.dispatchEvent(new PointerEvent('pointerup',{...c,pointerType:'mouse',isPrimary:true,buttons:0}));b.dispatchEvent(new MouseEvent('mouseup',{...c,buttons:0}));b.dispatchEvent(new MouseEvent('click',{...c,buttons:0}));return true})()"
+  save splitval = eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');return el?.parentElement?.querySelector('button')?.textContent.trim()})()"
+  click --role button --name "${splitval}"
   expect --role button --name "Tag" visible
   click --role button --name "Tag"
   expect js "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');return el?.parentElement?.querySelector('button')?.textContent.trim()})()" is "Tag"
@@ -569,8 +580,10 @@ scenario "Switches to Area Graph and checks the visuals"
 scenario "Switches to Donut Graph and checks the visuals"
   click --role button --name "Add new widget"
   click --role button --name "New custom report"
+  expect url contains "/reports/custom"
   eval "(()=>{const s=document.createElement('style');s.textContent='[role=\"tooltip\"] { display: none !important; }';document.head.appendChild(s);return true})()"
   click --role button --name "Total"
+  expect --role button --name "Donut Graph" visible
   click --role button --name "Donut Graph"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
