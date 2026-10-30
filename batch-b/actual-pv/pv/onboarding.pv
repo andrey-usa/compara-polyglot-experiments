@@ -3,11 +3,12 @@
 # (no createTestFile): visuals on the welcome page, imports of YNAB4
 # (zip), nYNAB (json) and Actual (zip) budgets, a fresh empty budget,
 # and back-to-start via "No server" + "Start using a server".
-# Import flow: "Import my budget" -> type button -> file chooser.
-# Upstream uses the OS file chooser (waitForEvent + setFiles); this
-# port sets the file directly on the file input (batch A precedent for
-# transaction imports), without clicking the "Select file..." button
-# that would open the chooser. The three import fixtures are copied
+# Import flow: "Import my budget" -> type button -> "Select file..."
+# (upstream's file-chooser trigger) -> file input. Upstream uses the
+# OS file chooser (waitForEvent + setFiles); this port clicks the
+# same trigger button, then sets the file directly on the file input
+# (batch A precedent for transaction imports), because the input is
+# not in the DOM until that button is clicked. The three import fixtures are copied
 # verbatim from upstream e2e/data/ and sit beside this file.
 # Schedule-name checks: upstream counts table rows filtered by text
 # (filter({hasText}) == 1 per name). Primavera has no hasText locator
@@ -55,6 +56,7 @@ scenario "checks the page visuals"
 scenario "creates a new budget file by importing YNAB4 budget"
   click --role button --name "Import my budget"
   click --role button --name "YNAB4 The old unsupported desktop app"
+  click --role button --name "Select zip file..."
   upload --selector "input[type=file]" ynab4-demo-budget.zip
   expect --testid budget-table visible --timeout-ms 30000
   click --role link --name "Account1 with Starting Balance"
@@ -65,6 +67,7 @@ scenario "creates a new budget file by importing YNAB4 budget"
 scenario "creates a new budget file by importing nYNAB budget"
   click --role button --name "Import my budget"
   click --role button --name "nYNAB The newer web app"
+  click --role button --name "Select file..."
   upload --selector "input[type=file]" ynab5-demo-budget.json
   expect --testid budget-table visible --timeout-ms 30000
   click --role link --name "Checking"
@@ -91,6 +94,7 @@ scenario "creates a new budget file by importing nYNAB budget"
 scenario "creates a new budget file by importing Actual budget"
   click --role button --name "Import my budget"
   click --role button --name "Actual Import a file exported from Actual"
+  click --role button --name "Select file..."
   upload --selector "input[type=file]" actual-demo-budget.zip
   expect --testid budget-table visible --timeout-ms 20000
   click --role link --name "Ally Savings"

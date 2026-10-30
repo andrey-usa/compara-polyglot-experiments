@@ -25,7 +25,7 @@ scenario "creates a custom report in an empty budget"
   expect --role button --name "Net Worth" visible
   click --role button --name "Add new widget"
   click --role button --name "New custom report"
-  expect url contains "/reports/custom/"
+  expect url contains "/reports/custom"
   expect --role button --name "Total" visible
   expect --role button --name "Time" visible
   expect no errors

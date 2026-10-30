@@ -2,7 +2,8 @@
 # 2 upstream tests, 2 scenarios. Upstream: fresh demo budget per test
 # (createTestFile = click "Try the demo", wait for budget-table, plus
 # "Add group" visible). The bar is a combobox named "Command Bar",
-# opened with ControlOrMeta+k, closed with Escape. Test 2: type
+# opened with ControlOrMeta+k (Control+k on Linux CI, W9: primavera
+# has no ControlOrMeta modifier), closed with Escape. Test 2: type
 # "reports", Enter -> reports page loaded; reopen, ArrowDown twice to
 # highlight "Schedules", Enter -> "Add new schedule" visible.
 # Upstream screenshot calls are toMatchThemeScreenshots on the page;
@@ -28,21 +29,21 @@ before each
   expect --role button --name "Add group" visible --timeout-ms 10000
 
 scenario "Check the command bar visuals"
-  press ControlOrMeta+k
+  press Control+k
   expect --role combobox --name "Command Bar" visible
   expect screenshot command-bar-open --max-diff-pixels 5000
   press Escape
   expect not --role combobox --name "Command Bar" visible
 
 scenario "Check the command bar search works correctly"
-  press ControlOrMeta+k
+  press Control+k
   expect --role combobox --name "Command Bar" visible
   expect --role combobox --name "Command Bar" value is ""
   fill --role combobox --name "Command Bar" "reports"
   press Enter
   expect --testid reports-page visible
   expect not text "Loading reports..." --timeout-ms 10000
-  press ControlOrMeta+k
+  press Control+k
   expect --role combobox --name "Command Bar" visible
   press ArrowDown
   press ArrowDown

@@ -26,7 +26,14 @@
 # (see that scenario). The empty-budget test's pageErrors check is
 # ported as `expect no errors` (stricter: also fails on console
 # errors, which upstream does not collect).
-# W1-W2 (pilot): not needed here. W3: report list extraction, split
+# W1-W2 (pilot): not needed here. W6: the report-list scenario sets
+# viewport 1280 720 (upstream Playwright default; navigera defaults
+# 1440x900, which renders extra lazy report cards below the fold and
+# breaks the exact list). W7: the forecast toggle uses click, not
+# check — upstream itself clicks the checkbox, and primavera's check
+# step reported clicking did not check it. W8: the Split row button
+# is scrolled into view before its eval click, then a wait for the
+# popover, because the Tag option was absent from the tree. W3: report list extraction, split
 # row button, tag scope search, drilldown cell click, budget-cell
 # picks, legend tagging (all eval/js over the same DOM, same
 # assertions). W5: legend scroll via `mouse wheel` after hover is
@@ -49,6 +56,7 @@ before each
   expect --role button --name "Net Worth" visible
 
 scenario "loads net worth and cash flow reports"
+  set viewport 1280 720
   expect js "[...document.querySelectorAll('[data-testid=reports-page] button')].map(b=>b.querySelector('h1,h2,h3,h4')?.textContent.trim()).filter(Boolean).join('|')" is "Total Income (YTD)|Total Expenses (YTD)|Avg Per Month|Avg Per Transaction|Net Worth|Cash Flow|This Month|Budget Overview|3-Month Average"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
@@ -149,7 +157,8 @@ scenario "loads balance forecast report with monthly granularity"
   click --role link --name "Settings"
   expect --testid settings visible
   click --role link --name "Experimental"
-  check --role checkbox --name "Balance Forecast Report"
+  click --role checkbox --name "Balance Forecast Report"
+  expect js "document.querySelector('#settings-flag-balanceForecastReport').checked"
   click --role link --name "Reports"
   expect --testid reports-page visible
   expect --role button --name "Net Worth" visible
@@ -172,7 +181,8 @@ scenario "switches to daily granularity"
   click --role link --name "Settings"
   expect --testid settings visible
   click --role link --name "Experimental"
-  check --role checkbox --name "Balance Forecast Report"
+  click --role checkbox --name "Balance Forecast Report"
+  expect js "document.querySelector('#settings-flag-balanceForecastReport').checked"
   click --role link --name "Reports"
   expect --testid reports-page visible
   expect --role button --name "Net Worth" visible
@@ -198,7 +208,8 @@ scenario "switches to Zero-Based Y-Axis"
   click --role link --name "Settings"
   expect --testid settings visible
   click --role link --name "Experimental"
-  check --role checkbox --name "Balance Forecast Report"
+  click --role checkbox --name "Balance Forecast Report"
+  expect js "document.querySelector('#settings-flag-balanceForecastReport').checked"
   click --role link --name "Reports"
   expect --testid reports-page visible
   expect --role button --name "Net Worth" visible
@@ -224,7 +235,8 @@ scenario "switches to daily granularity and Zero-Based Y-Axis"
   click --role link --name "Settings"
   expect --testid settings visible
   click --role link --name "Experimental"
-  check --role checkbox --name "Balance Forecast Report"
+  click --role checkbox --name "Balance Forecast Report"
+  expect js "document.querySelector('#settings-flag-balanceForecastReport').checked"
   click --role link --name "Reports"
   expect --testid reports-page visible
   expect --role button --name "Net Worth" visible
@@ -253,7 +265,8 @@ scenario "loads tracking budget forecast report"
   click --role link --name "Settings"
   expect --testid settings visible
   click --role link --name "Experimental"
-  check --role checkbox --name "Balance Forecast Report"
+  click --role checkbox --name "Balance Forecast Report"
+  expect js "document.querySelector('#settings-flag-balanceForecastReport').checked"
   click --role link --name "Reports"
   expect --testid reports-page visible
   expect --role button --name "Net Worth" visible
@@ -374,7 +387,8 @@ scenario "splits transactions into exact tag buckets and scopes them"
   expect --role button --name "Net Worth" visible
   click --role button --name "Add new widget"
   click --role button --name "New custom report"
-  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');b?.click();return !!b})()"
+  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');if(b){b.scrollIntoView();b.click();}return !!b})()"
+  wait --ms 1000
   click --role button --name "Tag"
   click --role button --name "Data Table"
   expect text "#red"
@@ -408,7 +422,8 @@ scenario "splits transactions into exact tag buckets and scopes them"
   expect js "[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=notes]')].map(n=>n.textContent.trim()).filter(t=>t.includes('#')).join('|')" is "#red #circle"
   back
   expect --testid reports-page visible
-  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');b?.click();return !!b})()"
+  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');if(b){b.scrollIntoView();b.click();}return !!b})()"
+  wait --ms 1000
   click --role button --name "Tag"
   click --role button --name "Data Table"
   click --role button --name "Tag scope: All tags"
@@ -430,7 +445,8 @@ scenario "warns about missing scoped tags without transaction filters"
   eval "(()=>{sessionStorage.setItem('url', window.location.pathname);sessionStorage.setItem('report', JSON.stringify({groupBy:'Tag',tagScope:{mode:'selected',tagIds:['deleted-tag-id']},conditions:[]}));return true})()"
   reload
   expect js "document.body.innerText.match(/non-existing filter or tag/) !== null"
-  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');b?.click();return !!b})()"
+  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');if(b){b.scrollIntoView();b.click();}return !!b})()"
+  wait --ms 1000
   click --role button --name "Category"
   expect js "document.body.innerText.match(/non-existing filter or tag/) === null"
 
