@@ -64,7 +64,7 @@ jobs:
           fi
       - name: Apply the click stable-box patch, run its test, build the patched primavera
         run: |
-          git -C navigera apply batch-a/navigera-click-stable-box.patch
+          git -C navigera apply "$GITHUB_WORKSPACE/batch-a/navigera-click-stable-box.patch"
           git -C navigera diff --stat
           NAVIGERA_REQUIRE_BROWSER=1 CARGO_TARGET_DIR="$RUNNER_TEMP/nv-test-target" cargo test --release --manifest-path navigera/Cargo.toml --test interactions a_click_waits_for_a_moving_target_to_stop
           CARGO_TARGET_DIR="$RUNNER_TEMP/pv-target-patched" cargo build --release --manifest-path primavera/Cargo.toml
