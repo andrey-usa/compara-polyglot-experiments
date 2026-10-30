@@ -87,14 +87,14 @@ jobs:
           primavera run pv/accounts.pv --grep "updates the running balance" --repeat 2 --junit results/running-balance-junit.xml --evidence results/evidence > results/running-balance-rerun.log 2>&1; P=$?
           cat results/running-balance-rerun.log
           echo "running-balance rerun rc=$P (non-gating; the batch gate below is authoritative)"
-      - name: Measure the by-payee race (T-0168; literal port, --repeat 10)
+      - name: "Measure the by-payee race (literal port, --repeat 10)"
         working-directory: batch-a/actual-pv
         run: |
           mkdir -p results
           primavera run pv/transactions.pv --grep "filters transactions by payee" --repeat 10 --junit results/by-payee-measure-junit.xml --evidence results/evidence > results/by-payee-measure.log 2>&1; P=$?
           cat results/by-payee-measure.log
           echo "by-payee measurement rc=$P (non-gating frequency measurement)"
-      - name: Control: by-payee with a 1-frame wait before Apply (--repeat 10)
+      - name: "Control - by-payee with a 1-frame wait before Apply (--repeat 10)"
         working-directory: batch-a/actual-pv
         run: |
           mkdir -p results
