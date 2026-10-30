@@ -1,0 +1,124 @@
+name: neon-arm64-cell
+
+# NEON wide scans on arm64: full suite plus a SWAR-vs-NEON A/B on one
+# arm64 runner. The patch under test is neon.patch in this branch, applied
+# to compara at BASE_SHA below; nothing here is pushed to compara. Base is
+# that commit as-is (SWAR on arm64: Wide::detect is None there); head is
+# the same commit plus the patch (NEON). Both arms run in one job,
+# interleaved, so the comparison is within one machine in one sitting.
+#
+# Triggered by a push to this branch; workflow_dispatch re-runs it.
+
+on:
+  push:
+    branches: [experiment-51]
+    paths:
+      - neon.patch
+      - .github/workflows/neon-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: a876b282a0208752283955948a9e0901518d7b69
+
+jobs:
+  suite:
+    name: suite on arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: cell
+      - uses: actions/checkout@v7
+        with:
+          repository: andrey-usa/compara
+          ref: ${{ env.BASE_SHA }}
+          path: compara
+      - name: apply patch
+        run: git -C compara apply ../cell/neon.patch && git -C compara status --short
+      - name: lint, as CI does
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+        working-directory: compara
+      - name: full suite
+        run: cargo test --locked --release
+        working-directory: compara
+
+  ab:
+    name: SWAR vs NEON A/B on arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: cell
+      - uses: actions/checkout@v7
+        with:
+          repository: andrey-usa/compara
+          ref: ${{ env.BASE_SHA }}
+          path: base
+      - uses: actions/checkout@v7
+        with:
+          repository: andrey-usa/compara
+          ref: ${{ env.BASE_SHA }}
+          path: head
+      - name: apply patch to head
+        run: git -C head apply ../cell/neon.patch && git -C head status --short
+      - name: open the perf counter
+        run: sudo sysctl -w kernel.perf_event_paranoid=1 || true
+      - name: build base
+        run: cargo build --locked --release --bin compara --bin compara-gen-data
+        working-directory: base
+      - name: build head
+        run: cargo build --locked --release --bin compara --bin compara-gen-data
+        working-directory: head
+      - name: generate data
+        run: |
+          ./base/target/release/compara-gen-data --rows 2m --out-dir ab --prefix pair
+          ./base/target/release/compara-gen-data --rows 2m --format parquet --out-dir ab --prefix pqpair
+          ls -la ab/
+      - name: identical output check
+        run: |
+          ./base/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pair_a.csv ab/pair_b.csv > base-out.txt
+          ./head/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pair_a.csv ab/pair_b.csv > head-out.txt
+          diff base-out.txt head-out.txt && echo "CSV output identical"
+          ./base/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pqpair_a.parquet ab/pqpair_b.parquet > base-pq.txt
+          ./head/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pqpair_a.parquet ab/pqpair_b.parquet > head-pq.txt
+          diff base-pq.txt head-pq.txt && echo "Parquet output identical"
+      - name: interleaved A/B, 7 runs each, CSV and Parquet
+        run: |
+          {
+            echo "format,run,arm,seconds,instructions"
+            for fmt in csv parquet; do
+              if [ "$fmt" = csv ]; then A=ab/pair_a.csv; B=ab/pair_b.csv; else A=ab/pqpair_a.parquet; B=ab/pqpair_b.parquet; fi
+              for i in 1 2 3 4 5 6 7; do
+                for arm in base head; do
+                  start=$(date +%s.%N)
+                  icount=$(COMPARA_PHASES=1 python3 base/scripts/icount.py --counter perf -- \
+                    ./$arm/target/release/compara compare \
+                    -k account_id,txn_id -i updated_at --engine turbo "$A" "$B" 2> "phases-$fmt-$arm-$i.txt")
+                  end=$(date +%s.%N)
+                  secs=$(python3 -c "print(f'{$end-$start:.3f}')")
+                  inst=$(echo "$icount" | grep -o '[0-9][0-9]*' | head -1)
+                  echo "$fmt,$i,$arm,$secs,$inst"
+                done
+              done
+            done
+          } | tee ab-table.csv
+          echo "--- sample phases (CSV, head, run 1) ---"
+          cat phases-csv-head-1.txt
+      - name: summary
+        run: |
+          python3 - <<'EOF'
+          import csv, statistics
+          rows = list(csv.DictReader(open('ab-table.csv')))
+          for fmt in ('csv', 'parquet'):
+              for arm in ('base', 'head'):
+                  sel = [r for r in rows if r['format'] == fmt and r['arm'] == arm]
+                  secs = [float(r['seconds']) for r in sel]
+                  inst = [r['instructions'] for r in sel]
+                  print(f"{fmt} {arm}: n={len(secs)} median_s={statistics.median(secs):.3f} "
+                        f"min_s={min(secs):.3f} max_s={max(secs):.3f} instructions={inst}")
+          EOF

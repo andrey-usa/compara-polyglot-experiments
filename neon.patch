@@ -1,0 +1,393 @@
+From 481e8e36de3b6f9dfbbac808c620ff0833dcdea2 Mon Sep 17 00:00:00 2001
+From: andrey-usa <62624421+andrey-usa@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 00:47:25 +0000
+Subject: [PATCH] Wide scans with NEON on aarch64
+
+Wide::detect is Some on aarch64, where NEON is baseline, and hits and same compare two 16-byte registers with a one-bit-per-byte mask packed by weight, so the callers are unchanged. The five text parsing copies carry target_feature(neon) on aarch64, and the setup paths take Wide there too. A randomized test checks the masks against a byte at a time for every delimiter value and every offset.
+---
+ src/engine/turbo/field.rs | 166 +++++++++++++++++++++++++++++++++++---
+ src/engine/turbo/text.rs  |  45 ++++++-----
+ 2 files changed, 182 insertions(+), 29 deletions(-)
+
+diff --git a/src/engine/turbo/field.rs b/src/engine/turbo/field.rs
+index d5cef4f..43ba534 100644
+--- a/src/engine/turbo/field.rs
++++ b/src/engine/turbo/field.rs
+@@ -70,7 +70,10 @@ pub(super) fn is_real(f: Field) -> bool {
+ // point in `text` then runs a copy of itself compiled for AVX2 (`*_wide`, marked
+ // `#[target_feature]`), into which every scan below inlines, or its SWAR copy.
+ // The check is a cached load and a branch per row, where a check and a call per
+-// scan would land between every field and the next.
++// scan would land between every field and the next. On aarch64, NEON is
++// baseline, so every build takes `Wide` with a thirty-two-byte step; the
++// `*_wide` copies there carry `#[target_feature(enable = "neon")]` and the
++// one-bit-per-byte mask below is unchanged, so no caller changes.
+ 
+ /// The width a scan steps in. Implemented by `Swar` and `Wide` only.
+ pub(super) trait Scan: Copy {
+@@ -125,7 +128,10 @@ impl Wide {
+             && std::arch::is_x86_feature_detected!("popcnt")
+             && std::arch::is_x86_feature_detected!("bmi1"))
+         .then_some(Wide(()));
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(target_arch = "aarch64")]
++        // NEON is baseline on aarch64: no run-time detection needed.
++        return Some(Wide(()));
++        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+         return None;
+     }
+ }
+@@ -165,10 +171,14 @@ impl Scan for Wide {
+         // caller has checked the bounds. Inside a function compiled for AVX2
+         // this inlines to the few instructions it is.
+         return unsafe { avx2_hits(data, at, a, b) };
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(target_arch = "aarch64")]
++        // Safety: `self` exists, so this is aarch64 with baseline NEON
++        // (`Wide::detect`), and the caller has checked the bounds.
++        return unsafe { neon_hits(data, at, a, b) };
++        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+         {
+             let _ = (data, at, a, b);
+-            unreachable!("no Wide scan off x86-64")
++            unreachable!("no Wide scan off x86-64 and aarch64")
+         }
+     }
+ 
+@@ -188,10 +198,14 @@ impl Scan for Wide {
+         // Safety: `self` exists, so the CPU has AVX2, and the caller has
+         // checked both bounds.
+         return unsafe { avx2_same(x, xi, y, yi) };
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(target_arch = "aarch64")]
++        // Safety: `self` exists, so this is aarch64 with baseline NEON, and
++        // the caller has checked both bounds.
++        return unsafe { neon_same(x, xi, y, yi) };
++        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+         {
+             let _ = (x, xi, y, yi);
+-            unreachable!("no Wide scan off x86-64")
++            unreachable!("no Wide scan off x86-64 and aarch64")
+         }
+     }
+ }
+@@ -235,6 +249,77 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
+     _mm256_movemask_epi8(equal) as u32 as u64
+ }
+ 
++/// The top bit of each byte of `v`, packed into bit `i` of the result for
++/// byte `i`. NEON has no movemask instruction, so the bits are packed by
++/// weight: each byte's top bit is shifted down to bit 0, byte `i` is weighted
++/// by `2^(i % 8)`, and the eight weights of each half are added. The weights
++/// are distinct powers of two, so the sum is the mask, not an approximation.
++///
++/// A 4-bits-per-byte mask (`vshrn`) would be fewer instructions here, but it
++/// does not fit what the callers count and find: they take `trailing_zeros` of
++/// a one-bit-per-byte mask and mask with `STEP` bits, so a 4-bit mask means
++/// changing every caller. The one-bit mask keeps the callers untouched.
++#[cfg(target_arch = "aarch64")]
++#[inline]
++unsafe fn neon_movemask(v: std::arch::aarch64::uint8x16_t) -> u32 {
++    use std::arch::aarch64::*;
++    // Safety: the lanes are plain arithmetic on a value the caller built.
++    let bits = unsafe { vshrq_n_u8::<7>(v) };
++    const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
++    let weighted = unsafe { vandq_u8(bits, vld1q_u8(WEIGHTS.as_ptr())) };
++    let lo = unsafe { vaddv_u8(vget_low_u8(weighted)) };
++    let hi = unsafe { vaddv_u8(vget_high_u8(weighted)) };
++    (lo as u32) | ((hi as u32) << 8)
++}
++
++/// The NEON compare of two registers' worth: one bit per byte of `x` at `xi`
++/// that equals `y` at `yi`.
++///
++/// # Safety
++/// NEON is baseline on aarch64, `xi + 32 <= x.len()` and `yi + 32 <= y.len()`.
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "neon")]
++#[inline]
++unsafe fn neon_same(x: &[u8], xi: usize, y: &[u8], yi: usize) -> u64 {
++    use std::arch::aarch64::*;
++    // Safety: the bounds are the caller's promise.
++    let (a_lo, a_hi, b_lo, b_hi) = unsafe {
++        (
++            vld1q_u8(x.as_ptr().add(xi)),
++            vld1q_u8(x.as_ptr().add(xi + 16)),
++            vld1q_u8(y.as_ptr().add(yi)),
++            vld1q_u8(y.as_ptr().add(yi + 16)),
++        )
++    };
++    let lo = unsafe { neon_movemask(vceqq_u8(a_lo, b_lo)) };
++    let hi = unsafe { neon_movemask(vceqq_u8(a_hi, b_hi)) };
++    (lo as u64) | ((hi as u64) << 16)
++}
++
++/// The NEON compare.
++///
++/// # Safety
++/// NEON is baseline on aarch64, and `at + 32 <= data.len()`.
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "neon")]
++#[inline]
++unsafe fn neon_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
++    use std::arch::aarch64::*;
++    // Safety: the bounds are the caller's promise.
++    let (lo, hi) = unsafe {
++        (
++            vld1q_u8(data.as_ptr().add(at)),
++            vld1q_u8(data.as_ptr().add(at + 16)),
++        )
++    };
++    let (ba, bb) = unsafe { (vdupq_n_u8(a), vdupq_n_u8(b)) };
++    let eq_lo = unsafe { vorrq_u8(vceqq_u8(lo, ba), vceqq_u8(lo, bb)) };
++    let eq_hi = unsafe { vorrq_u8(vceqq_u8(hi, ba), vceqq_u8(hi, bb)) };
++    let lo = unsafe { neon_movemask(eq_lo) };
++    let hi = unsafe { neon_movemask(eq_hi) };
++    (lo as u64) | ((hi as u64) << 16)
++}
++
+ const ONES: u64 = 0x0101_0101_0101_0101;
+ const HIGH: u64 = 0x8080_8080_8080_8080;
+ 
+@@ -435,9 +520,17 @@ fn word_at(data: &[u8], at: usize) -> u64 {
+ fn fixed() -> Wide {
+     Wide(())
+ }
+-#[cfg(not(all(
+-    target_arch = "x86_64",
+-    any(target_feature = "avx2", target_feature = "avx512bw")
++#[cfg(target_arch = "aarch64")]
++#[inline(always)]
++fn fixed() -> Wide {
++    Wide(())
++}
++#[cfg(not(any(
++    all(
++        target_arch = "x86_64",
++        any(target_feature = "avx2", target_feature = "avx512bw")
++    ),
++    target_arch = "aarch64"
+ )))]
+ #[inline(always)]
+ fn fixed() -> Swar {
+@@ -699,6 +792,61 @@ mod tests {
+         }
+     }
+ 
++    /// `Wide`'s masks against a byte at a time, for every delimiter value and
++    /// every offset a vector step can start at. Only runs where the CPU has
++    /// the vector width: elsewhere there is one width and nothing to compare.
++    /// `Swar` has no `hits`/`same` of its own -- its path is the `match_bits`
++    /// fallback in the `next_of*_with` functions, which
++    /// `both_widths_find_the_same_bytes` already compares end to end -- so
++    /// the reference here is the scalar definition of the mask itself.
++    #[test]
++    fn wide_masks_match_a_byte_at_a_time() {
++        let Some(w) = Wide::detect() else { return };
++        let mut x = 0x9e37_79b9_u32;
++        let mut next = || {
++            x ^= x << 13;
++            x ^= x >> 17;
++            x ^= x << 5;
++            x
++        };
++        // Random data with every byte value present, over several vector steps.
++        let mut d = Vec::new();
++        for _ in 0..300 {
++            d.push((next() % 251) as u8);
++        }
++        // Every delimiter value, paired with a second one that is sometimes
++        // the same, sometimes a neighbour, sometimes far away.
++        for a in 0..=255u8 {
++            for b in [a, a.wrapping_add(1), a.wrapping_sub(1), 0, 255] {
++                for at in 0..=(d.len() - STEP) {
++                    let mut want = 0u64;
++                    for i in 0..STEP {
++                        if d[at + i] == a || d[at + i] == b {
++                            want |= 1 << i;
++                        }
++                    }
++                    assert_eq!(w.hits(&d, at, a, b), want, "hits at {at} for {a}/{b}");
++                }
++            }
++        }
++        // `same` over two random slices, at every offset pair that fits.
++        let mut e = Vec::new();
++        for _ in 0..300 {
++            e.push((next() % 251) as u8);
++        }
++        for xi in 0..=(d.len() - STEP) {
++            for yi in 0..=(e.len() - STEP) {
++                let mut want = 0u64;
++                for i in 0..STEP {
++                    if d[xi + i] == e[yi + i] {
++                        want |= 1 << i;
++                    }
++                }
++                assert_eq!(w.same(&d, xi, &e, yi), want, "same at {xi}/{yi}");
++            }
++        }
++    }
++
+     #[test]
+     fn an_over_long_field_is_a_sentinel_rather_than_a_truncation() {
+         assert_eq!(pack(0, MAX_FIELD_LEN + 1, false), TOO_LONG);
+diff --git a/src/engine/turbo/text.rs b/src/engine/turbo/text.rs
+index 0dc90d9..e9a2d2c 100644
+--- a/src/engine/turbo/text.rs
++++ b/src/engine/turbo/text.rs
+@@ -754,16 +754,16 @@ pub(super) fn guard_span(
+     commas: usize,
+ ) -> Option<usize> {
+     match Wide::detect() {
+-        // Safety: `w` proves the CPU has AVX2.
++        // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
+         Some(w) => unsafe { guard_span_wide(w, data, lo, hi, delimiter, commas) },
+         None => guard_span_with(Swar, data, lo, hi, delimiter, commas),
+     }
+ }
+ 
+-/// [`guard_span_with`], compiled for AVX2 in a baseline build.
++/// [`guard_span_with`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64.
+ ///
+ /// # Safety
+-/// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
++/// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
+ #[cfg_attr(
+     all(
+         target_arch = "x86_64",
+@@ -771,7 +771,8 @@ pub(super) fn guard_span(
+     ),
+     target_feature(enable = "avx2,popcnt,bmi1")
+ )]
+-// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
++#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
++// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
+ // enables; the body is the safe `guard_span_with`, so the feature is the only requirement.
+ unsafe fn guard_span_wide(
+     w: Wide,
+@@ -884,16 +885,16 @@ impl Runs {
+         out: &mut [(usize, usize)],
+     ) -> bool {
+         match Wide::detect() {
+-            // Safety: `w` proves the CPU has AVX2.
++            // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
+             Some(w) => unsafe { self.of_row_wide(w, data, lo, hi, delimiter, out) },
+             None => self.of_row_with(Swar, data, lo, hi, delimiter, out),
+         }
+     }
+ 
+-    /// [`Runs::of_row_with`], compiled for AVX2 in a baseline build.
++    /// [`Runs::of_row_with`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64.
+     ///
+     /// # Safety
+-    /// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
++    /// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
+     #[cfg_attr(
+         all(
+             target_arch = "x86_64",
+@@ -901,7 +902,8 @@ impl Runs {
+         ),
+         target_feature(enable = "avx2,popcnt,bmi1")
+     )]
+-    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
++    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
++    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
+     // enables; the body is the safe `of_row_with`, so the feature is the only requirement.
+     unsafe fn of_row_wide(
+         &self,
+@@ -968,16 +970,16 @@ impl Runs {
+         delimiter: u8,
+     ) -> bool {
+         match Wide::detect() {
+-            // Safety: `w` proves the CPU has AVX2.
++            // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
+             Some(w) => unsafe { self.matches_wide(w, a, spans, b, lo, hi, delimiter) },
+             None => self.matches_with(Swar, a, spans, b, lo, hi, delimiter),
+         }
+     }
+ 
+-    /// [`Runs::matches_with`], compiled for AVX2 in a baseline build.
++    /// [`Runs::matches_with`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64.
+     ///
+     /// # Safety
+-    /// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
++    /// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
+     #[allow(clippy::too_many_arguments)]
+     #[cfg_attr(
+         all(
+@@ -986,7 +988,8 @@ impl Runs {
+         ),
+         target_feature(enable = "avx2,popcnt,bmi1")
+     )]
+-    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
++    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
++    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
+     // enables; the body is the safe `matches_with`, so the feature is the only requirement.
+     unsafe fn matches_wide(
+         &self,
+@@ -1143,17 +1146,17 @@ impl RowParser {
+     /// compares as absent — a difference to report, not a file to refuse.
+     pub(super) fn parse(&self, data: &[u8], start: usize, end: usize, out: &mut [Field]) -> usize {
+         match Wide::detect() {
+-            // Safety: `w` proves the CPU has AVX2.
++            // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
+             Some(w) => unsafe { self.parse_wide(w, data, start, end, out) },
+             None => self.parse_with(Swar, data, start, end, out),
+         }
+     }
+ 
+-    /// [`RowParser::parse_with`], compiled for AVX2 in a baseline build, so
++    /// [`RowParser::parse_with`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64, so
+     /// every scan of the row inlines into it as a vector compare.
+     ///
+     /// # Safety
+-    /// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
++    /// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
+     #[cfg_attr(
+         all(
+             target_arch = "x86_64",
+@@ -1161,7 +1164,8 @@ impl RowParser {
+         ),
+         target_feature(enable = "avx2,popcnt,bmi1")
+     )]
+-    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
++    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
++    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
+     // enables; the body is the safe `parse_with`, so the feature is the only requirement.
+     unsafe fn parse_wide(
+         &self,
+@@ -1547,16 +1551,16 @@ pub(super) fn json_rows_match_at(
+     b_hi: usize,
+ ) -> bool {
+     match Wide::detect() {
+-        // Safety: `w` proves the CPU has AVX2.
++        // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
+         Some(w) => unsafe { json_rows_match_wide(w, p, a, a_lo, a_hi, b, b_lo, b_hi) },
+         None => json_rows_match_with(Swar, p, a, a_lo, a_hi, b, b_lo, b_hi),
+     }
+ }
+ 
+-/// [`json_rows_match_with`], compiled for AVX2 in a baseline build.
++/// [`json_rows_match_with`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64.
+ ///
+ /// # Safety
+-/// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
++/// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
+ #[cfg_attr(
+     all(
+         target_arch = "x86_64",
+@@ -1564,8 +1568,9 @@ pub(super) fn json_rows_match_at(
+     ),
+     target_feature(enable = "avx2,popcnt,bmi1")
+ )]
++#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+ #[allow(clippy::too_many_arguments)]
+-// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
++// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
+ // enables; the body is the safe `json_rows_match_with`, so the feature is the only requirement.
+ unsafe fn json_rows_match_wide(
+     w: Wide,
+-- 
+2.43.0
+
