@@ -1,2 +1,4 @@
 <!doctype html><html><head><meta charset=utf-8><title>bench</title></head>
-<body><button id=b style="width:120px;height:40px">static target</button></body></html>
+<body><button id=b style="width:120px;height:40px"
+  onclick="document.getElementById('out').textContent=String(performance.now()-window.__t0)">static target</button>
+<span id=out></span></body></html>

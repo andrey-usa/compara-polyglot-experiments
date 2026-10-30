@@ -114,7 +114,7 @@ jobs:
           "$RUNNER_TEMP/pv-target-patched/release/primavera" run pv/transactions.pv --grep "filters transactions by payee" --repeat 10 --junit results/by-payee-patched-junit.xml --evidence results/evidence > results/by-payee-patched.log 2>&1 || P=$?
           cat results/by-payee-patched.log
           echo "patched by-payee rc=$P (non-gating patched measurement)"
-      - name: "Click cost on a static button, before vs after (20 clicks each)"
+      - name: "Click latency on a static button, before vs after (20 tries each: isolated click + end-to-end try)"
         run: |
           mkdir -p batch-a/actual-pv/results
           python3 -m http.server 8123 --directory batch-a/bench &>/dev/null &
@@ -124,7 +124,9 @@ jobs:
           "$RUNNER_TEMP/pv-target-patched/release/primavera" run batch-a/bench/click-cost.pv --repeat 20 --reporter jsonl > batch-a/actual-pv/results/click-cost-after.jsonl 2>&1 || true
           kill $SRV || true
           for f in before after; do
-            echo "click-cost $f:"
+            echo "click-cost $f (isolated click latency, eval-bracketed):"
+            jq -r 'select(.event=="scenario") | .saved.delta // empty' batch-a/actual-pv/results/click-cost-$f.jsonl | sort -n | awk '{a[NR]=$1} END{printf "  n=%d median=%.1fms min=%.1f max=%.1f\n", NR, a[int((NR+1)/2)], a[1], a[NR]}'
+            echo "click-cost $f (end-to-end goto+click try latency):"
             jq -r 'select(.event=="scenario") | .ms' batch-a/actual-pv/results/click-cost-$f.jsonl | sort -n | awk '{a[NR]=$1} END{printf "  n=%d median=%.1fms min=%.1f max=%.1f\n", NR, a[int((NR+1)/2)], a[1], a[NR]}'
           done
       - name: Run the converted batch (per-test results)
