@@ -6,7 +6,7 @@ name: real-smoke
 # before any paid cell runs. A no-op episode must judge FAILURE.
 #
 # Protocol: bench/real/README.md. Navigera is built from the
-# public navigera repo `next` branch @ 575564eea8e56ef49ce2af91e26574b7edb1b752 in full;
+# public navigera repo `next` branch @ e08688b9c905f5788fabf145d34ef3f9b617ebcf in full;
 # agent-browser is npm agent-browser@0.39.1. No model key is needed or
 # used here (the harness runs in --scripted-policy mode).
 
@@ -48,12 +48,12 @@ jobs:
         if: matrix.tool == 'navigera'
         with:
           repository: andrey-usa/navigera
-          ref: 575564eea8e56ef49ce2af91e26574b7edb1b752
+          ref: e08688b9c905f5788fabf145d34ef3f9b617ebcf
           path: nav-src
       - name: Build navigera (release)
         if: matrix.tool == 'navigera'
         run: |
-          echo "navigera pin: 575564eea8e56ef49ce2af91e26574b7edb1b752"
+          echo "navigera pin: e08688b9c905f5788fabf145d34ef3f9b617ebcf"
           cd "$GITHUB_WORKSPACE/nav-src"
           cargo build --release --locked --bin navigera
           echo "NAV_BIN=$PWD/target/release/navigera" >> "$GITHUB_ENV"
