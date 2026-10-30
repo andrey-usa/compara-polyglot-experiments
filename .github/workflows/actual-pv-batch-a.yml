@@ -77,35 +77,35 @@ jobs:
         working-directory: batch-a/actual-pv
         run: |
           mkdir -p results
-          primavera run pv/accounts.pv --grep "right clicking an account in sidebar" --repeat 2 --junit results/sidebar-junit.xml --evidence results/evidence > results/sidebar-rerun.log 2>&1; P=$?
+          primavera run pv/accounts.pv --grep "right clicking an account in sidebar" --repeat 2 --junit results/sidebar-junit.xml --evidence results/evidence > results/sidebar-rerun.log 2>&1 || P=$?
           cat results/sidebar-rerun.log
           echo "sidebar rerun rc=$P (recorded here; the batch gate below is authoritative)"
       - name: Rerun the running-balance test twice (guarded-save verification)
         working-directory: batch-a/actual-pv
         run: |
           mkdir -p results
-          primavera run pv/accounts.pv --grep "updates the running balance" --repeat 2 --junit results/running-balance-junit.xml --evidence results/evidence > results/running-balance-rerun.log 2>&1; P=$?
+          primavera run pv/accounts.pv --grep "updates the running balance" --repeat 2 --junit results/running-balance-junit.xml --evidence results/evidence > results/running-balance-rerun.log 2>&1 || P=$?
           cat results/running-balance-rerun.log
           echo "running-balance rerun rc=$P (non-gating; the batch gate below is authoritative)"
       - name: "Measure the by-payee race (literal port, --repeat 10)"
         working-directory: batch-a/actual-pv
         run: |
           mkdir -p results
-          primavera run pv/transactions.pv --grep "filters transactions by payee" --repeat 10 --junit results/by-payee-measure-junit.xml --evidence results/evidence > results/by-payee-measure.log 2>&1; P=$?
+          primavera run pv/transactions.pv --grep "filters transactions by payee" --repeat 10 --junit results/by-payee-measure-junit.xml --evidence results/evidence > results/by-payee-measure.log 2>&1 || P=$?
           cat results/by-payee-measure.log
           echo "by-payee measurement rc=$P (non-gating frequency measurement)"
       - name: "Control - by-payee with a 1-frame wait before Apply (--repeat 10)"
         working-directory: batch-a/actual-pv
         run: |
           mkdir -p results
-          primavera run pv/controls-by-payee-1frame.pv --repeat 10 --junit results/by-payee-control-junit.xml --evidence results/evidence > results/by-payee-control.log 2>&1; P=$?
+          primavera run pv/controls-by-payee-1frame.pv --repeat 10 --junit results/by-payee-control-junit.xml --evidence results/evidence > results/by-payee-control.log 2>&1 || P=$?
           cat results/by-payee-control.log
           echo "by-payee control rc=$P (non-gating pacing control)"
       - name: Run the converted batch (per-test results)
         working-directory: batch-a/actual-pv
         run: |
           mkdir -p results
-          primavera run pv/rules.pv pv/schedules.pv pv/budget.pv pv/transactions.pv pv/accounts.pv --retries 1 --junit results/junit.xml --evidence results/evidence > results/batch-a-run.log 2>&1; P=$?
+          primavera run pv/rules.pv pv/schedules.pv pv/budget.pv pv/transactions.pv pv/accounts.pv --retries 1 --junit results/junit.xml --evidence results/evidence > results/batch-a-run.log 2>&1 || P=$?
           cat results/batch-a-run.log
           ! grep -q "scenarios not run" results/batch-a-run.log || { echo "batch did not execute"; exit 1; }
           T=$(grep -c "<testcase " results/junit.xml || true)
