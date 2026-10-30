@@ -7,11 +7,11 @@
 # and a Next button; the last step shows Finish, which closes the
 # tour. The skip test clicks "Skip tour" on the first step and
 # expects the tour tooltip gone.
-# Port kind: literal for both tests. The tour step counter is read with
-# a js check (no locator hasText filtering in primavera, pilot G4/W3
-# class, but here the counter text is read directly, not used to pick
-# an element, so no W-number is claimed for it).
-# W1-W3 (pilot): not needed here. No new workaround.
+# Port kind: literal for both tests, except W14 (walk unrolled, see
+# the scenario): the tour step counter is asserted with a text
+# contains check after each Next click, as upstream asserts the
+# counter after each click.
+# W1-W3 (pilot): not needed here. W14: see the walk scenario.
 # Requires: set ua "playwright" (pilot G3: matches upstream config
 # userAgent, seeds deterministic demo data).
 base http://127.0.0.1:3001
@@ -27,11 +27,32 @@ scenario "walks through each tour step"
   click --role button --name "Take a tour"
   expect --testid tour-tooltip visible
   # Upstream reads the total from the "N of total" counter, then clicks
-  # Next until the last step. Here the loop clicks Next until the
-  # tooltip's counter reaches its total, then the Finish check below
-  # (with a long timeout) verifies the walk really arrived there.
-  eval "(() => { const dialog = () => document.querySelector('[data-testid=tour-tooltip]'); const counter = () => { const m = (dialog()?.innerText || '').match(/(\d+) of (\d+)/); return m ? [Number(m[1]), Number(m[2])] : null; }; let guard = 0; while (guard++ < 50) { const c = counter(); if (!c) return false; if (c[0] >= c[1]) return true; const next = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Next'); if (!next) return false; next.click(); } return false; })()"
-  expect --role button --name "Finish" visible --timeout-ms 60000
+  # Next until the last step, asserting the counter after each click.
+  # W14: that loop is unrolled here — a synchronous eval loop never
+  # lets React re-render between clicks, so the tour never advanced
+  # and Finish never appeared. Each step below clicks Next inside
+  # the tooltip, then asserts the counter, giving React a render
+  # between steps. Total is 8 steps at the pinned commit (steps.tsx:
+  # Welcome, Your Budget, Saved/To Budget, Categories, Month by
+  # Month, Getting Around, Add Your Accounts, Getting Help).
+  expect --testid tour-tooltip text contains "Welcome to Actual!"
+  expect --testid tour-tooltip text contains "1 of 8"
+  eval "(()=>{const t=document.querySelector('[data-testid=tour-tooltip]');const b=[...t.querySelectorAll('button')].find(x=>x.textContent.trim()==='Next');b?.click();return !!b})()"
+  expect --testid tour-tooltip text contains "2 of 8"
+  eval "(()=>{const t=document.querySelector('[data-testid=tour-tooltip]');const b=[...t.querySelectorAll('button')].find(x=>x.textContent.trim()==='Next');b?.click();return !!b})()"
+  expect --testid tour-tooltip text contains "3 of 8"
+  eval "(()=>{const t=document.querySelector('[data-testid=tour-tooltip]');const b=[...t.querySelectorAll('button')].find(x=>x.textContent.trim()==='Next');b?.click();return !!b})()"
+  expect --testid tour-tooltip text contains "4 of 8"
+  eval "(()=>{const t=document.querySelector('[data-testid=tour-tooltip]');const b=[...t.querySelectorAll('button')].find(x=>x.textContent.trim()==='Next');b?.click();return !!b})()"
+  expect --testid tour-tooltip text contains "5 of 8"
+  eval "(()=>{const t=document.querySelector('[data-testid=tour-tooltip]');const b=[...t.querySelectorAll('button')].find(x=>x.textContent.trim()==='Next');b?.click();return !!b})()"
+  expect --testid tour-tooltip text contains "6 of 8"
+  eval "(()=>{const t=document.querySelector('[data-testid=tour-tooltip]');const b=[...t.querySelectorAll('button')].find(x=>x.textContent.trim()==='Next');b?.click();return !!b})()"
+  expect --testid tour-tooltip text contains "7 of 8"
+  eval "(()=>{const t=document.querySelector('[data-testid=tour-tooltip]');const b=[...t.querySelectorAll('button')].find(x=>x.textContent.trim()==='Next');b?.click();return !!b})()"
+  expect --testid tour-tooltip text contains "8 of 8"
+  expect --testid tour-tooltip text contains "Getting Help"
+  expect --role button --name "Finish" visible
   click --role button --name "Finish"
   expect not --testid tour-tooltip visible
 

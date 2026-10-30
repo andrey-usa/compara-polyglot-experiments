@@ -27,13 +27,27 @@
 # ported as `expect no errors` (stricter: also fails on console
 # errors, which upstream does not collect).
 # W1-W2 (pilot): not needed here. W6: the report-list scenario sets
-# viewport 1280 720 (upstream Playwright default; navigera defaults
-# 1440x900, which renders extra lazy report cards below the fold and
-# breaks the exact list). W7: the forecast toggle uses click, not
+# W6 (superseded): the scenario-level viewport pin did not take
+# effect, because cards latch once rendered at the larger default
+# size. Replaced by the before-each viewport below (upstream
+# Playwright default, set before any render) plus W11. W11: the
+# report list filters buttons to those actually in the viewport —
+# upstream getByRole is visible-only, while a DOM query is not, so
+# below-the-fold cards (Transaction Calendar, Recent Net Worth
+# Change) must be excluded by bounding rect. W7: the forecast toggle uses click, not
 # check — upstream itself clicks the checkbox, and primavera's check
 # step reported clicking did not check it. W8: the Split row button
 # is scrolled into view before its eval click, then a wait for the
-# popover, because the Tag option was absent from the tree. W3: report list extraction, split
+# popover. W13: Split/Type dropdown options are clicked via eval,
+# not a primavera role click — the role click found 0 matches for
+# Tag (nearest Total/Static), while the option is present in the
+# DOM popover; the following expect verifies the row value changed.
+# W12: the forecast card is scrolled into view, then an expect js
+# polls until its heading renders (upstream scrolls in a retry loop;
+# the old single-shot eval ran before the async card render, so no
+# click ever happened and the URL stayed on the dashboard), then a
+# reverse-iteration eval clicks the card's navigate button.
+# W3: report list extraction, split
 # row button, tag scope search, drilldown cell click, budget-cell
 # picks, legend tagging (all eval/js over the same DOM, same
 # assertions). W5: legend scroll via `mouse wheel` after hover is
@@ -46,6 +60,7 @@
 base http://127.0.0.1:3001
 
 before each
+  set viewport 1280 720
   set ua "playwright"
   init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
   goto /
@@ -56,8 +71,7 @@ before each
   expect --role button --name "Net Worth" visible
 
 scenario "loads net worth and cash flow reports"
-  set viewport 1280 720
-  expect js "[...document.querySelectorAll('[data-testid=reports-page] button')].map(b=>b.querySelector('h1,h2,h3,h4')?.textContent.trim()).filter(Boolean).join('|')" is "Total Income (YTD)|Total Expenses (YTD)|Avg Per Month|Avg Per Transaction|Net Worth|Cash Flow|This Month|Budget Overview|3-Month Average"
+  expect js "[...document.querySelectorAll('[data-testid=reports-page] button')].filter(b=>{const r=b.getBoundingClientRect();return r.height>0&&r.top>=0&&r.top<window.innerHeight}).map(b=>b.querySelector('h1,h2,h3,h4')?.textContent.trim()).filter(Boolean).join('|')" is "Total Income (YTD)|Total Expenses (YTD)|Avg Per Month|Avg Per Transaction|Net Worth|Cash Flow|This Month|Budget Overview|3-Month Average"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
   expect screenshot reports-list-auto --max-diff-pixels 5000
@@ -150,9 +164,10 @@ scenario "opens the date range picker and checks visuals"
 # before-each): Settings -> Experimental -> check "Balance Forecast
 # Report", back to reports, "Add new widget" -> "Balance forecast",
 # then scroll the dashboard grid until the Balance Forecast card
-# renders and click its button (W3: card picked via eval over the
-# grid items, as the upstream model scrolls items into view), wait
-# for /reports/forecast/ and the Monthly button.
+# renders and click its button (W12: scroll, poll for the heading,
+# reverse-iterate to the card and click its navigate button, as
+# upstream scrolls in a retry loop), wait for /reports/forecast/
+# and the Monthly button.
 scenario "loads balance forecast report with monthly granularity"
   click --role link --name "Settings"
   expect --testid settings visible
@@ -164,7 +179,10 @@ scenario "loads balance forecast report with monthly granularity"
   expect --role button --name "Net Worth" visible
   click --role button --name "Add new widget"
   click --role button --name "Balance forecast"
-  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();if(i.textContent.includes('Balance Forecast')){const b=[...i.querySelectorAll('button')].find(x=>/Balance Forecast/i.test(x.textContent));if(b){b.click();return true;}}}return false})()"
+  wait --ms 1000
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();}return items.length})()"
+  expect js "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];return items.some(i=>[...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim())))})()"
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(let k=items.length-1;k>=0;k--){const i=items[k];if([...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim()))){const b=[...i.querySelectorAll('button')].find(x=>/^Balance Forecast/.test(x.textContent.trim()));if(b){b.click();return true;}}}return false})()"
   expect url contains "/reports/forecast/"
   expect --role button --name "Monthly" visible
   eval "window.Actual.setTheme('auto')"
@@ -188,7 +206,10 @@ scenario "switches to daily granularity"
   expect --role button --name "Net Worth" visible
   click --role button --name "Add new widget"
   click --role button --name "Balance forecast"
-  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();if(i.textContent.includes('Balance Forecast')){const b=[...i.querySelectorAll('button')].find(x=>/Balance Forecast/i.test(x.textContent));if(b){b.click();return true;}}}return false})()"
+  wait --ms 1000
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();}return items.length})()"
+  expect js "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];return items.some(i=>[...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim())))})()"
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(let k=items.length-1;k>=0;k--){const i=items[k];if([...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim()))){const b=[...i.querySelectorAll('button')].find(x=>/^Balance Forecast/.test(x.textContent.trim()));if(b){b.click();return true;}}}return false})()"
   expect url contains "/reports/forecast/"
   expect --role button --name "Monthly" visible
   click --role button --name "Monthly"
@@ -215,7 +236,10 @@ scenario "switches to Zero-Based Y-Axis"
   expect --role button --name "Net Worth" visible
   click --role button --name "Add new widget"
   click --role button --name "Balance forecast"
-  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();if(i.textContent.includes('Balance Forecast')){const b=[...i.querySelectorAll('button')].find(x=>/Balance Forecast/i.test(x.textContent));if(b){b.click();return true;}}}return false})()"
+  wait --ms 1000
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();}return items.length})()"
+  expect js "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];return items.some(i=>[...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim())))})()"
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(let k=items.length-1;k>=0;k--){const i=items[k];if([...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim()))){const b=[...i.querySelectorAll('button')].find(x=>/^Balance Forecast/.test(x.textContent.trim()));if(b){b.click();return true;}}}return false})()"
   expect url contains "/reports/forecast/"
   expect --role button --name "Monthly" visible
   click --role button --name "Auto"
@@ -242,7 +266,10 @@ scenario "switches to daily granularity and Zero-Based Y-Axis"
   expect --role button --name "Net Worth" visible
   click --role button --name "Add new widget"
   click --role button --name "Balance forecast"
-  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();if(i.textContent.includes('Balance Forecast')){const b=[...i.querySelectorAll('button')].find(x=>/Balance Forecast/i.test(x.textContent));if(b){b.click();return true;}}}return false})()"
+  wait --ms 1000
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();}return items.length})()"
+  expect js "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];return items.some(i=>[...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim())))})()"
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(let k=items.length-1;k>=0;k--){const i=items[k];if([...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim()))){const b=[...i.querySelectorAll('button')].find(x=>/^Balance Forecast/.test(x.textContent.trim()));if(b){b.click();return true;}}}return false})()"
   expect url contains "/reports/forecast/"
   expect --role button --name "Monthly" visible
   click --role button --name "Monthly"
@@ -272,7 +299,10 @@ scenario "loads tracking budget forecast report"
   expect --role button --name "Net Worth" visible
   click --role button --name "Add new widget"
   click --role button --name "Balance forecast"
-  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();if(i.textContent.includes('Balance Forecast')){const b=[...i.querySelectorAll('button')].find(x=>/Balance Forecast/i.test(x.textContent));if(b){b.click();return true;}}}return false})()"
+  wait --ms 1000
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();}return items.length})()"
+  expect js "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];return items.some(i=>[...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim())))})()"
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(let k=items.length-1;k>=0;k--){const i=items[k];if([...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim()))){const b=[...i.querySelectorAll('button')].find(x=>/^Balance Forecast/.test(x.textContent.trim()));if(b){b.click();return true;}}}return false})()"
   expect url contains "/reports/forecast/"
   expect --role button --name "Monthly" visible
   click --role link --name "Settings"
@@ -300,7 +330,10 @@ scenario "loads tracking budget forecast report"
   click --role link --name "Reports"
   expect --testid reports-page visible
   expect --role button --name "Net Worth" visible
-  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();if(i.textContent.includes('Balance Forecast')){const b=[...i.querySelectorAll('button')].find(x=>/Balance Forecast/i.test(x.textContent));if(b){b.click();return true;}}}return false})()"
+  wait --ms 1000
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(const i of items){i.scrollIntoView();}return items.length})()"
+  expect js "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];return items.some(i=>[...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim())))})()"
+  eval "(()=>{const items=[...document.querySelectorAll('[data-testid=reports-page] .react-grid-item')];for(let k=items.length-1;k>=0;k--){const i=items[k];if([...i.querySelectorAll('h1,h2,h3,h4')].some(x=>/^Balance Forecast/i.test(x.textContent.trim()))){const b=[...i.querySelectorAll('button')].find(x=>/^Balance Forecast/.test(x.textContent.trim()));if(b){b.click();return true;}}}return false})()"
   expect url contains "/reports/forecast/"
   expect --role button --name "Monthly" visible
   click --role button --name "Scheduled transactions"
@@ -389,7 +422,8 @@ scenario "splits transactions into exact tag buckets and scopes them"
   click --role button --name "New custom report"
   eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');if(b){b.scrollIntoView();b.click();}return !!b})()"
   wait --ms 1000
-  click --role button --name "Tag"
+  eval "(()=>{const opt=[...document.querySelectorAll('button, [role=option]')].find(e=>e.textContent.trim()==='Tag');if(opt){opt.scrollIntoView();opt.click();return true;}return false})()"
+  expect js "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');return el?.parentElement?.querySelector('button')?.textContent.trim()})()" is "Tag"
   click --role button --name "Data Table"
   expect text "#red"
   expect text "#circle"
@@ -424,7 +458,8 @@ scenario "splits transactions into exact tag buckets and scopes them"
   expect --testid reports-page visible
   eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');if(b){b.scrollIntoView();b.click();}return !!b})()"
   wait --ms 1000
-  click --role button --name "Tag"
+  eval "(()=>{const opt=[...document.querySelectorAll('button, [role=option]')].find(e=>e.textContent.trim()==='Tag');if(opt){opt.scrollIntoView();opt.click();return true;}return false})()"
+  expect js "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');return el?.parentElement?.querySelector('button')?.textContent.trim()})()" is "Tag"
   click --role button --name "Data Table"
   click --role button --name "Tag scope: All tags"
   fill --role textbox --name "Search tags" "red"
@@ -435,7 +470,8 @@ scenario "splits transactions into exact tag buckets and scopes them"
   expect --selector "[data-testid='report-row-#red']" text contains "-40.00"
   expect not text "#circle + #red"
   eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Type:');const b=el?.parentElement?.querySelector('button');b?.click();return !!b})()"
-  click --role button --name "Budgeted"
+  wait --ms 1000
+  eval "(()=>{const opt=[...document.querySelectorAll('button, [role=option]')].find(e=>e.textContent.trim()==='Budgeted');if(opt){opt.scrollIntoView();opt.click();return true;}return false})()"
   expect js "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');return el?.parentElement?.querySelector('button')?.textContent.trim()})()" is "Category"
 
 scenario "warns about missing scoped tags without transaction filters"
