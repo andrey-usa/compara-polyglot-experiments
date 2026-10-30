@@ -1,16 +1,18 @@
-From 2354b087f84dafcf00a541d5ee466c804a487171 Mon Sep 17 00:00:00 2001
+From 443ccd0b28b87649458df2af44dbc7ea1934ef2d Mon Sep 17 00:00:00 2001
 From: andrey-usa <62624421+andrey-usa@users.noreply.github.com>
-Date: Fri, 30 Oct 2026 00:47:25 +0000
+Date: Fri, 30 Oct 2026 01:32:16 +0000
 Subject: [PATCH] Wide scans with NEON on aarch64
 
 Wide::detect is Some on aarch64, where NEON is baseline, and hits and same compare two 16-byte registers with a one-bit-per-byte mask packed by weight, so the callers are unchanged. The five text parsing copies carry target_feature(neon) on aarch64, and the setup paths take Wide there too. A randomized test checks the masks against a byte at a time for every delimiter value and every offset.
+
+The movemask ANDs the full compare byte (0xFF for a match, 0x00 otherwise) with its weight. Shifting the top bit down to bit 0 first dropped every lane but the first of each half: 1 & 2, 1 & 4 and so on are all zero, so only mask bits 0, 8, 16 and 24 ever survived -- the arm64 suite failure.
 ---
- src/engine/turbo/field.rs | 174 ++++++++++++++++++++++++++++++++++++--
+ src/engine/turbo/field.rs | 181 ++++++++++++++++++++++++++++++++++++--
  src/engine/turbo/text.rs  |  45 +++++-----
- 2 files changed, 190 insertions(+), 29 deletions(-)
+ 2 files changed, 197 insertions(+), 29 deletions(-)
 
 diff --git a/src/engine/turbo/field.rs b/src/engine/turbo/field.rs
-index d5cef4f..2fbe245 100644
+index d5cef4f..2938322 100644
 --- a/src/engine/turbo/field.rs
 +++ b/src/engine/turbo/field.rs
 @@ -70,7 +70,10 @@ pub(super) fn is_real(f: Field) -> bool {
@@ -71,15 +73,23 @@ index d5cef4f..2fbe245 100644
          }
      }
  }
-@@ -235,6 +249,85 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
+@@ -235,6 +249,92 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
      _mm256_movemask_epi8(equal) as u32 as u64
  }
  
 +/// The top bit of each byte of `v`, packed into bit `i` of the result for
 +/// byte `i`. NEON has no movemask instruction, so the bits are packed by
-+/// weight: each byte's top bit is shifted down to bit 0, byte `i` is weighted
-+/// by `2^(i % 8)`, and the eight weights of each half are added. The weights
-+/// are distinct powers of two, so the sum is the mask, not an approximation.
++/// weight: byte `i` is weighted by `2^(i % 8)`, and the eight weights of each
++/// half are added. The weights are distinct powers of two, so the sum is the
++/// mask, not an approximation.
++///
++/// The weight has to meet a full byte, not a single bit: a compare byte is
++/// `0xFF` for a match and `0x00` otherwise, so ANDing it with its weight
++/// gives the weight for a match and zero for a miss. Shifting the top bit
++/// down to bit 0 first would break this -- `1 & 2`, `1 & 4` and so on are
++/// all zero, so every lane but the first of each half would be dropped
++/// (that was the arm64 suite failure: only mask bits 0, 8, 16 and 24 ever
++/// survived).
 +///
 +/// A 4-bits-per-byte mask (`vshrn`) would be fewer instructions here, but it
 +/// does not fit what the callers count and find: they take `trailing_zeros` of
@@ -94,9 +104,8 @@ index d5cef4f..2fbe245 100644
 +unsafe fn neon_movemask(v: std::arch::aarch64::uint8x16_t) -> u32 {
 +    use std::arch::aarch64::*;
 +    // Safety: the lanes are plain arithmetic on a value the caller built.
-+    let bits = unsafe { vshrq_n_u8::<7>(v) };
 +    const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-+    let weighted = unsafe { vandq_u8(bits, vld1q_u8(WEIGHTS.as_ptr())) };
++    let weighted = unsafe { vandq_u8(v, vld1q_u8(WEIGHTS.as_ptr())) };
 +    let lo = unsafe { vaddv_u8(vget_low_u8(weighted)) };
 +    let hi = unsafe { vaddv_u8(vget_high_u8(weighted)) };
 +    (lo as u32) | ((hi as u32) << 8)
@@ -157,7 +166,7 @@ index d5cef4f..2fbe245 100644
  const ONES: u64 = 0x0101_0101_0101_0101;
  const HIGH: u64 = 0x8080_8080_8080_8080;
  
-@@ -435,9 +528,17 @@ fn word_at(data: &[u8], at: usize) -> u64 {
+@@ -435,9 +535,17 @@ fn word_at(data: &[u8], at: usize) -> u64 {
  fn fixed() -> Wide {
      Wide(())
  }
@@ -178,7 +187,7 @@ index d5cef4f..2fbe245 100644
  )))]
  #[inline(always)]
  fn fixed() -> Swar {
-@@ -699,6 +800,61 @@ mod tests {
+@@ -699,6 +807,61 @@ mod tests {
          }
      }
  

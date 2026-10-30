@@ -92,16 +92,22 @@ jobs:
           ./head/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pair_a.csv ab/pair_b.csv > head-out.txt || true
           sed -E 's/, [0-9]+\.[0-9]+s$//' base-out.txt > base-out.norm
           sed -E 's/, [0-9]+\.[0-9]+s$//' head-out.txt > head-out.norm
-          diff base-out.norm head-out.norm && echo "CSV output identical"
+          # A bare diff, not `diff && echo`: under bash -e a failing diff
+          # inside an && list does NOT fail the step, so the last run's
+          # head-CSV error passed this check silently (its stdout was
+          # empty, the diff failed, the step still went green).
+          diff base-out.norm head-out.norm
+          echo "CSV output identical"
           ./base/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pqpair_a.parquet ab/pqpair_b.parquet > base-pq.txt || true
           ./head/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pqpair_a.parquet ab/pqpair_b.parquet > head-pq.txt || true
           sed -E 's/, [0-9]+\.[0-9]+s$//' base-pq.txt > base-pq.norm
           sed -E 's/, [0-9]+\.[0-9]+s$//' head-pq.txt > head-pq.norm
-          diff base-pq.norm head-pq.norm && echo "Parquet output identical"
+          diff base-pq.norm head-pq.norm
+          echo "Parquet output identical"
       - name: interleaved A/B, 7 runs each, CSV and Parquet
         run: |
           {
-            echo "format,run,arm,seconds,instructions"
+            echo "format,run,arm,seconds,instructions,status"
             for fmt in csv parquet; do
               if [ "$fmt" = csv ]; then A=ab/pair_a.csv; B=ab/pair_b.csv; else A=ab/pqpair_a.parquet; B=ab/pqpair_b.parquet; fi
               for i in 1 2 3 4 5 6 7; do
@@ -109,6 +115,11 @@ jobs:
                   start=$(date +%s.%N)
                   # icount exits with the command's status, and compare exits
                   # 1 on differing files, so the `|| true` keeps the step alive.
+                  # A compare that errors at startup also exits nonzero and
+                  # prints only the error to the phases file, so a run whose
+                  # phases file has no sweep lines is recorded as error, not
+                  # as a fast compare: the last run's head-CSV numbers were
+                  # exactly that, an error exit timed at 0.036s.
                   icount=$(COMPARA_PHASES=1 python3 base/scripts/icount.py --counter perf -- \
                     ./$arm/target/release/compara compare \
                     -k account_id,txn_id -i updated_at --engine turbo "$A" "$B" 2> "phases-$fmt-$arm-$i.txt" || true)
@@ -116,9 +127,11 @@ jobs:
                   secs=$(python3 -c "print(f'{$end-$start:.3f}')")
                   # icount inherits compare's stdout, so the summary line is
                   # in $icount too: take the instructions line only, and drop
-                  # its thousands separators.
+                  # its thousands separators. Compare itself prints no
+                  # "instructions:" line, so this line is icount's perf count.
                   inst=$(echo "$icount" | grep -o 'instructions: [0-9,]*' | grep -o '[0-9,]*' | tr -d ',')
-                  echo "$fmt,$i,$arm,$secs,$inst"
+                  if grep -q '^error' "phases-$fmt-$arm-$i.txt"; then st=error; else st=ok; fi
+                  echo "$fmt,$i,$arm,$secs,$inst,$st"
                 done
               done
             done
@@ -135,8 +148,14 @@ jobs:
       - name: summary
         run: |
           python3 - <<'EOF'
-          import csv, statistics
+          import csv, statistics, sys
           rows = list(csv.DictReader(open('ab-table.csv')))
+          bad = [r for r in rows if r.get('status') != 'ok']
+          if bad:
+              print(f"ERROR: {len(bad)} run(s) errored, their numbers are not compares:")
+              for r in bad:
+                  print(f"  {r['format']} {r['arm']} run {r['run']}: {r['seconds']}s, {r['instructions']} instructions")
+              sys.exit(1)
           for fmt in ('csv', 'parquet'):
               for arm in ('base', 'head'):
                   sel = [r for r in rows if r['format'] == fmt and r['arm'] == arm]
