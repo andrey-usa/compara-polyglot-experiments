@@ -6,7 +6,33 @@
 # (fresh demo budget per scenario) verified in probe30, so the filter
 # describe's afterEach removeFilter is only ported where the TEST BODY calls
 # it (the "by payee" test), not between scenarios.
-# NO supplemental screenshot scenario "filters transactions by payee"
+# NO supplemental screenshot scenario (parent 2026-10-30): upstream's
+# toMatchThemeScreenshots calls are VRT-gated no-ops in default CI.
+# W3 DEVIATION (same class as pilot/rules/schedules/budget, gap G4 - no
+# hasText/exact-text/name-scoped locator filtering): clicks inside the filter
+# tooltips/datepicker and regex row asserts use eval exact-text clicks and
+# `expect js` queries over the same DOM.
+# Typing: fill --keys stands in for pressSequentially/keyboard.type. The
+# new-transaction-row Tab commits (payee incl. NEW payees, and category) are
+# LITERAL - same keyboard gesture as upstream, probe40-C verified
+# (row 0 category "Food" after --keys + Tab).
+# Exact-text asserts: toHaveText ports as primavera `text is` for clean
+# single-value cells and as textContent collapse+trim equality (true upstream
+# normalization semantics, probe39) where rendering inserts newlines.
+# Value capture: window.__* stands in for upstream JS variables (harness
+# mechanics).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  click --role link --name "Ally Savings"
+  expect --testid transaction-table visible
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length>0" --timeout-ms 15000
+scenario "filters transactions by payee"
   click --role link --name "Capital One Checking"
   expect --testid transaction-table visible
   wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length>0" --timeout-ms 15000
