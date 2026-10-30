@@ -1,0 +1,116 @@
+# transactions.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b).
+# Upstream tests (11: 1 visuals + 4 filters + create/split/transfer +
+# notes tooltip + 2 column-manager), mapped by exact name in each scenario.
+# UA: the global e2e config forces userAgent "playwright" (seeded deterministic
+# demo data); reproduced with `set ua` in before each. Scenario isolation
+# (fresh demo budget per scenario) verified in probe30, so the filter
+# describe's afterEach removeFilter is only ported where the TEST BODY calls
+# it (the "by payee" test), not between scenarios.
+# NO supplemental screenshot scenario (parent 2026-10-30): upstream's
+# toMatchThemeScreenshots calls are VRT-gated no-ops in default CI.
+# W3 DEVIATION (same class as pilot/rules/schedules/budget, gap G4 - no
+# hasText/exact-text/name-scoped locator filtering): clicks inside the filter
+# tooltips/datepicker and regex row asserts use eval exact-text clicks and
+# `expect js` queries over the same DOM.
+# Typing: fill --keys stands in for pressSequentially/keyboard.type. The
+# new-transaction-row Tab commits (payee incl. NEW payees, and category) are
+# LITERAL - same keyboard gesture as upstream, probe40-C verified
+# (row 0 category "Food" after --keys + Tab).
+# Exact-text asserts: toHaveText ports as primavera `text is` for clean
+# single-value cells and as textContent collapse+trim equality (true upstream
+# normalization semantics, probe39) where rendering inserts newlines.
+# Value capture: window.__* stands in for upstream JS variables (harness
+# mechanics).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  click --role link --name "Ally Savings"
+  expect --testid transaction-table visible
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length>0" --timeout-ms 15000
+
+# VARIANT (not batch-A coverage, no verdict change): the accepted port
+# applies the Kroger filter via a page-side eval .click() on Apply (W3).
+# This variant is identical except that ONE step uses a real driver click
+# on the same button (type=submit in the tooltip form), to test whether a
+# trusted click between the item click and Apply changes the race outcome.
+scenario "filters transactions by payee (driver-apply variant)"
+  click --role link --name "Capital One Checking"
+  expect --testid transaction-table visible
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length>0" --timeout-ms 15000
+  click --role button --name "Filter"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Payee').click()"
+  wait --ms 600
+  # LITERAL: upstream autocomplete.click() (auto-open broken for 'is')
+  click --selector "[data-testid='filters-menu-tooltip'] [aria-label='Payee']"
+  wait --ms 800
+  click --testid Kroger-payee-item
+  # state guard (ci-run1: the one-shot Apply eval raced the autocomplete select
+  # commit on both tries -> filter applied as "payee is (nothing)"; gate Apply on
+  # the observable committed value, not ms)
+  expect js "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] input')].some(i=>i.value==='Kroger')" --timeout-ms 10000
+  # VARIANT CHANGE: driver click on the same Apply button (tooltip form's submit)
+  click --selector "[data-testid='filters-menu-tooltip'] button[type='submit']"
+  # committed-state guard (ci-run1): the chip renders the applied filter - gate on it, not only the input value
+  expect text "payee is Kroger" --timeout-ms 10000
+  # harness settle: async table requery after Apply
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]').length>=10" --timeout-ms 15000
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 1 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 2 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 3 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 4 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 5 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 6 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 7 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 8 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 9 text is "Kroger"
+  # removeFilter(0)
+  click --role button --name "Delete filter"
+  click --role button --name "Filter"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Payee').click()"
+  wait --ms 600
+  # W3: op pick 'contains'
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='contains').click()"
+  fill --selector "[data-testid='filters-menu-tooltip'] input[placeholder='nothing']" "De"
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # harness settle: async table requery after Apply
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]').length>=9" --timeout-ms 15000
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 1 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 2 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 3 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 4 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 5 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 6 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 7 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 8 text is "Deposit"
+  click --role button --name "Delete filter"
+  click --role button --name "Filter"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Payee').click()"
+  wait --ms 600
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='contains').click()"
+  fill --selector "[data-testid='filters-menu-tooltip'] input[placeholder='nothing']" "l"
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # harness settle: async table requery after Apply
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]').length>=2" --timeout-ms 15000
+  # W3: upstream regex /l/ per row 0..1
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]')[0].textContent.includes('l')"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]')[1].textContent.includes('l')"
+  click --role button --name "Delete filter"
+  click --role button --name "Filter"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Payee').click()"
+  wait --ms 600
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='does not contain').click()"
+  fill --selector "[data-testid='filters-menu-tooltip'] input[placeholder='nothing']" "l"
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # harness settle: async table requery after Apply
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]').length>=19" --timeout-ms 15000
+  # W3: upstream 19x not.toHaveText(/l/), bundled into one .every (per-row
+  # diagnostics lost on failure - stated, not silently dropped)
+  expect js "[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]')].slice(0,19).every(e=>!e.textContent.includes('l'))"
+

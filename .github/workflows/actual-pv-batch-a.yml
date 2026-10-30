@@ -142,6 +142,20 @@ jobs:
             echo "click-cost $f (end-to-end goto+click try latency):"
             jq -r 'select(.event=="scenario") | .ms' batch-a/actual-pv/results/click-cost-$f.jsonl | sort -n | awk '{a[NR]=$1} END{printf "  n=%d median=%.1fms min=%.1f max=%.1f\n", NR, a[int((NR+1)/2)], a[1], a[NR]}'
           done
+      - name: "Variant (driver-click Apply), unpatched build (--repeat 10)"
+        working-directory: batch-a/actual-pv
+        run: |
+          mkdir -p results
+          primavera run variants/by-payee-driver-apply.pv --repeat 10 --junit results/by-payee-driver-apply-unpatched-junit.xml --evidence results/evidence > results/by-payee-driver-apply-unpatched.log 2>&1 || P=$?
+          cat results/by-payee-driver-apply-unpatched.log
+          echo "driver-apply variant unpatched rc=$P (non-gating experimental variant)"
+      - name: "Variant (driver-click Apply), patched build (--repeat 10)"
+        working-directory: batch-a/actual-pv
+        run: |
+          mkdir -p results
+          "$RUNNER_TEMP/pv-target-patched/release/primavera" run variants/by-payee-driver-apply.pv --repeat 10 --junit results/by-payee-driver-apply-patched-junit.xml --evidence results/evidence > results/by-payee-driver-apply-patched.log 2>&1 || P=$?
+          cat results/by-payee-driver-apply-patched.log
+          echo "driver-apply variant patched rc=$P (non-gating experimental variant)"
       - name: Run the converted batch (per-test results)
         if: ${{ !contains(github.event.head_commit.message, '[skip-batch]') }}
         working-directory: batch-a/actual-pv
