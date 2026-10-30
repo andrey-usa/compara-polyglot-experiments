@@ -2,7 +2,7 @@
 # accounts - 45 upstream tests) converted from Playwright to primavera (.pv),
 # against actualbudget/actual @ dff6b4b21bed7d20a0977cd71c990f40b6e26e8e.
 # primavera @ 2ee2589cb8d481e120d1808f79a428dda93227b7, navigera @
-# 575564eea8e56ef49ce2af91e26574b7edb1b752 (public repos). Same container and
+# e08688b9c905f5788fabf145d34ef3f9b617ebcf (public repos). Same container and
 # app start as the Playwright baseline; per-test results via junit.xml.
 # Standard GitHub-hosted runner; no secrets; no paid calls.
 # Supplemental theme-screenshot scenarios (*.supp.pv) are NOT upstream coverage
@@ -47,7 +47,7 @@ jobs:
       - name: Build primavera + navigera @ pinned commits
         run: |
           git clone --filter=blob:none https://github.com/andrey-usa/navigera.git navigera
-          git -C navigera checkout 575564eea8e56ef49ce2af91e26574b7edb1b752
+          git -C navigera checkout e08688b9c905f5788fabf145d34ef3f9b617ebcf
           git clone --filter=blob:none https://github.com/andrey-usa/primavera.git primavera
           git -C primavera checkout 2ee2589cb8d481e120d1808f79a428dda93227b7
           CARGO_TARGET_DIR="$RUNNER_TEMP/pv-target" cargo build --release --manifest-path primavera/Cargo.toml
@@ -73,6 +73,13 @@ jobs:
           printf 'base http://127.0.0.1:3001\nscenario "probe"\n  goto /\n  expect text "Try the demo" --timeout-ms 30000\n' > /tmp/probe.pv
           primavera run /tmp/probe.pv | tee probe.log
           grep -q "1 passed" probe.log || { echo "browser probe did not execute"; exit 1; }
+      - name: Rerun the sidebar context-menu test twice (G5 follow-up)
+        working-directory: batch-a/actual-pv
+        run: |
+          mkdir -p results
+          primavera run pv/accounts.pv --grep "right clicking an account in sidebar" --repeat 2 --junit results/sidebar-junit.xml --evidence results/evidence | tee results/sidebar-rerun.log
+          P=${PIPESTATUS[0]}
+          echo "sidebar rerun rc=$P (recorded here; the batch gate below is authoritative)"
       - name: Run the converted batch (per-test results)
         working-directory: batch-a/actual-pv
         run: |
