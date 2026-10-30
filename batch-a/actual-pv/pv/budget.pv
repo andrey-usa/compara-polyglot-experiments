@@ -1,0 +1,131 @@
+# budget.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b).
+# Upstream tests (8: 7 in describe "Budget" + 1 in describe "Budget scroll
+# position"), mapped by exact name in each scenario below.
+# UA: the global e2e config forces userAgent "playwright" (seeded deterministic
+# demo data); reproduced with `set ua` in before each. Scenario isolation
+# (fresh demo budget per scenario) verified in probe30.
+# DROPPED harness step (stated, not silently): upstream beforeEach does
+# page.mouse.move(0,0) to avoid hover-induced input rendering - it exists for
+# the VRT-gated screenshots only; primavera has no pointer-move step and this
+# spec has no screenshot assertions (see next line), so it is dropped.
+# NO supplemental screenshot scenario: per parent 2026-10-30, supplemental VRT
+# is excluded from routine runs (noise/cost, known flaky class); upstream's
+# toMatchThemeScreenshots calls are VRT-gated no-ops in default CI.
+# W3 DEVIATION (same class as pilot/rules/schedules, gap G4 - no
+# hasText/exact-text/regex locator filtering): Playwright getByText and
+# filtered-locator reads are ported as `expect js`/`wait --js` queries over
+# the same DOM; element-level substring/regex + rendered checks preserve the
+# upstream match semantics as closely as primavera allows.
+# W4 DEVIATION (transfer modal): option click replaces Enter commit.
+# W7 DEVIATION (group context menu): synthetic contextmenu event replaces a
+# trusted right-click (handler on a no-testid text div).
+# Typing: fill --keys stands in for keyboard.type/pressSequentially (same
+# note as rules.pv/schedules.pv). The transfer category Enter commit is
+# LITERAL (upstream presses Enter; probe34 verified Enter commits the
+# downshift option here).
+# Value capture: upstream reads balances/scrollTop into JS variables; .pv has
+# no variables, so window.__bal*/window.__st stand in (harness mechanics, not
+# a behavior change).
+# Flat --nth note: budget-table row 0 is the "Usual Expenses" GROUP row and
+# has no category-name/category-month-spent cells (probe34), so flat cell
+# selectors shift one vs upstream row indices; each affected step carries a
+# comment. Deterministic demo seeds: row1=Food (1155.00), row2=Restaurants
+# (900.00) (probe34).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+
+scenario "renders the summary information: available funds, overspent, budgeted and for next month"
+  expect --testid budget-summary visible --timeout-ms 10000
+  # W3: upstream summary.getByText(...) element-level matches, rendered-visible
+  expect js "[...document.querySelectorAll('[data-testid=budget-summary] *')].some(e=>e.textContent.includes('Available funds')&&e.getClientRects().length>0)"
+  # W3: upstream regex /^Overspent in /
+  expect js "[...document.querySelectorAll('[data-testid=budget-summary] *')].some(e=>/^Overspent in /.test(e.textContent.trim())&&e.getClientRects().length>0)"
+  expect js "[...document.querySelectorAll('[data-testid=budget-summary] *')].some(e=>e.textContent.includes('Budgeted')&&e.getClientRects().length>0)"
+  expect js "[...document.querySelectorAll('[data-testid=budget-summary] *')].some(e=>e.textContent.includes('For next month')&&e.getClientRects().length>0)"
+
+scenario "transfer funds to another category"
+  # upstream getBalanceForRow(1)/(2): textContent -> parseFloat -> x100 -> round
+  eval "window.__balA=Math.round(parseFloat(document.querySelectorAll('[data-testid=budget-table] [data-testid=row]')[1].querySelector('[data-testid=balance]').textContent.replace(/,/g,''))*100);window.__balB=Math.round(parseFloat(document.querySelectorAll('[data-testid=budget-table] [data-testid=row]')[2].querySelector('[data-testid=balance]').textContent.replace(/,/g,''))*100);'captured'"
+  # transferAllBalance(1,2): row1(Food) balance cell's [data-testid^=budget]
+  # click. FLAT --nth 0: the group row has NO nested budget testid, so flat
+  # order is Food=0, Restaurants=1 (probe38: nth 1 opened Restaurants'
+  # transfer, amount 900.00 - and filtered Restaurants out of its own
+  # target list, which is what made the option list empty in probe36/37).
+  click --selector "[data-testid='budget-table'] [data-testid='row'] [data-testid='balance'] [data-testid^='budget']" --nth 0
+  wait --ms 600
+  click --role button --name "Transfer to another category"
+  wait --ms 600
+  click --selector "input[placeholder='(none)']"
+  # toName = row2 category-name = "Restaurants" (deterministic seeds, probe34)
+  fill --selector "input[placeholder='(none)']" "Restaurants" --keys
+  wait --ms 1200
+  # W4: option click replaces upstream keyboard.press('Enter'). (probe34's
+  # Enter-commit reading was inconclusive: it never checked button state;
+  # run1 with an EMPTY option list left Transfer disabled. Option click is
+  # the established commit port, same class as rules.pv/schedules.pv.)
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Restaurants')).click()"
+  wait --ms 500
+  click --role button --name "Transfer"
+  # upstream: expect.poll(getBalanceForRow(2)).toEqual(A+B); expect auto-retries
+  expect js "Math.round(parseFloat(document.querySelectorAll('[data-testid=budget-table] [data-testid=row]')[2].querySelector('[data-testid=balance]').textContent.replace(/,/g,''))*100)===window.__balA+window.__balB"
+
+scenario "budget table is rendered"
+  expect --testid budget-table visible
+  # upstream getTableTotals: parseInt(textContent,10) of the three totals
+  # cells, expect.any(Number); regex getByTestId(/total-*$/) = CSS $= here
+  expect js "[...document.querySelectorAll('[data-testid=budget-totals] [data-testid$=total-budgeted],[data-testid=budget-totals] [data-testid$=total-spent],[data-testid=budget-totals] [data-testid$=total-leftover]')].length===3 && [...document.querySelectorAll('[data-testid=budget-totals] [data-testid$=total-budgeted],[data-testid=budget-totals] [data-testid$=total-spent],[data-testid=budget-totals] [data-testid$=total-leftover]')].every(e=>!isNaN(parseInt(e.textContent,10)))"
+
+scenario "clicking on spent amounts opens a transaction page"
+  # upstream row nth(1) = Food; flat spent-cell nth 0 (group row 0 has none)
+  click --selector "[data-testid='budget-table'] [data-testid='row'] [data-testid='category-month-spent']" --nth 0
+  expect url contains "/accounts"
+  expect --testid account-name text contains "All Accounts"
+  click --role button --name "Back"
+  # added harness sanity (upstream ends at the Back click): budget page back
+  expect --testid budget-table visible --timeout-ms 15000
+
+scenario "right clicking a category opens context menu"
+  # upstream row nth(1) category-name = Food; flat name-cell nth 0 (see header)
+  click --selector "[data-testid='budget-table'] [data-testid='row'] [data-testid='category-name']" --nth 0 --button right
+  expect --role menu visible
+  expect --role menu text contains "Rename"
+
+scenario "right clicking a category group opens context menu"
+  # W7 (new): synthetic contextmenu dispatch replaces a trusted right-click.
+  # The handler sits on a no-testid text div inside the group row (probe35);
+  # a trusted right-click on the row itself does NOT open the menu (run1).
+  # Dispatch on the exact-text element bubbles to React's delegated handler
+  # (probe36 verified: menu + Rename render).
+  eval "(()=>{const el=[...document.querySelectorAll('[data-testid=budget-table] *')].find(e=>e.textContent.trim()==='Usual Expenses'&&e.children.length===0);el.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}));return 'dispatched'})()"
+  expect --role menu visible
+  expect --role menu text contains "Rename"
+
+scenario "right clicking budget name opens context menu"
+  click --testid budget-name --button right
+  expect --role menu visible
+  expect --role menu text contains "Switch file"
+
+scenario "scroll position is restored when navigating back from spent transactions page"
+  # upstream second describe's beforeEach, inlined (scenario-isolated budget):
+  # verbatim port of the page.evaluate category seeding
+  eval "(async()=>{const groupId=await window.$send('category-group-create',{name:'Extra Categories'});for(let i=1;i<=20;i++){await window.$send('category-create',{name:'Category '+i,groupId})}await window.__TANSTACK_QUERY_CLIENT__.invalidateQueries({queryKey:['categories','lists']});return 'ok'})()"
+  # W3: upstream getByText('Category 20', exact).waitFor(visible)
+  wait --js "[...document.querySelectorAll('[data-testid=budget-table] [data-testid=category-name]')].some(e=>e.textContent.trim()==='Category 20')" --timeout-ms 15000
+  # verbatim scrollToBottom
+  eval "(()=>{const el=document.querySelector('[data-testid=budget-table-scroll-container]');el.scrollTop=el.scrollHeight;return el.scrollTop})()"
+  eval "window.__st=document.querySelector('[data-testid=budget-table-scroll-container]').scrollTop;'saved'"
+  expect js "window.__st>0"
+  # verbatim clickOnSpentAmountForLastVisibleRow (upstream page.evaluate)
+  eval "(()=>{const container=document.querySelector('[data-testid=budget-table-scroll-container]');if(!container)throw new Error('Budget scroll container not found');const containerRect=container.getBoundingClientRect();const cells=container.querySelectorAll('[data-testid=category-month-spent]');for(const cell of [...cells].reverse()){const rect=cell.getBoundingClientRect();if(rect.top>=containerRect.top&&rect.bottom<=containerRect.bottom){cell.click();return true}}return false})()"
+  expect url contains "/accounts"
+  click --role button --name "Back"
+  # upstream budgetPage.waitFor()
+  expect --testid budget-table visible --timeout-ms 15000
+  # upstream toBe (exact scrollTop equality)
+  expect js "document.querySelector('[data-testid=budget-table-scroll-container]').scrollTop===window.__st"

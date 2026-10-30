@@ -1,9 +1,13 @@
-# Actual Budget e2e specs converted from Playwright to primavera (.pv):
-# settings, multitab (incl. tab refresh) and help-menu (visual snapshots),
-# against actualbudget/actual @ dff6b4b. Same container and app start as the
-# Playwright baseline; per-test results via junit.xml. Standard GitHub-hosted
-# runner; no secrets; no paid calls.
-name: actual-pv-pilot
+# Actual Budget e2e desktop-core batch (rules, schedules, budget, transactions,
+# accounts - 45 upstream tests) converted from Playwright to primavera (.pv),
+# against actualbudget/actual @ dff6b4b21bed7d20a0977cd71c990f40b6e26e8e.
+# primavera @ 2ee2589cb8d481e120d1808f79a428dda93227b7, navigera @
+# 575564eea8e56ef49ce2af91e26574b7edb1b752 (public repos). Same container and
+# app start as the Playwright baseline; per-test results via junit.xml.
+# Standard GitHub-hosted runner; no secrets; no paid calls.
+# Supplemental theme-screenshot scenarios (*.supp.pv) are NOT upstream coverage
+# and are excluded from this run.
+name: actual-pv-batch-a
 on:
   workflow_dispatch:
   push:
@@ -12,7 +16,7 @@ permissions:
   contents: read
 
 jobs:
-  pilot:
+  batch-a:
     runs-on: ubuntu-latest
     container:
       image: mcr.microsoft.com/playwright:v1.61.1-jammy
@@ -69,41 +73,24 @@ jobs:
           printf 'base http://127.0.0.1:3001\nscenario "probe"\n  goto /\n  expect text "Try the demo" --timeout-ms 30000\n' > /tmp/probe.pv
           primavera run /tmp/probe.pv | tee probe.log
           grep -q "1 passed" probe.log || { echo "browser probe did not execute"; exit 1; }
-      - name: Capture screenshot baselines in this environment
-        working-directory: pilot/actual-pv
+      - name: Run the converted batch (per-test results)
+        working-directory: batch-a/actual-pv
         run: |
-          mkdir -p results
-          primavera run pv/settings.pv pv/help-menu.pv --update-screenshots | tee results/vrt-baseline-pass.log
-          ! grep -q "scenarios not run" results/vrt-baseline-pass.log || { echo "baseline pass did not execute"; exit 1; }
-          N=$(ls pv/settings.pv.screenshots/*.png pv/help-menu.pv.screenshots/*.png 2>/dev/null | wc -l)
-          [ "$N" -ge 15 ] || { echo "expected >=15 baselines, got $N"; exit 1; }
-      - name: Run the converted suite (per-test results)
-        working-directory: pilot/actual-pv
-        run: |
-          primavera run pv/settings.pv pv/multitab.pv pv/multitab-refresh.pv pv/help-menu.pv --retries 1 --junit results/junit.xml --evidence results/evidence | tee results/pilot-run.log
-          ! grep -q "scenarios not run" results/pilot-run.log || { echo "suite did not execute"; exit 1; }
-          T=$(grep -c "<testcase " results/junit.xml)
-          F=$(grep -cE "<(failure|error)[ >]" results/junit.xml)
-          echo "junit: $T testcases, $F failures/errors"
-          [ "$T" -eq 11 ] || { echo "expected 11 testcases, got $T"; exit 1; }
-          [ "$F" -eq 0 ] || { echo "unexpected failures/errors"; exit 1; }
-      - name: Run the literal multitab takeover port (expected failure, defect repro)
-        if: ${{ always() }}
-        working-directory: pilot/actual-pv
-        run: |
-          set +e
-          primavera run pv/multitab-literal.pv > results/d3-repro.log 2>&1
-          code=$?
-          echo "literal port exit code: $code"
-          if [ $code -eq 0 ]; then echo "UNEXPECTED: literal port passed - expectation violated" | tee results/d3-unexpected-pass.txt; exit 1; fi
-          grep -q "0 passed, 1 failed" results/d3-repro.log || { echo "literal port outcome not the expected failure shape"; exit 1; }
+          primavera run pv/rules.pv pv/schedules.pv pv/budget.pv pv/transactions.pv pv/accounts.pv --retries 1 --junit results/junit.xml --evidence results/evidence | tee results/batch-a-run.log
+          ! grep -q "scenarios not run" results/batch-a-run.log || { echo "batch did not execute"; exit 1; }
+          T=$(grep -c "<testcase " results/junit.xml || true)
+          F=$(grep -cE "<(failure|error)[ >]" results/junit.xml || true)
+          R=$(grep -c "FLAKY" results/batch-a-run.log || true)
+          echo "junit: $T testcases, $F failures/errors, $R flaky (pass-on-retry)"
+          [ "$T" -eq 45 ] || { echo "expected 45 testcases, got $T"; exit 1; }
+          [ "$F" -eq 0 ] || { echo "failures/errors present - see junit + evidence artifacts"; exit 1; }
       - name: Upload results
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: actual-pv-pilot-results
+          name: actual-pv-batch-a-results
           path: |
-            pilot/actual-pv/results/
-            pilot/actual-pv/pv/settings.pv.screenshots/
-            pilot/actual-pv/pv/help-menu.pv.screenshots/
+            batch-a/actual-pv/results/
+            app.log
+            probe.log
           retention-days: 30

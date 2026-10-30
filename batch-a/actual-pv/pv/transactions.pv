@@ -1,0 +1,344 @@
+# transactions.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b).
+# Upstream tests (11: 1 visuals + 4 filters + create/split/transfer +
+# notes tooltip + 2 column-manager), mapped by exact name in each scenario.
+# UA: the global e2e config forces userAgent "playwright" (seeded deterministic
+# demo data); reproduced with `set ua` in before each. Scenario isolation
+# (fresh demo budget per scenario) verified in probe30, so the filter
+# describe's afterEach removeFilter is only ported where the TEST BODY calls
+# it (the "by payee" test), not between scenarios.
+# NO supplemental screenshot scenario (parent 2026-10-30): upstream's
+# toMatchThemeScreenshots calls are VRT-gated no-ops in default CI.
+# W3 DEVIATION (same class as pilot/rules/schedules/budget, gap G4 - no
+# hasText/exact-text/name-scoped locator filtering): clicks inside the filter
+# tooltips/datepicker and regex row asserts use eval exact-text clicks and
+# `expect js` queries over the same DOM.
+# Typing: fill --keys stands in for pressSequentially/keyboard.type. The
+# new-transaction-row Tab commits (payee incl. NEW payees, and category) are
+# LITERAL - same keyboard gesture as upstream, probe40-C verified
+# (row 0 category "Food" after --keys + Tab).
+# Exact-text asserts: toHaveText ports as primavera `text is` for clean
+# single-value cells and as textContent collapse+trim equality (true upstream
+# normalization semantics, probe39) where rendering inserts newlines.
+# Value capture: window.__* stands in for upstream JS variables (harness
+# mechanics).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  click --role link --name "Ally Savings"
+  expect --testid transaction-table visible
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length>0" --timeout-ms 15000
+
+scenario "checks the page visuals"
+  # Literal remainder: NONE beyond the before-each navigation. Upstream's
+  # sole assertion is VRT-gated. Not assertion coverage.
+  print eval "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length"
+
+scenario "filters transactions by date"
+  click --role button --name "Filter"
+  # W3: field pick inside filters-select-tooltip (probe40-A)
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Date').click()"
+  wait --ms 600
+  # LITERAL: upstream keyboard.press('Space') opens the datepicker
+  press Space
+  wait --ms 600
+  expect --testid date-select-tooltip visible
+  # W3: datepicker getByText('20', exact) - one leaf match (probe40-A)
+  eval "[...document.querySelectorAll('[data-testid=date-select-tooltip] *')].find(e=>e.textContent.trim()==='20'&&e.children.length===0).click()"
+  # W3: tooltip-scoped Apply
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # upstream: transactionTable toHaveText('No transactions')
+  expect js "document.querySelector('[data-testid=transaction-table]').textContent.replace(/\s+/g,' ').trim()==='No transactions'"
+
+scenario "filters transactions by category"
+  click --role button --name "Filter"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Category').click()"
+  wait --ms 600
+  # upstream keyboard.type('C') into the focused field: the autocomplete
+  # testid is the POPOVER (probe41); the input is the tooltip's downshift
+  # input (placeholder "nothing"), which is focused after the field pick
+  fill --selector "[data-testid='filters-menu-tooltip'] input" "C" --keys
+  wait --ms 800
+  click --testid Clothing-category-item
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # harness settle: async table requery after Apply
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=category]').length>=5" --timeout-ms 15000
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 0 text is "Clothing"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 1 text is "Clothing"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 2 text is "Clothing"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 3 text is "Clothing"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 4 text is "Clothing"
+
+scenario "filters transactions by category group"
+  click --role link --name "Capital One Checking"
+  expect --testid transaction-table visible
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length>0" --timeout-ms 15000
+  click --role button --name "Filter"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Category').click()"
+  wait --ms 600
+  # W3: tooltip button 'Category' exact, then page-level 'Category group'
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Category').click()"
+  wait --ms 400
+  eval "[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Category group').click()"
+  wait --ms 400
+  fill --selector "[data-testid='filters-menu-tooltip'] input" "U" --keys
+  wait --ms 800
+  click --testid "Usual Expenses-category-group-item"
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # harness settle: async table requery after Apply
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=category]').length>=5" --timeout-ms 15000
+  # W3: upstream regex /^(Savings|Medical|Gift|General|Clothing|Entertainment|Restaurants|Food)$/ per row 0..4
+  expect js "/^(Savings|Medical|Gift|General|Clothing|Entertainment|Restaurants|Food)$/.test(document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=category]')[0].textContent.trim())"
+  expect js "/^(Savings|Medical|Gift|General|Clothing|Entertainment|Restaurants|Food)$/.test(document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=category]')[1].textContent.trim())"
+  expect js "/^(Savings|Medical|Gift|General|Clothing|Entertainment|Restaurants|Food)$/.test(document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=category]')[2].textContent.trim())"
+  expect js "/^(Savings|Medical|Gift|General|Clothing|Entertainment|Restaurants|Food)$/.test(document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=category]')[3].textContent.trim())"
+  expect js "/^(Savings|Medical|Gift|General|Clothing|Entertainment|Restaurants|Food)$/.test(document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=category]')[4].textContent.trim())"
+
+scenario "filters transactions by payee"
+  click --role link --name "Capital One Checking"
+  expect --testid transaction-table visible
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length>0" --timeout-ms 15000
+  click --role button --name "Filter"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Payee').click()"
+  wait --ms 600
+  # LITERAL: upstream autocomplete.click() (auto-open broken for 'is')
+  click --selector "[data-testid='filters-menu-tooltip'] [aria-label='Payee']"
+  wait --ms 800
+  click --testid Kroger-payee-item
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # harness settle: async table requery after Apply
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]').length>=10" --timeout-ms 15000
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 1 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 2 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 3 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 4 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 5 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 6 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 7 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 8 text is "Kroger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 9 text is "Kroger"
+  # removeFilter(0)
+  click --role button --name "Delete filter"
+  click --role button --name "Filter"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Payee').click()"
+  wait --ms 600
+  # W3: op pick 'contains'
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='contains').click()"
+  fill --selector "[data-testid='filters-menu-tooltip'] input[placeholder='nothing']" "De"
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # harness settle: async table requery after Apply
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]').length>=9" --timeout-ms 15000
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 1 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 2 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 3 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 4 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 5 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 6 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 7 text is "Deposit"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 8 text is "Deposit"
+  click --role button --name "Delete filter"
+  click --role button --name "Filter"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Payee').click()"
+  wait --ms 600
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='contains').click()"
+  fill --selector "[data-testid='filters-menu-tooltip'] input[placeholder='nothing']" "l"
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # harness settle: async table requery after Apply
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]').length>=2" --timeout-ms 15000
+  # W3: upstream regex /l/ per row 0..1
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]')[0].textContent.includes('l')"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]')[1].textContent.includes('l')"
+  click --role button --name "Delete filter"
+  click --role button --name "Filter"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Payee').click()"
+  wait --ms 600
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='does not contain').click()"
+  fill --selector "[data-testid='filters-menu-tooltip'] input[placeholder='nothing']" "l"
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # harness settle: async table requery after Apply
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]').length>=19" --timeout-ms 15000
+  # W3: upstream 19x not.toHaveText(/l/), bundled into one .every (per-row
+  # diagnostics lost on failure - stated, not silently dropped)
+  expect js "[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]')].slice(0,19).every(e=>!e.textContent.includes('l'))"
+
+scenario "creates a test transaction"
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "12.34" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='payee']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='payee'] input" "Home Depot" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  # upstream notes: combobox .fill (atomic)
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "Notes field"
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='category']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='category'] input" "Food" --keys
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Home Depot"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='notes']" --nth 0 text is "Notes field"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 0 text is "Food"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='debit']" --nth 0 text is "12.34"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[0].querySelector('[data-testid=credit]').textContent.trim()===''"
+
+scenario "creates a split test transaction"
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "333.33" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='payee']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='payee'] input" "Krogger" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "Notes"
+  press Tab
+  # upstream categoryCell.click() then split-transaction-button click.
+  # W8 (deviation): after the notes Tab the category popover may ALREADY be
+  # open; a trusted click on the cell then lands on the overlaying popover
+  # (run1: it hit the split button itself). Guarded eval opens the cell only
+  # if the split button is absent - a conditional synthetic click replacing
+  # upstream's unconditional trusted click.
+  eval "(()=>{if(!document.querySelector('[data-testid=split-transaction-button]')){document.querySelector('[data-testid=new-transaction] [data-testid=category]').click()}return 'ok'})()"
+  wait --ms 500
+  click --testid split-transaction-button
+  wait --ms 600
+  # child 0 (newTransactionRow.nth(1)): category General + debit 222.22
+  click --selector "[data-testid='new-transaction'] [data-testid='row'] [data-testid='category']" --nth 1
+  fill --selector "[data-testid='new-transaction'] [data-testid='category'] input" "General" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='row'] [data-testid='debit']" --nth 1
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "222.22" --keys
+  press Tab
+  # child 1 (nth(2)): debit 111.11
+  click --selector "[data-testid='new-transaction'] [data-testid='row'] [data-testid='debit']" --nth 2
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "111.11" --keys
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Krogger"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='notes']" --nth 0 text is "Notes"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 0 text is "Split"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='debit']" --nth 0 text is "333.33"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[0].querySelector('[data-testid=credit]').textContent.trim()===''"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 1 text is "Krogger"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[1].querySelector('[data-testid=notes]').textContent.trim()===''"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 1 text is "General"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='debit']" --nth 1 text is "222.22"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[1].querySelector('[data-testid=credit]').textContent.trim()===''"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 2 text is "Krogger"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[2].querySelector('[data-testid=notes]').textContent.trim()===''"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 2 text is "Categorize"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='debit']" --nth 2 text is "111.11"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[2].querySelector('[data-testid=credit]').textContent.trim()===''"
+
+scenario "creates a transfer test transaction"
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "12.34" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='payee']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='payee'] input" "Bank of America" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "Notes field"
+  press Tab
+  # upstream: entered row category input has value 'Transfer' (auto-transfer)
+  expect --selector "[data-testid='new-transaction'] [data-testid='category'] input" value is "Transfer"
+  eval "window.__accBal=document.querySelector('[data-testid=account-balance]').textContent;window.__allAcc=document.querySelector('[data-testid=sidebar-all-accounts-balance]').textContent;window.__onBudget=document.querySelector('[data-testid=sidebar-on-budget-balance]').textContent;'captured'"
+  click --testid add-button
+  click --role button --name "Cancel"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Bank of America"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='notes']" --nth 0 text is "Notes field"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 0 text is "Transfer"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='debit']" --nth 0 text is "12.34"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[0].querySelector('[data-testid=credit]').textContent.trim()===''"
+  # upstream toPass polls: account balance changes, totals unchanged
+  expect js "document.querySelector('[data-testid=account-balance]').textContent!==window.__accBal"
+  expect js "document.querySelector('[data-testid=sidebar-all-accounts-balance]').textContent===window.__allAcc && document.querySelector('[data-testid=sidebar-on-budget-balance]').textContent===window.__onBudget"
+
+scenario "shows the full note and its tags only when the note is truncated"
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='payee']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='payee'] input" "Home Depot" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "This is a deliberately long note about a grocery run that should overflow the notes column and get truncated with an ellipsis #groceries at the very end of the note text."
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='payee']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='payee'] input" "Kroger" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "short note"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 1 text is "Home Depot"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Kroger"
+  hover --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='notes']" --nth 0
+  wait --ms 700
+  expect --role tooltip hidden
+  hover --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='notes']" --nth 1
+  expect --role tooltip visible
+  expect --role tooltip text contains "This is a deliberately long note about a grocery run that should overflow the notes column and get truncated with an ellipsis #groceries at the very end of the note text."
+  expect --role button --name "#groceries" visible
+
+scenario "hides and reorders columns"
+  expect --testid transaction-table-header text contains "Notes"
+  click --role button --name "Account menu"
+  wait --ms 600
+  click --role button --name "Manage table columns"
+  expect --testid transaction-table-columns-modal visible
+  click --selector "label[for='toggle-column-notes']"
+  # LITERAL: .focus() then Enter/ArrowUp/ArrowUp/Enter keyboard reorder
+  # (Playwright focus() is the same DOM focus; probe40-F: aria-label exists)
+  eval "document.querySelector('button[aria-label=\"Reorder Category column\"]').focus()"
+  press Enter
+  press ArrowUp
+  press ArrowUp
+  press Enter
+  click --role button --name "Save"
+  expect --testid transaction-table-columns-modal hidden
+  # upstream: header toHaveText('DateCategoryPayeePaymentDeposit✓')
+  expect js "document.querySelector('[data-testid=transaction-table-header]').textContent.replace(/\s+/g,' ').trim()==='DateCategoryPayeePaymentDeposit✓'"
+  click --role button --name "Account menu"
+  wait --ms 600
+  click --role button --name "Manage table columns"
+  expect --testid transaction-table-columns-modal visible
+  # upstream: #toggle-column-notes not checked (js: input may be hidden)
+  expect js "document.querySelector('#toggle-column-notes').checked===false"
+  click --role button --name "Reset to default"
+  click --role button --name "Save"
+  expect --testid transaction-table-columns-modal hidden
+  expect js "document.querySelector('[data-testid=transaction-table-header]').textContent.replace(/\s+/g,' ').trim()==='DatePayeeNotesCategoryPaymentDeposit✓'"
+
+scenario "applies columns to all transaction tables when enabled"
+  click --role button --name "Account menu"
+  wait --ms 600
+  click --role button --name "Manage table columns"
+  expect --testid transaction-table-columns-modal visible
+  click --selector "label[for='toggle-column-notes']"
+  # W3: modal.getByText('Apply to all transaction tables')
+  eval "[...document.querySelectorAll('[data-testid=transaction-table-columns-modal] *')].find(e=>e.textContent.trim()==='Apply to all transaction tables'&&e.children.length===0).click()"
+  click --role button --name "Save"
+  expect --testid transaction-table-columns-modal hidden
+  expect js "!document.querySelector('[data-testid=transaction-table-header]').textContent.includes('Notes')"
+  click --role link --name "Bank of America"
+  expect --testid transaction-table visible
+  expect js "!document.querySelector('[data-testid=transaction-table-header]').textContent.includes('Notes')"

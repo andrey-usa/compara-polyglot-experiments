@@ -1,0 +1,396 @@
+# schedules.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b).
+# Upstream tests (6), mapped by exact name in each scenario below.
+# UA: the global e2e config forces userAgent "playwright" (seeded deterministic
+# demo data); reproduced with `set ua` in before each.
+# ISOLATION VERIFIED (probe30): each primavera scenario gets a fresh demo
+# budget, so upstream fresh-test-file row indices hold VERBATIM (a new
+# schedule sorts to row index 2; seeds: Fast Internet / Dominion Power /
+# None / None).
+# Screenshots: upstream gates toMatchThemeScreenshots behind VRT=true, so those
+# assertions are DISABLED in the regular e2e baseline. The screenshot steps
+# here are a SUPPLEMENTAL in-environment repeatability check (fresh baselines,
+# --max-diff-pixels 5000), not upstream coverage and not equivalent to the
+# upstream VRT assertions (maxDiffPixels: 5, threshold 0.05).
+# Screenshots moved to schedules.supp.pv (2026-10-30): excluded from routine
+# full runs; baselines preserved in schedules.supp.pv.screenshots/. Not all upstream
+# screenshot points are repeated (gap, stated): the supplemental scenario
+# covers fresh/added/posted/completed page states only.
+# W3 DEVIATION (same class as pilot + rules, gap G4 - no hasText/substring
+# locator filtering): option selection clicks the first [role=option] whose
+# textContent includes the typed value, via eval, standing in for Playwright's
+# getByRole('option').filter({ hasText }).first().click(). NOTE: unlike
+# rules.pv (W4), upstream schedule-edit-modal.ts ITSELF clicks the option
+# (pressSequentially + click), so only the matching mechanism deviates here,
+# not the commit gesture. fill --keys stands in for pressSequentially (same
+# note as rules.pv).
+# W3 DEVIATION (scenario 3, same G4 class): the destination-account preview
+# row filter (locator.filter({ has: schedule-icon, hasText })) and the
+# toHaveCount(1)/per-field checks are asserted with `expect js` queries.
+# Amount-cell exact asserts (NOT a deviation, resolved 2026-10-30): the cell
+# DOM is <div>~</div><span>25.00</span> (probe39: textContent "~25.00",
+# innerText "~\n25.00"). Upstream toHaveText compares normalized
+# textContent, so the true port is textContent collapse+trim equality -
+# implemented as such. (primavera `text is` uses innerText-style extraction,
+# which is why it saw the newline.)
+# W5 DEVIATION (new, harness mechanics): the schedule amount field is a
+# masked currency input that ignores primavera's atomic fill unless focused
+# first (observed: saved 0.00; probe31). Ported as click-to-focus + fill +
+# Tab commit, standing in for upstream's plain amountInput.fill(String(n)).
+# The amount cell renders tilde+newline+value; upstream toHaveText normalizes
+# whitespace, so the exact port is expect js with whitespace-normalized
+# equality (NOT primavera text is, which compared the raw newline).
+# Exact-text assertions: upstream toHaveText is exact; ported as
+# `text is` (normalized) where primavera supports it, and `expect js` with
+# trimmed equality for empty-string cells (credit '') and the multi-line
+# rule conditions/actions cells.
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  click --role link --name "Schedules"
+  # wait for the schedules table to finish loading (async)
+  wait --js "document.querySelectorAll('[data-testid=table] [data-testid=row]').length>0" --timeout-ms 15000
+
+scenario "checks the page visuals"
+  # Literal remainder: NONE beyond the before-each navigation. Upstream's
+  # sole assertion is VRT-gated (toMatchThemeScreenshots no-ops without
+  # VRT=true). Theme screenshots: final supplemental scenario.
+  print eval "document.querySelectorAll('[data-testid=table] [data-testid=row]').length"
+
+scenario "creates a new schedule, posts the transaction and later completes it"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  # W3: first substring-matching option click (upstream: same click via filter)
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  # W3: same option-click port
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "25"
+  press Tab
+  click --role button --name "Add"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='payee']" --nth 2 text is "Home Depot"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='account']" --nth 2 text is "HSBC"
+  expect js "document.querySelectorAll('[data-testid=table] [data-testid=row] [data-testid=amount]')[2].textContent.replace(/\s+/g,' ').trim()==='~25.00'"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='status']" --nth 2 text is "Due"
+  # postNthSchedule(2): row actions button, then the page-level menu button
+  click --selector "[data-testid='table'] [data-testid='row'] [data-testid='actions'] button" --nth 2
+  wait --ms 400
+  click --role button --name "Post transaction today"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='status']" --nth 2 text is "Paid"
+  # goToAccountPage('HSBC')
+  click --role link --name "HSBC"
+  expect --testid transaction-table visible
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length>0" --timeout-ms 15000
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Home Depot"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 0 text is "Categorize"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='debit']" --nth 0 text is "25.00"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[0].querySelector('[data-testid=credit]').textContent.trim()===''"
+  # upstream: icon.hover() (tooltip content is only VRT-asserted; gated)
+  hover --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee'] [data-testid='schedule-icon']" --nth 0
+  wait --ms 500
+  # goToRulesPage(): Settings -> Rules
+  click --role link --name "Settings"
+  expect --testid settings visible
+  click --role link --name "Rules"
+  expect --role button --name "Create new rule" visible
+  wait --js "document.querySelectorAll('[data-testid=table] [data-testid=row]').length>0" --timeout-ms 15000
+  fill --placeholder "Filter rules..." "Home Depot"
+  expect --selector "[data-testid='table'] [data-testid='row']" count is 1
+  # upstream: rule.actions toHaveText(['link schedule Home Depot (2017-01-01)'])
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')[0].querySelectorAll('[data-testid=actions] > div')].map(d=>d.textContent.trim()).join('|')==='link schedule Home Depot (2017-01-01)'"
+  # upstream: rule.conditions toHaveText([4 lines])
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')[0].querySelectorAll('[data-testid=conditions] > div')].map(d=>d.textContent.trim()).join('|')==='payee is Home Depot|and account is HSBC|and date is approx Every month on the 1st|and amount is approx -25.00'"
+  # back to schedules; completeNthSchedule(2)
+  click --role link --name "Schedules"
+  wait --js "document.querySelectorAll('[data-testid=table] [data-testid=row]').length>0" --timeout-ms 15000
+  click --selector "[data-testid='table'] [data-testid='row'] [data-testid='actions'] button" --nth 2
+  wait --ms 400
+  click --role button --name "Complete"
+  expect --selector "[data-testid='table'] [data-testid='row']" count is 5
+  expect --selector "[data-testid='table'] [data-testid='row']" --nth 4 text contains "Show completed schedules"
+
+scenario "shows a scheduled split transfer in its destination account"
+  # verbatim port of the upstream page.evaluate setup block ($send queries +
+  # rule-update); primavera eval awaits the returned promise (probe29).
+  eval "(async()=>{const q=(t,f,s)=>window.$send('query',{table:t,tableOptions:{},filterExpressions:f,selectExpressions:s,groupExpressions:[],orderExpressions:[],calculation:false,rawMode:false,withDead:false,validateRefs:true,limit:null,offset:null});const {data:[da]}=await q('accounts',[{name:'Ally Savings'}],['id']);const {data:[dp]}=await q('payees',[{transfer_acct:da.id}],['id']);const {data:[sc]}=await q('schedules',[{name:'Phone bills'}],['rule']);const rule=await window.$send('rule-get',{id:sc.rule});await window.$send('rule-update',{...rule,actions:[...rule.actions,{op:'set-split-amount',value:-7000,options:{splitIndex:1,method:'fixed-amount'}},{op:'set-split-amount',value:null,options:{splitIndex:2,method:'remainder'}},{op:'set',field:'payee',value:dp.id,options:{splitIndex:2}}]});return 'done'})()"
+  click --role link --name "Ally Savings"
+  expect --testid transaction-table visible
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length>0" --timeout-ms 15000
+  # W3: upstream locator.filter({ has: schedule-icon, hasText: 'Bank of America' })
+  expect js "[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].filter(r=>r.querySelector('[data-testid=schedule-icon]')&&r.textContent.includes('Bank of America')).length===1"
+  expect js "(()=>{const r=[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].find(r=>r.querySelector('[data-testid=schedule-icon]')&&r.textContent.includes('Bank of America'));return r.querySelector('[data-testid=category]').textContent.includes('Due')})()"
+  expect js "(()=>{const r=[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].find(r=>r.querySelector('[data-testid=schedule-icon]')&&r.textContent.includes('Bank of America'));return r.querySelector('[data-testid=debit]').textContent.trim()===''})()"
+  expect js "(()=>{const r=[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].find(r=>r.querySelector('[data-testid=schedule-icon]')&&r.textContent.includes('Bank of America'));return r.querySelector('[data-testid=credit]').textContent.trim()==='50.00'})()"
+
+scenario "creates two new schedules, posts both transactions and later completes one"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Apple" --keys
+  # W3: option click port
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Apple')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  # W3: option click port
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "5"
+  press Tab
+  click --role button --name "Add"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Apple" --keys
+  # W3: option click port
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Apple')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  # W3: option click port
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "5"
+  press Tab
+  click --role button --name "Add"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='payee']" --nth 2 text is "Apple"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='account']" --nth 2 text is "HSBC"
+  expect js "document.querySelectorAll('[data-testid=table] [data-testid=row] [data-testid=amount]')[2].textContent.replace(/\s+/g,' ').trim()==='~5.00'"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='status']" --nth 2 text is "Due"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='payee']" --nth 3 text is "Apple"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='account']" --nth 3 text is "HSBC"
+  expect js "document.querySelectorAll('[data-testid=table] [data-testid=row] [data-testid=amount]')[3].textContent.replace(/\s+/g,' ').trim()==='~5.00'"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='status']" --nth 3 text is "Due"
+  click --selector "[data-testid='table'] [data-testid='row'] [data-testid='actions'] button" --nth 2
+  wait --ms 400
+  click --role button --name "Post transaction today"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='status']" --nth 2 text is "Paid"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='status']" --nth 3 text is "Due"
+  click --selector "[data-testid='table'] [data-testid='row'] [data-testid='actions'] button" --nth 3
+  wait --ms 400
+  click --role button --name "Post transaction today"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='status']" --nth 2 text is "Paid"
+  expect --selector "[data-testid='table'] [data-testid='row'] [data-testid='status']" --nth 3 text is "Paid"
+  click --role link --name "HSBC"
+  expect --testid transaction-table visible
+  wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]').length>=2" --timeout-ms 15000
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Apple"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 0 text is "Categorize"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='debit']" --nth 0 text is "5.00"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[0].querySelector('[data-testid=credit]').textContent.trim()===''"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 1 text is "Apple"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 1 text is "Categorize"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='debit']" --nth 1 text is "5.00"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[1].querySelector('[data-testid=credit]').textContent.trim()===''"
+  hover --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee'] [data-testid='schedule-icon']" --nth 0
+  wait --ms 500
+  hover --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee'] [data-testid='schedule-icon']" --nth 1
+  wait --ms 500
+
+scenario "creates a \"full\" list of schedules"
+  # 10x verbatim unroll of the upstream for-loop (Home Depot / HSBC / 0).
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "0"
+  press Tab
+  click --role button --name "Add"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "0"
+  press Tab
+  click --role button --name "Add"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "0"
+  press Tab
+  click --role button --name "Add"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "0"
+  press Tab
+  click --role button --name "Add"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "0"
+  press Tab
+  click --role button --name "Add"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "0"
+  press Tab
+  click --role button --name "Add"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "0"
+  press Tab
+  click --role button --name "Add"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "0"
+  press Tab
+  click --role button --name "Add"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "0"
+  press Tab
+  click --role button --name "Add"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "0"
+  press Tab
+  click --role button --name "Add"
+  # added harness sanity (upstream asserts only the gated screenshot):
+  # 4 seeds + 10 created = 14 rows
+  expect --selector "[data-testid='table'] [data-testid='row']" count is 14
+
+scenario "right clicking a schedule opens context menu"
+  click --role button --name "Add new schedule"
+  expect --testid schedule-edit-modal visible --timeout-ms 15000
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Payee']" "Home Depot" --keys
+  # W3: option click port
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('Home Depot')).click()"
+  wait --ms 300
+  click --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']"
+  fill --selector "[data-testid='schedule-edit-modal'] input[aria-label='Account']" "HSBC" --keys
+  # W3: option click port
+  wait --ms 1200
+  eval "[...document.querySelectorAll('[role=option]')].find(o=>o.textContent.includes('HSBC')).click()"
+  wait --ms 300
+  click --selector "#amount-field"
+  fill --selector "#amount-field" "25"
+  press Tab
+  click --role button --name "Add"
+  click --selector "[data-testid='table'] [data-testid='row']" --nth 2 --button right
+  expect --role menu visible
+  expect --role menu text contains "Complete"
+

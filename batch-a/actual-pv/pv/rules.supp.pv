@@ -1,0 +1,39 @@
+# supplemental theme screenshots - NOT upstream coverage; excluded from routine batch runs
+scenario "supplemental theme screenshots (NOT upstream coverage)"
+  # Fresh in-env baselines, --max-diff-pixels 5000: in-environment
+  # repeatability only, never literal coverage. Relies on server-side state
+  # left by the two create scenarios above (rule + transactions persist).
+  fill --placeholder "Filter rules..." "Dominion"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot supp-visuals-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot supp-visuals-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot supp-visuals-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  fill --placeholder "Filter rules..." "Fast Internet"
+  expect screenshot supp-created-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect screenshot supp-created-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect screenshot supp-created-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  click --role link --name "HSBC"
+  expect --testid transaction-table visible
+  eval "window.Actual.setTheme('dark')"
+  expect screenshot supp-txn-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect screenshot supp-txn-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  expect screenshot supp-txn-auto --max-diff-pixels 5000
+  click --role link --name "Capital One Checking"
+  expect --testid transaction-table visible
+  eval "window.Actual.setTheme('dark')"
+  expect screenshot supp-split-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect screenshot supp-split-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  expect screenshot supp-split-auto --max-diff-pixels 5000

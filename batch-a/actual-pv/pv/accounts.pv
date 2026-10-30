@@ -1,0 +1,389 @@
+# accounts.pv - port of upstream accounts.test.ts (16 tests). Actual e2e batch A spec 5/5.
+# Upstream createTestFile = fresh file per test; primavera "Try the demo" = fresh demo budget per scenario (probe30).
+base http://127.0.0.1:3001
+before each
+  set ua "playwright"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+
+# --- createAccount helper steps (navigation.createAccount): Add account -> heading wait ->
+# fillReactInput(Name/Balance) [upstream itself bypasses Playwright fill via native setter;
+# primavera atomic fill = same end state] -> clickReactAriaButton(Create) [upstream el.click()] ---
+# W3: getByLabel('Name') has no aria-label in DOM; identified by placeholder (probe43).
+
+scenario "creates a new account and views the initial balance transaction"
+  click --role button --name "Add account"
+  expect --role heading --name "Add account" visible
+  fill --selector "input[placeholder='e.g. Bank, Savings, Credit Card, Cash']" "New Account"
+  fill --selector "input:not([type='checkbox']):not([placeholder])" "100"
+  click --role button --name "Create"
+  expect --testid transaction-table visible --timeout-ms 30000
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Starting Balance"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[0].querySelector('[data-testid=notes]').textContent.trim()===''"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 0 text is "Starting Balances"
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[0].querySelector('[data-testid=debit]').textContent.trim()===''"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='credit']" --nth 0 text is "100.00"
+
+scenario "account register widens amount columns for large balances"
+  click --role button --name "Add account"
+  expect --role heading --name "Add account" visible
+  fill --selector "input[placeholder='e.g. Bank, Savings, Credit Card, Cash']" "Large Balance Account"
+  fill --selector "input:not([type='checkbox']):not([placeholder])" "12345678.9"
+  click --role button --name "Create"
+  expect --testid transaction-table visible --timeout-ms 30000
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='credit']" --nth 0 text is "12,345,678.90"
+  # upstream: boundingBox().width > 100 (default 100px) - same rect measurement
+  expect js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')[0].querySelector('[data-testid=credit]').getBoundingClientRect().width>100"
+
+scenario "closes an account"
+  click --role link --name "Roth IRA"
+  expect --testid account-name text is "Roth IRA"
+  click --role button --name "Account menu"
+  click --role button --name "Close account"
+  expect --testid close-account-modal visible
+  # upstream modal.selectTransferAccount: fill placeholder + keyboard Enter (literal)
+  fill --selector "[data-testid='close-account-modal'] input[placeholder='Select account...']" "Vanguard 401k"
+  wait --ms 800
+  press Enter
+  wait --ms 400
+  click --role button --name "Close account"
+  expect --testid account-name text is "Closed: Roth IRA"
+
+scenario "right clicking an account in sidebar opens context menu"
+  # upstream rightClickAccount: trusted right-click on link ^Roth IRA. Ported 1:1.
+  # UNRESOLVED (run1+run2): menu never became visible after the trusted right-click
+  # locally; cause not yet established (probe pending). Faithful failing port kept -
+  # no synthetic event stacking.
+  click --role link --name "Roth IRA" --button right
+  expect --role menu visible
+  expect js "[...document.querySelectorAll('[role=menu] button')].some(b=>b.textContent.trim()==='Rename')"
+
+scenario "right clicking a transaction row opens context menu"
+  click --role button --name "Add account"
+  expect --role heading --name "Add account" visible
+  fill --selector "input[placeholder='e.g. Bank, Savings, Credit Card, Cash']" "New Account"
+  fill --selector "input:not([type='checkbox']):not([placeholder])" "100"
+  click --role button --name "Create"
+  expect --testid transaction-table visible --timeout-ms 30000
+  click --selector "[data-testid='transaction-table'] [data-testid='row']" --nth 0 --button right
+  expect --role menu visible
+  expect js "[...document.querySelectorAll('[role=menu] button')].some(b=>b.textContent.trim()==='Delete')"
+
+scenario "updates the running balance after editing a transaction amount"
+  click --role button --name "Add account"
+  expect --role heading --name "Add account" visible
+  fill --selector "input[placeholder='e.g. Bank, Savings, Credit Card, Cash']" "Running balance"
+  fill --selector "input:not([type='checkbox']):not([placeholder])" "0"
+  click --role button --name "Create"
+  expect --testid transaction-table visible --timeout-ms 30000
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='credit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='credit'] input" "10.00" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "editable transaction"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  # setTransactionColumnVisibility('balance', true)
+  click --role button --name "Account menu"
+  click --role button --name "Manage table columns"
+  expect --testid transaction-table-columns-modal visible
+  click --selector "label[for='toggle-column-balance']"
+  click --role button --name "Save"
+  expect --testid transaction-table-columns-modal hidden
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='balance']" --nth 0 text is "10.00"
+  # edit credit: selectInputText + pressSequentially + Tab; atomic fill replaces whole value = same end state
+  click --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='credit']" --nth 0
+  wait --ms 400
+  fill --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='credit'] input" "25.00"
+  press Tab
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='balance']" --nth 0 text is "25.00"
+
+scenario "bulk editing the date shows a properly formatted date picker"
+  click --role link --name "Ally Savings"
+  expect --testid transaction-table visible
+  wait --ms 500
+  click --selector "[data-testid='transaction-table'] [data-testid='select']" --nth 0
+  click --testid transactions-select-button
+  # settle: tooltip animates in after the button click (run1: one-shot eval raced it)
+  expect js "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].some(b=>b.textContent.trim()==='Date')" --timeout-ms 10000
+  # W3: action pick inside transactions-select-tooltip
+  eval "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].find(b=>b.textContent.trim()==='Date').click()"
+  expect --role dialog visible
+  expect --selector "[role=dialog] .react-aria-CalendarGrid" visible
+  # upstream: |leftGap-rightGap| <= 2 (same rect math)
+  expect js "(()=>{const d=document.querySelector('[role=dialog]').getBoundingClientRect();const g=document.querySelector('[role=dialog] .react-aria-CalendarGrid').getBoundingClientRect();return Math.abs((g.x-d.x)-(d.x+d.width-(g.x+g.width)))<=2})()"
+  click --role button --name "Next month"
+  click --role button --name "Next month"
+  click --role button --name "Next month"
+  expect --selector ".calendar-header-title" text is "April 2017"
+  expect js "(()=>{const d=document.querySelector('[role=dialog]').getBoundingClientRect();const g=document.querySelector('[role=dialog] .react-aria-CalendarGrid').getBoundingClientRect();return g.y+g.height<=d.y+d.height})()"
+  set viewport 2560 1080
+  wait --ms 500
+  expect js "document.querySelector('[role=dialog]').getBoundingClientRect().width<=700"
+
+scenario "shift-click range selection skips hidden reconciled transactions"
+  click --role button --name "Add account"
+  expect --role heading --name "Add account" visible
+  fill --selector "input[placeholder='e.g. Bank, Savings, Credit Card, Cash']" "Range Select"
+  fill --selector "input:not([type='checkbox']):not([placeholder])" "0"
+  click --role button --name "Create"
+  expect --testid transaction-table visible --timeout-ms 30000
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "10.00" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "range-one"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "10.00" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "range-two"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "10.00" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "range-three"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  # newest first: row0=range-three, row1=range-two, row2=range-one. Flat --nth on one-per-row testid = row order.
+  click --selector "[data-testid='transaction-table'] [data-testid='cleared']" --nth 1
+  wait --ms 400
+  click --role button --name "Reconcile"
+  expect --selector "[data-popover] input" visible
+  # W3: popover-scoped Reconcile (toolbar button of same name still present)
+  eval "[...document.querySelectorAll('[data-popover] button')].find(b=>b.textContent.trim()==='Reconcile').click()"
+  click --role button --name "Lock transactions"
+  # settle: reconcile commit must flush before hide-reconciled takes effect (run1 flake)
+  wait --ms 800
+  click --role button --name "Account menu"
+  click --role button --name "Manage table columns"
+  expect --testid transaction-table-columns-modal visible
+  click --selector "label[for='toggle-column-balance']"
+  click --role button --name "Save"
+  expect --testid transaction-table-columns-modal hidden
+  click --role button --name "Account menu"
+  click --role button --name "Hide reconciled transactions"
+  wait --ms 600
+  # upstream: row range-two not visible
+  expect js "![...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].some(r=>r.offsetParent!==null&&r.textContent.includes('range-two'))" --timeout-ms 10000
+  click --selector "[data-testid='transaction-table'] [data-testid='select']" --nth 0
+  # upstream: click with modifiers ['Shift']; navigera holds keydown state across steps (docs)
+  keydown Shift
+  click --selector "[data-testid='transaction-table'] [data-testid='select']" --nth 1
+  keyup Shift
+  expect --testid transactions-select-button text is "2 transactions"
+
+scenario "opens the other side of a transfer from its arrow"
+  click --role link --name "Bank of America"
+  expect --testid transaction-table visible
+  wait --ms 500
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "12.34" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='payee']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='payee'] input" "Ally Savings" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "Transfer to point out"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  # newest row first -> its transfer-icon is flat nth 0
+  click --selector "[data-testid='transaction-table'] [data-testid='transfer-icon']" --nth 0
+  expect --testid account-name text is "Ally Savings"
+  expect js "(()=>{const r=[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].find(r=>r.textContent.includes('Transfer to point out'));return !!r&&r.getAttribute('data-pulse')==='true'})()"
+  # upstream toBeInViewport: bounding rect fully within viewport
+  expect js "(()=>{const r=[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].find(r=>r.textContent.includes('Transfer to point out'));const b=r.getBoundingClientRect();return b.top>=0&&b.left>=0&&b.bottom<=window.innerHeight&&b.right<=window.innerWidth})()"
+  # pulse expires (expect retries)
+  expect js "(()=>{const r=[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].find(r=>r.textContent.includes('Transfer to point out'));return !!r&&!r.hasAttribute('data-pulse')})()" --timeout-ms 20000
+
+scenario "opens the other side of a transfer older than the first loaded page"
+  # upstream page.evaluate verbatim port; primavera eval awaits the returned promise
+  eval "(async()=>{const $send=window.$send;const accounts=await $send('accounts-get');const payees=await $send('payees-get');const bankOfAmerica=accounts.find(a=>a.name==='Bank of America');const allySavings=accounts.find(a=>a.name==='Ally Savings');const allySavingsPayee=payees.find(p=>p.transfer_acct===allySavings.id);await $send('transactions-batch-update',{added:Array.from({length:200},()=>({id:crypto.randomUUID(),account:allySavings.id,date:'2001-01-01',amount:-100}))});await $send('transaction-add',{id:crypto.randomUUID(),account:bankOfAmerica.id,date:'2000-01-01',amount:-1234,payee:allySavingsPayee.id,notes:'Old transfer to point out'});return 'done'})()"
+  click --role link --name "Bank of America"
+  expect --testid transaction-table visible
+  wait --ms 500
+  fill --selector "input[placeholder='Search']" "Old transfer to point out"
+  wait --ms 800
+  click --selector "[data-testid='transaction-table'] [data-testid='transfer-icon']" --nth 0
+  expect --testid account-name text is "Ally Savings"
+  expect js "(()=>{const r=[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].find(r=>r.textContent.includes('Old transfer to point out'));return !!r&&r.getAttribute('data-pulse')==='true'})()"
+  expect js "(()=>{const r=[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].find(r=>r.textContent.includes('Old transfer to point out'));const b=r.getBoundingClientRect();return b.top>=0&&b.left>=0&&b.bottom<=window.innerHeight&&b.right<=window.innerWidth})()"
+
+scenario "creates a transfer from two existing transactions"
+  click --role link --name "On budget"
+  expect --testid account-name text is "On Budget Accounts"
+  # filterByNote('Test Acc Transfer')
+  click --role button --name "Filter"
+  # settle: tooltip animates in after the Filter click (run1: one-shot eval raced it)
+  expect js "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].some(b=>b.textContent.trim()==='Note')" --timeout-ms 10000
+  # W3: field pick inside filters-select-tooltip
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Note').click()"
+  wait --ms 500
+  # upstream keyboard.type into the note value input
+  click --selector "[data-testid='filters-menu-tooltip'] input"
+  fill --selector "[data-testid='filters-menu-tooltip'] input" "Test Acc Transfer" --keys
+  # W3: tooltip-scoped Apply
+  eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  wait --ms 600
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='debit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='debit'] input" "34.56" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='account']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='account'] input" "Ally Savings" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='category']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='category'] input" "Food" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "Test Acc Transfer"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  click --role button --name "Add New"
+  wait --ms 600
+  click --selector "[data-testid='new-transaction'] [data-testid='credit']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='credit'] input" "34.56" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='account']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='account'] input" "HSBC" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='category']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='category'] input" "Food" --keys
+  press Tab
+  click --selector "[data-testid='new-transaction'] [data-testid='notes']"
+  fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "Test Acc Transfer"
+  press Tab
+  click --testid add-button
+  click --role button --name "Cancel"
+  # upstream: wait for getNthTransaction(1).payee visible before selecting (parallel-CI race fix)
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 1 visible
+  click --selector "[data-testid='transaction-table'] [data-testid='select']" --nth 0
+  click --selector "[data-testid='transaction-table'] [data-testid='select']" --nth 1
+  click --testid transactions-select-button
+  expect js "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].some(b=>b.textContent.trim()==='Make transfer')" --timeout-ms 10000
+  # W3: action pick inside transactions-select-tooltip
+  eval "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].find(b=>b.textContent.trim()==='Make transfer').click()"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Ally Savings"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 0 text is "Transfer"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='credit']" --nth 0 text is "34.56"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='account']" --nth 0 text is "HSBC"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 1 text is "HSBC"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 1 text is "Transfer"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='debit']" --nth 1 text is "34.56"
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='account']" --nth 1 text is "Ally Savings"
+
+scenario "imports transactions from a CSV file"
+  click --role button --name "Add account"
+  expect --role heading --name "Add account" visible
+  fill --selector "input[placeholder='e.g. Bank, Savings, Credit Card, Cash']" "CSV import"
+  fill --selector "input:not([type='checkbox']):not([placeholder])" "0"
+  click --role button --name "Create"
+  expect --testid transaction-table visible --timeout-ms 30000
+  click --role button --name "Import"
+  upload --selector "input[type=file]" test.csv
+  expect --role button --name "Import 8 transactions" visible --timeout-ms 30000
+  click --role button --name "Import 8 transactions"
+  expect --role button --name "Import 8 transactions" hidden
+
+scenario "preserves QIF categories in preview and imported transactions"
+  click --role button --name "Add account"
+  expect --role heading --name "Add account" visible
+  fill --selector "input[placeholder='e.g. Bank, Savings, Credit Card, Cash']" "CSV import"
+  fill --selector "input:not([type='checkbox']):not([placeholder])" "0"
+  click --role button --name "Create"
+  expect --testid transaction-table visible --timeout-ms 30000
+  click --role button --name "Import"
+  upload --selector "input[type=file]" qif-categories.qif
+  expect --role dialog visible --timeout-ms 30000
+  expect text "Food" --within --role dialog
+  expect text "Income" --within --role dialog
+  click --role button --name "Import 2 transactions"
+  expect --role dialog hidden
+  # upstream: rows filtered by text, category cell toHaveText
+  expect js "(()=>{const r=[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].find(r=>r.textContent.toLowerCase().includes('qif cafe'));return !!r&&r.querySelector('[data-testid=category]').textContent.trim()==='Food'})()"
+  expect js "(()=>{const r=[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].find(r=>r.textContent.toLowerCase().includes('qif salary'));return !!r&&r.querySelector('[data-testid=category]').textContent.trim()==='Income'})()"
+
+scenario "import csv file twice"
+  click --role button --name "Add account"
+  expect --role heading --name "Add account" visible
+  fill --selector "input[placeholder='e.g. Bank, Savings, Credit Card, Cash']" "CSV import"
+  fill --selector "input:not([type='checkbox']):not([placeholder])" "0"
+  click --role button --name "Create"
+  expect --testid transaction-table visible --timeout-ms 30000
+  click --role button --name "Import"
+  upload --selector "input[type=file]" test.csv
+  expect --role button --name "Import 8 transactions" visible --timeout-ms 30000
+  click --role button --name "Import 8 transactions"
+  expect --role button --name "Import 8 transactions" hidden
+  click --role button --name "Import"
+  upload --selector "input[type=file]" test.csv
+  expect --role button --name "Import 0 transactions" disabled --timeout-ms 30000
+  click --role button --name "Close"
+  expect --role button --name "Import 0 transactions" hidden
+
+scenario "imports a new transaction when an unchecked match has the same amount"
+  click --role button --name "Add account"
+  expect --role heading --name "Add account" visible
+  fill --selector "input[placeholder='e.g. Bank, Savings, Credit Card, Cash']" "CSV import"
+  fill --selector "input:not([type='checkbox']):not([placeholder])" "0"
+  click --role button --name "Create"
+  expect --testid transaction-table visible --timeout-ms 30000
+  # upstream setFiles with in-memory buffer; file content written verbatim to same-amount-1.csv (harness mechanics)
+  click --role button --name "Import"
+  upload --selector "input[type=file]" same-amount-1.csv
+  expect --role button --name "Import 1 transactions" visible --timeout-ms 30000
+  click --role button --name "Import 1 transactions"
+  expect --role dialog hidden
+  click --role button --name "Import"
+  upload --selector "input[type=file]" same-amount-2.csv
+  expect --role dialog visible --timeout-ms 30000
+  expect text "Corner Coffee" --within --role dialog
+  # upstream clicks the Netflix row checkbox twice (merge -> import as new).
+  # W3 (deviation): the row toggle is a styled icon button, not a role=checkbox
+  # element (run1 screenshot), so the checkbox click is a row-scoped eval click
+  # on its first button.
+  eval "(()=>{const r=[...document.querySelectorAll('[role=dialog] [data-testid=row]')].find(r=>/netflix/i.test(r.textContent));(r.querySelector('button,[role=checkbox],input[type=checkbox]')||r).click();return 'ok'})()"
+  wait --ms 400
+  eval "(()=>{const r=[...document.querySelectorAll('[role=dialog] [data-testid=row]')].find(r=>/netflix/i.test(r.textContent));(r.querySelector('button,[role=checkbox],input[type=checkbox]')||r).click();return 'ok'})()"
+  wait --ms 400
+  click --role button --name "Import 1 transactions"
+  expect --role dialog hidden
+  expect text "Corner Coffee" --within --testid transaction-table
+  expect js "[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].filter(r=>r.textContent.includes('Subscription')).length===0"
+
+scenario "import notes checkbox is not shown for CSV files"
+  click --role button --name "Add account"
+  expect --role heading --name "Add account" visible
+  fill --selector "input[placeholder='e.g. Bank, Savings, Credit Card, Cash']" "CSV import"
+  fill --selector "input:not([type='checkbox']):not([placeholder])" "0"
+  click --role button --name "Create"
+  expect --testid transaction-table visible --timeout-ms 30000
+  click --role button --name "Import"
+  upload --selector "input[type=file]" test.csv
+  expect --role button --name "Import 8 transactions" visible --timeout-ms 30000
+  # upstream: getByRole checkbox 'Import notes from file' not visible (name from wrapping label text)
+  expect js "![...document.querySelectorAll('label')].some(l=>/import notes from file/i.test(l.textContent)&&l.offsetParent!==null)"
+  click --role button --name "Import 8 transactions"
+  expect --role button --name "Import 8 transactions" hidden
