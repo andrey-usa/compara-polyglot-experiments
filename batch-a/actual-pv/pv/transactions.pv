@@ -64,7 +64,11 @@ scenario "filters transactions by category"
   fill --selector "[data-testid='filters-menu-tooltip'] input" "C" --keys
   wait --ms 800
   click --testid Clothing-category-item
+  # state guard (same autocomplete-commit race class as by-payee in ci-run1; additive)
+  expect js "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] input')].some(i=>i.value==='Clothing')" --timeout-ms 10000
   eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # committed-state guard: the chip renders the applied filter (same class as by-payee ci-run1)
+  expect text "category is Clothing" --timeout-ms 10000
   # harness settle: async table requery after Apply
   wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=category]').length>=5" --timeout-ms 15000
   expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 0 text is "Clothing"
@@ -109,7 +113,13 @@ scenario "filters transactions by payee"
   click --selector "[data-testid='filters-menu-tooltip'] [aria-label='Payee']"
   wait --ms 800
   click --testid Kroger-payee-item
+  # state guard (ci-run1: the one-shot Apply eval raced the autocomplete select
+  # commit on both tries -> filter applied as "payee is (nothing)"; gate Apply on
+  # the observable committed value, not ms)
+  expect js "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] input')].some(i=>i.value==='Kroger')" --timeout-ms 10000
   eval "[...document.querySelectorAll('[data-testid=filters-menu-tooltip] button')].find(b=>b.textContent.trim()==='Apply').click()"
+  # committed-state guard (ci-run1): the chip renders the applied filter - gate on it, not only the input value
+  expect text "payee is Kroger" --timeout-ms 10000
   # harness settle: async table requery after Apply
   wait --js "document.querySelectorAll('[data-testid=transaction-table] [data-testid=row] [data-testid=payee]').length>=10" --timeout-ms 15000
   expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Kroger"

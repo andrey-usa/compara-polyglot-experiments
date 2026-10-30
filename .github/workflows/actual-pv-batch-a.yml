@@ -76,14 +76,16 @@ jobs:
       - name: Run the converted batch (per-test results)
         working-directory: batch-a/actual-pv
         run: |
+          mkdir -p results
           primavera run pv/rules.pv pv/schedules.pv pv/budget.pv pv/transactions.pv pv/accounts.pv --retries 1 --junit results/junit.xml --evidence results/evidence | tee results/batch-a-run.log
+          P=${PIPESTATUS[0]}
           ! grep -q "scenarios not run" results/batch-a-run.log || { echo "batch did not execute"; exit 1; }
           T=$(grep -c "<testcase " results/junit.xml || true)
           F=$(grep -cE "<(failure|error)[ >]" results/junit.xml || true)
           R=$(grep -c "FLAKY" results/batch-a-run.log || true)
           echo "junit: $T testcases, $F failures/errors, $R flaky (pass-on-retry)"
           [ "$T" -eq 45 ] || { echo "expected 45 testcases, got $T"; exit 1; }
-          [ "$F" -eq 0 ] || { echo "failures/errors present - see junit + evidence artifacts"; exit 1; }
+          [ "$F" -eq 0 ] && [ "$P" -eq 0 ] || { echo "failures/errors present (primavera rc=$P) - see junit + evidence artifacts"; exit 1; }
       - name: Upload results
         if: ${{ always() }}
         uses: actions/upload-artifact@v4

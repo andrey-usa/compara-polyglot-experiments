@@ -109,9 +109,12 @@ scenario "bulk editing the date shows a properly formatted date picker"
   click --selector "[data-testid='transaction-table'] [data-testid='select']" --nth 0
   click --testid transactions-select-button
   # settle: tooltip animates in after the button click (run1: one-shot eval raced it)
-  expect js "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].some(b=>b.textContent.trim()==='Date')" --timeout-ms 10000
+  # comparator fix (CI screenshot): action buttons carry shortcut hints in
+  # textContent ('Date E'); upstream getByRole name matching is substring, so
+  # the port matches the leading label, not exact equality.
+  expect js "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].some(b=>b.textContent.replace(/\s+/g,' ').trim().toLowerCase().includes('date'))" --timeout-ms 10000
   # W3: action pick inside transactions-select-tooltip
-  eval "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].find(b=>b.textContent.trim()==='Date').click()"
+  eval "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].find(b=>b.textContent.replace(/\s+/g,' ').trim().toLowerCase().includes('date')).click()"
   expect --role dialog visible
   expect --selector "[role=dialog] .react-aria-CalendarGrid" visible
   # upstream: |leftGap-rightGap| <= 2 (same rect math)
@@ -162,13 +165,18 @@ scenario "shift-click range selection skips hidden reconciled transactions"
   press Tab
   click --testid add-button
   click --role button --name "Cancel"
-  # newest first: row0=range-three, row1=range-two, row2=range-one. Flat --nth on one-per-row testid = row order.
-  click --selector "[data-testid='transaction-table'] [data-testid='cleared']" --nth 1
+  # upstream filter({hasText:'range-two'}).getByTestId('cleared'): --near scopes to the row showing the note
+  # (local diagnosis: flat --nth mis-targeted - Actual's same-date sort is not insertion order)
+  click --testid cleared --near "range-two"
   wait --ms 400
   click --role button --name "Reconcile"
   expect --selector "[data-popover] input" visible
   # W3: popover-scoped Reconcile (toolbar button of same name still present)
   eval "[...document.querySelectorAll('[data-popover] button')].find(b=>b.textContent.trim()==='Reconcile').click()"
+  # state guard (CI run1: reconcile commit raced the hide on both tries; make
+  # the commit observable instead of adding more blind ms) - the popover closes
+  # when the reconcile applies
+  expect --selector "[data-popover]" hidden --timeout-ms 10000
   click --role button --name "Lock transactions"
   # settle: reconcile commit must flush before hide-reconciled takes effect (run1 flake)
   wait --ms 800
@@ -183,10 +191,11 @@ scenario "shift-click range selection skips hidden reconciled transactions"
   wait --ms 600
   # upstream: row range-two not visible
   expect js "![...document.querySelectorAll('[data-testid=transaction-table] [data-testid=row]')].some(r=>r.offsetParent!==null&&r.textContent.includes('range-two'))" --timeout-ms 10000
-  click --selector "[data-testid='transaction-table'] [data-testid='select']" --nth 0
+  # upstream: row filter hasText 'range-three' / 'range-one'
+  click --testid select --near "range-three"
   # upstream: click with modifiers ['Shift']; navigera holds keydown state across steps (docs)
   keydown Shift
-  click --selector "[data-testid='transaction-table'] [data-testid='select']" --nth 1
+  click --testid select --near "range-one"
   keyup Shift
   expect --testid transactions-select-button text is "2 transactions"
 
@@ -235,9 +244,12 @@ scenario "creates a transfer from two existing transactions"
   # filterByNote('Test Acc Transfer')
   click --role button --name "Filter"
   # settle: tooltip animates in after the Filter click (run1: one-shot eval raced it)
-  expect js "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].some(b=>b.textContent.trim()==='Note')" --timeout-ms 10000
+  # comparator fix (CI screenshot): the field label is 'Notes'; upstream
+  # getByRole('button', {name:'Note'}) matches it by substring - port uses the
+  # rendered label.
+  expect js "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].some(b=>b.textContent.replace(/\s+/g,' ').trim().toLowerCase().includes('note'))" --timeout-ms 10000
   # W3: field pick inside filters-select-tooltip
-  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.trim()==='Note').click()"
+  eval "[...document.querySelectorAll('[data-testid=filters-select-tooltip] button')].find(b=>b.textContent.replace(/\s+/g,' ').trim().toLowerCase().includes('note')).click()"
   wait --ms 500
   # upstream keyboard.type into the note value input
   click --selector "[data-testid='filters-menu-tooltip'] input"
@@ -282,9 +294,9 @@ scenario "creates a transfer from two existing transactions"
   click --selector "[data-testid='transaction-table'] [data-testid='select']" --nth 0
   click --selector "[data-testid='transaction-table'] [data-testid='select']" --nth 1
   click --testid transactions-select-button
-  expect js "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].some(b=>b.textContent.trim()==='Make transfer')" --timeout-ms 10000
+  expect js "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].some(b=>b.textContent.replace(/\s+/g,' ').trim().toLowerCase().includes('make transfer'))" --timeout-ms 10000
   # W3: action pick inside transactions-select-tooltip
-  eval "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].find(b=>b.textContent.trim()==='Make transfer').click()"
+  eval "[...document.querySelectorAll('[data-testid=transactions-select-tooltip] button, [data-popover] button')].find(b=>b.textContent.replace(/\s+/g,' ').trim().toLowerCase().includes('make transfer')).click()"
   expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='payee']" --nth 0 text is "Ally Savings"
   expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='category']" --nth 0 text is "Transfer"
   expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='credit']" --nth 0 text is "34.56"
