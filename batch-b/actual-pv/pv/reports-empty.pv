@@ -1,0 +1,31 @@
+# reports.test.ts, describe "Reports without transactions", converted
+# from Playwright (Actual Budget e2e @ dff6b4b). 1 upstream test.
+# Upstream's describe has its own beforeEach (a fresh page, no demo
+# budget) and the test starts a fresh empty budget, so it cannot
+# share reports.pv's demo-budget before-each; it lives in this file
+# with the same spec's name, keeping the 24-test reports total.
+# Upstream collects page errors via a pageerror listener and asserts
+# the list is empty; this port uses `expect no errors` (stricter: it
+# also fails on console errors, which upstream does not collect).
+# Port kind: literal, except the pageErrors check as above.
+# W1-W3 (pilot): not needed here. No new workaround.
+# Requires: set ua "playwright" (pilot G3: matches upstream config
+# userAgent, seeds deterministic demo data).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  goto /
+
+scenario "creates a custom report in an empty budget"
+  click --role button --name "Start budgeting"
+  expect --testid budget-table visible
+  click --role link --name "Reports"
+  expect --testid reports-page visible
+  expect --role button --name "Net Worth" visible
+  click --role button --name "Add new widget"
+  click --role button --name "New custom report"
+  expect url contains "/reports/custom/"
+  expect --role button --name "Total" visible
+  expect --role button --name "Time" visible
+  expect no errors

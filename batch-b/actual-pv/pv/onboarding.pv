@@ -1,0 +1,114 @@
+# onboarding.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b)
+# 6 upstream tests, 6 scenarios. Upstream starts at / with no budget
+# (no createTestFile): visuals on the welcome page, imports of YNAB4
+# (zip), nYNAB (json) and Actual (zip) budgets, a fresh empty budget,
+# and back-to-start via "No server" + "Start using a server".
+# Import flow: "Import my budget" -> type button -> file chooser.
+# Upstream uses the OS file chooser (waitForEvent + setFiles); this
+# port sets the file directly on the file input (batch A precedent for
+# transaction imports), without clicking the "Select file..." button
+# that would open the chooser. The three import fixtures are copied
+# verbatim from upstream e2e/data/ and sit beside this file.
+# Schedule-name checks: upstream counts table rows filtered by text
+# (filter({hasText}) == 1 per name). Primavera has no hasText locator
+# filtering (pilot G4), so each name is counted with a js check over
+# the table rows (W3 class: eval instead of a filtered locator).
+# Upstream screenshot calls are toMatchThemeScreenshots on the page;
+# the baseline run executes with VRT unset, so upstream-as-run they
+# are no-ops. This port takes in-environment themed screenshots
+# (pilot pattern, repeatability only, NOT cross-tool pixel equivalence).
+# Port kind: literal for the balance/heading/schedule assertions;
+# W3 for the schedule row counts; screenshot checks are in-environment
+# repeatability checks, as in the pilot.
+# W1-W2 (pilot): not needed here. W3: see above.
+# Requires: set ua "playwright" (pilot G3: matches upstream config
+# userAgent, seeds deterministic demo data).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  goto /
+
+scenario "checks the page visuals"
+  expect text "Welcome to Actual"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot onboarding-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot onboarding-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot onboarding-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  click --role button --name "Connect to a sync server"
+  expect --role heading text contains "Connect to a server"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot onboarding-server-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot onboarding-server-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot onboarding-server-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+
+scenario "creates a new budget file by importing YNAB4 budget"
+  click --role button --name "Import my budget"
+  click --role button --name "YNAB4 The old unsupported desktop app"
+  upload --selector "input[type=file]" ynab4-demo-budget.zip
+  expect --testid budget-table visible --timeout-ms 30000
+  click --role link --name "Account1 with Starting Balance"
+  expect --testid account-balance text is "-400.00"
+  click --role link --name "Account2 no Starting Balance"
+  expect --testid account-balance text is "2,607.00"
+
+scenario "creates a new budget file by importing nYNAB budget"
+  click --role button --name "Import my budget"
+  click --role button --name "nYNAB The newer web app"
+  upload --selector "input[type=file]" ynab5-demo-budget.json
+  expect --testid budget-table visible --timeout-ms 30000
+  click --role link --name "Checking"
+  expect --testid account-balance text is "2,600.00"
+  click --role link --name "Saving"
+  expect --testid account-balance text is "250.00"
+  click --role link --name "Schedules"
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated every four weeks')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated every other week')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated every other year')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated every four months')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated twice a month')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated monthly')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated weekly')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - not repeated')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated twice a year')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated yearly')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated every other month')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated every three months')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - repeated daily')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - split categories monthly')).length" is 1
+  expect js "[...document.querySelectorAll('[data-testid=table] [data-testid=row]')].filter(r=>r.textContent.includes('Scheduled - transfer to Saving')).length" is 1
+
+scenario "creates a new budget file by importing Actual budget"
+  click --role button --name "Import my budget"
+  click --role button --name "Actual Import a file exported from Actual"
+  upload --selector "input[type=file]" actual-demo-budget.zip
+  expect --testid budget-table visible --timeout-ms 20000
+  click --role link --name "Ally Savings"
+  expect --testid account-balance text is "1,772.80"
+  click --role link --name "Roth IRA"
+  expect --testid account-balance text is "2,745.81"
+
+scenario "creates a new empty budget file"
+  click --role button --name "Start budgeting"
+  expect --testid budget-table visible
+  click --role link --name "All accounts"
+  expect --testid account-name visible
+  expect --testid account-name text is "All Accounts"
+  expect --testid account-balance text is "0.00"
+
+scenario "navigates back to start page by clicking on \"no server\" in an empty budget file"
+  click --role button --name "Start budgeting"
+  expect --testid budget-table visible
+  click --role button --name "No server"
+  click --role button --name "Start using a server"
+  expect --role heading text contains "Connect to a server"

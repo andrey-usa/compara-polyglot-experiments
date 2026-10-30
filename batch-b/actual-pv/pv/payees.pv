@@ -1,0 +1,70 @@
+# payees.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b)
+# 5 upstream tests, 5 scenarios. Upstream: fresh demo budget per test
+# (createTestFile = click "Try the demo", wait for budget-table), then
+# navigation.goToPayeesPage (Settings -> Payees section).
+# Visuals test: screenshot, search "Fast Internet", screenshot again.
+# The other tests search and check visible text, or right-click the
+# first table row and check the context menu (role menu, "Create rule"
+# button inside it).
+# Upstream screenshot calls are toMatchThemeScreenshots on the page;
+# the baseline run executes with VRT unset, so upstream-as-run they
+# are no-ops. This port takes in-environment themed screenshots
+# (pilot pattern, repeatability only, NOT cross-tool pixel equivalence).
+# Port kind: literal for the text/menu assertions; screenshot checks
+# are in-environment repeatability checks, as in the pilot.
+# W1-W3 (pilot): not needed here. No new workaround.
+# Note: the right-click port is a trusted right-click, 1:1 with
+# upstream (batch A precedent). If the menu does not open in the
+# navigera browser, that is reported as a gap/defect, not shimmed.
+# Requires: set ua "playwright" (pilot G3: matches upstream config
+# userAgent, seeds deterministic demo data).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  click --role link --name "Settings"
+  expect --testid settings visible
+  click --role link --name "Payees"
+  expect --placeholder "Filter payees..." visible
+
+scenario "checks the payees page visuals"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot payees-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot payees-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot payees-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  fill --placeholder "Filter payees..." "Fast Internet"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot payees-search-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot payees-search-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot payees-search-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+
+scenario "shows Fast Internet in the payee list"
+  fill --placeholder "Filter payees..." "Fast Internet"
+  expect text "Fast Internet"
+
+scenario "shows \"Create rule\" text for a payee"
+  fill --placeholder "Filter payees..." "Deposit"
+  expect text "Create rule"
+
+scenario "filters out unrelated payees"
+  fill --placeholder "Filter payees..." "asdfasdf-nonsense"
+  expect text "No payees"
+
+scenario "right clicking a payee opens context menu"
+  fill --placeholder "Filter payees..." "Fast Internet"
+  click --selector "[data-testid='table'] [data-testid='row']" --nth 0 --button right
+  expect --role menu visible
+  expect --role button --name "Create rule" visible

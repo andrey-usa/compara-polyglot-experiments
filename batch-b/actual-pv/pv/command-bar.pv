@@ -1,0 +1,51 @@
+# command-bar.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b)
+# 2 upstream tests, 2 scenarios. Upstream: fresh demo budget per test
+# (createTestFile = click "Try the demo", wait for budget-table, plus
+# "Add group" visible). The bar is a combobox named "Command Bar",
+# opened with ControlOrMeta+k, closed with Escape. Test 2: type
+# "reports", Enter -> reports page loaded; reopen, ArrowDown twice to
+# highlight "Schedules", Enter -> "Add new schedule" visible.
+# Upstream screenshot calls are toMatchThemeScreenshots on the page;
+# the baseline run executes with VRT unset, so upstream-as-run they
+# are no-ops. This port keeps the navigation assertions and adds
+# in-environment screenshots (pilot pattern, repeatability only, NOT
+# cross-tool pixel equivalence).
+# Port kind: literal for the navigation assertions; screenshot checks
+# are in-environment repeatability checks, as in the pilot.
+# W1-W3 (pilot): not needed here. No new workaround.
+# Note: upstream's page.mouse.move(0,0) (park the mouse so no budget
+# element renders a hover input) has no direct primavera step and is
+# not ported; navigera starts with the mouse at the origin.
+# Requires: set ua "playwright" (pilot G3: matches upstream config
+# userAgent, seeds deterministic demo data).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  expect --role button --name "Add group" visible --timeout-ms 10000
+
+scenario "Check the command bar visuals"
+  press ControlOrMeta+k
+  expect --role combobox --name "Command Bar" visible
+  expect screenshot command-bar-open --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  press Escape
+  expect not --role combobox --name "Command Bar" visible
+
+scenario "Check the command bar search works correctly"
+  press ControlOrMeta+k
+  expect --role combobox --name "Command Bar" visible
+  expect --role combobox --name "Command Bar" value is ""
+  fill --role combobox --name "Command Bar" "reports"
+  press Enter
+  expect --testid reports-page visible
+  expect not text "Loading reports..." --timeout-ms 10000
+  press ControlOrMeta+k
+  expect --role combobox --name "Command Bar" visible
+  press ArrowDown
+  press ArrowDown
+  expect screenshot command-bar-schedules --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  press Enter
+  expect --role button --name "Add new schedule" visible

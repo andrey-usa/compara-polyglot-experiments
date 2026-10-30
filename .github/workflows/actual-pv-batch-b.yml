@@ -1,0 +1,111 @@
+# Actual Budget e2e desktop-rest batch (reports, onboarding, payees,
+# automatic-budget-range, command-bar, tour, bank-sync - 43 upstream tests)
+# converted from Playwright to primavera (.pv), against
+# actualbudget/actual @ dff6b4b21bed7d20a0977cd71c990f40b6e26e8e.
+# primavera @ 2ee2589cb8d481e120d1808f79a428dda93227b7, navigera @
+# 575564eea8e56ef49ce2af91e26574b7edb1b752 (public repos). Same container and
+# app start as the Playwright baseline; per-test results via junit.xml.
+# Standard GitHub-hosted runner; no secrets; no paid calls.
+# Screenshot assertions are in-environment repeatability checks only (see the
+# batch report): baselines are captured in this job, then verified in it.
+name: actual-pv-batch-b
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  batch-b:
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-jammy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone actual @ pinned commit
+        run: |
+          git clone --filter=blob:none https://github.com/actualbudget/actual.git actual
+          cd actual && git checkout dff6b4b21bed7d20a0977cd71c990f40b6e26e8e
+      - name: Trust the repository directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/actual"
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'actual/.nvmrc'
+      - name: Enable corepack (yarn 4)
+        run: corepack enable
+      - name: Install dependencies
+        run: cd actual && yarn install --immutable
+      - name: Build browser bundle (CI parity)
+        env:
+          REACT_APP_NETLIFY: 'true'
+        run: cd actual && yarn build:browser --skip-translations
+      - name: Install Rust (for the primavera source build)
+        run: |
+          command -v cc >/dev/null || { apt-get update && apt-get install -y --no-install-recommends build-essential; }
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build primavera + navigera @ pinned commits
+        run: |
+          git clone --filter=blob:none https://github.com/andrey-usa/navigera.git navigera
+          git -C navigera checkout 575564eea8e56ef49ce2af91e26574b7edb1b752
+          git clone --filter=blob:none https://github.com/andrey-usa/primavera.git primavera
+          git -C primavera checkout 2ee2589cb8d481e120d1808f79a428dda93227b7
+          CARGO_TARGET_DIR="$RUNNER_TEMP/pv-target" cargo build --release --manifest-path primavera/Cargo.toml
+          echo "$RUNNER_TEMP/pv-target/release" >> "$GITHUB_PATH"
+      - name: Resolve a browser for primavera
+        run: |
+          B="$(find /ms-playwright -maxdepth 4 -type f \( -name chrome -o -name headless_shell -o -name chrome-headless-shell \) 2>/dev/null | sort | head -1)"
+          if [ -n "$B" ]; then
+            echo "using preinstalled browser: $B"
+            echo "CHROME_BIN=$B" >> "$GITHUB_ENV"
+          else
+            echo "no preinstalled browser under /ms-playwright; falling back to primavera navigera install-browser (chrome-headless-shell download, same container)"
+            primavera navigera install-browser
+          fi
+      - name: Start the app (baseline's server)
+        run: |
+          PORT=3001 node actual/packages/desktop-client/bin/serve-build.mjs > app.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:3001/ && break || sleep 2; done
+          curl -fsS -o /dev/null http://127.0.0.1:3001/
+      - name: Assert the browser really runs
+        run: |
+          if [ -n "$CHROME_BIN" ]; then test -x "$CHROME_BIN" || { echo "CHROME_BIN not executable: $CHROME_BIN"; exit 1; }; fi
+          printf 'base http://127.0.0.1:3001\nscenario "probe"\n  goto /\n  expect text "Try the demo" --timeout-ms 30000\n' > /tmp/probe.pv
+          primavera run /tmp/probe.pv | tee probe.log
+          grep -q "1 passed" probe.log || { echo "browser probe did not execute"; exit 1; }
+      - name: Capture screenshot baselines in this environment
+        working-directory: batch-b/actual-pv
+        run: |
+          mkdir -p results
+          primavera run pv/reports.pv pv/reports-empty.pv pv/onboarding.pv pv/payees.pv pv/automatic-budget-range.pv pv/command-bar.pv pv/tour.pv pv/bank-sync.pv --update-screenshots > results/vrt-baseline-pass.log 2>&1; P=$?
+          cat results/vrt-baseline-pass.log
+          ! grep -q "scenarios not run" results/vrt-baseline-pass.log || { echo "baseline pass did not execute"; exit 1; }
+          [ "$P" -eq 0 ] || { echo "baseline pass failed (rc=$P)"; exit 1; }
+          N=$(find pv -name "*.png" | wc -l)
+          echo "baseline screenshots: $N"
+          [ "$N" -ge 1 ] || { echo "expected at least 1 baseline screenshot, got $N"; exit 1; }
+      - name: Run the converted batch (per-test results)
+        working-directory: batch-b/actual-pv
+        run: |
+          mkdir -p results
+          primavera run pv/reports.pv pv/reports-empty.pv pv/onboarding.pv pv/payees.pv pv/automatic-budget-range.pv pv/command-bar.pv pv/tour.pv pv/bank-sync.pv --retries 1 --junit results/junit.xml --evidence results/evidence > results/batch-b-run.log 2>&1; P=$?
+          cat results/batch-b-run.log
+          ! grep -q "scenarios not run" results/batch-b-run.log || { echo "batch did not execute"; exit 1; }
+          T=$(grep -c "<testcase " results/junit.xml || true)
+          F=$(grep -cE "<(failure|error)[ >]" results/junit.xml || true)
+          R=$(grep -c "FLAKY" results/batch-b-run.log || true)
+          echo "junit: $T testcases, $F failures/errors, $R flaky (pass-on-retry)"
+          [ "$T" -eq 43 ] || { echo "expected 43 testcases, got $T"; exit 1; }
+          [ "$F" -eq 0 ] && [ "$P" -eq 0 ] || { echo "failures/errors present (primavera rc=$P) - see junit + evidence artifacts"; exit 1; }
+      - name: Upload results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: actual-pv-batch-b-results
+          path: |
+            batch-b/actual-pv/results/
+            batch-b/actual-pv/pv/
+            app.log
+            probe.log
+          retention-days: 30

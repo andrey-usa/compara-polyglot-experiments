@@ -1,0 +1,160 @@
+# automatic-budget-range.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b)
+# 3 upstream tests, 3 scenarios: desktop extends/shrinks, mobile
+# extends/shrinks, desktop columns-inside-range. Upstream loops
+# goToNextMonth (click Next, wait for data-month to change); this port
+# unrolls the walks with an explicit data-month check after each click,
+# which is stricter than upstream's change-wait (it pins the exact month).
+# setBudgetAmount is upstream's $send helper, ported as an async eval
+# (batch A precedent) plus a settle wait.
+# Desktop: selected month = testid selected-budget-month, Next = title
+# "Next month", columns test uses testid selected-budget-month count 3
+# with maxMonths 3 (save-global-prefs). Mobile: selected = heading
+# button[data-month], Next = role button "Next month"; at the range end
+# the mobile Next button is disabled instead of clickable (upstream
+# expectLastMonth branch), and mobile navigation to the budget page is
+# a direct goto /budget (W4: the navbar drag-up/drag-down animation
+# has no primavera step; the budget-range assertions, not navigation,
+# are under test).
+# Port kind: literal for the desktop tests; W4 (navigation method only)
+# for the mobile test. No screenshot assertions upstream.
+# W1-W3 (pilot): not needed here. W4: mobile budget navigation, see above.
+# Requires: set ua "playwright" (pilot G3: matches upstream config
+# userAgent, seeds deterministic demo data).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+
+scenario "Automatic budget range (desktop) › extends after budgeting the last month and shrinks on reload"
+  set viewport 1280 900
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  click --role link --name "Budget"
+  expect --testid budget-table visible
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-02
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-03
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-04
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-05
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-06
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-07
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-08
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-09
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-10
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-11
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2017-12
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2018-01
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2018-01
+  eval "(async()=>{const {list}=await window.$send('get-categories');const category=list.find(item=>!item.is_income&&!item.hidden);if(!category) return false;await window.$send('budget/budget-amount',{category:category.id,month:'2018-01',amount:200});return true})()"
+  wait --ms 1000
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2018-02
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2018-03
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2018-04
+  click --selector "[title='Next month']"
+  expect --testid selected-budget-month attr data-month is 2018-04
+  eval "(async()=>{const {list}=await window.$send('get-categories');const category=list.find(item=>!item.is_income&&!item.hidden);if(!category) return false;await window.$send('budget/budget-amount',{category:category.id,month:'2018-01',amount:0});return true})()"
+  wait --ms 1000
+  expect --testid selected-budget-month attr data-month is 2018-04
+  reload
+  expect --testid budget-table visible --timeout-ms 60000
+  expect --testid selected-budget-month attr data-month is 2018-01
+scenario "Automatic budget range (mobile) › extends after budgeting the last month and shrinks on reload"
+  set viewport 350 600
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  goto /budget
+  expect --testid budget-table visible
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-02
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-03
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-04
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-05
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-06
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-07
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-08
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-09
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-10
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-11
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2017-12
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2018-01
+  expect --role button --name "Next month" disabled
+  expect --selector "button[data-month]" attr data-month is 2018-01
+  eval "(async()=>{const {list}=await window.$send('get-categories');const category=list.find(item=>!item.is_income&&!item.hidden);if(!category) return false;await window.$send('budget/budget-amount',{category:category.id,month:'2018-01',amount:200});return true})()"
+  wait --ms 1000
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2018-02
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2018-03
+  click --role button --name "Next month"
+  expect --selector "button[data-month]" attr data-month is 2018-04
+  expect --role button --name "Next month" disabled
+  expect --selector "button[data-month]" attr data-month is 2018-04
+  eval "(async()=>{const {list}=await window.$send('get-categories');const category=list.find(item=>!item.is_income&&!item.hidden);if(!category) return false;await window.$send('budget/budget-amount',{category:category.id,month:'2018-01',amount:0});return true})()"
+  wait --ms 1000
+  expect --selector "button[data-month]" attr data-month is 2018-04
+  reload
+  expect --testid budget-table visible --timeout-ms 60000
+  expect --selector "button[data-month]" attr data-month is 2018-01
+scenario "Automatic budget range (desktop) › keeps every displayed column inside the range"
+  set viewport 1800 900
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  click --role link --name "Budget"
+  expect --testid budget-table visible
+  eval "window.$send('save-global-prefs', { maxMonths: 3 })"
+  wait --ms 1000
+  eval "(async()=>{const {list}=await window.$send('get-categories');const category=list.find(item=>!item.is_income&&!item.hidden);if(!category) return false;await window.$send('budget/budget-amount',{category:category.id,month:'2018-01',amount:200});return true})()"
+  wait --ms 1000
+  reload
+  expect --testid budget-table visible --timeout-ms 60000
+  expect js "document.querySelectorAll('[data-testid=selected-budget-month]').length" is 3
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  click --selector "[title='Next month']"
+  expect js "[...document.querySelectorAll('[data-testid=selected-budget-month]')].at(-1).getAttribute('data-month')" is "2018-04"
+  eval "(async()=>{const {list}=await window.$send('get-categories');const category=list.find(item=>!item.is_income&&!item.hidden);if(!category) return false;await window.$send('budget/budget-amount',{category:category.id,month:'2018-01',amount:0});return true})()"
+  wait --ms 1000
+  reload
+  expect --testid budget-table visible --timeout-ms 60000
+  expect js "[...document.querySelectorAll('[data-testid=selected-budget-month]')][0].getAttribute('data-month')" is "2017-11"
+  expect js "[...document.querySelectorAll('[data-testid=selected-budget-month]')].at(-1).getAttribute('data-month')" is "2018-01"

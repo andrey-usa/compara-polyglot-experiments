@@ -1,0 +1,42 @@
+# tour.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b)
+# 2 upstream tests, 2 scenarios. Upstream: fresh demo budget per test
+# (createTestFile = click "Try the demo", wait for budget-table).
+# Tour flow: Help menu -> "Take a tour" opens a dialog; each step shows
+# "N of total" and a Next button; the last step shows Finish, which
+# closes the tour. The skip test clicks "Skip tour" on the first step
+# and expects the tour dialog gone.
+# Port kind: literal for both tests. The tour step counter is read with
+# a js check (no locator hasText filtering in primavera, pilot G4/W3
+# class, but here the counter text is read directly, not used to pick
+# an element, so no W-number is claimed for it).
+# W1-W3 (pilot): not needed here. No new workaround.
+# Requires: set ua "playwright" (pilot G3: matches upstream config
+# userAgent, seeds deterministic demo data).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+
+scenario "walks through each tour step"
+  click --role button --name "Help"
+  click --role button --name "Take a tour"
+  expect --role dialog visible
+  # Upstream reads the total from the "N of total" counter, then clicks
+  # Next until the last step. Here the loop clicks Next until the
+  # dialog's counter reaches its total, then the Finish check below
+  # (with a long timeout) verifies the walk really arrived there.
+  eval "(() => { const dialog = () => document.querySelector('[role=dialog]'); const counter = () => { const m = (dialog()?.innerText || '').match(/(\d+) of (\d+)/); return m ? [Number(m[1]), Number(m[2])] : null; }; let guard = 0; while (guard++ < 50) { const c = counter(); if (!c) return false; if (c[0] >= c[1]) return true; const next = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Next'); if (!next) return false; next.click(); } return false; })()"
+  expect --role button --name "Finish" visible --timeout-ms 60000
+  click --role button --name "Finish"
+  expect not --role dialog visible
+
+scenario "skips the tour"
+  click --role button --name "Help"
+  click --role button --name "Take a tour"
+  expect --role dialog visible
+  expect --role button --name "Skip tour" visible
+  click --role button --name "Skip tour"
+  expect not --role dialog visible

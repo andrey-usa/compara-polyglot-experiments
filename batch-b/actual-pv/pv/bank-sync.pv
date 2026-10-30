@@ -1,0 +1,39 @@
+# bank-sync.test.ts converted from Playwright (Actual Budget e2e @ dff6b4b)
+# 1 upstream test, 1 scenario. Upstream: fresh demo budget per test
+# (createTestFile = click "Try the demo", wait for budget-table), then
+# navigation.goToBankSyncPage (Settings -> Bank Sync section, wait for
+# "Bank Sync" text) and a single toMatchThemeScreenshots assertion.
+# Port kind: screenshot-only, same as the pilot's help-menu visuals.
+# The baseline run executes with VRT unset, so upstream-as-run the
+# screenshot call is a no-op; this port instead takes in-environment
+# themed screenshots (auto/dark/midnight, mask on [data-vrt-mask='true'],
+# --max-diff-pixels 5000, pilot tolerance) and verifies them against
+# baselines captured in the same CI job. That proves in-environment
+# repeatability only, NOT cross-tool pixel equivalence with upstream
+# Playwright screenshots (upstream baselines are not committed).
+# W1-W3 (pilot): not needed here. No new workaround.
+# Requires: set ua "playwright" (pilot G3, withdrawn as a gap: navigera
+# has UA control; matches upstream config userAgent at module load,
+# which seeds the deterministic demo data).
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  click --role link --name "Settings"
+  expect --testid settings visible
+  click --role link --name "Bank Sync"
+  expect text "Bank Sync" --timeout-ms 10000
+
+scenario "checks the page visuals"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot bank-sync-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot bank-sync-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot bank-sync-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
