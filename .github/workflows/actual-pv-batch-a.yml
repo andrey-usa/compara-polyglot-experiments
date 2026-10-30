@@ -80,6 +80,13 @@ jobs:
           primavera run pv/accounts.pv --grep "right clicking an account in sidebar" --repeat 2 --junit results/sidebar-junit.xml --evidence results/evidence > results/sidebar-rerun.log 2>&1; P=$?
           cat results/sidebar-rerun.log
           echo "sidebar rerun rc=$P (recorded here; the batch gate below is authoritative)"
+      - name: Rerun the running-balance test twice (guarded-save verification)
+        working-directory: batch-a/actual-pv
+        run: |
+          mkdir -p results
+          primavera run pv/accounts.pv --grep "updates the running balance" --repeat 2 --junit results/running-balance-junit.xml --evidence results/evidence > results/running-balance-rerun.log 2>&1; P=$?
+          cat results/running-balance-rerun.log
+          echo "running-balance rerun rc=$P (non-gating; the batch gate below is authoritative)"
       - name: Run the converted batch (per-test results)
         working-directory: batch-a/actual-pv
         run: |

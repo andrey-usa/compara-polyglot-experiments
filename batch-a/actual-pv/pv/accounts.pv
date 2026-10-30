@@ -82,11 +82,17 @@ scenario "updates the running balance after editing a transaction amount"
   click --selector "[data-testid='new-transaction'] [data-testid='credit']"
   fill --selector "[data-testid='new-transaction'] [data-testid='credit'] input" "10.00" --keys
   press Tab
+  # committed-value guard (run 41040282125: fill raced the add-button commit and saved 0.00,
+  # both tries). After Tab the input unmounts and the cell re-renders the COMMITTED value;
+  # gate the save on that observable state (probe49: equality holds post-Tab), never on ms.
+  expect js "[...document.querySelectorAll(\"[data-testid='new-transaction'] [data-testid='credit']\")].some(e=>e.textContent.trim()==='10.00')" --timeout-ms 10000
   click --selector "[data-testid='new-transaction'] [data-testid='notes']"
   fill --selector "[data-testid='new-transaction'] [data-testid='notes'] input" "editable transaction"
   press Tab
   click --testid add-button
   click --role button --name "Cancel"
+  # saved-amount observation: the actual saved value (additive; precedes the balance assert)
+  expect --selector "[data-testid='transaction-table'] [data-testid='row'] [data-testid='credit']" --nth 0 text is "10.00"
   # setTransactionColumnVisibility('balance', true)
   click --role button --name "Account menu"
   click --role button --name "Manage table columns"
