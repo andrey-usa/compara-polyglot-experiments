@@ -107,6 +107,17 @@
 # under load (batch A precedent).
 # Requires: set ua "playwright" (pilot G3: matches upstream config
 # userAgent, seeds deterministic demo data).
+# W21 (net worth and cash flow graph scenarios): before the auto-theme
+# screenshot, wait for the report's explainer text ("How is net worth
+# calculated?" / "How is cash flow calculated?"). Both components return
+# null until their async data loads, so without this wait the auto
+# screenshot fires on the blank app shell: in run 10 both auto baselines
+# were byte-identical blank shells (sidebar + uniform 232,236,240 main
+# area), while the dark/midnight baselines, taken a step later, rendered
+# the graphs. The converted run then passed net worth blank-to-blank
+# and failed cash flow 19578 px (2.12%) rendered-vs-blank. Upstream's
+# Playwright screenshot waits for page stability; primavera's does not,
+# so the content-visible expect supplies that wait. No threshold change.
 base http://127.0.0.1:3001
 
 before each
@@ -164,6 +175,7 @@ scenario "right clicking a report card opens context menu"
 
 scenario "loads net worth graph and checks visuals"
   click --role button --name "Net Worth"
+  expect text "How is net worth calculated?"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
   expect screenshot reports-networth-auto --max-diff-pixels 5000
@@ -176,6 +188,7 @@ scenario "loads net worth graph and checks visuals"
 
 scenario "loads cash flow graph and checks visuals"
   click --role button --name "Cash Flow"
+  expect text "How is cash flow calculated?"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
   expect screenshot reports-cashflow-auto --max-diff-pixels 5000
