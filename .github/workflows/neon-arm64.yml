@@ -38,6 +38,10 @@ jobs:
           path: compara
       - name: apply patch
         run: git -C compara apply ../cell/neon.patch && git -C compara status --short
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
       - name: lint, as CI does
         run: |
           cargo fmt --check
@@ -80,13 +84,20 @@ jobs:
           ./base/target/release/compara-gen-data --rows 2m --format parquet --out-dir ab --prefix pqpair
           ls -la ab/
       - name: identical output check
+        # compare exits 1 when the files differ (they do: the pair has drift),
+        # and its one-line summary ends with the run's own seconds, so both
+        # are normalized before diffing: exit code ignored, timing stripped.
         run: |
-          ./base/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pair_a.csv ab/pair_b.csv > base-out.txt
-          ./head/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pair_a.csv ab/pair_b.csv > head-out.txt
-          diff base-out.txt head-out.txt && echo "CSV output identical"
-          ./base/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pqpair_a.parquet ab/pqpair_b.parquet > base-pq.txt
-          ./head/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pqpair_a.parquet ab/pqpair_b.parquet > head-pq.txt
-          diff base-pq.txt head-pq.txt && echo "Parquet output identical"
+          ./base/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pair_a.csv ab/pair_b.csv > base-out.txt || true
+          ./head/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pair_a.csv ab/pair_b.csv > head-out.txt || true
+          sed -E 's/, [0-9]+\.[0-9]+s$//' base-out.txt > base-out.norm
+          sed -E 's/, [0-9]+\.[0-9]+s$//' head-out.txt > head-out.norm
+          diff base-out.norm head-out.norm && echo "CSV output identical"
+          ./base/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pqpair_a.parquet ab/pqpair_b.parquet > base-pq.txt || true
+          ./head/target/release/compara compare -k account_id,txn_id -i updated_at --engine turbo ab/pqpair_a.parquet ab/pqpair_b.parquet > head-pq.txt || true
+          sed -E 's/, [0-9]+\.[0-9]+s$//' base-pq.txt > base-pq.norm
+          sed -E 's/, [0-9]+\.[0-9]+s$//' head-pq.txt > head-pq.norm
+          diff base-pq.norm head-pq.norm && echo "Parquet output identical"
       - name: interleaved A/B, 7 runs each, CSV and Parquet
         run: |
           {
@@ -96,9 +107,11 @@ jobs:
               for i in 1 2 3 4 5 6 7; do
                 for arm in base head; do
                   start=$(date +%s.%N)
+                  # icount exits with the command's status, and compare exits
+                  # 1 on differing files, so the `|| true` keeps the step alive.
                   icount=$(COMPARA_PHASES=1 python3 base/scripts/icount.py --counter perf -- \
                     ./$arm/target/release/compara compare \
-                    -k account_id,txn_id -i updated_at --engine turbo "$A" "$B" 2> "phases-$fmt-$arm-$i.txt")
+                    -k account_id,txn_id -i updated_at --engine turbo "$A" "$B" 2> "phases-$fmt-$arm-$i.txt" || true)
                   end=$(date +%s.%N)
                   secs=$(python3 -c "print(f'{$end-$start:.3f}')")
                   inst=$(echo "$icount" | grep -o '[0-9][0-9]*' | head -1)

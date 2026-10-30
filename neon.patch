@@ -1,16 +1,16 @@
-From 481e8e36de3b6f9dfbbac808c620ff0833dcdea2 Mon Sep 17 00:00:00 2001
+From dcb41e4581fa9fbfaa39c1c042a87ac24f9811e1 Mon Sep 17 00:00:00 2001
 From: andrey-usa <62624421+andrey-usa@users.noreply.github.com>
 Date: Fri, 30 Oct 2026 00:47:25 +0000
 Subject: [PATCH] Wide scans with NEON on aarch64
 
 Wide::detect is Some on aarch64, where NEON is baseline, and hits and same compare two 16-byte registers with a one-bit-per-byte mask packed by weight, so the callers are unchanged. The five text parsing copies carry target_feature(neon) on aarch64, and the setup paths take Wide there too. A randomized test checks the masks against a byte at a time for every delimiter value and every offset.
 ---
- src/engine/turbo/field.rs | 166 +++++++++++++++++++++++++++++++++++---
- src/engine/turbo/text.rs  |  45 ++++++-----
- 2 files changed, 182 insertions(+), 29 deletions(-)
+ src/engine/turbo/field.rs | 170 ++++++++++++++++++++++++++++++++++++--
+ src/engine/turbo/text.rs  |  45 +++++-----
+ 2 files changed, 186 insertions(+), 29 deletions(-)
 
 diff --git a/src/engine/turbo/field.rs b/src/engine/turbo/field.rs
-index d5cef4f..43ba534 100644
+index d5cef4f..aa95b22 100644
 --- a/src/engine/turbo/field.rs
 +++ b/src/engine/turbo/field.rs
 @@ -70,7 +70,10 @@ pub(super) fn is_real(f: Field) -> bool {
@@ -71,7 +71,7 @@ index d5cef4f..43ba534 100644
          }
      }
  }
-@@ -235,6 +249,77 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
+@@ -235,6 +249,81 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
      _mm256_movemask_epi8(equal) as u32 as u64
  }
  
@@ -85,6 +85,10 @@ index d5cef4f..43ba534 100644
 +/// does not fit what the callers count and find: they take `trailing_zeros` of
 +/// a one-bit-per-byte mask and mask with `STEP` bits, so a 4-bit mask means
 +/// changing every caller. The one-bit mask keeps the callers untouched.
++///
++/// # Safety
++/// None beyond the caller's value: the lanes are plain arithmetic, and no
++/// memory is touched.
 +#[cfg(target_arch = "aarch64")]
 +#[inline]
 +unsafe fn neon_movemask(v: std::arch::aarch64::uint8x16_t) -> u32 {
@@ -149,7 +153,7 @@ index d5cef4f..43ba534 100644
  const ONES: u64 = 0x0101_0101_0101_0101;
  const HIGH: u64 = 0x8080_8080_8080_8080;
  
-@@ -435,9 +520,17 @@ fn word_at(data: &[u8], at: usize) -> u64 {
+@@ -435,9 +524,17 @@ fn word_at(data: &[u8], at: usize) -> u64 {
  fn fixed() -> Wide {
      Wide(())
  }
@@ -170,7 +174,7 @@ index d5cef4f..43ba534 100644
  )))]
  #[inline(always)]
  fn fixed() -> Swar {
-@@ -699,6 +792,61 @@ mod tests {
+@@ -699,6 +796,61 @@ mod tests {
          }
      }
  
