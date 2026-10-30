@@ -6,8 +6,9 @@
 # Port kind: screenshot-only, same as the pilot's help-menu visuals.
 # The baseline run executes with VRT unset, so upstream-as-run the
 # screenshot call is a no-op; this port instead takes in-environment
-# themed screenshots (auto/dark/midnight, mask on [data-vrt-mask='true'],
-# --max-diff-pixels 5000, pilot tolerance) and verifies them against
+# themed screenshots (auto/dark/midnight, --max-diff-pixels 5000,
+# pilot tolerance; no --mask: primavera fails a screenshot step whose
+# mask matches nothing, and this page has no masked element) and verifies them against
 # baselines captured in the same CI job. That proves in-environment
 # repeatability only, NOT cross-tool pixel equivalence with upstream
 # Playwright screenshots (upstream baselines are not committed).
@@ -30,10 +31,10 @@ before each
 scenario "checks the page visuals"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot bank-sync-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot bank-sync-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot bank-sync-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot bank-sync-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot bank-sync-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot bank-sync-midnight --max-diff-pixels 5000

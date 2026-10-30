@@ -30,7 +30,7 @@ before each
 scenario "Check the command bar visuals"
   press ControlOrMeta+k
   expect --role combobox --name "Command Bar" visible
-  expect screenshot command-bar-open --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot command-bar-open --max-diff-pixels 5000
   press Escape
   expect not --role combobox --name "Command Bar" visible
 
@@ -46,6 +46,6 @@ scenario "Check the command bar search works correctly"
   expect --role combobox --name "Command Bar" visible
   press ArrowDown
   press ArrowDown
-  expect screenshot command-bar-schedules --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot command-bar-schedules --max-diff-pixels 5000
   press Enter
   expect --role button --name "Add new schedule" visible

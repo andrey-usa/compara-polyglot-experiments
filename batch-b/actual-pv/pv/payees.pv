@@ -33,23 +33,23 @@ before each
 scenario "checks the payees page visuals"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot payees-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot payees-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot payees-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot payees-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot payees-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot payees-midnight --max-diff-pixels 5000
   fill --placeholder "Filter payees..." "Fast Internet"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot payees-search-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot payees-search-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot payees-search-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot payees-search-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot payees-search-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot payees-search-midnight --max-diff-pixels 5000
 
 scenario "shows Fast Internet in the payee list"
   fill --placeholder "Filter payees..." "Fast Internet"

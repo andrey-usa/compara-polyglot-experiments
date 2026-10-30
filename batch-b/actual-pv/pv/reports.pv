@@ -12,8 +12,9 @@
 # (or, for the date-range picker and tag popover, on that element);
 # the baseline run executes with VRT unset, so upstream-as-run they
 # are no-ops. This port takes in-environment themed screenshots
-# (auto/dark/midnight, mask on [data-vrt-mask='true'],
-# --max-diff-pixels 5000, pilot tolerance) and verifies them against
+# (auto/dark/midnight, --max-diff-pixels 5000, pilot tolerance; no
+# --mask: primavera fails a screenshot step whose mask matches
+# nothing, and these pages have no masked element) and verifies them against
 # baselines captured in the same CI job. That proves in-environment
 # repeatability only, NOT cross-tool pixel equivalence with upstream
 # Playwright screenshots (upstream baselines are not committed).
@@ -51,13 +52,13 @@ scenario "loads net worth and cash flow reports"
   expect js "[...document.querySelectorAll('[data-testid=reports-page] button')].map(b=>b.querySelector('h1,h2,h3,h4')?.textContent.trim()).filter(Boolean).join('|')" is "Total Income (YTD)|Total Expenses (YTD)|Avg Per Month|Avg Per Transaction|Net Worth|Cash Flow|This Month|Budget Overview|3-Month Average"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-list-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-list-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-list-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-list-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-list-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-list-midnight --max-diff-pixels 5000
 
 scenario "resizes number cards with the viewport"
   set viewport 1440 900
@@ -65,23 +66,23 @@ scenario "resizes number cards with the viewport"
   eval "window.__font0 = getComputedStyle(document.querySelector('[aria-label*=\"amount:\"] span')).fontSize"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-resize-wide-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-resize-wide-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-resize-wide-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-resize-wide-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-resize-wide-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-resize-wide-midnight --max-diff-pixels 5000
   set viewport 900 900
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-resize-narrow-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-resize-narrow-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-resize-narrow-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-resize-narrow-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-resize-narrow-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-resize-narrow-midnight --max-diff-pixels 5000
   expect js "getComputedStyle(document.querySelector('[aria-label*=\"amount:\"] span')).fontSize !== window.__font0" --timeout-ms 10000
 
 scenario "right clicking a report card opens context menu"
@@ -93,25 +94,25 @@ scenario "loads net worth graph and checks visuals"
   click --role button --name "Net Worth"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-networth-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-networth-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-networth-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-networth-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-networth-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-networth-midnight --max-diff-pixels 5000
 
 scenario "loads cash flow graph and checks visuals"
   click --role button --name "Cash Flow"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-cashflow-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-cashflow-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-cashflow-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-cashflow-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-cashflow-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-cashflow-midnight --max-diff-pixels 5000
 
 scenario "opens the date range picker and checks visuals"
   click --role button --name "Net Worth"
@@ -119,23 +120,23 @@ scenario "opens the date range picker and checks visuals"
   expect --selector "[data-popover]" visible
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-picker-auto --selector "[data-popover]" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-picker-auto --selector "[data-popover]" --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-picker-dark --selector "[data-popover]" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-picker-dark --selector "[data-popover]" --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-picker-midnight --selector "[data-popover]" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-picker-midnight --selector "[data-popover]" --max-diff-pixels 5000
   click --role button --name "Day"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-picker-day-auto --selector "[data-popover]" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-picker-day-auto --selector "[data-popover]" --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-picker-day-dark --selector "[data-popover]" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-picker-day-dark --selector "[data-popover]" --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-picker-day-midnight --selector "[data-popover]" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-picker-day-midnight --selector "[data-popover]" --max-diff-pixels 5000
 
 # --- balance forecast setup, inlined per scenario (upstream describe
 # before-each): Settings -> Experimental -> check "Balance Forecast
@@ -159,13 +160,13 @@ scenario "loads balance forecast report with monthly granularity"
   expect --role button --name "Monthly" visible
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot forecast-monthly-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-monthly-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot forecast-monthly-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-monthly-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot forecast-monthly-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-monthly-midnight --max-diff-pixels 5000
 
 scenario "switches to daily granularity"
   click --role link --name "Settings"
@@ -185,13 +186,13 @@ scenario "switches to daily granularity"
   expect --role button --name "Daily" visible
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot forecast-daily-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-daily-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot forecast-daily-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-daily-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot forecast-daily-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-daily-midnight --max-diff-pixels 5000
 
 scenario "switches to Zero-Based Y-Axis"
   click --role link --name "Settings"
@@ -211,13 +212,13 @@ scenario "switches to Zero-Based Y-Axis"
   expect --role button --name "Zero-Based" visible
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot forecast-zero-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-zero-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot forecast-zero-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-zero-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot forecast-zero-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-zero-midnight --max-diff-pixels 5000
 
 scenario "switches to daily granularity and Zero-Based Y-Axis"
   click --role link --name "Settings"
@@ -240,13 +241,13 @@ scenario "switches to daily granularity and Zero-Based Y-Axis"
   expect --role button --name "Zero-Based" visible
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot forecast-daily-zero-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-daily-zero-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot forecast-daily-zero-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-daily-zero-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot forecast-daily-zero-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-daily-zero-midnight --max-diff-pixels 5000
 
 scenario "loads tracking budget forecast report"
   click --role link --name "Settings"
@@ -294,13 +295,13 @@ scenario "loads tracking budget forecast report"
   expect --role button --name "Tracking budget" visible
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot forecast-tracking-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-tracking-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot forecast-tracking-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-tracking-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot forecast-tracking-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot forecast-tracking-midnight --max-diff-pixels 5000
 
 # --- custom reports: each scenario starts with the describe
 # before-each (go to custom report page + tooltip-hiding style tag).
@@ -383,24 +384,24 @@ scenario "splits transactions into exact tag buckets and scopes them"
   click --role button --name "Tag scope: All tags"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-tag-scope-auto --selector "[data-popover]" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-tag-scope-auto --selector "[data-popover]" --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-tag-scope-dark --selector "[data-popover]" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-tag-scope-dark --selector "[data-popover]" --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-tag-scope-midnight --selector "[data-popover]" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-tag-scope-midnight --selector "[data-popover]" --max-diff-pixels 5000
   press Escape
   eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const row=el?.parentElement;if(row){row.setAttribute('data-pv-split','1');}return !!row})()"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-split-row-auto --selector "[data-pv-split='1']" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-split-row-auto --selector "[data-pv-split='1']" --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-split-row-dark --selector "[data-pv-split='1']" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-split-row-dark --selector "[data-pv-split='1']" --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-split-row-midnight --selector "[data-pv-split='1']" --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-split-row-midnight --selector "[data-pv-split='1']" --max-diff-pixels 5000
   eval "(()=>{const cell=[...document.querySelectorAll('[data-testid=\"report-row-#circle + #red\"] *')].find(e=>e.textContent.trim()==='-30.00');cell?.click();return !!cell})()"
   expect url contains "/accounts"
   expect js "[...document.querySelectorAll('[data-testid=transaction-table] [data-testid=notes]')].filter(n=>n.textContent.includes('#red #circle')).length" is 1
@@ -441,13 +442,13 @@ scenario "Switches to Data Table and checks the visuals"
   click --role button --name "Data Table"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-viz-table-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-table-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-viz-table-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-table-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-viz-table-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-table-midnight --max-diff-pixels 5000
 
 scenario "Switches to Bar Graph and checks the visuals"
   click --role button --name "Add new widget"
@@ -457,13 +458,13 @@ scenario "Switches to Bar Graph and checks the visuals"
   click --role button --name "Bar Graph"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-viz-bar-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-bar-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-viz-bar-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-bar-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-viz-bar-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-bar-midnight --max-diff-pixels 5000
 
 scenario "Switches to Line Graph and checks the visuals"
   click --role button --name "Add new widget"
@@ -473,13 +474,13 @@ scenario "Switches to Line Graph and checks the visuals"
   click --role button --name "Line Graph"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-viz-line-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-line-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-viz-line-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-line-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-viz-line-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-line-midnight --max-diff-pixels 5000
 
 scenario "Switches to Area Graph and checks the visuals"
   click --role button --name "Add new widget"
@@ -489,13 +490,13 @@ scenario "Switches to Area Graph and checks the visuals"
   click --role button --name "Area Graph"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-viz-area-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-area-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-viz-area-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-area-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-viz-area-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-area-midnight --max-diff-pixels 5000
 
 scenario "Switches to Donut Graph and checks the visuals"
   click --role button --name "Add new widget"
@@ -505,13 +506,13 @@ scenario "Switches to Donut Graph and checks the visuals"
   click --role button --name "Donut Graph"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-viz-donut-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-donut-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-viz-donut-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-donut-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-viz-donut-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-donut-midnight --max-diff-pixels 5000
 
 scenario "Validates that \"show legend\" button shows the legend side-bar"
   click --role button --name "Add new widget"
@@ -521,13 +522,13 @@ scenario "Validates that \"show legend\" button shows the legend side-bar"
   click --role button --name "Show Legend"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-viz-legend-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-legend-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-viz-legend-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-legend-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-viz-legend-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-legend-midnight --max-diff-pixels 5000
   click --role button --name "Show Legend"
 
 scenario "Bar Graph keeps its height when the legend needs scrolling"
@@ -582,13 +583,13 @@ scenario "Validates that \"show summary\" button shows the summary"
   click --role button --name "Show Summary"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-viz-summary-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-summary-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-viz-summary-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-summary-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-viz-summary-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-summary-midnight --max-diff-pixels 5000
   click --role button --name "Show Summary"
 
 scenario "Validates that \"show labels\" button shows the labels"
@@ -599,12 +600,12 @@ scenario "Validates that \"show labels\" button shows the labels"
   click --role button --name "Show Labels"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot reports-viz-labels-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-labels-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot reports-viz-labels-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-labels-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot reports-viz-labels-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot reports-viz-labels-midnight --max-diff-pixels 5000
   click --role button --name "Show Labels"
 

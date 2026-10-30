@@ -33,24 +33,24 @@ scenario "checks the page visuals"
   expect text "Welcome to Actual"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot onboarding-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot onboarding-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot onboarding-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot onboarding-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot onboarding-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot onboarding-midnight --max-diff-pixels 5000
   click --role button --name "Connect to a sync server"
   expect --role heading text contains "Connect to a server"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
-  expect screenshot onboarding-server-auto --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot onboarding-server-auto --max-diff-pixels 5000
   eval "window.Actual.setTheme('dark')"
   expect --selector "[data-theme]" attr data-theme is dark
-  expect screenshot onboarding-server-dark --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot onboarding-server-dark --max-diff-pixels 5000
   eval "window.Actual.setTheme('midnight')"
   expect --selector "[data-theme]" attr data-theme is midnight
-  expect screenshot onboarding-server-midnight --mask "[data-vrt-mask='true']" --max-diff-pixels 5000
+  expect screenshot onboarding-server-midnight --max-diff-pixels 5000
 
 scenario "creates a new budget file by importing YNAB4 budget"
   click --role button --name "Import my budget"
