@@ -77,7 +77,17 @@
 # [data-popover] with a non-zero rect), marked, and clicked with
 # a real click; the role expect/click pair is dropped. Upstream
 # clicks the same Tag option via Playwright's visible-only role
-# locator.
+# locator. W20 (both Split occurrences, supersedes W16/W18 for opening
+# the popover): the synthetic pointer sequence opened the popover only
+# intermittently (first occurrence passed in runs 6-7, poll false in
+# run 9) — a dispatched pointer sequence is not a trusted click, and
+# React Aria's press handling need not fire on it. So, after a
+# Split-button-exists poll and a 1 s settle wait (the custom editor
+# re-renders right after creation, which is what wiped marks in run 5),
+# the trigger is marked and clicked with a real primavera click, the
+# same proven pattern as the Type trigger and budget cell; upstream
+# clicks the splitRow button itself with Playwright's real click.
+# The W19 Tag poll/mark/click is unchanged.
 # now asserts the custom-editor URL and Donut-button visibility
 # before clicking (upstream's goToCustomReportPage/selectMode
 # auto-waits); its run-6 failure is recorded as flaky-or-timing
@@ -463,7 +473,10 @@ scenario "splits transactions into exact tag buckets and scopes them"
   expect --role button --name "Net Worth" visible
   click --role button --name "Add new widget"
   click --role button --name "New custom report"
-  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');if(!b)return false;b.scrollIntoView();const r=b.getBoundingClientRect();const c={bubbles:true,cancelable:true,button:0,clientX:r.left+r.width/2,clientY:r.top+r.height/2};b.dispatchEvent(new PointerEvent('pointerover',{...c,pointerType:'mouse',isPrimary:true}));b.dispatchEvent(new PointerEvent('pointerdown',{...c,pointerType:'mouse',isPrimary:true,buttons:1}));b.dispatchEvent(new MouseEvent('mousedown',{...c,buttons:1}));b.focus();b.dispatchEvent(new PointerEvent('pointerup',{...c,pointerType:'mouse',isPrimary:true,buttons:0}));b.dispatchEvent(new MouseEvent('mouseup',{...c,buttons:0}));b.dispatchEvent(new MouseEvent('click',{...c,buttons:0}));return true})()"
+  expect js "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');return !!el?.parentElement?.querySelector('button')})()"
+  wait --ms 1000
+  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');if(!b)return false;b.scrollIntoView();b.setAttribute('data-pv-split-trigger','1');return true})()"
+  click --selector "[data-pv-split-trigger='1']"
   expect js "(()=>{const b=[...document.querySelectorAll('[data-popover] button')].find(x=>x.textContent.trim()==='Tag');const r=b?.getBoundingClientRect();return !!(b&&r&&r.width>0&&r.height>0)})()"
   eval "(()=>{const b=[...document.querySelectorAll('[data-popover] button')].find(x=>x.textContent.trim()==='Tag');if(!b)return false;b.setAttribute('data-pv-tag','1');return true})()"
   click --selector "[data-pv-tag='1']"
@@ -501,7 +514,9 @@ scenario "splits transactions into exact tag buckets and scopes them"
   back
   expect --testid reports-page visible
   expect js "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');return !!el?.parentElement?.querySelector('button')})()"
-  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');if(!b)return false;b.scrollIntoView();const r=b.getBoundingClientRect();const c={bubbles:true,cancelable:true,button:0,clientX:r.left+r.width/2,clientY:r.top+r.height/2};b.dispatchEvent(new PointerEvent('pointerover',{...c,pointerType:'mouse',isPrimary:true}));b.dispatchEvent(new PointerEvent('pointerdown',{...c,pointerType:'mouse',isPrimary:true,buttons:1}));b.dispatchEvent(new MouseEvent('mousedown',{...c,buttons:1}));b.focus();b.dispatchEvent(new PointerEvent('pointerup',{...c,pointerType:'mouse',isPrimary:true,buttons:0}));b.dispatchEvent(new MouseEvent('mouseup',{...c,buttons:0}));b.dispatchEvent(new MouseEvent('click',{...c,buttons:0}));return true})()"
+  wait --ms 1000
+  eval "(()=>{const el=[...document.querySelectorAll('*')].find(e=>e.textContent.trim()==='Split:');const b=el?.parentElement?.querySelector('button');if(!b)return false;b.scrollIntoView();b.setAttribute('data-pv-split-trigger','1');return true})()"
+  click --selector "[data-pv-split-trigger='1']"
   expect js "(()=>{const b=[...document.querySelectorAll('[data-popover] button')].find(x=>x.textContent.trim()==='Tag');const r=b?.getBoundingClientRect();return !!(b&&r&&r.width>0&&r.height>0)})()"
   eval "(()=>{const b=[...document.querySelectorAll('[data-popover] button')].find(x=>x.textContent.trim()==='Tag');if(!b)return false;b.setAttribute('data-pv-tag','1');return true})()"
   click --selector "[data-pv-tag='1']"
