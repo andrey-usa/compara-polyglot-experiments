@@ -1,0 +1,119 @@
+# The two drag-and-drop tests from Actual Budget's budget.mobile spec, rerun
+# against navigera with the real-drag fix (batch C D5): navigera next c660a00
+# (CI run 41118096313 green), Actual @ dff6b4b, primavera next 7ea6551.
+# Each scenario runs 3 times (--repeat 3); the drag result JSON (path,
+# dropped) is saved per try as `dr` and printed as ::notice lines by the
+# parse step below, so every try's drag path is visible in the run log.
+# Same container and app start as the batch C workflow; no secrets.
+name: actual-pv-drag
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  drag:
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-jammy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone actual @ pinned commit
+        run: |
+          git clone --filter=blob:none https://github.com/actualbudget/actual.git actual
+          cd actual && git checkout dff6b4b21bed7d20a0977cd71c990f40b6e26e8e
+      - name: Trust the repository directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/actual"
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'actual/.nvmrc'
+      - name: Enable corepack (yarn 4)
+        run: corepack enable
+      - name: Install dependencies
+        run: cd actual && yarn install --immutable
+      - name: Build browser bundle (CI parity)
+        env:
+          REACT_APP_NETLIFY: 'true'
+        run: cd actual && yarn build:browser --skip-translations
+      - name: Install Rust (for the primavera source build)
+        run: |
+          command -v cc >/dev/null || { apt-get update && apt-get install -y --no-install-recommends build-essential; }
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build primavera + navigera @ pinned commits
+        run: |
+          git clone --filter=blob:none https://github.com/andrey-usa/navigera.git navigera
+          git -C navigera checkout c660a0000f8bbbac7b9fc1302f6daafca7bb21f5
+          git clone --filter=blob:none https://github.com/andrey-usa/primavera.git primavera
+          git -C primavera checkout 7ea655134ccfbd2b8776dbab7e62b6ac761b302e
+          CARGO_TARGET_DIR="$RUNNER_TEMP/pv-target" cargo build --release --manifest-path primavera/Cargo.toml
+          echo "$RUNNER_TEMP/pv-target/release" >> "$GITHUB_PATH"
+      - name: Resolve a browser for primavera
+        run: |
+          B="$(find /ms-playwright -maxdepth 4 -type f \( -name chrome -o -name headless_shell -o -name chrome-headless-shell \) 2>/dev/null | sort | head -1)"
+          if [ -n "$B" ]; then
+            echo "using preinstalled browser: $B"
+            echo "CHROME_BIN=$B" >> "$GITHUB_ENV"
+          else
+            echo "no preinstalled browser under /ms-playwright; falling back to primavera navigera install-browser (chrome-headless-shell download, same container)"
+            primavera navigera install-browser
+          fi
+      - name: Start the app (baseline's server)
+        run: |
+          PORT=3001 node actual/packages/desktop-client/bin/serve-build.mjs > app.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:3001/ && break || sleep 2; done
+          curl -fsS -o /dev/null http://127.0.0.1:3001/
+      - name: Assert the browser really runs
+        run: |
+          if [ -n "$CHROME_BIN" ]; then test -x "$CHROME_BIN" || { echo "CHROME_BIN not executable: $CHROME_BIN"; exit 1; }; fi
+          printf 'base http://127.0.0.1:3001\nscenario "probe"\n  goto /\n  expect text "Try the demo" --timeout-ms 30000\n' > /tmp/probe.pv
+          primavera run /tmp/probe.pv | tee probe.log
+          grep -q "1 passed" probe.log || { echo "browser probe did not execute"; exit 1; }
+      - name: Run the two drag tests x3
+        working-directory: pilot/actual-pv-drag
+        run: |
+          mkdir -p results
+          CODE=0
+          primavera run pv/drag-mobile.pv --repeat 3 --reporter jsonl --reporter console --junit results/junit.xml --evidence results/evidence > results/drag-run.log 2>&1 || CODE=$?
+          echo "$CODE" > results/exit-code.txt
+          python3 - <<'PYEOF'
+          import json, sys
+          rows = []
+          try:
+              lines = open('results/drag-run.log', encoding='utf-8', errors='replace').read().splitlines()
+          except FileNotFoundError:
+              lines = []
+          for ln in lines:
+              try:
+                  o = json.loads(ln)
+              except ValueError:
+                  continue
+              if o.get('event') != 'scenario':
+                  continue
+              dr = (o.get('saved') or {}).get('dr', '')
+              try:
+                  drag = json.loads(dr).get('drag', {})
+              except ValueError:
+                  drag = {'raw': dr[:200]}
+              rows.append((o.get('name', '?'), o.get('attempt', '?'), o.get('status', '?'), drag))
+              print(f"::notice::drag {o.get('name')} try {o.get('attempt')}: status={o.get('status')} path={drag.get('path')} dropped={drag.get('dropped')}")
+          with open('results/drag-summary.txt', 'w') as f:
+              for name, attempt, status, drag in rows:
+                  f.write(f"{status} try {attempt} path={drag.get('path')} dropped={drag.get('dropped')} :: {name}\n")
+          print(f"drag tries parsed: {len(rows)}")
+          PYEOF
+          T=$(grep -c "<testcase " results/junit.xml || true)
+          F=$(grep -cE "<(failure|error)[ >]" results/junit.xml || true)
+          echo "junit: $T testcases, $F failures/errors"
+          [ "$T" -eq 6 ] || { echo "expected 6 testcases, got $T"; exit 1; }
+          [ "$CODE" -eq 0 ] || { echo "primavera exit $CODE"; exit "$CODE"; }
+          [ "$F" -eq 0 ] || { echo "unexpected failures/errors"; exit 1; }
+      - name: Upload results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: actual-pv-drag-results
+          path: pilot/actual-pv-drag/results/
+          retention-days: 30

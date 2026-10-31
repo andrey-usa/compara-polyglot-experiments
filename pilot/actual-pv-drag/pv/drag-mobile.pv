@@ -1,0 +1,74 @@
+# The two "moves a category to another group with drag and drop" tests from
+# budget.mobile.test.ts (Actual Budget e2e), rerun against navigera with the
+# real-drag fix: batch C drove these with raw mouse move/down/move/up, which
+# cannot initiate an HTML5 drag in the headless shell (batch C D5). Here the
+# mouse sequence is replaced by navigera's native `drag`, which runs a real
+# browser drag (Input.setInterceptDrags + Input.dispatchDragEvent) and reports
+# `path` ("drag", "mouse" or "synthetic") and `dropped`. The result JSON is
+# saved as `dr` per try and printed by the CI step as ::notice lines.
+#
+# Pins: navigera next c660a00, Actual dff6b4b, primavera next 7ea6551.
+# Scenarios, setup flows and the final assertion are copied unchanged from
+# batch C (experiment-53 @ 8aaeee7, pilot/actual-pv-batch-c/pv/budget-mobile.pv).
+#
+# Known difference from upstream: navigera `drag` aims at the target element's
+# center, while upstream drops on the Internet row's top edge (x+20, y+5). If
+# a try reports path "drag" with dropped true but the order assertion fails,
+# the drop landed but at the wrong position inside the row (center vs top
+# edge); that is a drop-position gap, not a drag-initiation gap.
+
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 350 600 --mobile
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+
+flow nav-settings
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Settings').click()"
+  expect --testid settings visible --timeout-ms 30000
+
+flow nav-budget
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Budget').click()"
+  expect --testid budget-table visible --timeout-ms 60000
+
+flow setup-envelope
+  run nav-settings
+  click --role link --name "General"
+  expect text "Budget type" --timeout-ms 30000
+  save sw = eval "([...document.querySelectorAll('button')].find(b=>/Switch to .* budgeting/i.test(b.textContent))?.textContent||'')"
+  if ${sw} contains envelope
+    click --role button --name "Switch to envelope budgeting"
+  run nav-budget
+  expect js "[...document.querySelectorAll('button')].some(b=>['To Budget','Overbudgeted'].some(t=>b.textContent.trim().startsWith(t)))"
+
+flow setup-tracking
+  run nav-settings
+  click --role link --name "General"
+  expect text "Budget type" --timeout-ms 30000
+  save sw = eval "([...document.querySelectorAll('button')].find(b=>/Switch to .* budgeting/i.test(b.textContent))?.textContent||'')"
+  if ${sw} contains tracking
+    click --role button --name "Switch to tracking budgeting"
+  run nav-budget
+  expect js "[...document.querySelectorAll('button')].some(b=>['Saved','Projected savings','Overspent'].some(t=>b.textContent.trim().startsWith(t)))"
+
+scenario "Mobile Budget [Envelope] › moves a category to another group with drag and drop"
+  run setup-envelope
+  set viewport 350 1000
+  run nav-budget
+  eval "(()=>{const rows=[...document.querySelectorAll(\"[data-testid='budget-table'] [data-testid='budget-groups'] [data-testid='category-row']\")]; const tag=(name,t)=>{const r=rows.find(x=>{const n=x.querySelector(\"[data-testid='category-name']\"); return n&&n.textContent.trim()===name}); r.setAttribute('data-pv-target',t)}; tag('Gift','gift-row'); tag('Internet','internet-row'); return 'ok'})()"
+  save dr = drag "[data-pv-target='gift-row']" "[data-pv-target='internet-row']"
+  save bills = eval "(()=>{const g=[...document.querySelectorAll('[role=\"grid\"]')].find(x=>(x.getAttribute('aria-label')||'')==='Bills expense group categories'); return [...g.querySelectorAll(\"[data-testid='category-name']\")].map(e=>e.textContent.trim()).join('|')})()"
+  expect ${bills} is "Cell|Gift|Internet|Mortgage|Water|Power"
+
+scenario "Mobile Budget [Tracking] › moves a category to another group with drag and drop"
+  run setup-tracking
+  set viewport 350 1000
+  run nav-budget
+  eval "(()=>{const rows=[...document.querySelectorAll(\"[data-testid='budget-table'] [data-testid='budget-groups'] [data-testid='category-row']\")]; const tag=(name,t)=>{const r=rows.find(x=>{const n=x.querySelector(\"[data-testid='category-name']\"); return n&&n.textContent.trim()===name}); r.setAttribute('data-pv-target',t)}; tag('Gift','gift-row'); tag('Internet','internet-row'); return 'ok'})()"
+  save dr = drag "[data-pv-target='gift-row']" "[data-pv-target='internet-row']"
+  save bills = eval "(()=>{const g=[...document.querySelectorAll('[role=\"grid\"]')].find(x=>(x.getAttribute('aria-label')||'')==='Bills expense group categories'); return [...g.querySelectorAll(\"[data-testid='category-name']\")].map(e=>e.textContent.trim()).join('|')})()"
+  expect ${bills} is "Cell|Gift|Internet|Mortgage|Water|Power"
