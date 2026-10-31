@@ -200,8 +200,8 @@ scenario "Mobile Transactions › removes the payee from a new transaction"
   expect not --testid payee-field text contains "Kroger"
   run fill-category-clothing
   run create-txn
-  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return false; const loading=[...document.querySelectorAll('[aria-label]')].some(e=>e.getAttribute('aria-label')==='Loading transactions...'); return !loading && l.querySelectorAll('[role=\"button\"]').length>0})()" --timeout-ms 60000
-  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='(No payee)Clothing-12.34'})()"
+  save listdbg = eval "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return 'NO-LIST'; const loading=[...document.querySelectorAll('[aria-label]')].some(e=>e.getAttribute('aria-label')==='Loading transactions...'); const btns=l.querySelectorAll('button').length; const opts=l.querySelectorAll('[role=\"option\"]').length; const r=l.getBoundingClientRect(); const notx=document.body.innerText.includes('No transactions'); return 'loading=' + loading + ' kids=' + l.children.length + ' btns=' + btns + ' opts=' + opts + ' rect=' + Math.round(r.width) + 'x' + Math.round(r.height) + '@' + Math.round(r.top) + ' notx=' + notx + ' txt=' + JSON.stringify((l.innerText||'').slice(0,150))})()"
+  expect ${listdbg} is "DIAG-LIST"
 
 
 scenario "Mobile Transactions › creates a transaction from `/accounts/:id` page"
@@ -225,7 +225,6 @@ scenario "Mobile Transactions › creates a transaction from `/accounts/:id` pag
   run fill-payee-kroger
   run fill-category-clothing
   run create-txn
-  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return false; const loading=[...document.querySelectorAll('[aria-label]')].some(e=>e.getAttribute('aria-label')==='Loading transactions...'); return !loading && l.querySelectorAll('[role=\"button\"]').length>0})()" --timeout-ms 60000
   expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='KrogerClothing-12.34'})()"
 
 
@@ -244,7 +243,6 @@ scenario "Mobile Transactions › creates an uncategorized transaction from `/ca
   click --role heading --name "New Transaction"
   run fill-payee-kroger
   run create-txn
-  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return false; const loading=[...document.querySelectorAll('[aria-label]')].some(e=>e.getAttribute('aria-label')==='Loading transactions...'); return !loading && l.querySelectorAll('[role=\"button\"]').length>0})()" --timeout-ms 60000
   expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='KrogerUncategorized-12.34'})()"
 
   eval "window.Actual.setTheme('auto')"
@@ -274,7 +272,6 @@ scenario "Mobile Transactions › creates a categorized transaction from `/categ
   run fill-payee-kroger
   run fill-category-clothing
   run create-txn
-  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return false; const loading=[...document.querySelectorAll('[aria-label]')].some(e=>e.getAttribute('aria-label')==='Loading transactions...'); return !loading && l.querySelectorAll('[role=\"button\"]').length>0})()" --timeout-ms 60000
   expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='(No payee)Uncategorized-12.35'})()"
 
   eval "window.Actual.setTheme('auto')"

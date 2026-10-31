@@ -55,10 +55,11 @@ before each
 scenario "Mobile Reports › transaction calendar renders its transaction list on a narrow viewport"
   click --role link --name "Reports"
   expect --testid reports-page visible --timeout-ms 30000
-  expect js "(()=>{const p=document.querySelector('[data-testid=\"reports-page\"]'); return !!p&&[...p.querySelectorAll('button')].some(b=>b.textContent.trim().startsWith('Net')&&b.offsetParent!==null)})()"
+  expect js "(()=>{const p=document.querySelector('[data-testid=\"reports-page\"]'); const items=[...p.querySelectorAll('.react-grid-item')]; for(let i=items.length-1;i>=0;i--){const it=items[i]; it.scrollIntoView({block:'center'}); const card=[...it.querySelectorAll('button')].find(b=>[...b.querySelectorAll('[role=\"heading\"],h1,h2,h3,h4')].some(h=>h.textContent.trim()==='Calendar')); if(card){const r=card.getBoundingClientRect(); if(r.width>0&&r.height>0){card.setAttribute('data-pv-target','cal-card'); return true;}}} return false})()" --timeout-ms 60000
   click --role button --name "Add new widget"
   click --role button --name "Calendar card"
-  expect js "(()=>{const p=document.querySelector('[data-testid=\"reports-page\"]'); const items=[...p.querySelectorAll('.react-grid-item')]; if(window.__calIdx===undefined) window.__calIdx=items.length-1; const card=[...p.querySelectorAll('button')].find(b=>{const h=b.querySelector('[role=\"heading\"],h1,h2,h3,h4'); if(!h||h.textContent.trim()!=='Calendar') return false; const r=b.getBoundingClientRect(); return r.width>0&&r.height>0;}); if(card){card.setAttribute('data-pv-target','cal-card'); card.scrollIntoView({block:'center'}); return true;} if(window.__calIdx>=0){items[window.__calIdx].scrollIntoView({block:'center'}); window.__calIdx--;} return false})()" --timeout-ms 60000
+  expect js "(()=>{const p=document.querySelector('[data-testid=\"reports-page\"]'); const items=[...p.querySelectorAll('.react-grid-item')]; for(let i=items.length-1;i>=0;i--){const it=items[i]; it.scrollIntoView({block:'center'}); const card=[...it.querySelectorAll('button')].find(b=>[...b.querySelectorAll('[role=\"heading\"],h1,h2,h3,h4')].some(h=>h.textContent.trim()==='Calendar')); if(card){const r=card.getBoundingClientRect(); if(r.width>0&&r.height>0){card.setAttribute('data-pv-target','cal-card'); return true;}}} return false})()" --timeout-ms 60000
+  eval "(()=>{const c=document.querySelector('[data-pv-target=\"cal-card\"]'); if(c) c.scrollIntoView({block:'center'}); return 'ok'})()"
   expect --selector "[data-pv-target='cal-card']" visible
   click --selector "[data-pv-target='cal-card']"
   expect url contains "/reports/calendar/"
@@ -67,5 +68,5 @@ scenario "Mobile Reports › transaction calendar renders its transaction list o
   expect no text "Something went wrong loading this section."
   click --role button --name "Show transactions"
   expect --label "Transaction list" visible
-  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return false; const o=l.querySelector('[role=\"option\"]'); if(!o) return false; const r=o.getBoundingClientRect(); return r.width>0&&r.height>0})()"
+  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return false; const o=l.querySelector('[role=\"option\"]'); if(o){o.scrollIntoView({block:'center'}); const r=o.getBoundingClientRect(); return r.width>0&&r.height>0;} l.scrollIntoView({block:'start'}); return false})()" --timeout-ms 30000
   expect no text "Something went wrong loading this section."
