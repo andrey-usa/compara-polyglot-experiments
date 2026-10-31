@@ -44,6 +44,10 @@
 #   the search, and polls the count with a 5000 ms expect. DEVIATION: if
 #   the rule save is still in flight after that one reload, the count
 #   expect times out instead of reloading again.
+# - W24 (row text reads): Playwright toHaveText compares rendered text
+#   (innerText), not textContent, so the first-row assertions read
+#   innerText; textContent additionally picks up non-rendered content in
+#   the row button and never matches.
 base http://127.0.0.1:3001
 
 before each
@@ -195,7 +199,7 @@ scenario "Mobile Transactions › removes the payee from a new transaction"
   expect not --testid payee-field text contains "Kroger"
   run fill-category-clothing
   run create-txn
-  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.textContent.trim()==='(No payee)Clothing-12.34'})()"
+  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='(No payee)Clothing-12.34'})()"
 
 scenario "Mobile Transactions › creates a transaction from `/accounts/:id` page"
   run nav-accounts
@@ -218,7 +222,7 @@ scenario "Mobile Transactions › creates a transaction from `/accounts/:id` pag
   run fill-payee-kroger
   run fill-category-clothing
   run create-txn
-  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.textContent.trim()==='KrogerClothing-12.34'})()"
+  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='KrogerClothing-12.34'})()"
 
 scenario "Mobile Transactions › creates an uncategorized transaction from `/categories/uncategorized` page"
   run nav-transaction-entry
@@ -235,7 +239,7 @@ scenario "Mobile Transactions › creates an uncategorized transaction from `/ca
   click --role heading --name "New Transaction"
   run fill-payee-kroger
   run create-txn
-  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.textContent.trim()==='KrogerUncategorized-12.34'})()"
+  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='KrogerUncategorized-12.34'})()"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
   expect screenshot txn-uncat-final-auto --max-diff-pixels 5000
@@ -263,7 +267,7 @@ scenario "Mobile Transactions › creates a categorized transaction from `/categ
   run fill-payee-kroger
   run fill-category-clothing
   run create-txn
-  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.textContent.trim()==='(No payee)Uncategorized-12.35'})()"
+  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='(No payee)Uncategorized-12.35'})()"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
   expect screenshot txn-cat-final-auto --max-diff-pixels 5000

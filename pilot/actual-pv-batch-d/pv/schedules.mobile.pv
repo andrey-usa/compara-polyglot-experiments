@@ -39,6 +39,12 @@
 #   112-114) become expect js with 5000 ms (the expect.poll default).
 #   DEVIATION, not literal: the polling target is the same gridcell count,
 #   but the retry loop is primavera's expect retry, not Playwright's poll.
+# - W23 (gridcell box): navigera reports no layout box for the gridcell
+#   itself (a click on it refuses, and offsetParent reads null), so clicks
+#   go to the first boxed leaf-text element inside the first gridcell and
+#   visibility reads go to the row item's box. The clicked/asserted row is
+#   the same first row upstream clicks; the mechanism (not the row) is the
+#   deviation.
 base http://127.0.0.1:3001
 
 before each
@@ -88,7 +94,7 @@ scenario "Mobile Schedules › page handles empty state gracefully"
 scenario "Mobile Schedules › clicking on a schedule opens edit form"
   run wait-loading
   expect js "document.querySelectorAll('[aria-label=\"Schedules\"] [role=\"gridcell\"]').length > 0" --timeout-ms 5000
-  eval "(()=>{const g=document.querySelector('[aria-label=\"Schedules\"]'); const c=g.querySelectorAll('[role=\"gridcell\"]')[0]; c.setAttribute('data-pv-target','sched0'); return 'ok'})()"
+  eval "(()=>{const g=document.querySelector('[aria-label=\"Schedules\"]'); const c=g.querySelectorAll('[role=\"gridcell\"]')[0]; if(!c) return 'missing'; const leaf=[...c.querySelectorAll('*')].find(e=>e.children.length===0 && (e.textContent||'').trim().length>0 && e.getBoundingClientRect().width>0); if(!leaf) return 'missing'; leaf.setAttribute('data-pv-target','sched0'); return 'ok'})()"
   click --selector "[data-pv-target='sched0']"
   expect --role heading --name "Edit Schedule" visible
   expect --role button --name "Save" visible
@@ -136,7 +142,7 @@ scenario "Mobile Schedules › searches and filters schedules"
 scenario "Mobile Schedules › displays schedule details correctly in list"
   run wait-loading
   expect js "document.querySelectorAll('[aria-label=\"Schedules\"] [role=\"gridcell\"]').length > 0" --timeout-ms 5000
-  expect js "(()=>{const c=document.querySelectorAll('[aria-label=\"Schedules\"] [role=\"gridcell\"]')[0]; return !!c && c.offsetParent!==null && (c.textContent||'').length>0})()"
+  expect js "(()=>{const c=document.querySelectorAll('[aria-label=\"Schedules\"] [role=\"gridcell\"]')[0]; if(!c) return false; const row=c.closest('.react-aria-GridListItem')||c; const r=row.getBoundingClientRect(); return (c.textContent||'').length>0 && r.width>0 && r.height>0})()"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
   expect screenshot sched-details-auto --max-diff-pixels 5000

@@ -27,7 +27,10 @@
 #   (data-vrt-mask exists only on banksync/settings rows), so --mask fails
 #   the step; upstream's mask is a no-op filter here. Screenshots here
 #   run unmasked, as in-env repeatability checks only (see header).
-# - No new workaround labels in this file.
+# - W23 (gridcell box): navigera reports no layout box for the gridcell
+#   itself (a click on it refuses), so the payee click goes to the first
+#   boxed leaf-text element inside the first gridcell. The clicked row is
+#   the same first row upstream clicks; the mechanism is the deviation.
 base http://127.0.0.1:3001
 
 before each
@@ -88,7 +91,8 @@ scenario "Mobile Payees › filters out unrelated payees"
 scenario "Mobile Payees › clicking on a payee opens payee edit page"
   run wait-loading
   expect --selector "[role='grid'][aria-label='Payees'] [role='gridcell']" count > 0
-  click --selector "[role='grid'][aria-label='Payees'] [role='gridcell']" --nth 0
+  eval "(()=>{const c=document.querySelectorAll('[role=\"grid\"][aria-label=\"Payees\"] [role=\"gridcell\"]')[0]; if(!c) return 'missing'; const leaf=[...c.querySelectorAll('*')].find(e=>e.children.length===0 && (e.textContent||'').trim().length>0 && e.getBoundingClientRect().width>0); if(!leaf) return 'missing'; leaf.setAttribute('data-pv-target','payee0'); return 'ok'})()"
+  click --selector "[data-pv-target='payee0']"
   expect url contains "/payees/"
   expect js "location.pathname.replace('/payees/','').length > 0"
   expect --role heading --name "Edit Payee" visible

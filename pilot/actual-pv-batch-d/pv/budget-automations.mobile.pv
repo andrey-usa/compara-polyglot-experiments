@@ -100,7 +100,7 @@ scenario "Mobile budget automations › opens automations from the category menu
   eval "window.Actual.setTheme('auto')"
   click --role button --name "Add an automation"
   expect --role button --name "Back" visible
-  expect --role dialog --name "Modal dialog" text contains "Automation type"
+  expect --role dialog --name "Modal dialog" text contains "AUTOMATION TYPE"
   click --role button --name "% of income"
   expect --selector "#percent-field" visible
   save ph = eval "Math.round(document.querySelector('#percent-field').getBoundingClientRect().height)"

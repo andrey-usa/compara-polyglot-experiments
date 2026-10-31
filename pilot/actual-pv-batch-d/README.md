@@ -47,6 +47,6 @@ they are not committed, because fonts and Chromium builds differ between
 machines.
 
 Workarounds are labeled in each file header (pilot W1-W3, batch C
-W4/W8/W12 where reused, batch D W14-W22). calculator.mobile is not
+W4/W8/W12 where reused, batch D W14-W24). calculator.mobile is not
 ported: it needs a fake clock and raw touch, so it stays on Playwright
 and is listed as a gap in the batch report.

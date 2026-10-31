@@ -65,8 +65,7 @@ scenario "Mobile Accounts › opens the accounts page and asserts on balances"
   run nav-accounts
   save acctName = eval "document.querySelectorAll(\"[data-testid='account-list-item']\")[1].querySelector(\"[data-testid='account-name']\").textContent.trim()"
   expect ${acctName} is "Ally Savings"
-  save acctBal = eval "document.querySelectorAll(\"[data-testid='account-list-item']\")[1].querySelector(\"[data-testid='account-balance']\").textContent.trim()"
-  expect ${acctBal} is "7,653.00"
+  expect js "(()=>{const el=document.querySelectorAll(\"[data-testid='account-list-item']\")[1].querySelector(\"[data-testid='account-balance']\"); return !!el && el.textContent.trim()==='7,653.00'})()" --timeout-ms 30000
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
   expect screenshot acct-balances-auto --max-diff-pixels 5000

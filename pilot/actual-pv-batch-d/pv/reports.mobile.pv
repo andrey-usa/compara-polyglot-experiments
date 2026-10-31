@@ -58,7 +58,7 @@ scenario "Mobile Reports › transaction calendar renders its transaction list o
   expect js "(()=>{const p=document.querySelector('[data-testid=\"reports-page\"]'); return !!p&&[...p.querySelectorAll('button')].some(b=>b.textContent.trim().startsWith('Net')&&b.offsetParent!==null)})()"
   click --role button --name "Add new widget"
   click --role button --name "Calendar card"
-  eval "(()=>{const p=document.querySelector('[data-testid=\"reports-page\"]'); const items=[...p.querySelectorAll('.react-grid-item')]; for(const it of items){it.scrollIntoView(); const card=[...p.querySelectorAll('button')].find(b=>{const h=b.querySelector('[role=\"heading\"],h1,h2,h3,h4'); return h&&h.textContent.trim()==='Calendar'}); if(card&&card.offsetParent!==null){card.setAttribute('data-pv-target','cal-card'); return 'ok'}} return 'missing'})()"
+  eval "(()=>{const p=document.querySelector('[data-testid=\"reports-page\"]'); const items=[...p.querySelectorAll('.react-grid-item')]; for(let i=items.length-1;i>=0;i--){const it=items[i]; it.scrollIntoView({block:'center'}); const card=[...it.querySelectorAll('button')].find(b=>{const h=b.querySelector('[role=\"heading\"],h1,h2,h3,h4'); return h&&h.textContent.trim()==='Calendar'}); if(card){const r=card.getBoundingClientRect(); if(r.width>0&&r.height>0){card.setAttribute('data-pv-target','cal-card'); return 'ok'}}} return 'missing'})()"
   expect --selector "[data-pv-target='cal-card']" visible
   click --selector "[data-pv-target='cal-card']"
   expect url contains "/reports/calendar/"
