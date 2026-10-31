@@ -199,7 +199,9 @@ scenario "Mobile Transactions › removes the payee from a new transaction"
   expect not --testid payee-field text contains "Kroger"
   run fill-category-clothing
   run create-txn
-  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='(No payee)Clothing-12.34'})()"
+  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); return !!l && l.querySelectorAll('[role=\"button\"]').length>0})()" --timeout-ms 30000
+  save rowdbg = eval "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return 'NO-LIST'; const bs=l.querySelectorAll('[role=\"button\"]'); if(!bs.length) return 'NO-BUTTONS'; const b=bs[0]; return 'n=' + bs.length + ' inner=' + JSON.stringify(b.innerText) + ' textc=' + JSON.stringify(b.textContent)})()"
+  expect ${rowdbg} is "DIAG-ROW"
 
 scenario "Mobile Transactions › creates a transaction from `/accounts/:id` page"
   run nav-accounts
@@ -222,7 +224,9 @@ scenario "Mobile Transactions › creates a transaction from `/accounts/:id` pag
   run fill-payee-kroger
   run fill-category-clothing
   run create-txn
-  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='KrogerClothing-12.34'})()"
+  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); return !!l && l.querySelectorAll('[role=\"button\"]').length>0})()" --timeout-ms 30000
+  save rowdbg = eval "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return 'NO-LIST'; const bs=l.querySelectorAll('[role=\"button\"]'); if(!bs.length) return 'NO-BUTTONS'; const b=bs[0]; return 'n=' + bs.length + ' inner=' + JSON.stringify(b.innerText) + ' textc=' + JSON.stringify(b.textContent)})()"
+  expect ${rowdbg} is "DIAG-ROW"
 
 scenario "Mobile Transactions › creates an uncategorized transaction from `/categories/uncategorized` page"
   run nav-transaction-entry
@@ -239,7 +243,9 @@ scenario "Mobile Transactions › creates an uncategorized transaction from `/ca
   click --role heading --name "New Transaction"
   run fill-payee-kroger
   run create-txn
-  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='KrogerUncategorized-12.34'})()"
+  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); return !!l && l.querySelectorAll('[role=\"button\"]').length>0})()" --timeout-ms 30000
+  save rowdbg = eval "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return 'NO-LIST'; const bs=l.querySelectorAll('[role=\"button\"]'); if(!bs.length) return 'NO-BUTTONS'; const b=bs[0]; return 'n=' + bs.length + ' inner=' + JSON.stringify(b.innerText) + ' textc=' + JSON.stringify(b.textContent)})()"
+  expect ${rowdbg} is "DIAG-ROW"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
   expect screenshot txn-uncat-final-auto --max-diff-pixels 5000
@@ -267,7 +273,9 @@ scenario "Mobile Transactions › creates a categorized transaction from `/categ
   run fill-payee-kroger
   run fill-category-clothing
   run create-txn
-  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='(No payee)Uncategorized-12.35'})()"
+  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); return !!l && l.querySelectorAll('[role=\"button\"]').length>0})()" --timeout-ms 30000
+  save rowdbg = eval "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return 'NO-LIST'; const bs=l.querySelectorAll('[role=\"button\"]'); if(!bs.length) return 'NO-BUTTONS'; const b=bs[0]; return 'n=' + bs.length + ' inner=' + JSON.stringify(b.innerText) + ' textc=' + JSON.stringify(b.textContent)})()"
+  expect ${rowdbg} is "DIAG-ROW"
   eval "window.Actual.setTheme('auto')"
   expect --selector "[data-theme]" attr data-theme is auto
   expect screenshot txn-cat-final-auto --max-diff-pixels 5000
