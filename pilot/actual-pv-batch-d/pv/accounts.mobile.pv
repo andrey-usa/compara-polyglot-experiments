@@ -1,0 +1,172 @@
+# accounts.mobile.test.ts converted from Playwright (Actual Budget e2e).
+# 3 upstream tests: Mobile Accounts, same order as the spec. Scenario names are the exact
+# upstream names, including the describe prefix.
+#
+# Emulation mapping (upstream Playwright config has no device descriptor):
+# - config-wide userAgent 'playwright' -> set ua "playwright" (seeds the
+#   same deterministic demo data as Playwright).
+# - spec beforeEach page.setViewportSize(350, 600) -> set viewport 350 600
+#   --mobile in before each: upstream sets a plain viewport (no touch flag,
+#   no device descriptor); --mobile additionally enables touch emulation,
+#   which the app does not branch on (its narrow layout keys off width < 512 only).
+# - fixtures' disableAnimations init script is inlined in before each.
+# - toMatchThemeScreenshots is a no-op in the baseline (VRT unset), so the
+#   screenshot steps here are in-environment repeatability checks only:
+#   baselines are captured in the run's own environment (--update-screenshots pass)
+#   and verified by the main pass. They are not compared against upstream Playwright screenshots.
+#
+# Workarounds (pilot W1-W3 and the budget mobile port's W4-W13 as defined there;
+# W1-W2 and W5-W7, W9-W13 do not occur in this spec):
+# - W3 (eval-tag targeting then trusted click): the nth account list item
+#   is eval-tagged before a trusted click on the tag, and the first
+#   'Unclear transaction' / 'Clear transaction' button is eval-tagged
+#   before a trusted click, because a plain role click is ambiguous
+#   where several buttons share a name and primavera has no first-match click.
+# - W4 (navbar): upstream drags the bottom navbar up/down around a
+#   synthetic link click (react-spring transforms defeat Playwright's
+#   click-stability check). Here the link is clicked by eval directly and
+#   the drag steps are omitted: the synthetic click fires regardless of
+#   the navbar's transform state, and the destination page's waitFor
+#   proves the navigation landed.
+# - W8 (screenshots): these pages have no [data-vrt-mask] element
+#   (data-vrt-mask exists only on banksync/settings rows), so --mask fails
+#   the step; upstream's mask is a no-op filter here. Screenshots here
+#   run unmasked, as in-env repeatability checks only (see header).
+# - W17 (account search box): upstream locates it by placeholder regex
+#   /^Search/, which primavera cannot express; the box is filled via the
+#   CSS placeholder-prefix selector input[placeholder^='Search'], which
+#   matches the same single input ('Search Bank of America' for the
+#   account opened here).
+# - W18 (reconciling banner state): both banner states stay rendered and
+#   the inactive one is visibility:hidden, so a plain text read cannot
+#   tell them apart; the visible state is checked by computed visibility
+#   of the banner's child views (children[0] is 'All reconciled!',
+#   children[1] is the 'needs' difference view), alongside the text check.
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 350 600 --mobile
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+
+flow nav-accounts
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Accounts').click()"
+  expect --label "Account list" visible --timeout-ms 30000
+
+flow open-account(n)
+  eval "(()=>{const items=document.querySelectorAll(\"[data-testid='account-list-item']\"); items[${n}].setAttribute('data-pv-target','acct-open'); return 'ok'})()"
+  click --selector "[data-pv-target='acct-open']"
+  expect --label "Transaction list" visible --timeout-ms 30000
+
+scenario "Mobile Accounts › opens the accounts page and asserts on balances"
+  run nav-accounts
+  save acctName = eval "document.querySelectorAll(\"[data-testid='account-list-item']\")[1].querySelector(\"[data-testid='account-name']\").textContent.trim()"
+  expect ${acctName} is "Ally Savings"
+  save acctBal = eval "document.querySelectorAll(\"[data-testid='account-list-item']\")[1].querySelector(\"[data-testid='account-balance']\").textContent.trim()"
+  expect ${acctBal} is "7,653.00"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot acct-balances-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot acct-balances-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot acct-balances-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Accounts › opens individual account page and checks that filtering is working"
+  run nav-accounts
+  run open-account 0
+  expect --role heading --name "Bank of America" text is "Bank of America"
+  expect --label "Transaction list" visible
+  save bal = eval "parseInt(document.querySelector(\"[data-testid='transactions-balance']\").textContent, 10)"
+  expect ${bal} > 0
+  expect not text "No transactions"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot acct-filter-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot acct-filter-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot acct-filter-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  fill --selector "input[placeholder^='Search']" "nothing should be found"
+  expect text "No transactions"
+  expect --selector "[aria-label='Transaction list'] button" count is 0
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot acct-filter-none-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot acct-filter-none-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot acct-filter-none-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  fill --selector "input[placeholder^='Search']" ""
+  expect --selector "[aria-label='Transaction list'] button" count > 0
+  fill --selector "input[placeholder^='Search']" "Kroger"
+  expect --selector "[aria-label='Transaction list'] button" count > 0
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot acct-filter-kroger-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot acct-filter-kroger-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot acct-filter-kroger-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Accounts › reconciles an account"
+  run nav-accounts
+  run open-account 0
+  click --role button --name "Bank of America"
+  click --role button --name "Reconcile"
+  expect --testid amount-input visible --timeout-ms 30000
+  fill --testid amount-input "200.00"
+  click --role button --name "Reconcile"
+  expect --testid reconciling-banner visible --timeout-ms 30000
+  expect --testid reconciling-banner text contains "needs"
+  expect js "(()=>{const b=document.querySelector('[data-testid=\"reconciling-banner\"]'); return !!b && getComputedStyle(b.children[1]).visibility!=='hidden'})()"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot acct-reconcile-start-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot acct-reconcile-start-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot acct-reconcile-start-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  click --role button --name "Create reconciliation transaction"
+  expect --testid reconciling-banner text contains "All reconciled!"
+  expect js "(()=>{const b=document.querySelector('[data-testid=\"reconciling-banner\"]'); return !!b && getComputedStyle(b.children[0]).visibility!=='hidden'})()"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot acct-reconcile-created-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot acct-reconcile-created-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot acct-reconcile-created-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  eval "(()=>{const b=[...document.querySelectorAll('button')].find(x=>(x.getAttribute('aria-label')||'')==='Unclear transaction'); b.setAttribute('data-pv-target','unclear0'); return 'ok'})()"
+  click --selector "[data-pv-target='unclear0']"
+  expect --testid reconciling-banner text contains "needs"
+  expect js "(()=>{const b=document.querySelector('[data-testid=\"reconciling-banner\"]'); return !!b && getComputedStyle(b.children[1]).visibility!=='hidden'})()"
+  eval "(()=>{const b=[...document.querySelectorAll('button')].find(x=>(x.getAttribute('aria-label')||'')==='Clear transaction'); b.setAttribute('data-pv-target','clear0'); return 'ok'})()"
+  click --selector "[data-pv-target='clear0']"
+  expect --testid reconciling-banner text contains "All reconciled!"
+  expect js "(()=>{const b=document.querySelector('[data-testid=\"reconciling-banner\"]'); return !!b && getComputedStyle(b.children[0]).visibility!=='hidden'})()"
+  click --role button --name "Lock transactions"
+  expect not --testid reconciling-banner visible
+  click --role button --name "Back"
+  expect --label "Account list" visible

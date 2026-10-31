@@ -1,0 +1,305 @@
+# transactions.mobile.test.ts converted from Playwright (Actual Budget e2e).
+# 7 upstream tests: Mobile Transactions, same order as the spec. Scenario
+# names are the exact upstream names, including the describe prefix.
+#
+# Emulation mapping (upstream Playwright config has no device descriptor):
+# - config-wide userAgent 'playwright' -> set ua "playwright" (seeds the
+#   same deterministic demo data as Playwright; same as the pilot's
+#   settings file).
+# - spec beforeEach page.setViewportSize(350, 600) -> set viewport 350 600
+#   --mobile in before each. Upstream sets a plain viewport (no touch flag,
+#   no device descriptor); --mobile is the prior mobile-port convention for
+#   narrow layout, and the app's narrow layout keys off width < 512 only.
+# - fixtures' disableAnimations init script is inlined in before each,
+#   as in the pilot's multitab file.
+# - toMatchThemeScreenshots is a no-op in the baseline (VRT unset), so the
+#   screenshot steps here are in-environment repeatability checks only,
+#   exactly as in the prior mobile port: baselines are captured in the run's
+#   own environment (--update-screenshots pass) and verified by the main pass.
+#   They are not compared against upstream Playwright screenshots.
+#
+# Workarounds (pilot W1-W3 and prior mobile-port W4-W13 apply where noted;
+# new ones below, in first-use order):
+# - W3 (gap: no scoped role+name / hasText filtering): the nth account row,
+#   the first transaction row is read by eval, and each fill-field option
+#   pick eval-tags the first option containing the value, then a real
+#   trusted click on the tag. The combobox input itself is eval-tagged
+#   before fill, since the role=combobox element may be the input or a
+#   wrapper around it.
+# - W4 (navbar): upstream clicks the navbar link by eval (react-spring
+#   transforms defeat Playwright's click-stability check). Here the link is
+#   clicked by eval directly and the drag steps are omitted: the synthetic
+#   click fires regardless of the navbar's transform state, and the
+#   destination page's waitFor proves the navigation landed.
+# - W8 (screenshots): screenshots run unmasked, as in-env repeatability
+#   checks only (see header).
+# - W14 (aria snapshot): primavera has no aria-snapshot assertion, so the
+#   URL-prefill snapshot (upstream lines 64-84) is decomposed into one
+#   expect per snapshot line (texts, disabled buttons/inputs, checked
+#   checkbox). DEVIATION: snapshot ORDER is not asserted, only presence
+#   and state of each element.
+# - W15 (reload-until): upstream lines 234-238 wrap reload + search +
+#   count==1 in expect(...).toPass(), which retries the whole callback.
+#   Primavera has no loop step, so the port does a single reload, re-fills
+#   the search, and polls the count with a 5000 ms expect. DEVIATION: if
+#   the rule save is still in flight after that one reload, the count
+#   expect times out instead of reloading again.
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 350 600 --mobile
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+
+flow nav-transaction-entry
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Transaction').click()"
+  expect --testid transaction-form visible --timeout-ms 30000
+
+flow nav-accounts
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Accounts').click()"
+  expect --label "Account list" visible --timeout-ms 30000
+
+flow open-account-2
+  eval "(()=>{const it=[...document.querySelectorAll('[data-testid=\"account-list-item\"]')][2]; it.setAttribute('data-pv-target','acct2'); return 'ok'})()"
+  click --selector "[data-pv-target='acct2']"
+  expect --label "Transaction list" visible --timeout-ms 30000
+
+flow nav-settings
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Settings').click()"
+  expect --testid settings visible --timeout-ms 30000
+
+flow nav-rules
+  run nav-settings
+  click --role link --name "Rules"
+  expect --role main visible --timeout-ms 30000
+
+flow fill-amount(v)
+  fill --testid amount-input "${v}"
+  eval "document.activeElement && document.activeElement.blur()"
+  expect js "[...document.querySelectorAll('[data-testid=\"transaction-form\"] button')].some(b=>b.textContent.includes('${v}'))"
+
+flow fill-payee-kroger
+  click --testid payee-field
+  eval "(()=>{const c=document.querySelector('[role=\"combobox\"]'); const inp=c?(c.tagName==='INPUT'?c:c.querySelector('input')):null; if(!inp) return 'missing'; inp.setAttribute('data-pv-target','combo'); return 'ok'})()"
+  fill --selector "[data-pv-target='combo']" "Kroger" --keys
+  eval "(()=>{const o=[...document.querySelectorAll('[role=\"option\"]')].find(x=>x.textContent.includes('Kroger')); if(!o) return 'missing'; o.setAttribute('data-pv-target','opt'); return 'ok'})()"
+  click --selector "[data-pv-target='opt']"
+  expect js "(()=>{const c=document.querySelector('[role=\"combobox\"]'); const inp=c?(c.tagName==='INPUT'?c:c.querySelector('input')):null; return !inp || inp.offsetParent===null})()"
+  expect --testid payee-field text contains "Kroger"
+
+flow fill-payee-learned
+  click --testid payee-field
+  eval "(()=>{const c=document.querySelector('[role=\"combobox\"]'); const inp=c?(c.tagName==='INPUT'?c:c.querySelector('input')):null; if(!inp) return 'missing'; inp.setAttribute('data-pv-target','combo'); return 'ok'})()"
+  fill --selector "[data-pv-target='combo']" "Learned Payee" --keys
+  eval "(()=>{const o=[...document.querySelectorAll('[role=\"option\"]')].find(x=>x.textContent.includes('Learned Payee')); if(!o) return 'missing'; o.setAttribute('data-pv-target','opt'); return 'ok'})()"
+  click --selector "[data-pv-target='opt']"
+  expect js "(()=>{const c=document.querySelector('[role=\"combobox\"]'); const inp=c?(c.tagName==='INPUT'?c:c.querySelector('input')):null; return !inp || inp.offsetParent===null})()"
+  expect --testid payee-field text contains "Learned Payee"
+
+flow fill-category-clothing
+  click --testid category-field
+  eval "(()=>{const c=document.querySelector('[role=\"combobox\"]'); const inp=c?(c.tagName==='INPUT'?c:c.querySelector('input')):null; if(!inp) return 'missing'; inp.setAttribute('data-pv-target','combo'); return 'ok'})()"
+  fill --selector "[data-pv-target='combo']" "Clothing" --keys
+  eval "(()=>{const o=[...document.querySelectorAll('[role=\"option\"]')].find(x=>x.textContent.includes('Clothing')); if(!o) return 'missing'; o.setAttribute('data-pv-target','opt'); return 'ok'})()"
+  click --selector "[data-pv-target='opt']"
+  expect js "(()=>{const c=document.querySelector('[role=\"combobox\"]'); const inp=c?(c.tagName==='INPUT'?c:c.querySelector('input')):null; return !inp || inp.offsetParent===null})()"
+  expect --testid category-field text contains "Clothing"
+
+flow fill-account-ally
+  click --testid account-field
+  eval "(()=>{const c=document.querySelector('[role=\"combobox\"]'); const inp=c?(c.tagName==='INPUT'?c:c.querySelector('input')):null; if(!inp) return 'missing'; inp.setAttribute('data-pv-target','combo'); return 'ok'})()"
+  fill --selector "[data-pv-target='combo']" "Ally Savings" --keys
+  eval "(()=>{const o=[...document.querySelectorAll('[role=\"option\"]')].find(x=>x.textContent.includes('Ally Savings')); if(!o) return 'missing'; o.setAttribute('data-pv-target','opt'); return 'ok'})()"
+  click --selector "[data-pv-target='opt']"
+  expect js "(()=>{const c=document.querySelector('[role=\"combobox\"]'); const inp=c?(c.tagName==='INPUT'?c:c.querySelector('input')):null; return !inp || inp.offsetParent===null})()"
+  expect --testid account-field text contains "Ally Savings"
+
+flow create-txn
+  click --role button --name "Add transaction"
+
+scenario "Mobile Transactions › creates a transaction via footer button"
+  run nav-transaction-entry
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot txn-footer-entry-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot txn-footer-entry-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot txn-footer-entry-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  expect --role heading --name "New Transaction" text is "New Transaction"
+  run fill-amount 12.34
+  click --role heading --name "New Transaction"
+  run fill-payee-kroger
+  run fill-category-clothing
+  run fill-account-ally
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot txn-footer-filled-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot txn-footer-filled-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot txn-footer-filled-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  run create-txn
+  expect js "document.querySelectorAll('[aria-label=\"Transaction list\"]').length === 0"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot txn-footer-created-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot txn-footer-created-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot txn-footer-created-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Transactions › prefills a new transaction with URL search params"
+  run nav-transaction-entry
+  goto /transactions/new?category=Food&amount=23.42&account=HSBC&date=2025-10-31&cleared=true&payee=Kroger&notes=just+a+note
+  expect --testid transaction-form visible --timeout-ms 30000
+  expect --testid transaction-form text contains "Amount"
+  expect --testid amount-input visible
+  expect --testid transaction-form text contains "23.42"
+  expect js "(()=>{const b=[...document.querySelectorAll('[data-testid=\"transaction-form\"] button')].find(x=>x.textContent.trim()==='Kroger'); return !!b && (b.disabled || b.getAttribute('aria-disabled')==='true')})()"
+  expect --testid transaction-form text contains "Category"
+  expect js "(()=>{const b=[...document.querySelectorAll('[data-testid=\"transaction-form\"] button')].find(x=>x.textContent.trim()==='Food'); return !!b && (b.disabled || b.getAttribute('aria-disabled')==='true')})()"
+  expect js "(()=>{const b=[...document.querySelectorAll('[data-testid=\"transaction-form\"] button')].find(x=>x.textContent.trim()==='Split'); return !!b && (b.disabled || b.getAttribute('aria-disabled')==='true')})()"
+  expect --testid transaction-form text contains "Account"
+  expect js "(()=>{const b=[...document.querySelectorAll('[data-testid=\"transaction-form\"] button')].find(x=>x.textContent.trim()==='HSBC'); return !!b && (b.disabled || b.getAttribute('aria-disabled')==='true')})()"
+  expect --testid transaction-form text contains "Date"
+  expect js "(()=>{const i=[...document.querySelectorAll('[data-testid=\"transaction-form\"] input')].find(x=>x.value==='2025-10-31'); return !!i && (i.disabled || i.getAttribute('aria-disabled')==='true')})()"
+  expect --testid transaction-form text contains "Cleared"
+  expect js "(()=>{const c=document.querySelector('[data-testid=\"transaction-form\"] input[type=\"checkbox\"]'); return !!c && c.checked})()"
+  expect --testid transaction-form text contains "Notes"
+  expect js "(()=>{const i=[...document.querySelectorAll('[data-testid=\"transaction-form\"] input')].find(x=>x.value==='just a note'); return !!i && (i.disabled || i.getAttribute('aria-disabled')==='true')})()"
+
+scenario "Mobile Transactions › removes the payee from a new transaction"
+  run nav-accounts
+  run open-account-2
+  click --role button --name "Add Transaction"
+  expect --testid transaction-form visible --timeout-ms 30000
+  run fill-amount 12.34
+  click --role heading --name "New Transaction"
+  run fill-payee-kroger
+  expect --testid payee-field text contains "Kroger"
+  click --testid payee-field
+  click --role button --name "No payee"
+  expect not --testid payee-field text contains "Kroger"
+  run fill-category-clothing
+  run create-txn
+  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.textContent.trim()==='(No payee)Clothing-12.34'})()"
+
+scenario "Mobile Transactions › creates a transaction from `/accounts/:id` page"
+  run nav-accounts
+  run open-account-2
+  click --role button --name "Add Transaction"
+  expect --testid transaction-form visible --timeout-ms 30000
+  expect --role heading --name "New Transaction" text is "New Transaction"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot txn-account-entry-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot txn-account-entry-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot txn-account-entry-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  run fill-amount 12.34
+  click --role heading --name "New Transaction"
+  run fill-payee-kroger
+  run fill-category-clothing
+  run create-txn
+  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.textContent.trim()==='KrogerClothing-12.34'})()"
+
+scenario "Mobile Transactions › creates an uncategorized transaction from `/categories/uncategorized` page"
+  run nav-transaction-entry
+  run fill-amount 12.35
+  click --role heading --name "New Transaction"
+  run fill-account-ally
+  run create-txn
+  click --role button --name "Categorize"
+  expect --label "Transaction list" visible --timeout-ms 30000
+  click --role button --name "Add Transaction"
+  expect --testid transaction-form visible --timeout-ms 30000
+  expect --role heading --name "New Transaction" text is "New Transaction"
+  run fill-amount 12.34
+  click --role heading --name "New Transaction"
+  run fill-payee-kroger
+  run create-txn
+  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.textContent.trim()==='KrogerUncategorized-12.34'})()"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot txn-uncat-final-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot txn-uncat-final-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot txn-uncat-final-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Transactions › creates a categorized transaction from `/categories/uncategorized` page"
+  run nav-transaction-entry
+  run fill-amount 12.35
+  click --role heading --name "New Transaction"
+  run fill-account-ally
+  run create-txn
+  click --role button --name "Categorize"
+  expect --label "Transaction list" visible --timeout-ms 30000
+  click --role button --name "Add Transaction"
+  expect --testid transaction-form visible --timeout-ms 30000
+  expect --role heading --name "New Transaction" text is "New Transaction"
+  run fill-amount 12.34
+  click --role heading --name "New Transaction"
+  run fill-payee-kroger
+  run fill-category-clothing
+  run create-txn
+  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.textContent.trim()==='(No payee)Uncategorized-12.35'})()"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot txn-cat-final-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot txn-cat-final-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot txn-cat-final-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Transactions › learns a category rule from new transactions"
+  run nav-transaction-entry
+  run fill-amount 1.00
+  click --role heading --name "New Transaction"
+  run fill-payee-learned
+  run fill-category-clothing
+  run fill-account-ally
+  run create-txn
+  run nav-transaction-entry
+  run fill-amount 2.00
+  click --role heading --name "New Transaction"
+  run fill-payee-learned
+  run fill-category-clothing
+  run fill-account-ally
+  run create-txn
+  run nav-transaction-entry
+  run fill-amount 3.00
+  click --role heading --name "New Transaction"
+  run fill-payee-learned
+  run fill-category-clothing
+  run fill-account-ally
+  run create-txn
+  run nav-rules
+  reload
+  expect --role main visible --timeout-ms 30000
+  fill --placeholder "Filter rules…" "Learned Payee"
+  expect js "document.querySelectorAll('[aria-label=\"Rules\"] [role=\"row\"]').length === 1" --timeout-ms 5000
+  expect js "(()=>{const r=document.querySelectorAll('[aria-label=\"Rules\"] [role=\"row\"]')[0]; return !!r && r.textContent.includes('Clothing')})()"

@@ -1,0 +1,112 @@
+# rules.mobile.test.ts converted from Playwright (Actual Budget e2e).
+# 4 upstream tests: Mobile Rules, same order as the spec. Scenario names are the exact
+# upstream names, including the describe prefix.
+#
+# Emulation mapping (upstream Playwright config has no device descriptor):
+# - config-wide userAgent 'playwright' -> set ua "playwright" (seeds the
+#   same deterministic demo data as Playwright).
+# - spec beforeEach page.setViewportSize(350, 600) -> set viewport 350 600
+#   --mobile in before each: upstream sets a plain viewport (no touch flag,
+#   no device descriptor); --mobile additionally enables touch emulation,
+#   which the app does not branch on (its narrow layout keys off width < 512 only).
+# - fixtures' disableAnimations init script is inlined in before each.
+# - toMatchThemeScreenshots is a no-op in the baseline (VRT unset), so the
+#   screenshot steps here are in-environment repeatability checks only:
+#   baselines are captured in the run's own environment (--update-screenshots pass)
+#   and verified by the main pass. They are not compared against upstream Playwright screenshots.
+#
+# Workarounds (pilot W1-W3 and the budget mobile port's W4-W13 as defined there;
+# W1-W3 and W5-W7, W9-W13 do not occur in this spec):
+# - W4 (navbar): upstream drags the bottom navbar up/down around a
+#   synthetic link click (react-spring transforms defeat Playwright's
+#   click-stability check). Here the link is clicked by eval directly and
+#   the drag steps are omitted: the synthetic click fires regardless of
+#   the navbar's transform state, and the destination page's waitFor
+#   proves the navigation landed.
+# - W8 (screenshots): these pages have no [data-vrt-mask] element
+#   (data-vrt-mask exists only on banksync/settings rows), so --mask fails
+#   the step; upstream's mask is a no-op filter here. Screenshots here
+#   run unmasked, as in-env repeatability checks only (see header).
+# - No new workaround labels in this file.
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 350 600 --mobile
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  run nav-rules
+
+flow nav-settings
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Settings').click()"
+  expect --testid settings visible --timeout-ms 30000
+
+flow nav-rules
+  run nav-settings
+  if not --role link --name "Rules" visible
+    click --role button --name "Back"
+  click --role link --name "Rules"
+  expect --role main visible --timeout-ms 30000
+  expect --placeholder "Filter rules…" visible
+
+scenario "Mobile Rules › checks the page visuals"
+  fill --placeholder "Filter rules…" "Dominion"
+  expect --role heading --name "Rules" visible
+  expect --role button --name "Add new rule" visible
+  expect --placeholder "Filter rules…" visible
+  expect --placeholder "Filter rules…" attr placeholder is "Filter rules…"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot rules-visuals-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot rules-visuals-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot rules-visuals-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Rules › clicking add button opens rule creation form"
+  click --role button --name "Add new rule"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot rules-add-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot rules-add-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot rules-add-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Rules › clicking on a rule opens edit form"
+  expect js "document.querySelectorAll('[role=\"grid\"][aria-label=\"Rules\"] [role=\"row\"]').length > 0"
+  click --selector "[role='grid'][aria-label='Rules'] [role='row']" --nth 0
+  click --role heading --name "Edit Rule"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot rules-edit-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot rules-edit-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot rules-edit-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Rules › page handles empty state gracefully"
+  fill --placeholder "Filter rules…" "NonExistentRule123456789"
+  expect text "No rules found"
+  expect --selector "[role='grid'][aria-label='Rules'] [role='row']" count is 0
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot rules-empty-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot rules-empty-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot rules-empty-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"

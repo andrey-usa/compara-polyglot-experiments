@@ -1,0 +1,150 @@
+# payees.mobile.test.ts converted from Playwright (Actual Budget e2e).
+# 5 upstream tests: Mobile Payees, same order as the spec. Scenario names are the exact
+# upstream names, including the describe prefix.
+#
+# Emulation mapping (upstream Playwright config has no device descriptor):
+# - config-wide userAgent 'playwright' -> set ua "playwright" (seeds the
+#   same deterministic demo data as Playwright).
+# - spec beforeEach page.setViewportSize(350, 600) -> set viewport 350 600
+#   --mobile in before each: upstream sets a plain viewport (no touch flag,
+#   no device descriptor); --mobile additionally enables touch emulation,
+#   which the app does not branch on (its narrow layout keys off width < 512 only).
+# - fixtures' disableAnimations init script is inlined in before each.
+# - toMatchThemeScreenshots is a no-op in the baseline (VRT unset), so the
+#   screenshot steps here are in-environment repeatability checks only:
+#   baselines are captured in the run's own environment (--update-screenshots pass)
+#   and verified by the main pass. They are not compared against upstream Playwright screenshots.
+#
+# Workarounds (pilot W1-W3 and the budget mobile port's W4-W13 as defined there;
+# W1-W3 and W5-W7, W9-W13 do not occur in this spec):
+# - W4 (navbar): upstream drags the bottom navbar up/down around a
+#   synthetic link click (react-spring transforms defeat Playwright's
+#   click-stability check). Here the link is clicked by eval directly and
+#   the drag steps are omitted: the synthetic click fires regardless of
+#   the navbar's transform state, and the destination page's waitFor
+#   proves the navigation landed.
+# - W8 (screenshots): these pages have no [data-vrt-mask] element
+#   (data-vrt-mask exists only on banksync/settings rows), so --mask fails
+#   the step; upstream's mask is a no-op filter here. Screenshots here
+#   run unmasked, as in-env repeatability checks only (see header).
+# - No new workaround labels in this file.
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 350 600 --mobile
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  run nav-payees
+
+flow nav-settings
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Settings').click()"
+  expect --testid settings visible --timeout-ms 30000
+
+flow nav-payees
+  run nav-settings
+  if not --role link --name "Payees" visible
+    click --role button --name "Back"
+  click --role link --name "Payees"
+  expect --role grid --name "Payees" visible --timeout-ms 30000
+  expect --placeholder "Filter payees…" visible
+
+flow wait-loading
+  expect not --testid animated-loading visible
+
+scenario "Mobile Payees › checks the page visuals"
+  run wait-loading
+  expect --role heading --name "Payees" visible
+  expect --placeholder "Filter payees…" visible
+  expect --placeholder "Filter payees…" attr placeholder is "Filter payees…"
+  expect --selector "[role='grid'][aria-label='Payees'] [role='gridcell']" count > 0
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot pay-visuals-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot pay-visuals-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot pay-visuals-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Payees › filters out unrelated payees"
+  fill --placeholder "Filter payees…" "asdfasdf-nonsense"
+  expect text "No payees found."
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot pay-filters-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot pay-filters-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot pay-filters-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Payees › clicking on a payee opens payee edit page"
+  run wait-loading
+  expect --selector "[role='grid'][aria-label='Payees'] [role='gridcell']" count > 0
+  click --selector "[role='grid'][aria-label='Payees'] [role='gridcell']" --nth 0
+  expect url contains "/payees/"
+  expect js "location.pathname.replace('/payees/','').length > 0"
+  expect --role heading --name "Edit Payee" visible
+  expect --placeholder "Payee name" visible
+  expect --role button --name "Save" visible
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot pay-edit-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot pay-edit-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot pay-edit-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Payees › page handles empty state gracefully"
+  fill --placeholder "Filter payees…" "NonExistentPayee123456789"
+  expect text "No payees found."
+  expect --selector "[role='grid'][aria-label='Payees'] [role='gridcell']" count is 0
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot pay-empty-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot pay-empty-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot pay-empty-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Payees › search functionality works correctly"
+  run wait-loading
+  fill --placeholder "Filter payees…" "Fast Internet"
+  save payeeCount = eval "document.querySelectorAll(\"[role='grid'][aria-label='Payees'] [role='gridcell']\").length"
+  expect ${payeeCount} > 0
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot pay-search-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot pay-search-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot pay-search-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  fill --placeholder "Filter payees…" ""
+  save allPayeeCount = eval "document.querySelectorAll(\"[role='grid'][aria-label='Payees'] [role='gridcell']\").length"
+  expect ${allPayeeCount} > ${payeeCount}
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot pay-search-cleared-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot pay-search-cleared-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot pay-search-cleared-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"

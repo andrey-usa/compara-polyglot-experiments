@@ -1,0 +1,135 @@
+# budget-automations.mobile.test.ts converted from Playwright
+# (Actual Budget e2e).
+# 1 upstream test. The scenario name is the exact upstream name,
+# including the describe prefix.
+#
+# Emulation mapping (upstream Playwright config has no device descriptor):
+# - config-wide userAgent 'playwright' -> set ua "playwright" (seeds the
+#   same deterministic demo data as Playwright).
+# - spec beforeEach page.setViewportSize(350, 600) -> set viewport 350 600
+#   --mobile in before each: upstream sets a plain viewport (no touch flag,
+#   no device descriptor); --mobile is the batch-C convention for narrow
+#   layout (the app's narrow layout keys off width < 512 only, and
+#   --mobile additionally enables touch emulation).
+# - fixtures' disableAnimations init script is inlined in before each.
+# - toMatchThemeScreenshots is a no-op in the baseline (VRT unset), so the
+#   screenshot steps here are in-environment repeatability checks only,
+#   exactly as in the pilot: baselines are captured in the run's own
+#   environment (--update-screenshots pass) and verified by the main pass.
+#   They are not compared against upstream Playwright screenshots.
+#
+# Workarounds (pilot W1-W3 apply where noted; batch-C W4-W13 as defined
+# in the batch C report):
+# - W3 (gap: no scoped role+name / hasText filtering): the category menu
+#   open eval-tags the row's button, then a real trusted click on the tag.
+#   A plain unscoped click by button name is ambiguous where a group and
+#   a category share a name.
+# - W4 (navbar): upstream drags the bottom navbar up/down around a
+#   synthetic link click (react-spring transforms defeat Playwright's
+#   click-stability check). Here the link is clicked by eval directly and
+#   the drag steps are omitted: the synthetic click fires regardless of
+#   the navbar's transform state, and the destination page's waitFor
+#   proves the navigation landed.
+# - W8 (screenshots): screenshots run unmasked, as in-env repeatability
+#   checks only (see header). The automations modal carries no
+#   [data-vrt-mask] element, so upstream's mask is a no-op filter here.
+# - W12 (feature flags): upstream-faithful role clicks, with two traps
+#   found in batch C: (a) the flag must not be clicked before the
+#   Experimental section renders (wait for 'Goal templates' text first);
+#   (b) the flag write is async (Redux pref round-trip), so the wait for
+#   the 'Budget automations UI' sub-feature (which renders only when the
+#   flag lands) is the real signal, and the final checked read retries.
+# - W19 (viewport geometry via eval): primavera has no toBeInViewport or
+#   boundingBox step, so the ratio-1 in-viewport assertions and the
+#   editor-box height bound are expressed as bounding-rect checks against
+#   window.innerHeight in eval. The field-height assertions are not a
+#   workaround: upstream measures them with evaluate() itself, so the
+#   eval reads here are literal.
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 350 600 --mobile
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  run nav-settings
+  click --role link --name "Experimental"
+  expect text "Goal templates" --timeout-ms 30000
+  expect --role checkbox --name "Goal templates" visible
+  if --role checkbox --name "Goal templates" unchecked
+    click --role checkbox --name "Goal templates"
+  expect --role checkbox --name "Budget automations UI" visible --timeout-ms 30000
+  if --role checkbox --name "Budget automations UI" unchecked
+    click --role checkbox --name "Budget automations UI"
+  expect js "!!document.getElementById('settings-flag-goalTemplatesUIEnabled')?.checked"
+
+flow nav-settings
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Settings').click()"
+  expect --testid settings visible --timeout-ms 30000
+
+flow nav-budget
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Budget').click()"
+  expect --testid budget-table visible --timeout-ms 60000
+
+flow in-viewport(label)
+  expect js "(()=>{const d=[...document.querySelectorAll('[role=\"dialog\"]')].at(-1); const b=[...d.querySelectorAll('button')].find(x=>x.textContent.trim()==='${label}'); if(!b) return false; const r=b.getBoundingClientRect(); return r.top>=0&&r.left>=0&&r.bottom<=window.innerHeight&&r.right<=window.innerWidth})()"
+
+scenario "Mobile budget automations › opens automations from the category menu and drills into the editor"
+  run nav-budget
+  save cat = eval "[...document.querySelectorAll(\"[data-testid='budget-table'] [data-testid='budget-groups'] [data-testid='category-row'] [data-testid='category-name']\")][1].textContent.trim()"
+  eval "(()=>{const rows=[...document.querySelectorAll(\"[data-testid='budget-table'] [data-testid='budget-groups'] [data-testid='category-row']\")]; const r=rows.find(x=>{const n=x.querySelector(\"[data-testid='category-name']\"); return n&&n.textContent.trim()==='${cat}'}); const b=[...r.querySelectorAll('button')].find(x=>x.textContent.trim()==='${cat}'); b.setAttribute('data-pv-target','cat1'); return 'ok'})()"
+  click --selector "[data-pv-target='cat1']"
+  expect --role dialog visible
+  click --role button --name "Budget automations"
+  expect --role dialog --name "Modal dialog" visible
+  expect --role dialog --name "Modal dialog" text contains "${cat}"
+  expect --role button --name "Add an automation" visible
+  run in-viewport Cancel
+  run in-viewport Save
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot automations-list-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot automations-list-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot automations-list-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  click --role button --name "Add an automation"
+  expect --role button --name "Back" visible
+  expect --role dialog --name "Modal dialog" text contains "Automation type"
+  click --role button --name "% of income"
+  expect --selector "#percent-field" visible
+  save ph = eval "Math.round(document.querySelector('#percent-field').getBoundingClientRect().height)"
+  expect ${ph} >= 36
+  save ch = eval "Math.round(document.querySelector('#category-field').getBoundingClientRect().height)"
+  save pdiff = eval "Math.abs(${ch} - ${ph})"
+  expect ${pdiff} <= 3
+  click --role button --name "Save by date"
+  expect --selector "#by-amount-field" visible
+  save ah = eval "Math.round(document.querySelector('#by-amount-field').getBoundingClientRect().height)"
+  expect ${ah} >= 36
+  save mh = eval "Math.round(document.querySelector('#by-month-field').getBoundingClientRect().height)"
+  save adiff = eval "Math.abs(${mh} - ${ah})"
+  expect ${adiff} <= 3
+  expect js "(()=>{const d=[...document.querySelectorAll('[role=\"dialog\"]')].at(-1); return Math.round(d.getBoundingClientRect().height) <= window.innerHeight+1})()"
+  run in-viewport Back
+  expect js "(()=>{const d=[...document.querySelectorAll('[role=\"dialog\"]')].at(-1); return [...d.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Save').length===0})()"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot automations-editor-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot automations-editor-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot automations-editor-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  click --role button --name "Back"
+  expect --role button --name "Add an automation" visible
+  run in-viewport Save
+  click --role button --name "Cancel"
+  expect not --role dialog --name "Modal dialog" visible

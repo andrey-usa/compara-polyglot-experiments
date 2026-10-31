@@ -1,0 +1,71 @@
+# reports.mobile.test.ts converted from Playwright (Actual Budget e2e).
+# 1 upstream test. The scenario name is the exact upstream name,
+# including the describe prefix.
+#
+# Emulation mapping (upstream Playwright config has no device descriptor):
+# - config-wide userAgent 'playwright' -> set ua "playwright" (seeds the
+#   same deterministic demo data as Playwright).
+# - Upstream sets NO viewport in beforeEach: the test starts at the
+#   Playwright default width on purpose (the calendar widget is not on
+#   the default dashboard and "Add new widget" is desktop-only, so the
+#   widget is added wide and then viewed narrow). See W20.
+# - The spec's own mid-test page.setViewportSize(350, 600) ->
+#   set viewport 350 600 --mobile after the calendar page loads: upstream
+#   sets a plain viewport (no touch flag, no device descriptor); --mobile
+#   is the batch-C convention for narrow layout (the app's narrow layout
+#   keys off width < 512 only, and --mobile additionally enables touch
+#   emulation).
+# - fixtures' disableAnimations init script is inlined in before each.
+# - This spec calls no toMatchThemeScreenshots, so there are no
+#   screenshot steps here.
+#
+# Workarounds (pilot W1-W3 apply where noted; batch-C W4-W13 as defined
+# in the batch C report; new ones below):
+# - W20 (explicit desktop viewport): primavera's browser default viewport
+#   is not Playwright's 1280x720 default, so before each sets viewport
+#   1280 720 (plain, no --mobile) explicitly to reproduce upstream's
+#   starting width. Nothing else about the flow changes: the widget is
+#   still added wide and viewed narrow, exactly as upstream.
+# - W21 (dashboard card targeting): primavera has no .filter({has})
+#   locator, so the calendar card is found by eval (a button inside the
+#   reports page containing a heading 'Calendar'), the reports grid
+#   items are scrolled into view one by one until it is visible (the
+#   card renders its children only once it enters the viewport), the
+#   card is eval-tagged, and a real trusted click follows on the tag
+#   (same tag+click mechanism as W3).
+# - W22 (conditional and scoped reads via eval): primavera has no .or()
+#   locator, so the settle-on-whichever-renders-first step is an eval
+#   boolean (Show transactions button visible OR the error-boundary text
+#   present in visible page text); and the transaction list's first
+#   option is read by eval (first [role="option"] inside the element
+#   labelled 'Transaction list' visible), since primavera has no scoped
+#   getByRole inside a labelled container. The /^Net/ reports-page wait
+#   is likewise an eval read (a visible reports-page button whose text
+#   starts with 'Net').
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 1280 720
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+
+scenario "Mobile Reports › transaction calendar renders its transaction list on a narrow viewport"
+  click --role link --name "Reports"
+  expect --testid reports-page visible --timeout-ms 30000
+  expect js "(()=>{const p=document.querySelector('[data-testid=\"reports-page\"]'); return !!p&&[...p.querySelectorAll('button')].some(b=>b.textContent.trim().startsWith('Net')&&b.offsetParent!==null)})()"
+  click --role button --name "Add new widget"
+  click --role button --name "Calendar card"
+  eval "(()=>{const p=document.querySelector('[data-testid=\"reports-page\"]'); const items=[...p.querySelectorAll('.react-grid-item')]; for(const it of items){it.scrollIntoView(); const card=[...p.querySelectorAll('button')].find(b=>{const h=b.querySelector('[role=\"heading\"],h1,h2,h3,h4'); return h&&h.textContent.trim()==='Calendar'}); if(card&&card.offsetParent!==null){card.setAttribute('data-pv-target','cal-card'); return 'ok'}} return 'missing'})()"
+  expect --selector "[data-pv-target='cal-card']" visible
+  click --selector "[data-pv-target='cal-card']"
+  expect url contains "/reports/calendar/"
+  set viewport 350 600 --mobile
+  expect js "(()=>{const btn=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Show transactions'); const btnVis=!!btn&&btn.offsetParent!==null; const err=document.body.innerText.includes('Something went wrong loading this section.'); return btnVis||err})()" --timeout-ms 30000
+  expect no text "Something went wrong loading this section."
+  click --role button --name "Show transactions"
+  expect --label "Transaction list" visible
+  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return false; const o=l.querySelector('[role=\"option\"]'); return !!o&&o.offsetParent!==null})()"
+  expect no text "Something went wrong loading this section."

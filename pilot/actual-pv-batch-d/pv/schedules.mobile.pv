@@ -1,0 +1,149 @@
+# schedules.mobile.test.ts converted from Playwright (Actual Budget e2e).
+# 5 upstream tests: Mobile Schedules, same order as the spec. Scenario
+# names are the exact upstream names, including the describe prefix.
+#
+# Emulation mapping (upstream Playwright config has no device descriptor):
+# - config-wide userAgent 'playwright' -> set ua "playwright" (seeds the
+#   same deterministic demo data as Playwright; same as the pilot's
+#   settings file).
+# - spec beforeEach page.setViewportSize(350, 600) -> set viewport 350 600
+#   --mobile in before each (the spec's own comment says "Set mobile
+#   viewport"). Upstream sets a plain viewport (no touch flag, no device
+#   descriptor); --mobile is the prior mobile-port convention for narrow
+#   layout, and the app's narrow layout keys off width < 512 only.
+# - fixtures' disableAnimations init script is inlined in before each,
+#   as in the pilot's multitab file.
+# - toMatchThemeScreenshots is a no-op in the baseline (VRT unset), so the
+#   screenshot steps here are in-environment repeatability checks only,
+#   exactly as in the prior mobile port: baselines are captured in the run's
+#   own environment (--update-screenshots pass) and verified by the main pass.
+#   They are not compared against upstream Playwright screenshots.
+#
+# Workarounds (pilot W1-W3 and prior mobile-port W4-W13 apply where noted;
+# new ones below, in first-use order):
+# - W4 (navbar): upstream clicks the navbar link by eval (react-spring
+#   transforms defeat Playwright's click-stability check). Here the
+#   Schedules link is clicked by eval directly and the drag steps are
+#   omitted: the synthetic click fires regardless of the navbar's transform
+#   state, and the schedules grid waitFor proves the navigation landed.
+# - W3 (gap: no scoped role+name / hasText filtering): the first schedule
+#   is opened by eval-tagging the first gridcell, then a real trusted click
+#   on the tag.
+# - W8 (screenshots): screenshots run unmasked, as in-env repeatability
+#   checks only (see header).
+# - W16 (polling expects): primavera has no expect.poll / expect(...).toPass
+#   step, so every retrying-function assertion is ported as a retrying
+#   expect js with an explicit timeout: the toPass count>0 waits (upstream
+#   lines 70-74, 93-97, 122-126) become expect js with 5000 ms (the toPass
+#   default), and the two expect.poll calls (upstream lines 104 and
+#   112-114) become expect js with 5000 ms (the expect.poll default).
+#   DEVIATION, not literal: the polling target is the same gridcell count,
+#   but the retry loop is primavera's expect retry, not Playwright's poll.
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 350 600 --mobile
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Schedules').click()"
+  expect --role grid --name "Schedules" visible --timeout-ms 30000
+
+flow wait-loading
+  expect not --testid animated-loading visible --timeout-ms 10000
+
+scenario "Mobile Schedules › checks the page visuals"
+  run wait-loading
+  expect --role heading --name "Schedules" visible
+  expect --role button --name "Add new schedule" visible
+  expect --placeholder "Filter schedules…" visible
+  expect --placeholder "Filter schedules…" attr placeholder is "Filter schedules…"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot sched-visuals-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot sched-visuals-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot sched-visuals-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Schedules › page handles empty state gracefully"
+  fill --placeholder "Filter schedules…" "NonExistentSchedule123456789"
+  expect text "No schedules found. Create your first schedule to get started!"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot sched-empty-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot sched-empty-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot sched-empty-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Schedules › clicking on a schedule opens edit form"
+  run wait-loading
+  expect js "document.querySelectorAll('[aria-label=\"Schedules\"] [role=\"gridcell\"]').length > 0" --timeout-ms 5000
+  eval "(()=>{const g=document.querySelector('[aria-label=\"Schedules\"]'); const c=g.querySelectorAll('[role=\"gridcell\"]')[0]; c.setAttribute('data-pv-target','sched0'); return 'ok'})()"
+  click --selector "[data-pv-target='sched0']"
+  expect --role heading --name "Edit Schedule" visible
+  expect --role button --name "Save" visible
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot sched-edit-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot sched-edit-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot sched-edit-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Schedules › searches and filters schedules"
+  run wait-loading
+  expect js "document.querySelectorAll('[aria-label=\"Schedules\"] [role=\"gridcell\"]').length > 0" --timeout-ms 5000
+  fill --placeholder "Filter schedules…" "Dominion Power"
+  save sb = get value --placeholder "Filter schedules…"
+  expect ${sb} is "Dominion Power"
+  expect js "document.querySelectorAll('[aria-label=\"Schedules\"] [role=\"gridcell\"]').length === 1" --timeout-ms 5000
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot sched-filtered-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot sched-filtered-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot sched-filtered-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  fill --placeholder "Filter schedules…" ""
+  expect js "document.querySelectorAll('[aria-label=\"Schedules\"] [role=\"gridcell\"]').length > 1" --timeout-ms 5000
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot sched-cleared-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot sched-cleared-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot sched-cleared-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Schedules › displays schedule details correctly in list"
+  run wait-loading
+  expect js "document.querySelectorAll('[aria-label=\"Schedules\"] [role=\"gridcell\"]').length > 0" --timeout-ms 5000
+  expect js "(()=>{const c=document.querySelectorAll('[aria-label=\"Schedules\"] [role=\"gridcell\"]')[0]; return !!c && c.offsetParent!==null && (c.textContent||'').length>0})()"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot sched-details-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot sched-details-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot sched-details-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"

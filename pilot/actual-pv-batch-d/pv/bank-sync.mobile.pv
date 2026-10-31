@@ -1,0 +1,92 @@
+# bank-sync.mobile.test.ts converted from Playwright (Actual Budget e2e).
+# 3 upstream tests, same order as the spec. Scenario names are the exact
+# upstream names, including the describe prefix.
+#
+# Emulation mapping (upstream Playwright config has no device descriptor):
+# - config-wide userAgent 'playwright' -> set ua "playwright" (seeds the
+#   same deterministic demo data as Playwright).
+# - spec beforeEach page.setViewportSize(350, 600) -> set viewport 350 600
+#   --mobile in before each: upstream sets a plain viewport (no touch flag,
+#   no device descriptor); --mobile is the batch-C convention for narrow
+#   layout (the app's narrow layout keys off width < 512 only, and
+#   --mobile additionally enables touch emulation).
+# - fixtures' disableAnimations init script is inlined in before each.
+# - toMatchThemeScreenshots is a no-op in the baseline (VRT unset), so the
+#   screenshot steps here are in-environment repeatability checks only,
+#   exactly as in the pilot: baselines are captured in the run's own
+#   environment (--update-screenshots pass) and verified by the main pass.
+#   They are not compared against upstream Playwright screenshots.
+#
+# Workarounds (pilot W1-W3 apply where noted; batch-C W4-W13 as defined
+# in the batch C report):
+# - W4 (navbar): upstream drags the bottom navbar up/down around a
+#   synthetic link click (react-spring transforms defeat Playwright's
+#   click-stability check). Here the link is clicked by eval directly and
+#   the drag steps are omitted: the synthetic click fires regardless of
+#   the navbar's transform state, and the destination page's waitFor
+#   proves the navigation landed.
+# - W8 (screenshots): screenshots run unmasked, as in-env repeatability
+#   checks only (see header). Upstream masks [data-vrt-mask="true"]
+#   elements (bank-sync rows carry data-vrt-mask for last-sync strings),
+#   but a --mask step fails outright when it matches nothing (the empty
+#   state has no rows), so the mask is not applied here.
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 350 600 --mobile
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+  run nav-settings
+  click --role link --name "Bank Sync"
+  expect --role main visible
+
+flow nav-settings
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Settings').click()"
+  expect --testid settings visible --timeout-ms 30000
+
+scenario "Mobile Bank Sync › checks the page visuals"
+  expect text "Bank Sync" --timeout-ms 10000
+  expect --role heading --name "Bank Sync" visible
+  expect --placeholder "Filter accounts…" visible
+  expect --placeholder "Filter accounts…" attr placeholder is "Filter accounts…"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot banksync-visuals-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot banksync-visuals-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot banksync-visuals-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Bank Sync › searches for accounts"
+  fill --placeholder "Filter accounts…" "Checking"
+  expect --placeholder "Filter accounts…" value is "Checking"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot banksync-search-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot banksync-search-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot banksync-search-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+
+scenario "Mobile Bank Sync › page handles empty state gracefully"
+  fill --placeholder "Filter accounts…" "NonExistentAccount123456789"
+  expect text "No accounts found"
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot banksync-empty-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot banksync-empty-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot banksync-empty-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"

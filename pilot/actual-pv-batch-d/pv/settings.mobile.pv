@@ -1,0 +1,80 @@
+# settings.mobile.test.ts converted from Playwright (Actual Budget e2e).
+# 1 upstream test. The scenario name is the exact upstream name,
+# including the describe prefix.
+#
+# Emulation mapping (upstream Playwright config has no device descriptor):
+# - config-wide userAgent 'playwright' -> set ua "playwright" (seeds the
+#   same deterministic demo data as Playwright).
+# - spec beforeEach page.setViewportSize(350, 600) -> set viewport 350 600
+#   --mobile in before each: upstream sets a plain viewport (no touch flag,
+#   no device descriptor); --mobile is the batch-C convention for narrow
+#   layout (the app's narrow layout keys off width < 512 only, and
+#   --mobile additionally enables touch emulation).
+# - fixtures' disableAnimations init script is inlined in before each.
+# - toMatchThemeScreenshots is a no-op in the baseline (VRT unset), so the
+#   screenshot steps here are in-environment repeatability checks only,
+#   exactly as in the pilot: baselines are captured in the run's own
+#   environment (--update-screenshots pass) and verified by the main pass.
+#   They are not compared against upstream Playwright screenshots.
+#
+# Workarounds (pilot W1-W3 apply where noted; batch-C W4-W13 as defined
+# in the batch C report):
+# - W4 (navbar): upstream drags the bottom navbar up/down around a
+#   synthetic link click (react-spring transforms defeat Playwright's
+#   click-stability check). Here the link is clicked by eval directly and
+#   the drag steps are omitted: the synthetic click fires regardless of
+#   the navbar's transform state, and the destination page's waitFor
+#   proves the navigation landed.
+# - W8 (screenshots): screenshots run unmasked, as in-env repeatability
+#   checks only (see header). Upstream masks [data-vrt-mask="true"]
+#   elements (the settings General section carries data-vrt-mask for
+#   version strings), but a --mask step fails outright when it matches
+#   nothing (the settings landing page has no masked element), so the
+#   mask is not applied here.
+#
+# Download note (not a workaround): upstream awaits the download event
+# and asserts the suggested filename against /^\d{4}-\d{2}-\d{2}-.*.zip$/.
+# Primavera's download glob supports only '*' (no '?' or digit classes),
+# so the expect uses the loose glob "*-*.zip" and then asserts the exact
+# upstream pattern against ${download.name}, which primavera sets from
+# the finished download. The filename assertion itself is literal.
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 350 600 --mobile
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+
+flow nav-settings
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Settings').click()"
+  expect --testid settings visible --timeout-ms 30000
+
+scenario "Mobile Settings › checks that settings page can be opened"
+  run nav-settings
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot settings-landing-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot settings-landing-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot settings-landing-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
+  click --role link --name "General"
+  click --role button --name "Export data"
+  expect download "*-*.zip" --timeout-ms 30000
+  expect ${download.name} matches '^\d{4}-\d{2}-\d{2}-.*\.zip$'
+  eval "window.Actual.setTheme('auto')"
+  expect --selector "[data-theme]" attr data-theme is auto
+  expect screenshot settings-export-auto --max-diff-pixels 5000
+  eval "window.Actual.setTheme('dark')"
+  expect --selector "[data-theme]" attr data-theme is dark
+  expect screenshot settings-export-dark --max-diff-pixels 5000
+  eval "window.Actual.setTheme('midnight')"
+  expect --selector "[data-theme]" attr data-theme is midnight
+  expect screenshot settings-export-midnight --max-diff-pixels 5000
+  eval "window.Actual.setTheme('auto')"
