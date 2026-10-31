@@ -1,6 +1,7 @@
 # The two drag-and-drop tests from Actual Budget's budget.mobile spec, rerun
-# against navigera with the real-drag fix (batch C D5): navigera next c660a00
-# (CI run 41118096313 green), Actual @ dff6b4b, primavera next 7ea6551.
+# against navigera with the real-drag fix (batch C D5): navigera next 49ec9a4
+# (CI run 41210105456 green; 20 px start moves, lead note 20261031T143136Z),
+# Actual @ dff6b4b, primavera next 7ea6551.
 # Each scenario runs 3 times (--repeat 3); the drag result JSON (path,
 # dropped) is saved per try as `dr` and printed as ::notice lines by the
 # parse step below, so every try's drag path is visible in the run log.
@@ -45,7 +46,7 @@ jobs:
       - name: Build primavera + navigera @ pinned commits
         run: |
           git clone --filter=blob:none https://github.com/andrey-usa/navigera.git navigera
-          git -C navigera checkout c660a0000f8bbbac7b9fc1302f6daafca7bb21f5
+          git -C navigera checkout 49ec9a441a21ed636b84e1e68e82cd83f3a6a41c
           git clone --filter=blob:none https://github.com/andrey-usa/primavera.git primavera
           git -C primavera checkout 7ea655134ccfbd2b8776dbab7e62b6ac761b302e
           CARGO_TARGET_DIR="$RUNNER_TEMP/pv-target" cargo build --release --manifest-path primavera/Cargo.toml
