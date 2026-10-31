@@ -101,6 +101,8 @@ jobs:
               print(f"::notice::drag {o.get('name')} try {o.get('attempt')}: status={o.get('status')} path={drag.get('path')} dropped={drag.get('dropped')}")
               if (o.get('saved') or {}).get('diag'):
                   print(f"::notice::diag {o.get('name')} try {o.get('attempt')}: {(o.get('saved') or {}).get('diag')}")
+              if (o.get('saved') or {}).get('pre'):
+                  print(f"::notice::pre {o.get('name')} try {o.get('attempt')}: {(o.get('saved') or {}).get('pre')}")
           with open('results/drag-summary.txt', 'w') as f:
               for name, attempt, status, drag in rows:
                   f.write(f"{status} try {attempt} path={drag.get('path')} dropped={drag.get('dropped')} :: {name}\n")
@@ -143,6 +145,8 @@ jobs:
               print(f"::notice::drag-diag {o.get('name')} try {o.get('attempt')}: status={o.get('status')} path={drag.get('path')} dropped={drag.get('dropped')}")
               if (o.get('saved') or {}).get('diag'):
                   print(f"::notice::diag {o.get('name')} try {o.get('attempt')}: {(o.get('saved') or {}).get('diag')}")
+              if (o.get('saved') or {}).get('pre'):
+                  print(f"::notice::pre {o.get('name')} try {o.get('attempt')}: {(o.get('saved') or {}).get('pre')}")
           with open('results-diag/drag-summary.txt', 'w') as f:
               for name, attempt, status, drag in rows:
                   f.write(f"{status} try {attempt} path={drag.get('path')} dropped={drag.get('dropped')} :: {name}\n")
