@@ -99,6 +99,8 @@ jobs:
                   drag = {'raw': dr[:200]}
               rows.append((o.get('name', '?'), o.get('attempt', '?'), o.get('status', '?'), drag))
               print(f"::notice::drag {o.get('name')} try {o.get('attempt')}: status={o.get('status')} path={drag.get('path')} dropped={drag.get('dropped')}")
+              if (o.get('saved') or {}).get('diag'):
+                  print(f"::notice::diag {o.get('name')} try {o.get('attempt')}: {(o.get('saved') or {}).get('diag')}")
           with open('results/drag-summary.txt', 'w') as f:
               for name, attempt, status, drag in rows:
                   f.write(f"{status} try {attempt} path={drag.get('path')} dropped={drag.get('dropped')} :: {name}\n")
@@ -110,10 +112,54 @@ jobs:
           [ "$T" -eq 6 ] || { echo "expected 6 testcases, got $T"; exit 1; }
           [ "$CODE" -eq 0 ] || { echo "primavera exit $CODE"; exit "$CODE"; }
           [ "$F" -eq 0 ] || { echo "unexpected failures/errors"; exit 1; }
+      - name: Run drag diagnostics x3 (Cell-row target)
+        if: ${{ always() }}
+        working-directory: pilot/actual-pv-drag
+        run: |
+          mkdir -p results-diag
+          CODE=0
+          primavera run pv/drag-diag.pv --repeat 3 --reporter jsonl --reporter console --junit results-diag/junit.xml --evidence results-diag/evidence > results-diag/drag-run.log 2>&1 || CODE=$?
+          echo "$CODE" > results-diag/exit-code.txt
+          python3 - <<'PYEOF'
+          import json
+          rows = []
+          try:
+              lines = open('results-diag/drag-run.log', encoding='utf-8', errors='replace').read().splitlines()
+          except FileNotFoundError:
+              lines = []
+          for ln in lines:
+              try:
+                  o = json.loads(ln)
+              except ValueError:
+                  continue
+              if o.get('event') != 'scenario':
+                  continue
+              dr = (o.get('saved') or {}).get('dr', '')
+              try:
+                  drag = json.loads(dr).get('drag', {})
+              except ValueError:
+                  drag = {'raw': dr[:200]}
+              rows.append((o.get('name', '?'), o.get('attempt', '?'), o.get('status', '?'), drag))
+              print(f"::notice::drag-diag {o.get('name')} try {o.get('attempt')}: status={o.get('status')} path={drag.get('path')} dropped={drag.get('dropped')}")
+              if (o.get('saved') or {}).get('diag'):
+                  print(f"::notice::diag {o.get('name')} try {o.get('attempt')}: {(o.get('saved') or {}).get('diag')}")
+          with open('results-diag/drag-summary.txt', 'w') as f:
+              for name, attempt, status, drag in rows:
+                  f.write(f"{status} try {attempt} path={drag.get('path')} dropped={drag.get('dropped')} :: {name}\n")
+          print(f"drag-diag tries parsed: {len(rows)}")
+          PYEOF
+          T=$(grep -c "<testcase " results-diag/junit.xml || true)
+          F=$(grep -cE "<(failure|error)[ >]" results-diag/junit.xml || true)
+          echo "junit: $T testcases, $F failures/errors"
+          [ "$T" -eq 6 ] || { echo "expected 6 testcases, got $T"; exit 1; }
+          [ "$CODE" -eq 0 ] || { echo "primavera exit $CODE"; exit "$CODE"; }
+          [ "$F" -eq 0 ] || { echo "unexpected failures/errors"; exit 1; }
       - name: Upload results
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: actual-pv-drag-results
-          path: pilot/actual-pv-drag/results/
+          path: |
+            pilot/actual-pv-drag/results/
+            pilot/actual-pv-drag/results-diag/
           retention-days: 30
