@@ -1,0 +1,54 @@
+name: drag-diag
+on:
+  push:
+    branches: [experiment-58]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-jammy
+    env:
+      NAV_REF: 71630143388e9be2927c2f75a203f0cc4677e048
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone actual @ pinned commit
+        run: |
+          git clone --filter=blob:none https://github.com/actualbudget/actual.git actual
+          cd actual && git checkout dff6b4b21bed7d20a0977cd71c990f40b6e26e8e
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE/actual"
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'actual/.nvmrc'
+      - run: corepack enable
+      - run: cd actual && yarn install --immutable
+      - name: Build browser bundle
+        env:
+          REACT_APP_NETLIFY: 'true'
+        run: cd actual && yarn build:browser --skip-translations
+      - name: Build navigera
+        run: |
+          command -v cc >/dev/null || { apt-get update && apt-get install -y --no-install-recommends build-essential; }
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          git clone --filter=blob:none https://github.com/andrey-usa/navigera.git navigera
+          git -C navigera checkout "$NAV_REF"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/nv" "$HOME/.cargo/bin/cargo" build --release --manifest-path navigera/Cargo.toml
+          echo "NAV=$RUNNER_TEMP/nv/release/navigera" >> "$GITHUB_ENV"
+      - name: Browser
+        run: |
+          B="$(find /ms-playwright -maxdepth 4 -type f -name chrome | sort | head -1)"
+          echo "CHROME_BIN=$B" >> "$GITHUB_ENV"; echo "$B"
+      - name: Start the app
+        run: |
+          PORT=3001 node actual/packages/desktop-client/bin/serve-build.mjs > app.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:3001/ && break || sleep 2; done
+      - name: Playwright dragTo (ground truth)
+        run: ACTUAL_DIR="$GITHUB_WORKSPACE/actual" node pilot/drag-diag/pw.mjs
+      - name: navigera drag
+        if: ${{ always() }}
+        run: |
+          for i in 1 2; do bash pilot/drag-diag/nav.sh shared$i; done
+          bash pilot/drag-diag/nav.sh own --own-browser
