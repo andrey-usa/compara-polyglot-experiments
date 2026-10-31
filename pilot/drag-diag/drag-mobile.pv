@@ -1,0 +1,62 @@
+# The two "moves a category to another group with drag and drop" tests from
+# budget.mobile.test.ts (Actual Budget e2e), against navigera next cf56f6f.
+# Setup flows unchanged from batch C (experiment-53 @ 8aaeee7). Changes from
+# experiment-57: the drop lands where upstream drops (`--to-at 20,5`, the
+# Internet row's top edge, as upstream's targetPosition), and the order is
+# checked with a retrying `expect js` (upstream's toHaveText retries; Actual
+# applies the move through an async mutation, so a single read right after
+# the drop can still see the old order). No diagnostic pre-scroll.
+
+base http://127.0.0.1:3001
+
+before each
+  set ua "playwright"
+  set viewport 350 600 --mobile
+  init-script "(()=>{const css='*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;animation-duration:0s !important;animation-delay:0s !important}';const f=()=>{const s=document.createElement('style');s.setAttribute('data-e2e-disable-animations','true');s.textContent = css;document.head.appendChild(s)};document.head?f():document.addEventListener('DOMContentLoaded',f,{once:true})})()"
+  goto /
+  click --role button --name "Try the demo"
+  expect --testid budget-table visible --timeout-ms 60000
+
+flow nav-settings
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Settings').click()"
+  expect --testid settings visible --timeout-ms 30000
+
+flow nav-budget
+  eval "[...document.querySelectorAll('[data-navbar-state] a')].find(a=>a.textContent.trim()==='Budget').click()"
+  expect --testid budget-table visible --timeout-ms 60000
+
+flow setup-envelope
+  run nav-settings
+  click --role link --name "General"
+  expect text "Budget type" --timeout-ms 30000
+  save sw = eval "([...document.querySelectorAll('button')].find(b=>/Switch to .* budgeting/i.test(b.textContent))?.textContent||'')"
+  if ${sw} contains envelope
+    click --role button --name "Switch to envelope budgeting"
+  run nav-budget
+  expect js "[...document.querySelectorAll('button')].some(b=>['To Budget','Overbudgeted'].some(t=>b.textContent.trim().startsWith(t)))"
+
+flow setup-tracking
+  run nav-settings
+  click --role link --name "General"
+  expect text "Budget type" --timeout-ms 30000
+  save sw = eval "([...document.querySelectorAll('button')].find(b=>/Switch to .* budgeting/i.test(b.textContent))?.textContent||'')"
+  if ${sw} contains tracking
+    click --role button --name "Switch to tracking budgeting"
+  run nav-budget
+  expect js "[...document.querySelectorAll('button')].some(b=>['Saved','Projected savings','Overspent'].some(t=>b.textContent.trim().startsWith(t)))"
+
+scenario "Mobile Budget [Envelope] › moves a category to another group with drag and drop"
+  run setup-envelope
+  set viewport 350 1000
+  run nav-budget
+  eval "(()=>{const rows=[...document.querySelectorAll(\"[data-testid='budget-table'] [data-testid='budget-groups'] [data-testid='category-row']\")]; const tag=(name,t)=>{const r=rows.find(x=>{const n=x.querySelector(\"[data-testid='category-name']\"); return n&&n.textContent.trim()===name}); r.setAttribute('data-pv-target',t)}; tag('Gift','gift-row'); tag('Internet','internet-row'); return 'ok'})()"
+  save dr = drag "[data-pv-target='gift-row']" "[data-pv-target='internet-row']" --to-at 20,5
+  expect js "(()=>{const g=[...document.querySelectorAll('[role=\"grid\"]')].find(x=>(x.getAttribute('aria-label')||'')==='Bills expense group categories'); return [...g.querySelectorAll(\"[data-testid='category-name']\")].map(e=>e.textContent.trim()).join('|')})()" is "Cell|Gift|Internet|Mortgage|Water|Power" --timeout-ms 5000
+
+scenario "Mobile Budget [Tracking] › moves a category to another group with drag and drop"
+  run setup-tracking
+  set viewport 350 1000
+  run nav-budget
+  eval "(()=>{const rows=[...document.querySelectorAll(\"[data-testid='budget-table'] [data-testid='budget-groups'] [data-testid='category-row']\")]; const tag=(name,t)=>{const r=rows.find(x=>{const n=x.querySelector(\"[data-testid='category-name']\"); return n&&n.textContent.trim()===name}); r.setAttribute('data-pv-target',t)}; tag('Gift','gift-row'); tag('Internet','internet-row'); return 'ok'})()"
+  save dr = drag "[data-pv-target='gift-row']" "[data-pv-target='internet-row']" --to-at 20,5
+  expect js "(()=>{const g=[...document.querySelectorAll('[role=\"grid\"]')].find(x=>(x.getAttribute('aria-label')||'')==='Bills expense group categories'); return [...g.querySelectorAll(\"[data-testid='category-name']\")].map(e=>e.textContent.trim()).join('|')})()" is "Cell|Gift|Internet|Mortgage|Water|Power" --timeout-ms 5000

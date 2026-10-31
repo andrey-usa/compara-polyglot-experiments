@@ -12,7 +12,8 @@ jobs:
     container:
       image: mcr.microsoft.com/playwright:v1.61.1-jammy
     env:
-      NAV_REF: 71630143388e9be2927c2f75a203f0cc4677e048
+      NAV_REF: cf56f6f78793fe7147b1d02a9ceed0e80294062e
+      PV_REF: 7ea655134ccfbd2b8776dbab7e62b6ac761b302e
     steps:
       - uses: actions/checkout@v4
       - name: Clone actual @ pinned commit
@@ -37,6 +38,12 @@ jobs:
           git -C navigera checkout "$NAV_REF"
           CARGO_TARGET_DIR="$RUNNER_TEMP/nv" "$HOME/.cargo/bin/cargo" build --release --manifest-path navigera/Cargo.toml
           echo "NAV=$RUNNER_TEMP/nv/release/navigera" >> "$GITHUB_ENV"
+      - name: Build primavera (path dependency on ../navigera, the commit above)
+        run: |
+          git clone --filter=blob:none https://github.com/andrey-usa/primavera.git primavera
+          git -C primavera checkout "$PV_REF"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/pv" "$HOME/.cargo/bin/cargo" build --release --manifest-path primavera/Cargo.toml
+          echo "$RUNNER_TEMP/pv/release" >> "$GITHUB_PATH"
       - name: Browser
         run: |
           B="$(find /ms-playwright -maxdepth 4 -type f -name chrome | sort | head -1)"
@@ -47,8 +54,16 @@ jobs:
           for i in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:3001/ && break || sleep 2; done
       - name: Playwright dragTo (ground truth)
         run: ACTUAL_DIR="$GITHUB_WORKSPACE/actual" node pilot/drag-diag/pw.mjs
-      - name: navigera drag
+      - name: navigera drag (event log)
         if: ${{ always() }}
         run: |
-          for i in 1 2; do bash pilot/drag-diag/nav.sh shared$i; done
-          bash pilot/drag-diag/nav.sh own --own-browser
+          bash pilot/drag-diag/nav.sh center
+          DRAG_ARGS="--to-at 20,5" bash pilot/drag-diag/nav.sh top-edge
+      - name: The two upstream tests through primavera, x3 (deciding)
+        if: ${{ always() }}
+        working-directory: pilot/drag-diag
+        run: |
+          primavera run drag-mobile.pv --repeat 3 --reporter console --junit junit.xml > run.log 2>&1; CODE=$?
+          cat run.log
+          echo "testcases: $(grep -c '<testcase ' junit.xml)  failures: $(grep -cE '<(failure|error)[ >]' junit.xml)  exit: $CODE"
+          exit $CODE
