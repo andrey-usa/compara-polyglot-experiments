@@ -122,7 +122,7 @@ flow fill-account-ally
   expect --testid account-field text contains "Ally Savings"
 
 flow create-txn
-  eval "(()=>{const f=document.querySelector('[data-testid=\"transaction-form\"]'); const b=f && [...f.querySelectorAll('button')].find(x=>(x.textContent||'').includes('Add transaction')); if(!b) return 'missing'; b.setAttribute('data-pv-target','form-add'); return 'ok'})()"
+  eval "(()=>{const f=document.querySelector('[data-testid=\"transaction-form-footer\"]'); const b=f && [...f.querySelectorAll('button')].find(x=>/add transaction/i.test(x.textContent||'')); if(!b) return 'missing'; b.setAttribute('data-pv-target','form-add'); return 'ok'})()"
   click --selector "[data-pv-target='form-add']"
 
 scenario "Mobile Transactions › creates a transaction via footer button"
@@ -199,6 +199,8 @@ scenario "Mobile Transactions › removes the payee from a new transaction"
   click --role button --name "No payee"
   expect not --testid payee-field text contains "Kroger"
   run fill-category-clothing
+  save btndbg = eval "(()=>{const btns=[...document.querySelectorAll('button')].filter(b=>/add transaction/i.test(b.textContent||'')); const foot=document.querySelector('[data-testid=\"transaction-form-footer\"]'); return 'n=' + btns.length + ' texts=' + JSON.stringify(btns.map(b=>(b.textContent||'').trim())) + ' foot=' + (foot ? [...foot.querySelectorAll('button')].map(b=>(b.textContent||'').trim()).join('|') : 'N') + ' url=' + location.pathname})()"
+  expect ${btndbg} is "DIAG-BTN"
   run create-txn
   expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='(No payee)Clothing-12.34'})()"
 
@@ -224,7 +226,8 @@ scenario "Mobile Transactions › creates a transaction from `/accounts/:id` pag
   run fill-payee-kroger
   run fill-category-clothing
   run create-txn
-  expect js "(()=>{const b=document.querySelectorAll('[aria-label=\"Transaction list\"] [role=\"button\"]')[0]; return !!b && b.innerText.trim()==='KrogerClothing-12.34'})()"
+  save pagedbg = eval "(()=>{const labs=[...document.querySelectorAll('[aria-label]')].map(e=>e.getAttribute('aria-label')).slice(0,25).join('~'); const heads=[...document.querySelectorAll('h1,h2,h3')].map(e=>e.textContent.trim()).join('~'); return 'url=' + location.pathname + ' labs=' + labs + ' heads=' + heads})()"
+  expect ${pagedbg} is "DIAG-PAGE"
 
 
 scenario "Mobile Transactions › creates an uncategorized transaction from `/categories/uncategorized` page"

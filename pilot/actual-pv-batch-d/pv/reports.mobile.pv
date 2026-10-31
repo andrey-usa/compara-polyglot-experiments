@@ -67,5 +67,5 @@ scenario "Mobile Reports › transaction calendar renders its transaction list o
   expect no text "Something went wrong loading this section."
   click --role button --name "Show transactions"
   expect --label "Transaction list" visible
-  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return false; const o=l.querySelector('[role=\"option\"]'); return !!o&&o.offsetParent!==null})()"
+  expect js "(()=>{const l=document.querySelector('[aria-label=\"Transaction list\"]'); if(!l) return false; const o=l.querySelector('[role=\"option\"]'); if(!o) return false; const r=o.getBoundingClientRect(); return r.width>0&&r.height>0})()"
   expect no text "Something went wrong loading this section."
