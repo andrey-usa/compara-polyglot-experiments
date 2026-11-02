@@ -13,10 +13,11 @@ deepseek-ai/DeepSeek-V4.1-Flash (the DeepSeek model the board's
 earlier cells used), key from SILICONFLOW_API_KEY in the environment
 (CI `main` environment secret; never in a sandbox). Prices verified
 against SiliconFlow's listing for this model: $0.15/M input,
-$0.003/M cached input, $0.60/M output. The budget guard reserves
-each request's documented maximum (context ceiling x input price +
-max_tokens x output price) before sending it; a request whose outcome
-is unknown keeps its full reservation. No client retries.
+$0.003/M cached input, $0.60/M output. The budget guard is per
+RUN (one Budget caps total spend across all sessions) and reserves
+each request's estimated cost from its actual messages before
+sending it; a failed request releases its reservation (no response,
+no usage, no charge). No client retries.
 
 Arms:
   nav-default       navigera CLI, default JSON output
@@ -48,9 +49,16 @@ import urllib.request
 API = "https://api.siliconflow.com/v1/chat/completions"
 MODEL_DEFAULT = "deepseek-ai/DeepSeek-V4.1-Flash"
 PRICE_IN, PRICE_IN_CACHED, PRICE_OUT = 0.15, 0.003, 0.60  # USD / 1M tokens
-CONTEXT_MAX = 1_049_000
 MAX_TOKENS = 1024
-RESERVE_PER_CALL = (CONTEXT_MAX * PRICE_IN + MAX_TOKENS * PRICE_OUT) / 1e6
+# Reservation is per CALL, estimated from the actual messages about to
+# be sent (~4 chars/token plus a fixed overhead for the tool
+# definition and message framing), NOT the model context ceiling: the
+# old constant reserved the full 1M-token context (about $0.158) for
+# every call, which made one kept reservation look like a session
+# budget. Sessions run sequentially, so at most one reservation is
+# ever outstanding.
+TOOL_DEF_OVERHEAD_TOKENS = 250
+MIN_RESERVE_USD = 0.005
 MAX_TURNS = 40
 CMD_TIMEOUT = 240
 SESSION_TIMEOUT = 1500
@@ -103,30 +111,63 @@ class BudgetStop(RuntimeError):
     pass
 
 
+def estimate_prompt_tokens(messages):
+    """Rough prompt size for the reservation: ~4 chars per token,
+    plus framing per message and the tool definition overhead."""
+    n = TOOL_DEF_OVERHEAD_TOKENS
+    for m in messages:
+        c = m.get("content", "")
+        if isinstance(c, str):
+            n += len(c) // 4 + 8
+        for call in (m.get("tool_calls") or []):
+            n += len(json.dumps(call)) // 4 + 8
+    return n
+
+
+def reserve_for(messages):
+    est = estimate_prompt_tokens(messages)
+    return max(MIN_RESERVE_USD,
+               (est * PRICE_IN + MAX_TOKENS * PRICE_OUT) / 1e6)
+
+
 class Budget:
+    """Guard is per RUN: one Budget caps total model spend across
+    all sessions (sessions run sequentially, so at most one call's
+    reservation is ever outstanding). A reservation is released when
+    its request fails: the provider bills only served completions
+    (usage in the response), so a raised request has no charge to
+    hold against the budget. The old code kept a failed call's full
+    worst-case reservation forever, so 31 fast-failing sessions
+    accumulated 31 x $0.158 = $4.90 of phantom reservations and the
+    32nd session tripped the $5 guard before its first call."""
+
     def __init__(self, total):
         self.total = total
         self.spent = 0.0
         self.reserved = 0.0
 
-    def check(self):
-        if self.spent + self.reserved + RESERVE_PER_CALL > self.total:
+    def check(self, amount):
+        if self.spent + self.reserved + amount > self.total:
             raise BudgetStop(
                 f"budget exceeded: spent {self.spent:.4f} + reserved "
-                f"{self.reserved:.4f} + reserve {RESERVE_PER_CALL:.4f} "
+                f"{self.reserved:.4f} + reserve {amount:.4f} "
                 f"> {self.total}")
 
-    def reserve(self):
-        self.check()
-        self.reserved += RESERVE_PER_CALL
+    def reserve(self, amount):
+        self.check(amount)
+        self.reserved += amount
 
-    def settle(self, cost):
-        self.reserved = max(0.0, self.reserved - RESERVE_PER_CALL)
+    def settle(self, amount, cost):
+        self.reserved = max(0.0, self.reserved - amount)
         self.spent += cost
+
+    def release(self, amount):
+        self.reserved = max(0.0, self.reserved - amount)
 
 
 def chat(key, model, messages, budget):
-    budget.reserve()
+    amount = reserve_for(messages)
+    budget.reserve(amount)
     body = json.dumps({"model": model, "messages": messages,
                        "temperature": 0, "max_tokens": MAX_TOKENS,
                        "tools": [{"type": "function", "function": {
@@ -144,15 +185,19 @@ def chat(key, model, messages, budget):
         with urllib.request.urlopen(req, timeout=120) as r:
             resp = json.loads(r.read())
     except Exception as e:
-        # Outcome unknown: the reservation stays (possibly charged).
-        raise RuntimeError(f"model request failed, reservation kept: {e}")
+        # No response, no usage: nothing was served, so nothing is
+        # charged. Release the reservation instead of holding it
+        # against every later session (see Budget).
+        budget.release(amount)
+        raise RuntimeError(f"model request failed, reservation "
+                           f"released: {e}")
     usage = resp.get("usage", {})
     prompt = usage.get("prompt_tokens", 0)
     completion = usage.get("completion_tokens", 0)
     cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
     cost = ((prompt - cached) * PRICE_IN + cached * PRICE_IN_CACHED
             + completion * PRICE_OUT) / 1e6
-    budget.settle(cost)
+    budget.settle(amount, cost)
     return resp["choices"][0]["message"], {
         "prompt": prompt, "completion": completion, "cached": cached,
         "cost": cost}
@@ -474,6 +519,9 @@ def cleanup(arm, sess, tools_dir, nav_bin, mcp):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", default=",".join(ALL_ARMS))
+    ap.add_argument("--tasks", default=None,
+                    help="comma-separated task subset (probe use); "
+                         "default is the arm's task list")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--model", default=MODEL_DEFAULT)
     ap.add_argument("--out", default="results")
@@ -493,13 +541,20 @@ def main():
                               stderr=subprocess.DEVNULL)
     budget = Budget(args.budget)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    only_tasks = ([t.strip() for t in args.tasks.split(",") if t.strip()]
+                  if args.tasks else None)
+
+    def tasks_for(arm):
+        base = ARM_TASKS.get(arm, ["search", "form", "table"])
+        return [t for t in base if t in only_tasks] if only_tasks \
+            else base
+
     records = []
     try:
         for rep in range(1, args.reps + 1):
             order = arms[rep % len(arms):] + arms[:rep % len(arms)]
             for arm in order:
-                for task in ARM_TASKS.get(arm, ["search", "form",
-                                                "table"]):
+                for task in tasks_for(arm):
                     print(f"--- {arm} / {task} / rep {rep} ---",
                           flush=True)
                     records.append(run_session(
@@ -514,7 +569,7 @@ def main():
     print("| arm | task | success | median turns | median wall ms | "
           "median tokens | median $ |", flush=True)
     for arm in arms:
-        for task in ARM_TASKS.get(arm, ["search", "form", "table"]):
+        for task in tasks_for(arm):
             rs = [r for r in records if r["arm"] == arm
                   and r["task"] == task]
             if not rs:

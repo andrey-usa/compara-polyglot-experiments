@@ -54,11 +54,14 @@ jobs:
           npm init -y >/dev/null 2>&1
           npm install --no-audit --no-fund agent-browser@0.41.1 @playwright/cli@0.1.23 @playwright/mcp@0.0.84 chrome-devtools-mcp@1.12.0
           npx playwright install --with-deps chromium
-      - name: Run LLM bench (3 reps per arm x task)
+      # PROBE (fix round 1): one session only, to measure a real
+      # session cost before the full rerun. Restored to --reps 3
+      # for the full bench once the probe cost is known.
+      - name: Run LLM bench (PROBE: 1 session)
         run: |
           echo "navigera next: $NAV_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
           NAV_BIN="$PWD/nav/target/release/navigera" TOOLS_DIR="$PWD/tools-npm" \
-            python3 llm-bench/llm_bench.py --reps 3 --out results
+            python3 llm-bench/llm_bench.py --arms nav-default --tasks search --reps 1 --out results
       - name: Append summary table
         if: always()
         run: |
