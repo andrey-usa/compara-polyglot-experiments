@@ -57,7 +57,7 @@ jobs:
       # PROBE (fix round 1): one session only, to measure a real
       # session cost before the full rerun. Restored to --reps 3
       # for the full bench once the probe cost is known.
-      - name: Run LLM bench (PROBE: 1 session)
+      - name: "Run LLM bench (PROBE: 1 session)"
         run: |
           echo "navigera next: $NAV_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
           NAV_BIN="$PWD/nav/target/release/navigera" TOOLS_DIR="$PWD/tools-npm" \
