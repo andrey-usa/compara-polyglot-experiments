@@ -1,0 +1,93 @@
+name: llm-bench
+
+# T-0225: LLM-in-the-loop repeat of the scripted tool bench.
+# One ubuntu job runs llm-bench/llm_bench.py: DeepSeek-V4.1-Flash
+# (via SiliconFlow, key in the `main` environment as
+# SILICONFLOW_API_KEY — never in a sandbox) drives each tool through
+# one shell tool, 3 reps per arm x task. Arms: navigera default /
+# --compact / batch, agent-browser, playwright-cli, playwright-mcp,
+# chrome-devtools-mcp, navigera WebMCP (native webmcp-list/call).
+# Per-session RESULT lines (success, turns, tokens, USD, wall ms)
+# go to stdout and to ::notice annotations; the summary table goes
+# to the job summary. Navigera is built from source at the `next`
+# tip present at run time; its sha is recorded in the summary.
+
+on:
+  push:
+    branches: [experiment-62]
+    paths:
+      - llm-bench/**
+      - .github/workflows/llm-bench.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    environment: main
+    env:
+      SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - name: Build navigera next from source
+        run: |
+          git clone --depth 1 --branch next https://github.com/andrey-usa/navigera.git nav
+          echo "NAV_SHA=$(git -C nav rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "::notice::navigera next sha $(git -C nav rev-parse HEAD)"
+          cargo build --release --manifest-path nav/Cargo.toml
+      - name: Install node tools and Chromium
+        run: |
+          mkdir -p tools-npm
+          cd tools-npm
+          npm init -y >/dev/null 2>&1
+          npm install --no-audit --no-fund agent-browser@0.41.1 @playwright/cli@0.1.23 @playwright/mcp@0.0.84 chrome-devtools-mcp@1.12.0
+          npx playwright install --with-deps chromium
+      - name: Run LLM bench (3 reps per arm x task)
+        run: |
+          echo "navigera next: $NAV_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          NAV_BIN="$PWD/nav/target/release/navigera" TOOLS_DIR="$PWD/tools-npm" \
+            python3 llm-bench/llm_bench.py --reps 3 --out results
+      - name: Append summary table
+        if: always()
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          p = "results/summary.json"
+          if not os.path.exists(p):
+              print("no summary.json (driver did not finish)")
+              raise SystemExit
+          s = json.load(open(p))
+          print(f"Model: {s['model']}")
+          print(f"Total model spend: ${s['total_cost_usd']:.4f}")
+          print("| arm | task | success | median turns | median wall ms | median tokens | median $ |")
+          print("|---|---|---|---|---|---|---|")
+          recs = s["records"]
+          arms = sorted({r["arm"] for r in recs})
+          tasks = ["search", "form", "table", "webmcp"]
+          for arm in arms:
+              for task in tasks:
+                  rs = [r for r in recs if r["arm"] == arm and r["task"] == task]
+                  if not rs:
+                      continue
+                  med = lambda k: sorted(r[k] for r in rs)[len(rs) // 2]
+                  toks = med("prompt_tokens") + med("completion_tokens")
+                  print(f"| {arm} | {task} | {sum(r['success'] for r in rs)}/{len(rs)} | {med('turns')} | {med('wall_ms')} | {toks} | {med('cost_usd'):.6f} |")
+          EOF
+      - name: Upload per-session results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-bench-results
+          path: results/
